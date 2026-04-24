@@ -1,8 +1,8 @@
 # T-0201 portable-pty spawn bash -l
 
 **Phase**: 2
-**Assigned**:
-**Status**: open
+**Assigned**: 写码-close
+**Status**: claimed
 **Budget**: tokenBudget=100k, walltime=3600s, cost=$5
 **Dependencies**: 无(Phase 2 起点;可与 T-0104 并行,两者无文件重叠)
 
