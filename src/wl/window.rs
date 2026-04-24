@@ -292,13 +292,23 @@ fn pump_once(
     }
 
     // 5a. PTY 可读 → 把 &mut PtyHandle 从 state.pty 借给 calloop 的 Generic
-    //      source 回调。T-0203 起 Data 从 `()` 升级为 PtyHandle,回调 `pty_read_callback`
-    //      用 `pty.read()` 读字节并 tracing。Duration::ZERO = 非阻塞 tick。
+    //      source 回调。T-0203 起 Data 从 `()` 升级为 PtyHandle,回调走 pty_read_tick
+    //      读字节 / trace / (T-0205) 触发退出。Duration::ZERO = 非阻塞 tick。
+    //
+    //      **revents 要看 IN | HUP | ERR**(T-0205 修的 bug):Linux 在 slave 端
+    //      关闭时给 master 设 POLLHUP,没有 POLLIN 的情况下 `.contains(IN)` 漏过
+    //      → callback 不跑 → pty_read_tick 永远看不到 EOF/EIO → should_exit 永远
+    //      不置位,bash 被 kill 也关不了 quill。intersects(IN|HUP|ERR) 覆盖全部
+    //      "master 有事发生" 的可能信号,交给 pty_read_tick 用 read 的返回值
+    //      精细分类(走 pty_readable_action)。
     //
     //      `if let` 守卫:正常路径 state.pty 必 Some(run_window 里 spawn_shell 成功
     //      才组装 pump_once 闭包);这里防御式 `None` 跳过,不 panic 不 expect,
     //      符合 CLAUDE.md "非 main/tests 禁用 unwrap/expect"。
-    if fds[2].revents().contains(PollFlags::IN) {
+    if fds[2]
+        .revents()
+        .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR)
+    {
         if let Some(pty) = state.pty.as_mut() {
             pty_core
                 .dispatch(Some(Duration::ZERO), pty)
@@ -328,21 +338,79 @@ fn pump_once(
 /// 内核缓冲,一次 read 基本能吞完 bash prompt / ANSI escape;满了就循环再读一次。
 const PTY_READ_BUF: usize = 4096;
 
-/// calloop Generic source 的回调,从 PTY master fd 读字节并 `tracing::trace!`。
+/// `pty_readable_action` 的返回:告诉 [`pty_read_tick`] 下一步该做什么。
 ///
-/// T-0203 实装:取代 T-0202 的 trace-only + drain-discard stopgap。循环读到
-/// `WouldBlock`(master 被 O_NONBLOCK 设过,无更多数据)才返回,每批字节用
-/// `escape_ascii` 渲染成可读 trace。错误处理:
-/// - `WouldBlock` → 正常,回到 calloop 等下一次 readable
-/// - `Interrupted` → 被 signal 打断,重试本轮 read
-/// - `Ok(0)` / 其它 IO 错(常见 EIO:slave 端关闭)→ `tracing::warn!`。**本 ticket 不退
-///   出主循环**(退出检测由 T-0205 的 `try_wait` + child-exit 路径负责),返回
-///   `Continue` 让 calloop 继续。
-fn pty_read_callback(
-    _readiness: calloop::Readiness,
-    _fd: &mut calloop::generic::NoIoDrop<BorrowedFd<'static>>,
-    pty: &mut PtyHandle,
-) -> std::io::Result<PostAction> {
+/// 抽成显式 enum(而非散落 `if` 分支)是 T-0107 / T-0205 的抽状态机路子 ——
+/// 纯逻辑决策能用 headless 单测覆盖,避免"PTY 真死了但主循环没退出"这类
+/// 回归(ticket T-0205 acceptance 显式要求单测这条路径)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PtyAction {
+    /// `Ok(n > 0)`:读到字节,trace 后继续循环 read。
+    /// `Err(EINTR)`:被 signal 打断,重试本轮 read(也走 Continue)。
+    ContinueReading,
+    /// `Err(WouldBlock / EAGAIN)`:暂时没更多数据 —— 跳出循环,回 calloop
+    /// 等下一次 readable。
+    ReturnContinue,
+    /// `Ok(0)` EOF / `Err(EIO)` slave 关闭 / 其它未知 IO 错:shell 死了,
+    /// 主循环退出路径要跑 —— 触发 `should_exit` + `try_wait` 收尸。
+    RequestExit,
+}
+
+/// 纯逻辑决策:看一次 `PtyHandle::read` 的结果,算出 [`PtyAction`]。
+///
+/// **无副作用、不碰 IO**,便于 headless 单测走所有分支。真 trace / reap /
+/// set-flag 都放在 [`pty_read_tick`] 的调用方里,按 action 分派。
+///
+/// T-0205 acceptance 对这条路径的要求:"read 返回 0 字节 → 触发 should_exit"
+/// —— 对应本函数 `Ok(0) -> PtyAction::RequestExit`,配合 `pty_read_tick` 里
+/// `RequestExit → should_exit.store(true)` 走完。
+pub(crate) fn pty_readable_action(result: &std::io::Result<usize>) -> PtyAction {
+    match result {
+        // Ok(0) = EOF。Linux 在 slave 关闭后通常给 EIO,但 BSD / macOS 或某些
+        // 路径会给 EOF;两者语义等价(shell 死了),都走退出路径。
+        Ok(0) => PtyAction::RequestExit,
+        Ok(_) => PtyAction::ContinueReading,
+        Err(e) => {
+            // 优先看 ErrorKind 的语义分类 —— std 帮我们把 errno 翻译成
+            // 跨平台 Kind,命中 WouldBlock / Interrupted 走快路径。
+            match e.kind() {
+                std::io::ErrorKind::WouldBlock => return PtyAction::ReturnContinue,
+                std::io::ErrorKind::Interrupted => return PtyAction::ContinueReading,
+                _ => {}
+            }
+            // ErrorKind 没匹配到(多见于 Kind::Uncategorized):再看 raw errno。
+            // EAGAIN 在 Linux 上 == EWOULDBLOCK(值都是 11),理论上 Kind 应是
+            // WouldBlock;防御性再匹配一次,不依赖具体 std 版本。
+            match e.raw_os_error() {
+                Some(errno) if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK => {
+                    PtyAction::ReturnContinue
+                }
+                Some(errno) if errno == libc::EINTR => PtyAction::ContinueReading,
+                // EIO:slave 已关闭或 tty 设备错。T-0205 acceptance 明确要求
+                // 视同 EOF 走退出路径。
+                Some(errno) if errno == libc::EIO => PtyAction::RequestExit,
+                // 其它未知 IO 错(EBADF / EFAULT 等):按"读不动了"处理 —— 保守
+                // 触发退出,避免卡 main loop 死等一个永远不再 ready 的 fd。
+                _ => PtyAction::RequestExit,
+            }
+        }
+    }
+}
+
+/// calloop Generic source 每次 readable 时跑一圈:循环 `pty.read` → 分派
+/// [`PtyAction`] → 处理。一个 tick 要么读尽(ReturnContinue)要么触发退出
+/// (RequestExit)。
+///
+/// T-0203 实装 trace,T-0205 接入 `should_exit` + `try_wait`:EOF / EIO 时
+/// - `should_exit.store(true, Relaxed)` —— 复用 T-0104 的统一退出路径,
+///   不新建机制。主循环 [`run_main_loop`] 下一轮 atomic load 命中后干净 Stop
+/// - `pty.try_wait()` 把子进程收尸并 `tracing::info!` 它的 exit code。
+///   `Ok(None)`(race:刚退还没被 kernel 标记)不 sleep 重试,接受延迟;进程
+///   将被 `PtyHandle::Drop` / init-adopt 兜底
+///
+/// `should_exit` 以 `&AtomicBool` 传入(外层闭包 move `Arc<AtomicBool>` 进
+/// 来时 deref 一下),本函数不 own Arc,也就不需要强 Arc clone。
+fn pty_read_tick(pty: &mut PtyHandle, should_exit: &AtomicBool) -> std::io::Result<PostAction> {
     // INV-009 sanity check:master fd 必须 O_NONBLOCK。由 T-0201 的 `spawn_program`
     // 在构造时 fcntl 一次设好,本 ticket **不重复** F_SETFL(会覆盖其它 flag 破
     // 坏不变式)。debug build panic 拦回归;release build 0 开销。
@@ -362,47 +430,75 @@ fn pty_read_callback(
 
     let mut buf = [0u8; PTY_READ_BUF];
     loop {
-        match pty.read(&mut buf) {
-            Ok(0) => {
-                // EOF:slave 端关闭。常见:子进程退出后 kernel 在 drain 完 buffer 后
-                // 给出 0 字节 read。本 ticket 仅 warn 不改控制流 —— 退出由 T-0205
-                // 的子进程 try_wait + should_exit 路径处理。
-                tracing::warn!(
-                    target: "quill::pty",
-                    "master fd 读到 EOF(0 字节);T-0205 的 try_wait 路径会处理子进程退出"
-                );
-                return Ok(PostAction::Continue);
-            }
-            Ok(n) => {
-                // `escape_ascii` 是 u8 稳定方法(Rust 1.60+),把不可打印字符变成
-                // \xNN / \e / \n 形式,trace 里可一眼看出终端转义序列而不污染 log。
-                let preview = buf[..n].escape_ascii().to_string();
-                tracing::trace!(
-                    target: "quill::pty",
-                    n,
-                    bytes = %preview,
-                    "pty bytes"
-                );
-                // 读满 buffer:肯定还有更多字节,继续循环。
-                // 读不满:可能 drained;继续循环交给下一轮 read 去 WouldBlock 兜底,
-                //         不用提前 break —— Linux PTY 把小块 write 合并的概率高,
-                //         多一次 syscall 换一次"确定性清空"。
+        let result = pty.read(&mut buf);
+        match pty_readable_action(&result) {
+            PtyAction::ContinueReading => {
+                // Ok(n>0) 路径:trace 字节。Err(EINTR) 路径:不 trace,沉默重试。
+                if let Ok(n) = result {
+                    debug_assert!(
+                        n > 0,
+                        "pty_readable_action::ContinueReading 分支不应对应 Ok(0)"
+                    );
+                    let preview = buf[..n].escape_ascii().to_string();
+                    tracing::trace!(
+                        target: "quill::pty",
+                        n,
+                        bytes = %preview,
+                        "pty bytes"
+                    );
+                }
                 continue;
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                return Ok(PostAction::Continue);
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => {
-                // 常见 EIO:slave 关闭后继续读。也可能 EBADF(fd 意外关了)等,
-                // 这里不区分 —— 都归为"读不动了",warn + continue。T-0205 的
-                // try_wait 会发现子进程退出,触发主循环退出。
-                tracing::warn!(
-                    target: "quill::pty",
-                    error = %e,
-                    kind = ?e.kind(),
-                    "pty read 报错(T-0205 的 try_wait 路径会处理)"
-                );
+            PtyAction::ReturnContinue => return Ok(PostAction::Continue),
+            PtyAction::RequestExit => {
+                // 记一次退出原因,方便日志排障(WARN 级是因为 shell 死是不常
+                // 见事件,不该被 trace 淹)。
+                match &result {
+                    Ok(0) => tracing::info!(
+                        target: "quill::pty",
+                        "master EOF:slave 端关闭,shell 退出"
+                    ),
+                    Err(e) => tracing::info!(
+                        target: "quill::pty",
+                        error = %e,
+                        errno = ?e.raw_os_error(),
+                        "master read IO 错:shell 退出"
+                    ),
+                    Ok(n) => tracing::warn!(
+                        target: "quill::pty",
+                        n,
+                        "pty_readable_action::RequestExit 对应 Ok(n>0),实现 bug"
+                    ),
+                }
+                // 非阻塞收尸。Ok(None) 接受:race 下 try_wait 可能还没见到 exit
+                // status,主循环反正要退,PtyHandle 的 Drop 路径再配合 init
+                // adopt zombie 兜底。
+                match pty.try_wait() {
+                    Ok(Some(code)) => {
+                        tracing::info!(
+                            target: "quill::pty",
+                            exit_code = code,
+                            "shell exited"
+                        );
+                    }
+                    Ok(None) => {
+                        tracing::info!(
+                            target: "quill::pty",
+                            "shell 正在退出,try_wait 尚未见到 exit status(init 兜底收养)"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "quill::pty",
+                            error = ?e,
+                            "try_wait 失败 —— 仍触发 should_exit"
+                        );
+                    }
+                }
+                // 触发主循环退出:复用 T-0104 的 should_exit 原子标志,不建
+                // 第二套机制。Relaxed 足够 —— run_main_loop 顶每轮 load 都看
+                // 到同 thread 的置位(单线程 loop)。
+                should_exit.store(true, Ordering::Relaxed);
                 return Ok(PostAction::Continue);
             }
         }
@@ -504,11 +600,16 @@ pub fn run_window() -> Result<()> {
     // 实际有效期 ≥ pty_core 与 event_loop 的生命周期,满足合约。
     #[allow(unsafe_code)]
     let pty_borrowed: BorrowedFd<'static> = unsafe { BorrowedFd::borrow_raw(pty_fd) };
+    // T-0205:`pty_read_tick` 需要 `Arc<AtomicBool>` 共享的退出标志,但 calloop
+    // 回调签名只接受 `&mut Data`(= `&mut PtyHandle`)。解法:move 一份 Arc 进
+    // 闭包,闭包里 deref 成 `&AtomicBool` 传给 tick。不新建退出机制,复用
+    // T-0104 的 should_exit,Lead 2026-04-25 拍板方案 3(TD-012)。
+    let pty_exit_flag = Arc::clone(&should_exit);
     pty_core
         .handle()
         .insert_source(
             Generic::new(pty_borrowed, Interest::READ, Mode::Level),
-            pty_read_callback,
+            move |_readiness, _fd, pty: &mut PtyHandle| pty_read_tick(pty, &pty_exit_flag),
         )
         .map_err(|e| anyhow!("calloop insert_source(pty master fd) 失败: {e}"))?;
 
@@ -893,5 +994,94 @@ mod tests {
         let (mut r, _w) = UnixStream::pair().expect("UnixStream pair");
         r.set_nonblocking(true).expect("set_nonblocking");
         drain_pipe(&mut r); // 不卡住即过
+    }
+
+    // ---------- T-0205 pty_readable_action 纯逻辑单测 ----------
+    // T-0205 acceptance:对"read 返回 0 字节 → 触发 should_exit"这条路径有单测。
+    // 我们把决策抽成纯函数 [`pty_readable_action`],单测覆盖全部分支 —— 仿
+    // T-0107 抽 `handle_event` 纯逻辑 + `tests/state_machine.rs` 的套路。
+    //
+    // 真 `pty_read_tick` 会调 `should_exit.store` + `tracing` + `try_wait`,
+    // 这些副作用不在纯函数里,所以本组测试不需要构造 PtyHandle / AtomicBool。
+
+    #[test]
+    fn pty_readable_action_ok_nonzero_continues_reading() {
+        assert_eq!(
+            pty_readable_action(&Ok(1)),
+            PtyAction::ContinueReading,
+            "读到 1 字节应继续循环"
+        );
+        assert_eq!(
+            pty_readable_action(&Ok(PTY_READ_BUF)),
+            PtyAction::ContinueReading,
+            "读满 buffer 必然还有更多数据,也继续循环"
+        );
+    }
+
+    #[test]
+    fn pty_readable_action_ok_zero_is_request_exit() {
+        // T-0205 acceptance 最直接一条:EOF(Ok(0))应触发退出路径。
+        assert_eq!(pty_readable_action(&Ok(0)), PtyAction::RequestExit);
+    }
+
+    #[test]
+    fn pty_readable_action_wouldblock_is_return_continue() {
+        // 正常的"没更多数据"语义 —— 跳出 tick 回 calloop 等下一次 ready。
+        let err = std::io::Error::from(std::io::ErrorKind::WouldBlock);
+        assert_eq!(pty_readable_action(&Err(err)), PtyAction::ReturnContinue);
+    }
+
+    #[test]
+    fn pty_readable_action_eagain_errno_is_return_continue() {
+        // 万一 std 版本或底层驱动把 EAGAIN 映射为 Kind::Uncategorized,raw errno
+        // 还是能兜住。防御性测试,对应 `pty_readable_action` 里的二级 raw_os_error
+        // 分支。
+        let err = std::io::Error::from_raw_os_error(libc::EAGAIN);
+        assert_eq!(pty_readable_action(&Err(err)), PtyAction::ReturnContinue);
+    }
+
+    #[test]
+    fn pty_readable_action_interrupted_is_continue_reading() {
+        // EINTR:signal 打断 syscall,重试本轮 read。
+        let err = std::io::Error::from(std::io::ErrorKind::Interrupted);
+        assert_eq!(pty_readable_action(&Err(err)), PtyAction::ContinueReading);
+    }
+
+    #[test]
+    fn pty_readable_action_eio_is_request_exit() {
+        // T-0205 Implementation notes:某些 kernel 返 EIO 而非 EOF 通知 slave 关闭。
+        // 与 Ok(0) 走同一退出路径。
+        let err = std::io::Error::from_raw_os_error(libc::EIO);
+        assert_eq!(pty_readable_action(&Err(err)), PtyAction::RequestExit);
+    }
+
+    #[test]
+    fn pty_readable_action_unknown_errno_is_request_exit() {
+        // 保守策略:未知 IO 错不继续死等,触发退出避免 main loop 卡死。
+        // 测两个典型不幸的 errno —— EBADF(fd 被关)和 EFAULT(buf 指针非法)。
+        for errno in [libc::EBADF, libc::EFAULT] {
+            let err = std::io::Error::from_raw_os_error(errno);
+            assert_eq!(
+                pty_readable_action(&Err(err)),
+                PtyAction::RequestExit,
+                "errno {errno} 应保守触发退出"
+            );
+        }
+    }
+
+    #[test]
+    fn pty_readable_action_exhaustive_coverage() {
+        // Meta-test:确保所有 PtyAction 变体都至少被一条真实 I/O 结果映射到过。
+        // 如果未来加了新的 PtyAction 变体却忘了加对应的映射,这条 meta-test 不
+        // 会失败(它只验已有的三种都可达),但 Rust 的 non_exhaustive match 会
+        // 在 callsite 编译期报错 —— 双重保险。
+        let samples = [
+            pty_readable_action(&Ok(1)),
+            pty_readable_action(&Ok(0)),
+            pty_readable_action(&Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))),
+        ];
+        assert!(samples.contains(&PtyAction::ContinueReading));
+        assert!(samples.contains(&PtyAction::RequestExit));
+        assert!(samples.contains(&PtyAction::ReturnContinue));
     }
 }
