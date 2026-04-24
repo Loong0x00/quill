@@ -341,8 +341,9 @@ mod tests {
         // 起 /bin/sleep 让 master 100ms 内不会收到任何字节。
         let mut handle = PtyHandle::spawn_program("sleep", &["0.1"], 80, 24).expect("spawn sleep");
         let mut buf = [0u8; 32];
-        // 可能第一次就 WouldBlock,也可能 echo 父 shell 写出啥来 —— 抢最多 1ms 多读
-        // 几次,只要能见到过一次 WouldBlock 就合格(证明非阻塞路径可达)。
+        // spawn sleep 0.1 不写 stdout,理论上第一次 read 立即返 WouldBlock;
+        // 10 次重试是防某些 PTY 初始化瞬间字节(terminfo / termios 交涉的边界),
+        // 只要能见到过一次 WouldBlock 就合格(证明非阻塞路径可达)。
         let mut saw_wouldblock = false;
         for _ in 0..10 {
             match handle.read(&mut buf) {
