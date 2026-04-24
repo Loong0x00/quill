@@ -2,7 +2,7 @@
 
 **Phase**: 3
 **Assigned**: 写码-close
-**Status**: claimed
+**Status**: in-review
 **Budget**: tokenBudget=80k(lead 派单未明)
 **Dependencies**: T-0301(Term 已集成)
 
