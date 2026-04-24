@@ -235,7 +235,7 @@ fn pump_once(
     event_queue: &mut EventQueue<State>,
     state: &mut State,
     sig_r: &mut UnixStream,
-    pty_core: &mut Core<'_, ()>,
+    pty_core: &mut Core<'_, PtyHandle>,
     pty_fd: RawFd,
 ) -> Result<StepResult> {
     // 1. 排空已缓冲的事件(首次 configure 就是在这里触发 init_renderer_and_draw)。
@@ -291,13 +291,19 @@ fn pump_once(
         Err(e) => return Err(anyhow!("poll(wayland + signal + pty) 失败: {e}")),
     }
 
-    // 5a. PTY 可读 → 让 calloop 的 Generic source 把 ready fd 传给回调(本 ticket
-    //      只 trace,不读字节)。Duration::ZERO = 非阻塞 tick,不影响后面的 wayland
-    //      处理节奏。
+    // 5a. PTY 可读 → 把 &mut PtyHandle 从 state.pty 借给 calloop 的 Generic
+    //      source 回调。T-0203 起 Data 从 `()` 升级为 PtyHandle,回调 `pty_read_callback`
+    //      用 `pty.read()` 读字节并 tracing。Duration::ZERO = 非阻塞 tick。
+    //
+    //      `if let` 守卫:正常路径 state.pty 必 Some(run_window 里 spawn_shell 成功
+    //      才组装 pump_once 闭包);这里防御式 `None` 跳过,不 panic 不 expect,
+    //      符合 CLAUDE.md "非 main/tests 禁用 unwrap/expect"。
     if fds[2].revents().contains(PollFlags::IN) {
-        pty_core
-            .dispatch(Some(Duration::ZERO), &mut ())
-            .context("pty_core.dispatch 失败")?;
+        if let Some(pty) = state.pty.as_mut() {
+            pty_core
+                .dispatch(Some(Duration::ZERO), pty)
+                .context("pty_core.dispatch(pty bytes read) 失败")?;
+        }
     }
 
     // 5b. 信号 pipe 可读 → drain 字节(防止 pipe 满、下次 handler 写入被
@@ -316,6 +322,91 @@ fn pump_once(
         drop(guard);
     }
     Ok(StepResult::Continue)
+}
+
+/// 单次 calloop 回调里的 PTY read buffer 大小。4 KiB 覆盖 Linux PTY master 的典型
+/// 内核缓冲,一次 read 基本能吞完 bash prompt / ANSI escape;满了就循环再读一次。
+const PTY_READ_BUF: usize = 4096;
+
+/// calloop Generic source 的回调,从 PTY master fd 读字节并 `tracing::trace!`。
+///
+/// T-0203 实装:取代 T-0202 的 trace-only + drain-discard stopgap。循环读到
+/// `WouldBlock`(master 被 O_NONBLOCK 设过,无更多数据)才返回,每批字节用
+/// `escape_ascii` 渲染成可读 trace。错误处理:
+/// - `WouldBlock` → 正常,回到 calloop 等下一次 readable
+/// - `Interrupted` → 被 signal 打断,重试本轮 read
+/// - `Ok(0)` / 其它 IO 错(常见 EIO:slave 端关闭)→ `tracing::warn!`。**本 ticket 不退
+///   出主循环**(退出检测由 T-0205 的 `try_wait` + child-exit 路径负责),返回
+///   `Continue` 让 calloop 继续。
+fn pty_read_callback(
+    _readiness: calloop::Readiness,
+    _fd: &mut calloop::generic::NoIoDrop<BorrowedFd<'static>>,
+    pty: &mut PtyHandle,
+) -> std::io::Result<PostAction> {
+    // INV-009 sanity check:master fd 必须 O_NONBLOCK。由 T-0201 的 `spawn_program`
+    // 在构造时 fcntl 一次设好,本 ticket **不重复** F_SETFL(会覆盖其它 flag 破
+    // 坏不变式)。debug build panic 拦回归;release build 0 开销。
+    // SAFETY: pty 持有 master fd,fd 此刻肯定有效;fcntl(F_GETFL) 是只读操作,
+    // 不改资源所有权、不与 INV-008 drop 序交互。
+    #[cfg(debug_assertions)]
+    {
+        #[allow(unsafe_code)]
+        let flags = unsafe { libc::fcntl(pty.raw_fd(), libc::F_GETFL) };
+        debug_assert!(
+            flags >= 0 && (flags & libc::O_NONBLOCK) != 0,
+            "INV-009 破坏:master fd 未置 O_NONBLOCK(T-0201 的 set_nonblocking 应已设;\
+             fcntl 返回 flags={flags:#x},errno={})",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    let mut buf = [0u8; PTY_READ_BUF];
+    loop {
+        match pty.read(&mut buf) {
+            Ok(0) => {
+                // EOF:slave 端关闭。常见:子进程退出后 kernel 在 drain 完 buffer 后
+                // 给出 0 字节 read。本 ticket 仅 warn 不改控制流 —— 退出由 T-0205
+                // 的子进程 try_wait + should_exit 路径处理。
+                tracing::warn!(
+                    target: "quill::pty",
+                    "master fd 读到 EOF(0 字节);T-0205 的 try_wait 路径会处理子进程退出"
+                );
+                return Ok(PostAction::Continue);
+            }
+            Ok(n) => {
+                // `escape_ascii` 是 u8 稳定方法(Rust 1.60+),把不可打印字符变成
+                // \xNN / \e / \n 形式,trace 里可一眼看出终端转义序列而不污染 log。
+                let preview = buf[..n].escape_ascii().to_string();
+                tracing::trace!(
+                    target: "quill::pty",
+                    n,
+                    bytes = %preview,
+                    "pty bytes"
+                );
+                // 读满 buffer:肯定还有更多字节,继续循环。
+                // 读不满:可能 drained;继续循环交给下一轮 read 去 WouldBlock 兜底,
+                //         不用提前 break —— Linux PTY 把小块 write 合并的概率高,
+                //         多一次 syscall 换一次"确定性清空"。
+                continue;
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                return Ok(PostAction::Continue);
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                // 常见 EIO:slave 关闭后继续读。也可能 EBADF(fd 意外关了)等,
+                // 这里不区分 —— 都归为"读不动了",warn + continue。T-0205 的
+                // try_wait 会发现子进程退出,触发主循环退出。
+                tracing::warn!(
+                    target: "quill::pty",
+                    error = %e,
+                    kind = ?e.kind(),
+                    "pty read 报错(T-0205 的 try_wait 路径会处理)"
+                );
+                return Ok(PostAction::Continue);
+            }
+        }
+    }
 }
 
 /// 非阻塞地把 signal pipe 里堆积的字节读干净。pipe 已被 `set_nonblocking(true)`,
@@ -401,12 +492,11 @@ pub fn run_window() -> Result<()> {
     let pty_fd = pty.raw_fd();
     state.pty = Some(pty);
 
-    // Core<()> 仅用作 PTY 源的承载:callback 无 state 依赖,占位 `trace!`,真读
-    // 字节是 T-0203。主控流仍由 [`run_main_loop`] / [`pump_once`] 驱动(T-0104
-    // 的手写 poll);pump_once 每轮 `core.dispatch(Duration::ZERO)` 把 calloop
-    // 的 PTY source 回调跑一次。待 wayland / signal 也迁入 calloop(遗留 T-0105
-    // refactor),本 Core 的 Data 会从 `()` 升级为 LoopState。
-    let mut pty_core: Core<'_, ()> = Core::new().context("calloop Core::new")?;
+    // T-0203:Core 的 Data 从 `()` 升级为 `PtyHandle` —— 回调现在真读字节
+    // 需要 `PtyHandle::read` 的出口,计数转给调用方。Lead 2026-04-25 拍板走
+    // 方案 A(独立 Data 升级),不把 wayland / signal 也合并进来(那是 T-0105
+    // refactor 的 scope)。dispatch 时从 state.pty 拿 `&mut PtyHandle` 传进去。
+    let mut pty_core: Core<'_, PtyHandle> = Core::new().context("calloop Core::new")?;
     // SAFETY: pty_fd 来自 spawn_shell 返回值的 pty.raw_fd() 缓存(PtyHandle
     // 的 master_fd 字段,spawn 时 as_raw_fd().ok_or_else 校验 Some 一次),
     // state.pty 持有该 PtyHandle 到 run_window 结束;BorrowedFd 的生命周期
@@ -418,35 +508,7 @@ pub fn run_window() -> Result<()> {
         .handle()
         .insert_source(
             Generic::new(pty_borrowed, Interest::READ, Mode::Level),
-            |_readiness, fd, _data: &mut ()| -> std::io::Result<PostAction> {
-                tracing::trace!(target: "quill::pty", "pty readable");
-                // T-0202 stopgap:Level-triggered source 若不清 fd 的就绪位,
-                // 本 source 会在每次 dispatch 无限触发 —— `RUST_LOG=quill::pty=trace`
-                // 手测里曾测得 700K trace/sec。drain 字节让 fd not-ready,下一次
-                // 数据到达再触发一次 trace,回到"数据到 → 单次回调"的正常节奏。
-                //
-                // **不处理字节** —— 丢弃即可。T-0203 会替换为 `PtyHandle::read` +
-                // 字节级 `tracing::trace!("{bytes:?}")`,届时 drain 由真正的 read
-                // 承担,此处会一并删除。
-                let mut buf = [0u8; 4096];
-                loop {
-                    match rustix::io::read(fd.as_fd(), &mut buf) {
-                        // Ok(非零) 读到字节,继续 drain
-                        Ok(n) if n > 0 => continue,
-                        // Ok(0) slave 端关闭 → EOF;T-0205 的子进程退出检测路径
-                        // 才处理"EOF → 退出循环",本 ticket 仅停止 drain
-                        Ok(_) => return Ok(PostAction::Continue),
-                        // AGAIN = 没更多数据(master 已置 O_NONBLOCK,INV-009);
-                        // 在 Linux 上 WOULDBLOCK == AGAIN(单一 errno 42),rustix
-                        // 把两者合并成 AGAIN 一个变体,一条就覆盖。
-                        // Interrupted = signal 打断,重试
-                        Err(rustix::io::Errno::AGAIN) => return Ok(PostAction::Continue),
-                        Err(rustix::io::Errno::INTR) => continue,
-                        // 其他错误:转成 io::Error 让 calloop 的 error path 处理
-                        Err(e) => return Err(std::io::Error::from_raw_os_error(e.raw_os_error())),
-                    }
-                }
-            },
+            pty_read_callback,
         )
         .map_err(|e| anyhow!("calloop insert_source(pty master fd) 失败: {e}"))?;
 
