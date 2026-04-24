@@ -1,8 +1,8 @@
 # T-0204 PTY resize (SIGWINCH 转发)
 
 **Phase**: 2
-**Assigned**:
-**Status**: open
+**Assigned**: 写码-close
+**Status**: claimed
 **Budget**: tokenBudget=80k, walltime=2400s, cost=$4
 **Dependencies**: T-0201(需要 `PtyHandle` 已有 master)
 
