@@ -6,7 +6,9 @@ authors = ["Loong0x00 <loong.0x00@gmail.com>"]
 
 [dependencies]
 anyhow = "1"
+calloop = { version = "0.14", features = ["signals"] }
 smithay-client-toolkit = "0.19"
+thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 wayland-client = "0.31"

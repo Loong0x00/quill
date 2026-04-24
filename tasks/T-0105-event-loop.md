@@ -1,8 +1,8 @@
 # T-0105 事件循环骨架
 
 **Phase**: 1
-**Assigned**:
-**Status**: open
+**Assigned**: 写码 B
+**Status**: in-review
 **Budget**: tokenBudget=100k, walltime=3600s, cost=$5
 **Dependencies**: 无
 
