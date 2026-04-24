@@ -16,8 +16,11 @@
 //!   内部调后者。分两个出口是为了让 T-0206 的集成测试能直接 spawn `echo`
 //!   而不需要经过 shell。
 //!
-//! 本 ticket(T-0201)只实装 `spawn_shell` / `spawn_program`。`raw_fd` /
-//! `read` / `resize` / `try_wait` 仍为 `todo!()`,由 T-0202..T-0205 依次填实。
+//! 填实进度:
+//! - T-0201:`spawn_shell` / `spawn_program`
+//! - T-0202:`raw_fd`(返回缓存的 master fd)
+//! - T-0203:`read`(包装 `try_clone_reader()` 的 reader)
+//! - `resize`(T-0204)/ `try_wait`(T-0205)仍为 `todo!()`。
 
 use std::io::{self, Read};
 use std::os::fd::RawFd;
@@ -35,10 +38,10 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize}
 /// 三者组合在一起保证:外界只能通过显式方法观察子进程状态(`try_wait` in T-0205);
 /// 丢失 handle 不会 leak fd 或 zombie(至少不会 leak **我们** 的引用)。
 //
-// `dead_code` 白名单:`reader` 要等 T-0203 填 `read()` 才被消费;`child` 要等
-// T-0205 填 `try_wait()`。spawn 之后 `master` 仅持有以保证 drop 序(INV-008)
-// 与 resize 出口(T-0204 里 `&self` 方法),直接 read 不需要。
-// T-0203 / T-0205 填实后可去掉。
+// `dead_code` 白名单:`child` 要等 T-0205 填 `try_wait()` 才被公开读;spawn
+// 之后 `master` 仅持有以保证 drop 序(INV-008)与 resize 出口(T-0204 里
+// `&self` 方法),直接 read 走 `reader`(T-0203 起已填实)不需要 `master`。
+// T-0205 填实后可去掉。
 #[allow(dead_code)]
 pub struct PtyHandle {
     reader: Box<dyn Read + Send>,
@@ -137,14 +140,16 @@ impl PtyHandle {
 
     /// 从 master 端非阻塞读字节。返回读到的字节数;0 表示 EOF(通常意味着子进程退出)。
     ///
-    /// why:Phase 2 只把字节 `tracing::trace!` 出来(T-0203);Phase 3 T-0302 才把
-    /// 字节喂 `alacritty_terminal::Term`。保持读字节与后续消费解耦,是本方法的
-    /// 职责分界。master fd 必须已置 `O_NONBLOCK`,`WouldBlock` 由调用方自行忽略。
+    /// why:Phase 2 只把字节 `tracing::trace!` 出来(T-0203 本 ticket);Phase 3
+    /// T-0302 才把字节喂 `alacritty_terminal::Term`。保持读字节与后续消费解耦,
+    /// 是本方法的职责分界。master fd 必须已置 `O_NONBLOCK`(INV-009,由
+    /// `spawn_program` 在构造时 `fcntl` 一次,参 `set_nonblocking`),
+    /// `WouldBlock` 由调用方自行忽略(通常是"没更多数据,等下一个 readable 事件")。
+    ///
+    /// reader 是 `try_clone_reader()` dup 出来的独立 fd,但 OFD 级 flags 随 dup 继承,
+    /// 所以 master 上设的 `O_NONBLOCK` 在 reader 上也生效。
     pub fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        todo!(
-            "T-0203: reader.read(buf), must be non-blocking, buf len = {}",
-            buf.len()
-        )
+        self.reader.read(buf)
     }
 
     /// 把新尺寸推给 master,底层触发 TIOCSWINSZ + SIGWINCH 给前台进程组。
@@ -283,6 +288,78 @@ mod tests {
             let code = h.wait_child_for_test().expect("wait");
             assert_eq!(code, 0);
         }
+    }
+
+    /// T-0203 acceptance:`spawn "echo hi"` 后循环非阻塞 read,聚合缓冲应以
+    /// `"hi\r\n"`(PTY 默认把 `\n` 转 CRLF)或 `"hi\n"`(若 `onlcr` 被关)开头。
+    /// 证明 `PtyHandle::read` 真从子进程 stdout 拿到字节 —— 这是 Phase 2 主要产出。
+    #[test]
+    fn read_captures_echo_hi_output() {
+        use std::time::{Duration, Instant};
+
+        let mut handle = PtyHandle::spawn_program("echo", &["hi"], 80, 24).expect("spawn echo hi");
+        let mut out: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 256];
+        let start = Instant::now();
+        let deadline = Duration::from_secs(2);
+
+        loop {
+            if start.elapsed() > deadline {
+                panic!("2 秒内没能读到 echo 输出,实际积累: {out:?}");
+            }
+            match handle.read(&mut buf) {
+                Ok(0) => break, // EOF(少见;Linux PTY 常给 EIO)
+                Ok(n) => {
+                    out.extend_from_slice(&buf[..n]);
+                    // 读到 "hi\r\n" 或 "hi\n" 就够了,不用非得等 EOF/EIO
+                    if out.starts_with(b"hi\r\n") || out.starts_with(b"hi\n") {
+                        break;
+                    }
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // 子进程还没写字节到 master;短 sleep 后重试。
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(ref e) if e.raw_os_error() == Some(libc::EIO) => break,
+                Err(e) => panic!("非预期 read 错误: {e} (kind={:?})", e.kind()),
+            }
+        }
+
+        assert!(
+            out.starts_with(b"hi\r\n") || out.starts_with(b"hi\n"),
+            "echo 输出应以 'hi\\r\\n' 或 'hi\\n' 开头 (PTY 默认 onlcr);实际: {out:?}"
+        );
+
+        let _ = handle.wait_child_for_test();
+    }
+
+    /// 回归守门:直接不等字节,`read` 非阻塞应立即返回 `WouldBlock`,不卡整个
+    /// 事件循环(CLAUDE.md 架构不变式 3、INV-009 保障)。
+    #[test]
+    fn read_returns_wouldblock_when_no_data_yet() {
+        // 起 /bin/sleep 让 master 100ms 内不会收到任何字节。
+        let mut handle = PtyHandle::spawn_program("sleep", &["0.1"], 80, 24).expect("spawn sleep");
+        let mut buf = [0u8; 32];
+        // 可能第一次就 WouldBlock,也可能 echo 父 shell 写出啥来 —— 抢最多 1ms 多读
+        // 几次,只要能见到过一次 WouldBlock 就合格(证明非阻塞路径可达)。
+        let mut saw_wouldblock = false;
+        for _ in 0..10 {
+            match handle.read(&mut buf) {
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    saw_wouldblock = true;
+                    break;
+                }
+                Ok(_) => {} // 有的话继续试
+                Err(ref e) if e.raw_os_error() == Some(libc::EIO) => break,
+                Err(e) => panic!("意外错误 {e:?}"),
+            }
+        }
+        assert!(
+            saw_wouldblock,
+            "非阻塞 read 应至少观察到一次 WouldBlock(INV-009 未生效?)"
+        );
+        let _ = handle.wait_child_for_test();
     }
 
     /// 尺寸参数原样落到 `PtySize` —— 非 0 值不能被 silently 吞成默认值。留给 T-0204
