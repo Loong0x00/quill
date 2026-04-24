@@ -5,8 +5,11 @@ edition = "2021"
 authors = ["Loong0x00 <loong.0x00@gmail.com>"]
 
 [dependencies]
+anyhow = "1"
+smithay-client-toolkit = "0.19"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+wayland-client = "0.31"
 
 [profile.dev]
 opt-level = 1
