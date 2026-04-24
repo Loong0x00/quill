@@ -100,6 +100,19 @@
 
 **Lead = user + Claude Code 主 session**。不写码,做 规划 / 合并 / 最终裁决。
 
+**强制 Agent Team 模式**(与用户全局 CLAUDE.md 一致,本项目硬约束):
+
+核心价值(按重要性排):
+1. **可审计** — 每个 agent 有 name + 共享任务板,Lead 随时能看每个 agent 进度到哪、输入输出啥
+2. **并发可控** — team 级预算 / 状态一致性,agent 不私自疯跑
+
+通信(`SendMessage`)是**副作用**,不是目的。Lead 介入优先,agent 之间握手能不做就不做。
+
+硬约束:
+- 所有并行 / 复杂任务必须 `TeamCreate` + `team_name` + `name` 寻址
+- **禁止无 `team_name` 的一次性 fan-out** —— 只有单行无状态查询(例: "列出当前 git 分支")可例外
+- team 名格式 `quill-phase<N>`,阶段结束 `TeamDelete` 清理
+
 **Teammate 角色**(spawn 时明确,一个 teammate 只担一个角色):
 
 | 角色 | 职责 | 实例数 |
