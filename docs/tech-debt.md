@@ -208,6 +208,74 @@
 
 ---
 
+## TD-011: T-0203 pty_read_callback sanity check SAFETY 注释详略
+
+**识别日期**: 2026-04-25
+**识别者**: 审码-opus (T-0203 audit P3-1)
+
+**代码位置**: `src/wl/window.rs:344` (pty_read_callback 顶端 debug_assertions block)
+
+**当前状态**: 不修
+- SAFETY 2 行覆盖 fd 来源 + 只读 syscall 关键点
+- 比 T-0201 `set_nonblocking` 的 4 点风格简
+- P3 偏好建议, 审码放行, 非 UB 风险
+
+**触发修理的条件**: T-0105 refactor 时顺手展开
+
+**解决路径**: 展成 4 点: (1) fd 来源 (2) 已关 fd EBADF 处理 (3) F_GETFL 只读不释资源 (4) debug_assert 捕获 flags<0 + O_NONBLOCK 两条
+
+---
+
+## TD-012: pty master EOF 导致 pump_once busy-warn (Level-triggered + 未 Remove source)
+
+**识别日期**: 2026-04-25
+**识别者**: 审码-opus (T-0203 audit P3-2)
+
+**代码位置**: `src/wl/window.rs::pty_read_callback` Ok(0) / EIO 分支
+
+**当前状态**: 不修 (T-0205 必接手)
+- Level-triggered + master EOF → fd 永久 readable
+- T-0203 的 callback 在 Ok(0) 或 EIO 只 warn + return Continue, 不置 should_exit 不 Remove source
+- 正常 bash 使用场景不触发 (bash 不主动退出)
+- 异常路径: shell 被 SIGKILL 等突然终止 → pump_once 每轮 dispatch callback → 每秒数千行 warn → 主循环被吞
+
+**触发修理的条件**: T-0205 实装时**必须接手**
+
+**解决路径 (Lead 2026-04-25 拍板方案 3)**:
+- 复用 T-0104 的 `Arc<AtomicBool> should_exit` 模式, 或引入独立的 `pty_exit_flag`
+- pty_read_callback Ok(0) / EIO 分支 → `exit_flag.store(true, Relaxed)` + return Continue
+- run_main_loop 顶部轮询 exit_flag 自然退出
+- callback 不返回 PostAction::Remove (避免 T-0105 refactor 时 Remove 语义不一致)
+- try_wait 收尸在 callback 同一分支调用
+
+不选方案 1 (Core Data 升 tuple `(&mut PtyHandle, &AtomicBool)` — 难看) / 方案 2 (等 T-0105 refactor — 阻塞 T-0205)。
+
+---
+
+## TD-013: T-0203 sanity check debug_assertions block 可抽函数
+
+**识别日期**: 2026-04-25
+**识别者**: 审码-opus (T-0203 audit P3-4)
+
+**代码位置**: `src/wl/window.rs::pty_read_callback` 顶端 `#[cfg(debug_assertions)]` block (14 行)
+
+**当前状态**: 不修
+- P3 风格偏好, 审码放行
+- 不影响正确性
+
+**触发修理的条件**: 任何新添类似 sanity check (例: T-0204 resize 验 fd 有效) 时重构复用
+
+**解决路径**: 抽成双版本:
+```rust
+#[cfg(debug_assertions)]
+fn debug_assert_nonblock(pty: &PtyHandle) { ... }
+#[cfg(not(debug_assertions))]
+fn debug_assert_nonblock(_pty: &PtyHandle) {}
+```
+Callback 内 `debug_assert_nonblock(pty);` 一行
+
+---
+
 ## TD-010: T-0201 bash -l 的 cwd 默认为进程 cwd (未做配置)
 
 **识别日期**: 2026-04-25 (T-0201 实装)
