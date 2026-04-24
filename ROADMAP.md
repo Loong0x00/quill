@@ -4,41 +4,44 @@
 
 ---
 
-## Phase 0 — 脚手架 (Lead 一次性, 半天)
+## Phase 0 — 脚手架 ✅ (Lead 一次性, 半天)
 
-**产出**:一个能 `cargo build` 通过的空骨架,后续 teammate 能无阻碍开工。
-
-- [x] `CLAUDE.md`(项目宪法 + 多 agent 协议)
-- [x] `ROADMAP.md`(本文件)
-- [ ] `Cargo.toml`(crate 元数据 + 空依赖列表)
-- [ ] `src/main.rs`(stub,`fn main() { tracing init; 打印 hello }`)
-- [ ] `.gitignore`(target/ + IDE 垃圾 + .DS_Store 防 Mac)
-- [ ] `rust-toolchain.toml`(锁 stable 版本)
-- [ ] `docs/adr/0001-language-rust.md`(第一个 ADR:为啥 Rust 不 Zig/C)
-- [ ] `docs/adr/0002-stack-lock.md`(锁死 smithay + wgpu + alacritty_terminal + cosmic-text)
-- [ ] `tasks/README.md`(任务队列目录说明 + ticket 模板)
-- [ ] `git init` + 初始 commit
-
-**不做**:依赖实装(等 Phase 1 写码 决定 crate 版本)、CI(等有代码再说)。
+**已完工** 2026-04-24。完整状态见 git history + CLAUDE.md + tasks/README.md。
 
 ---
 
-## Phase 1 — Wayland 窗口 + wgpu 纯色 (3-5 天, 2 写码 并行)
+## Phase 1 — Wayland 窗口 + wgpu 纯色 🟡 5/7 (2026-04-24~25)
 
-**产出**:能打开一个 Wayland 窗口,wgpu 渲染纯色背景,resize / close 正确。
+**实装验证已通过** 2026-04-24 夜:`cargo run --release` 在 NVIDIA 5090 + Wayland 上打开深蓝窗口,Vulkan backend 自动选中,**没 hang**,不需要 `WGPU_BACKEND=vulkan`。
+
+关键 ticket 状态:
+- [x] `T-0101` Wayland 窗口(xdg-toplevel + 占位 wl_shm 白 buffer)✅ merged
+- [x] `T-0102` wgpu surface 绑 WlSurface + 深蓝 clear pass ✅ merged
+- [ ] `T-0103` resize 动态重建 wgpu swapchain — **未开**,Phase 3+ 渲染文本时才真有用
+- [ ] `T-0104` close 事件优雅退出(wgpu resources 有序释放)— **未开**,当前 Ctrl+C 粗退
+- [x] `T-0105` `calloop::EventLoop` 骨架(`Core<State>`)✅ merged
+- [x] `T-0106` frame stats(tracing 每 60 帧一行)✅ merged
+- [x] `T-0107` state machine headless 测试(抽出 WindowCore/WindowEvent/handle_event)✅ merged
+
+**里程碑进度**:`cargo run` 开窗口 ✓。关不崩 ⏳ 等 T-0104。变色 ⏳ 等 Phase 3+。
+
+**不变式** 全部登记到 `docs/invariants.md`(INV-001..INV-007)。审码报告在 `docs/audit/`。
+
+### T-0103 / T-0104 剩余决策(2026-04-25)
+
+Lead 决定:**T-0104 + Phase 2 PTY 并行推进**。理由:
+- T-0104 只动 `src/wl/`(close handler + renderer drop)
+- Phase 2 新建 `src/pty/`,不撞
+- T-0103 暂不做,Phase 3 文本渲染接入时才有视觉可验(当前窗口一块深蓝,resize 看不出差异)
+
+---
+
+## Phase 2 — PTY 接入 (3-5 天) 🟢 可开
+
+**产出**:窗口打开后 spawn shell,PTY 输出能进 ppoll,还不渲染。
 
 关键 ticket:
-- `T-0101` smithay-client-toolkit 接入,`WlSurface` 创建
-- `T-0102` wgpu surface 绑 `WlSurface`,clear color 每帧
-- `T-0103` resize 事件 → 调整 wgpu 配置,不丢帧
-- `T-0104` close 事件优雅退出,资源正确 drop
-- `T-0105` `calloop::EventLoop` 骨架,所有事件走这一个 loop
-- `T-0106` `tracing` 输出 frame stats(每 60 帧一行)
-- `T-0107` 单元测试:headless 模拟 Wayland event,验证 state machine
-
-**里程碑**:`cargo run` 开一个会变色的窗口,关不崩。
-
-**潜在坑**:wgpu 初始化在 NVIDIA Wayland 有时 hang,准备好 `WGPU_BACKEND=vulkan` / `gl` 两条退路。
+- `T-0201` `portable-pty` spawn(优先用 `bash -l`)
 
 ---
 
@@ -139,4 +142,10 @@
 
 - 2026-04-24 Lead 启项目,锁 Rust + smithay + wgpu + alacritty_terminal + cosmic-text 栈
 - 2026-04-24 Lead 定 Phase 0-6 切分,多 agent 协议写入 CLAUDE.md
+- 2026-04-24 Phase 0 完工,git init + 9 文件脚手架
+- 2026-04-24 Phase 1 team quill-phase1 首次并行: impl-t0102/0106/0107 + audit
+- 2026-04-24 Phase 1 5/7 合 main (T-0101/0102/0105/0106/0107), 首次实装验证窗口打开
+- 2026-04-24 docs/invariants.md 建立, INV-001..007 登记硬约束
+- 2026-04-25 Lead 决定 T-0104 + Phase 2 并行(src/wl/ 和 src/pty/ 无交集)
+- 2026-04-25 T-0103 推迟到 Phase 3+(当前一块深蓝,resize 无视觉可验)
 - (后续每个阶段起止在这追加)

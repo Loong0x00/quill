@@ -143,20 +143,28 @@ git worktree add ../quill-impl-<name> -b feat/<ticket-id>
 
 ---
 
-## 常用命令(占位,Phase 0 之后完善)
+## 常用命令
 
 ```bash
-# 构建 + 测试(目前还没代码)
+# 构建 + 四门验收
 cargo build
-cargo test
-cargo clippy -- -D warnings
+cargo test                            # Phase 1 完有 29 tests(含 state_machine 11 / frame_stats 3)
+cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 
+# 启动窗口(Phase 1 起跑得动)
+cargo run --release                   # NVIDIA 5090 Wayland 自动选 Vulkan, 无需 env
+
 # 以后
-# cargo run --release                  # 启动 quill
-# cargo test --test soak_1h            # 1h 稳定性测试
-# cargo bench --bench render_frame     # 渲染性能 bench
+# cargo test --test soak_1h           # 1h 稳定性(Phase 6 T-0601)
+# cargo bench --bench render_frame    # 渲染性能
 ```
+
+## 已验证信号 (Phase 1 实装, 2026-04-24)
+
+- NVIDIA RTX 5090 + Wayland + wgpu 0.29 → Vulkan backend **自动选中不 hang**
+- xdg-toplevel 首次 configure 发 `new_size=None`, 需 fallback 到初始尺寸
+- compositor 会周期性重发 configure(focus / 窗口管理器事件), 用 `resize_dirty` idempotent 过滤
 
 ---
 
