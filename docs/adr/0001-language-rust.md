@@ -9,8 +9,8 @@ Accepted, 2026-04-24
 quill 是单用户 daily driver 终端,主要承载 Lead 的 Claude Code 长跑 session(连续运行 8h+)。
 核心可用性要求:内存安全(无 UAF / double-free / 堆损坏导致的 session 崩溃)、长时间运行下 RSS 稳定。
 
-项目开发模式是 AI orchestration:Lead 不手写代码,由 Implementer teammate 产出 diff,
-Gatekeeper 审查。这一模式对"编译期能把类别的错误堵死"有很强依赖 —— 错误越是运行期才
+项目开发模式是 AI orchestration:Lead 不手写代码,由 写码 teammate 产出 diff,
+审码 审查。这一模式对"编译期能把类别的错误堵死"有很强依赖 —— 错误越是运行期才
 暴露,反馈回路越长,AI 越容易在 token 预算内迷路。
 
 同时,Wayland / PTY / GPU 渲染这条链路上必须存在成熟的可复用基础设施,否则项目会在
@@ -23,7 +23,7 @@ Phase 1-2 就卡在基础设施造轮子上。
 理由:
 
 - **borrow checker 是 AI 的编译期反馈回路**:类型与生命周期错误在 `cargo check` 阶段
-  返回定位清晰的错误,Implementer 一两轮即可修正,不消耗长对话预算去追 run-time 崩溃。
+  返回定位清晰的错误,写码 一两轮即可修正,不消耗长对话预算去追 run-time 崩溃。
 - **Wayland crate 生态成熟**:`smithay-client-toolkit` / `wayland-client` / `calloop`
   由 Smithay 项目持续维护,和 Mutter / KWin 一样属于 Wayland 事实生态的一部分。
 - **alacritty_terminal 可直接复用**:VT 解析 + grid + scrollback 这部分 Alacritty 已经

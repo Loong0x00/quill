@@ -1,6 +1,6 @@
 # quill Roadmap
 
-分阶段。估时是 **AI orchestration 节奏**(Lead 每天投入 1-2 小时协调 + 2 implementer 并行),不是纯手写估时。
+分阶段。估时是 **AI 协调节奏**(Lead 每天投入 1-2 小时协调 + 2 写码 并行),不是纯手写估时。
 
 ---
 
@@ -19,11 +19,11 @@
 - [ ] `tasks/README.md`(任务队列目录说明 + ticket 模板)
 - [ ] `git init` + 初始 commit
 
-**不做**:依赖实装(等 Phase 1 Implementer 决定 crate 版本)、CI(等有代码再说)。
+**不做**:依赖实装(等 Phase 1 写码 决定 crate 版本)、CI(等有代码再说)。
 
 ---
 
-## Phase 1 — Wayland 窗口 + wgpu 纯色 (3-5 天, 2 implementer 并行)
+## Phase 1 — Wayland 窗口 + wgpu 纯色 (3-5 天, 2 写码 并行)
 
 **产出**:能打开一个 Wayland 窗口,wgpu 渲染纯色背景,resize / close 正确。
 

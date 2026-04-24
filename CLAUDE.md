@@ -83,7 +83,7 @@
 
 ---
 
-## 开发准则(强制,Gatekeeper 会挡)
+## 开发准则(强制,审码 会挡)
 
 - **一次 commit 做一件事**,diff < 300 行(大改拆成多个)
 - 禁止"顺手优化" —— 性能改动必须单独 commit,附 bench 证据
@@ -104,26 +104,26 @@
 
 | 角色 | 职责 | 实例数 |
 |---|---|---|
-| **Architect** | 一次性:写 ADR / 定模块切分 / 定接口形状 | 阶段起始 1 个,然后退 |
-| **Implementer** | 从 `tasks/` 抢未认领 ticket,在自己 worktree 干 | 2 个并行 |
-| **Gatekeeper** | pre-commit 审查 diff 是否违规 | 1 个常驻 |
-| **Integration Watcher** | main 每次更新后跑 full test + soak + bench,发现回归开 issue | 1 个常驻 |
+| **规划** | 一次性:写 ADR / 定模块切分 / 定接口形状 | 阶段起始 1 个,然后退 |
+| **写码** | 从 `tasks/` 抢未认领 ticket,在自己 worktree 干 | 2 个并行 |
+| **审码** | pre-commit 审查 diff 是否违规 | 1 个常驻 |
+| **跑测** | main 每次更新后跑 full test + soak + bench,发现回归开 issue | 1 个常驻 |
 
 **Spawn prompt 必须自包含**(teammate 不继承 lead 对话):
 - 任务目的(why)+ 边界(don'ts)+ 交付物(具体文件路径 / 测试)
 - 相关背景文件路径(CLAUDE.md / 相关源码 / ADR)
-- 接受标准(`cargo test && cargo clippy -- -D warnings && gatekeeper 放行`)
+- 接受标准(`cargo test && cargo clippy -- -D warnings && 审码 放行`)
 - 硬预算:`tokenBudget=100k / wallClockTimeout=3600s / costBudget=$5 / recursionDepth=10`
 
-**Worktree 约定**:每个 Implementer 用独立 worktree:
+**Worktree 约定**:每个 写码 用独立 worktree:
 ```bash
 git worktree add ../quill-impl-<name> -b feat/<ticket-id>
 ```
 
 **合并流程**:
-1. Implementer 本地 commit → 通知 Gatekeeper
-2. Gatekeeper review diff:通过 → Implementer merge 到 main;不过 → 改了再来
-3. Integration Watcher 监听 main 新 commit → 自动跑 full test + 1h soak
+1. 写码 本地 commit → 通知 审码
+2. 审码 review diff:通过 → 写码 merge 到 main;不过 → 改了再来
+3. 跑测 监听 main 新 commit → 自动跑 full test + 1h soak
 4. 回归 → 开 issue 扔回 task queue
 
 **禁止按组件分 agent**(反模式):不要"UI agent / DB agent / Docs agent",组件间天天卡接口。按**任务类型**分。

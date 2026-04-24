@@ -6,7 +6,7 @@ Accepted, 2026-04-24
 
 ## Context
 
-Phase 1 起 Implementer 会并行开工。若每个 ticket 都允许自由选 crate,必然在 Wayland 客户端、
+Phase 1 起 写码 会并行开工。若每个 ticket 都允许自由选 crate,必然在 Wayland 客户端、
 事件循环、GPU 抽象三条轴上发生选择冲突,最终导致架构碎裂。需要在 Phase 0 就把主干依赖
 一次锁死,后续通过 ADR 才能更换。
 
@@ -42,9 +42,9 @@ Phase 1 起 Implementer 会并行开工。若每个 ticket 都允许自由选 cr
 
 ## Consequences
 
-- 新增任何主干 crate(例如更换 `wgpu` 为 `vulkano`)必须新开 ADR,Gatekeeper 会挡。
-- 小版本号与 patch 号升级由 Implementer 在 ticket 内完成,不需 ADR,但必须在 commit
+- 新增任何主干 crate(例如更换 `wgpu` 为 `vulkano`)必须新开 ADR,审码 会挡。
+- 小版本号与 patch 号升级由 写码 在 ticket 内完成,不需 ADR,但必须在 commit
   message 说明升级理由。
-- Teammate spawn prompt 必须包含本文件路径,防止 Implementer 自行选型。
+- Teammate spawn prompt 必须包含本文件路径,防止 写码 自行选型。
 - 这些 crate 各自的不兼容变更会成为 Lead 的维护负担,特别是 `cosmic-text` 与
   `wgpu`(较新,breaking change 频繁),升级时要准备回滚路径。
