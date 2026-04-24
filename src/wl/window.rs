@@ -187,9 +187,10 @@ struct State {
     registry_state: RegistryState,
     output_state: OutputState,
     // Drop 顺序敏感:`renderer` 持有 wgpu `Surface`,后者内部保留了 wl_surface 裸指针。
-    // Rust 按字段声明顺序反向析构,所以 renderer 必须排在 `window` / `conn` 之前,
-    // 析构时 renderer 先释放 GPU 资源,窗口与连接才关闭 —— 指针在 Renderer 生命
-    // 周期内保持有效。
+    // Rust 按字段声明顺序**正向**析构 —— 第一个声明的字段先 drop。所以 renderer
+    // 必须排在 `window` / `conn` 之前,这样析构顺序是 renderer → window → conn,
+    // renderer 先释放 GPU 资源,窗口与连接才关闭,指针在 Renderer 生命周期内
+    // 保持有效。若把 renderer 挪到 window/conn 后面会立刻 UB。见 docs/invariants.md。
     renderer: Option<Renderer>,
     window: Window,
     conn: Connection,
@@ -219,8 +220,9 @@ impl State {
 
         // SAFETY: display_ptr / surface_ptr 来自本进程活跃的 Connection 与 Window。
         // Window (及其 WlSurface) 与 Connection 都被 State 持有;`renderer` 字段
-        // 声明位置在 `window` / `conn` 之前,Rust 反向析构 → renderer 先于
-        // window/conn 被 drop,两枚指针在 Renderer 生命周期内始终指向活对象。
+        // 声明位置在 `window` / `conn` 之前,Rust 按声明顺序**正向**析构 →
+        // renderer(第 3 个)先于 window(第 4)/ conn(第 5)被 drop,两枚指针
+        // 在 Renderer 生命周期内始终指向活对象。见 docs/invariants.md。
         #[allow(unsafe_code)]
         let renderer =
             unsafe { Renderer::new(display_ptr, surface_ptr, self.core.width, self.core.height)? };

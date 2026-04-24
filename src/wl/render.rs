@@ -56,8 +56,10 @@ fn clear_color_for(format: wgpu::TextureFormat) -> wgpu::Color {
 }
 
 pub struct Renderer {
-    // 顺序即 drop 顺序:surface 依赖 instance;device/queue 依赖 adapter (adapter 已
-    // drop,但 device 自带引用)。Rust 反向析构 —— surface 先释放,instance 最后。
+    // 字段声明顺序即 drop 顺序(Rust 按声明**正向**析构):
+    // surface(第 1)先释放,instance(第 6)最后。surface 依赖 instance 保持
+    // Vulkan/GL 实例存活;device/queue 依赖 adapter(已被构造完 drop,device
+    // 自带引用保持 GPU context)。见 docs/invariants.md。
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
