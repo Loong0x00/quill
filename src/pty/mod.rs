@@ -1,26 +1,49 @@
-//! PTY 子进程 + master fd 封装(Phase 2 骨架)。
+//! PTY 子进程 + master fd 封装(Phase 2)。
 //!
-//! 本模块在 Phase 1 末期由规划 teammate 挖好骨架,所有方法当前均为 `todo!()`,
-//! 由 T-0201..T-0205 写码 teammate 依次填实。外部入口只有 [`PtyHandle`] 这个
-//! 结构体 + 五个方法,语义上对应 "shell 子进程 + 非阻塞 master fd" 抽象。
+//! 外部入口只有 [`PtyHandle`] + 五个方法,语义上对应 "shell 子进程 + 非阻塞
+//! master fd" 抽象。封装策略:
+//! - 整个 crate 里 **只有本模块** 能持有 PTY 相关 fd;其它模块通过
+//!   [`PtyHandle::raw_fd`] 拿 `RawFd` 注册 calloop,但 **不负责 close**
+//!   (INV-005 配套)。
+//! - 字段声明顺序保证 drop 时 "reader → master → child" —— reader 先 drop
+//!   释放 `try_clone_reader` 的 dup fd;master drop 关闭主 fd,slave 端
+//!   读到 EOF / 写出 SIGHUP;child 最后 drop(**不阻塞 `wait`**,未 reap 的
+//!   子进程由进程退出 / T-0205 的 `try_wait` 兜底)。见 `docs/invariants.md`
+//!   INV-008。
+//! - master fd 在 `spawn_program` 返回前置 `O_NONBLOCK`,防止 T-0203 读字节时
+//!   把整个事件循环阻塞住(INV-009)。
+//! - `spawn_shell` 与 `spawn_program` 共享 openpty + slave drop 逻辑;前者
+//!   内部调后者。分两个出口是为了让 T-0206 的集成测试能直接 spawn `echo`
+//!   而不需要经过 shell。
 //!
-//! 设计要点(给后续写码的提示,不是实装):
-//! - 整个 crate 里 **只有本模块** 能持有 PTY 相关 fd;其它模块通过 [`PtyHandle::raw_fd`]
-//!   拿 `RawFd` 注册 calloop,但 **不负责 close**(INV-005 配套)。
-//! - 字段声明顺序必须保证 drop 时 "reader → master → child" —— 即 reader 先 drop
-//!   释放 dup 出的 fd,master drop 关闭主 fd 触发 slave 端 SIGHUP,child 最后被
-//!   回收。T-0201 写码时必须在此追加一条 INV 到 `docs/invariants.md`。
-//! - `spawn_shell` 与 `spawn_program` 共享 openpty + slave drop 逻辑;前者内部调后者。
-//!   分两个出口是为了让 T-0206 的集成测试能直接 spawn `echo` 而不需要经过 shell。
+//! 本 ticket(T-0201)只实装 `spawn_shell` / `spawn_program`。`raw_fd` /
+//! `read` / `resize` / `try_wait` 仍为 `todo!()`,由 T-0202..T-0205 依次填实。
 
-use std::io;
+use std::io::{self, Read};
 use std::os::fd::RawFd;
+
+use anyhow::{anyhow, Context, Result};
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
 /// 子进程 + master 端封装。
 ///
-/// Phase 2 骨架:T-0201 把本结构体改为真实 `PtyPair` / `Child` / reader 的持有者,
-/// 并接管 drop 顺序不变式。当前 unit struct 仅为编译占位。
-pub struct PtyHandle;
+/// 字段声明顺序即 Rust 正向 drop 顺序(见模块 doc + INV-008):
+/// 1. `reader` —— 释放 `try_clone_reader` 的 dup fd
+/// 2. `master` —— 关闭主 fd,slave 端读到 EOF 并/或收到 SIGHUP
+/// 3. `child`  —— 持有子进程句柄,Drop 不阻塞 wait;未 reap 由进程退出 / T-0205 兜底
+///
+/// 三者组合在一起保证:外界只能通过显式方法观察子进程状态(`try_wait` in T-0205);
+/// 丢失 handle 不会 leak fd 或 zombie(至少不会 leak **我们** 的引用)。
+//
+// `dead_code` 白名单:T-0201 scope 外的 `raw_fd` / `read` / `try_wait` 仍为
+// `todo!()`,从 release 构建的 CFG 视角看字段"只写不读"。一旦 T-0202 / T-0203 /
+// T-0205 把方法填实,这里会自然变 read,届时删白名单。
+#[allow(dead_code)]
+pub struct PtyHandle {
+    reader: Box<dyn Read + Send>,
+    master: Box<dyn MasterPty + Send>,
+    child: Box<dyn Child + Send + Sync>,
+}
 
 impl PtyHandle {
     /// 起一个登录 shell(当前写死 `bash -l`),返回持有 master 端的句柄。
@@ -28,8 +51,8 @@ impl PtyHandle {
     /// why:Phase 2 的产出是"窗口打开后 spawn shell";这是唯一被 `main.rs` 调用
     /// 的构造入口。`cols`/`rows` 在 Phase 2 由 T-0202 硬编码 80x24,Phase 3 T-0306
     /// 接窗口 resize 后才会真动态传入。
-    pub fn spawn_shell(cols: u16, rows: u16) -> anyhow::Result<Self> {
-        todo!("T-0201: openpty + CommandBuilder(\"bash -l\") + slave.spawn_command(), cols={cols} rows={rows}")
+    pub fn spawn_shell(cols: u16, rows: u16) -> Result<Self> {
+        Self::spawn_program("bash", &["-l"], cols, rows)
     }
 
     /// 起任意程序(给 T-0206 集成测试用,将来也可能服务 Phase 6 的 shell 配置)。
@@ -37,15 +60,57 @@ impl PtyHandle {
     /// why:bash 作为登录 shell 会进入交互态,不便于集成测试断言具体 stdout。
     /// 暴露通用 spawn 让测试能直接跑 `echo hello` 这类一次性命令。`spawn_shell`
     /// 内部就是调本函数。
-    pub fn spawn_program(
-        program: &str,
-        args: &[&str],
-        cols: u16,
-        rows: u16,
-    ) -> anyhow::Result<Self> {
-        todo!(
-            "T-0201: openpty + CommandBuilder({program:?}).args({args:?}) + spawn, cols={cols} rows={rows}"
-        )
+    pub fn spawn_program(program: &str, args: &[&str], cols: u16, rows: u16) -> Result<Self> {
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .context("portable_pty openpty 失败")?;
+
+        let mut cmd = CommandBuilder::new(program);
+        cmd.args(args);
+        // `CommandBuilder::new` 默认带一套 base_env(PATH / USER 等),`TERM` 不在
+        // 其中。若父进程 `TERM` 已设,继承之;否则用 `xterm-256color` —— 几乎所有
+        // 现代 ncurses / readline 程序都认这个值,比空字符串安全得多。
+        let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into());
+        cmd.env("TERM", term);
+
+        // 顺序敏感:`slave.spawn_command(cmd)` **必须** 在 `drop(pair.slave)` 之前。
+        // 调换顺序会导致 spawn 时 slave 已无效 / master 永远读不到 EOF(子进程
+        // 退出后也没人通知)。这是 portable-pty 文档里明写过的坑,T-0201 ticket
+        // Implementation notes 也复述了一遍。
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .with_context(|| format!("spawn_command({program:?}) 失败"))?;
+        drop(pair.slave);
+
+        // INV-009:master fd 必须 O_NONBLOCK。必须在返回 PtyHandle 之前设好,
+        // T-0203 的 `read` 拿到的是同一 OFD(或 dup 过来的,OFD 级 flags 随 dup
+        // 继承),直接读不会阻塞整个事件循环。
+        let master_fd = pair
+            .master
+            .as_raw_fd()
+            .ok_or_else(|| anyhow!("MasterPty::as_raw_fd() 返回 None —— 非 unix 后端?"))?;
+        set_nonblocking(master_fd).context("master fd 设 O_NONBLOCK 失败")?;
+
+        // reader 从 master dup 一份专读句柄。必须在 `pair.master` move 进 struct
+        // 之前拿:`try_clone_reader(&self)` 借用不可变 master,move 之后借用冲突。
+        let reader = pair
+            .master
+            .try_clone_reader()
+            .context("portable_pty try_clone_reader 失败")?;
+
+        // 字段顺序 = drop 序(INV-008):reader → master → child。
+        Ok(Self {
+            reader,
+            master: pair.master,
+            child,
+        })
     }
 
     /// 返回 master fd,供 calloop `Generic` source 注册。
@@ -74,7 +139,7 @@ impl PtyHandle {
     /// why:Phase 2 暂不接窗口 resize(T-0204 只开 API,Phase 3 T-0306 才接 Wayland
     /// configure → cell 尺寸换算 → 此方法)。`&self` 而非 `&mut self` 是因为
     /// `portable-pty::MasterPty::resize` 的签名就是这样。
-    pub fn resize(&self, cols: u16, rows: u16) -> anyhow::Result<()> {
+    pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
         todo!("T-0204: master.resize(PtySize {{ rows: {rows}, cols: {cols}, .. }})")
     }
 
@@ -82,7 +147,129 @@ impl PtyHandle {
     ///
     /// why:T-0205 需要在 PTY EOF / EIO 时把子进程收尸并往 `should_exit` 置位。
     /// 禁止阻塞 `wait()`,否则整个事件循环卡死(INV-005)。
-    pub fn try_wait(&mut self) -> anyhow::Result<Option<i32>> {
+    pub fn try_wait(&mut self) -> Result<Option<i32>> {
         todo!("T-0205: child.try_wait() -> Option<ExitStatus> -> Option<i32>")
+    }
+}
+
+/// 对任意 `RawFd` 开 `O_NONBLOCK`。保留成自由函数 + 明确 `SAFETY:` 注释块,
+/// 与 `src/wl/render.rs` 里 wgpu 的裸指针 unsafe 风格对齐。
+fn set_nonblocking(fd: RawFd) -> io::Result<()> {
+    // SAFETY:
+    // - `fd` 来自 `portable_pty::MasterPty::as_raw_fd()`,由 `openpty` 刚创建的
+    //   master 端,**进程内活跃**、`PtyHandle` 尚未组装成功前不存在任何别的
+    //   clone,单线程构造。
+    // - `libc::fcntl` 对已关闭的 fd 返回 `EBADF` 而非 UB —— 即便调用期间某条
+    //   未知路径提前关了 fd,最坏结果是本函数返回 io 错误,没有内存安全问题。
+    // - `F_GETFL` / `F_SETFL` 只读写 open-file-description 级别的 status flags
+    //   (O_NONBLOCK / O_APPEND 等),**不释放资源、不改 fd 所有权**,因此不会
+    //   与 struct 字段的 drop 顺序(INV-008)相互作用。
+    // - 返回值检查完整:两次 fcntl 都按 `< 0` 判错并转成 `io::Error::last_os_error`,
+    //   没有静默吞错。
+    #[allow(unsafe_code)]
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+// ---------- test-only 帮助 ----------
+//
+// 本 ticket 不对外开 `raw_fd()` / `try_wait()`(见 scope Out),但单测需要验证
+// O_NONBLOCK 置位 + 回收子进程。这两个帮助仅在 `#[cfg(test)]` 下编译,
+// 生产代码绝对拿不到。T-0202 / T-0205 写码把公开版本填实后,这里可以移除。
+
+#[cfg(test)]
+impl PtyHandle {
+    /// 测试专用:拿 master fd 来跑 `fcntl(F_GETFL)` 验证 INV-009。
+    pub(crate) fn master_raw_fd_for_test(&self) -> Option<RawFd> {
+        self.master.as_raw_fd()
+    }
+
+    /// 测试专用:阻塞 wait 子进程退出,防止单测跑完后残留僵尸。
+    pub(crate) fn wait_child_for_test(&mut self) -> io::Result<u32> {
+        let status = self.child.wait()?;
+        Ok(status.exit_code())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// T-0201 acceptance:`spawn_program("true", &[], 80, 24)` 成功返回;
+    /// 显式 wait 回收后 drop 不 panic / 不 leak zombie(测试内就能验)。
+    #[test]
+    fn spawn_program_true_succeeds_and_exits_cleanly() {
+        let mut handle =
+            PtyHandle::spawn_program("true", &[], 80, 24).expect("spawn `true` 应成功");
+        let code = handle.wait_child_for_test().expect("wait true 应成功");
+        assert_eq!(code, 0, "/usr/bin/true 退出码应为 0");
+        drop(handle);
+    }
+
+    /// T-0201 acceptance:`spawn_shell` 能真的拉起 `bash -l`。不做交互,不读
+    /// 字节(那是 T-0203);只验证返回 Ok + drop 路径不 panic。
+    #[test]
+    fn spawn_shell_returns_ok_and_drops_cleanly() {
+        let handle = PtyHandle::spawn_shell(80, 24).expect("spawn `bash -l` 应成功");
+        // 不 wait:bash 作为交互式登录 shell 在收到 SIGHUP 前可能不退出,wait 会卡。
+        // Drop 时 master 关闭 → slave EOF + SIGHUP → bash 很快退出,僵尸由 OS init
+        // 在本测试进程退出后收养回收。单测 scope 只验"构造 + Drop 不 panic"。
+        drop(handle);
+    }
+
+    /// T-0201 acceptance:"单测验证 O_NONBLOCK:spawn 后 fcntl(F_GETFL) 返回值与
+    /// O_NONBLOCK 按位与非零"。对应 INV-009。
+    #[test]
+    fn master_fd_is_nonblocking_after_spawn() {
+        let mut handle = PtyHandle::spawn_program("true", &[], 80, 24).expect("spawn");
+        let fd = handle
+            .master_raw_fd_for_test()
+            .expect("unix backend 应该返回 Some(fd)");
+
+        // SAFETY: fd 仍由 handle 持有,未被 close;本次 fcntl 只读 flag,不影响 drop 序。
+        #[allow(unsafe_code)]
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(
+            flags >= 0,
+            "fcntl F_GETFL 应成功 (errno: {})",
+            io::Error::last_os_error()
+        );
+        assert!(
+            flags & libc::O_NONBLOCK != 0,
+            "INV-009: master fd 必须 O_NONBLOCK, 实际 flags = {flags:#x}"
+        );
+
+        let _ = handle.wait_child_for_test();
+    }
+
+    /// 防御性:多次 spawn(串行)都能独立成功、独立 wait 回收。主要防 "一次 spawn
+    /// 成功就把全局状态污染掉" 这类隐式假设。
+    #[test]
+    fn spawn_program_is_reusable_serially() {
+        for _ in 0..3 {
+            let mut h = PtyHandle::spawn_program("true", &[], 80, 24).expect("spawn");
+            let code = h.wait_child_for_test().expect("wait");
+            assert_eq!(code, 0);
+        }
+    }
+
+    /// 尺寸参数原样落到 `PtySize` —— 非 0 值不能被 silently 吞成默认值。留给 T-0204
+    /// resize 之前,至少保证构造阶段传进去的尺寸不被改写。通过 `master.get_size()`
+    /// 间接观察。
+    #[test]
+    fn master_get_size_reflects_spawn_dimensions() {
+        let mut handle = PtyHandle::spawn_program("true", &[], 120, 40).expect("spawn");
+        let size = handle.master.get_size().expect("get_size 应成功");
+        assert_eq!(size.cols, 120, "cols 不应被改写");
+        assert_eq!(size.rows, 40, "rows 不应被改写");
+        let _ = handle.wait_child_for_test();
     }
 }

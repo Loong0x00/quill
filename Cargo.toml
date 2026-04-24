@@ -7,7 +7,9 @@ authors = ["Loong0x00 <loong.0x00@gmail.com>"]
 [dependencies]
 anyhow = "1"
 calloop = { version = "0.14", features = ["signals"] }
+libc = "0.2"
 pollster = "0.4"
+portable-pty = "0.9"
 raw-window-handle = "0.6"
 rustix = { version = "1", features = ["event"] }
 signal-hook = { version = "0.4", default-features = false }
