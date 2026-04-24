@@ -2,7 +2,7 @@
 
 **Phase**: 2
 **Assigned**: 写码-close
-**Status**: claimed
+**Status**: in-review
 **Budget**: tokenBudget=80k, walltime=2400s, cost=$4
 **Dependencies**: T-0201(需要 `PtyHandle` 已有 master)
 
