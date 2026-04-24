@@ -2,7 +2,7 @@
 
 **Phase**: 2
 **Assigned**: 写码-close
-**Status**: in-review
+**Status**: merged
 **Budget**: tokenBudget=60k, walltime=1800s, cost=$3
 **Dependencies**: T-0201(spawn)、T-0203(`read` 非阻塞 + O_NONBLOCK)
 
