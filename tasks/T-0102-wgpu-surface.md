@@ -1,8 +1,8 @@
 # T-0102 wgpu 绑定 Wayland 表面并每帧画纯色
 
 **Phase**: 1
-**Assigned**:
-**Status**: open
+**Assigned**: impl-t0102
+**Status**: claimed
 **Budget**: tokenBudget=100k, walltime=3600s, cost=$5
 **Dependencies**: T-0101
 
