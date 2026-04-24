@@ -12,3 +12,6 @@ Thumbs.db
 perf.data*
 flamegraph.svg
 heaptrack.*
+
+# Runtime logs:MCP / puppeteer / hook audit 等工具的本地 log,不应跟踪
+logs/
