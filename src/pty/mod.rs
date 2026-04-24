@@ -181,11 +181,16 @@ impl PtyHandle {
     /// why:T-0205 在 PTY EOF / EIO 时把子进程收尸并往主循环 `should_exit` 置位。
     /// **禁止阻塞 `wait()`**,否则整个事件循环卡死(INV-005)。
     ///
-    /// 返回 code 的语义:取 `ExitStatus::exit_code() as i32`。若子进程被 signal
-    /// 杀死,`portable-pty` 的 `ExitStatus::exit_code()` 通常返 0,真正 signal
-    /// 信息在 `ExitStatus::signal() -> Option<&str>` 里 —— 本 API 故意**不**暴露
-    /// signal 细节(T-0205 scope 只要"是否退出 + 数字 code",消费方当前只 tracing
-    /// 一下,不做 shell-style `128+signum` 编码;Phase 6 加 config 时再扩)。
+    /// 返回 code 的语义:依赖 portable-pty 在 Unix 已做的 `128 + signum` 编码
+    /// (参 `portable-pty 0.9` 的 `unix_child.rs` —— `From<std::process::ExitStatus>`
+    /// impl 里对 signal 杀死的子进程调 `Self::with_signal(..., 128 + signum as u32)`),
+    /// 本函数 `status.map(|s| s.exit_code() as i32)` 透传即可得到 shell-style 退出码
+    /// (128 + signum)。Windows 路径 portable-pty 未必同编码,Phase 2 不关注。
+    ///
+    /// 语义例:`SIGKILL (signum=9)` → exit_code = 137;`SIGTERM (15)` → 143。
+    /// 这正是 ticket T-0205 Implementation notes 里说的 "128 + signal 占位"。
+    /// 消费方当前只 tracing 一下不做特殊处理;Phase 6 加 config 时要显示
+    /// "Terminated: signal X" 字样再扩。
     pub fn try_wait(&mut self) -> Result<Option<i32>> {
         let status = self
             .child
