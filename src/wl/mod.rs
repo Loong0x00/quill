@@ -1,7 +1,8 @@
-//! Wayland 客户端封装。本阶段(T-0101)只拉起 xdg_toplevel 窗口,后续 ticket 会接
-//! calloop / wgpu / resize。对外只暴露 [`run_window`] 一个入口,隐藏 SCTK 与
-//! wayland-client 的全部原始类型。
+//! Wayland 客户端封装。本阶段只拉起 xdg_toplevel 窗口并用 wgpu 画一块清屏背景
+//! (T-0102)。对外只暴露 [`run_window`] 一个入口,隐藏 SCTK / wayland-client /
+//! wgpu 的全部原始类型。后续 ticket 接 calloop / resize。
 
+mod render;
 mod window;
 
 pub use window::run_window;

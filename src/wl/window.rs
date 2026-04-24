@@ -1,17 +1,20 @@
-//! xdg-toplevel 最小窗口。按 T-0101 的 Implementation notes:
-//! - 照 SCTK `simple_window` 抄 delegate_* 宏,不自卷 Dispatch
-//! - 第一次 configure 到达之前不 commit buffer(只 commit 空 surface 作 map 请求)
-//! - 初始尺寸硬编码 800x600
-//! - 事件循环用 `event_queue.blocking_dispatch`,T-0105 再换 calloop
+//! xdg-toplevel 最小窗口 + wgpu 清屏。
 //!
-//! 本 ticket 不画终端内容,但某些 compositor 在 toplevel 没有附 buffer 时不会真正
-//! 把窗口弹出来;所以 configure 回来后用 wl_shm 填一帧纯色(白)当占位,
-//! T-0102 会用 wgpu 替掉。
+//! 演进脉络:
+//! - T-0101 用 wl_shm 填一帧白占位。
+//! - T-0107 抽出 [`WindowCore`] / [`WindowEvent`] / [`handle_event`] 纯逻辑,
+//!   headless 测试覆盖。
+//! - T-0102(本 ticket)把占位绘制从 wl_shm 换成 wgpu `Surface` +
+//!   `LoadOp::Clear(深蓝)` —— 单色帧走真渲染通路,为后续字形 pass 铺骨架。
+//!   状态机仍由 `handle_event` 驱动,只把"needs_draw 时要做什么"由 shm 换成 wgpu。
+//! - 事件循环仍用 `event_queue.blocking_dispatch`,T-0105 再迁 calloop。
+
+use std::ffi::c_void;
 
 use anyhow::{anyhow, Context, Result};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
-    delegate_compositor, delegate_output, delegate_registry, delegate_shm, delegate_xdg_shell,
+    delegate_compositor, delegate_output, delegate_registry, delegate_xdg_shell,
     delegate_xdg_window,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
@@ -23,16 +26,14 @@ use smithay_client_toolkit::{
         },
         WaylandSurface,
     },
-    shm::{
-        slot::{Buffer, SlotPool},
-        Shm, ShmHandler,
-    },
 };
 use wayland_client::{
     globals::registry_queue_init,
-    protocol::{wl_output, wl_shm, wl_surface},
-    Connection, QueueHandle,
+    protocol::{wl_output, wl_surface},
+    Connection, Proxy, QueueHandle,
 };
+
+use super::render::Renderer;
 
 const INITIAL_WIDTH: u32 = 800;
 const INITIAL_HEIGHT: u32 = 600;
@@ -132,7 +133,8 @@ pub fn handle_event(state: &mut WindowCore, ev: WindowEvent) -> WindowAction {
     action
 }
 
-/// 启动 Wayland 连接、创建 xdg toplevel、阻塞 dispatch 直到窗口被关闭。
+/// 启动 Wayland 连接、创建 xdg toplevel、首次 configure 后建 wgpu renderer 并
+/// 画一次清屏,阻塞 dispatch 直到窗口被关闭。
 ///
 /// 本函数在用户点关闭时返回 `Ok(())`。T-0105 会替换内部循环到 calloop。
 pub fn run_window() -> Result<()> {
@@ -145,7 +147,6 @@ pub fn run_window() -> Result<()> {
     let compositor =
         CompositorState::bind(&globals, &qh).map_err(|e| anyhow!("wl_compositor 不可用: {e}"))?;
     let xdg_shell = XdgShell::bind(&globals, &qh).map_err(|e| anyhow!("xdg_shell 不可用: {e}"))?;
-    let shm = Shm::bind(&globals, &qh).map_err(|e| anyhow!("wl_shm 不可用: {e}"))?;
 
     let surface = compositor.create_surface(&qh);
     let window = xdg_shell.create_window(surface, WindowDecorations::RequestServer, &qh);
@@ -157,17 +158,13 @@ pub fn run_window() -> Result<()> {
     // 这是 xdg-shell 的 map 请求语义。
     window.commit();
 
-    let pool = SlotPool::new((INITIAL_WIDTH * INITIAL_HEIGHT * 4) as usize, &shm)
-        .context("分配 SlotPool 失败")?;
-
     let mut state = State {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
-        shm,
-        pool,
+        conn: conn.clone(),
         window,
         core: WindowCore::new(INITIAL_WIDTH, INITIAL_HEIGHT),
-        buffer: None,
+        renderer: None,
     };
 
     tracing::info!(
@@ -189,41 +186,51 @@ pub fn run_window() -> Result<()> {
 struct State {
     registry_state: RegistryState,
     output_state: OutputState,
-    shm: Shm,
-    pool: SlotPool,
+    // Drop 顺序敏感:`renderer` 持有 wgpu `Surface`,后者内部保留了 wl_surface 裸指针。
+    // Rust 按字段声明顺序**正向**析构 —— 第一个声明的字段先 drop。所以 renderer
+    // 必须排在 `window` / `conn` 之前,这样析构顺序是 renderer → window → conn,
+    // renderer 先释放 GPU 资源,窗口与连接才关闭,指针在 Renderer 生命周期内
+    // 保持有效。若把 renderer 挪到 window/conn 后面会立刻 UB。见 docs/invariants.md。
+    renderer: Option<Renderer>,
     window: Window,
+    conn: Connection,
     core: WindowCore,
-    buffer: Option<Buffer>,
 }
 
 impl State {
-    /// 画一帧纯色占位。ticket 要求"窗口里可以是空白",但部分 compositor(Mutter)
-    /// 在 toplevel 从未附 buffer 时会认为 surface 未就绪、不把窗口 map 出来,所以这里
-    /// 填一次白,保证窗口真正可见。T-0102 会用 wgpu 画实际终端内容。
-    fn draw_placeholder(&mut self) -> Result<()> {
-        let w = self.core.width as i32;
-        let h = self.core.height as i32;
-        let stride = w * 4;
-        let (buffer, canvas) = self
-            .pool
-            .create_buffer(w, h, stride, wl_shm::Format::Argb8888)
-            .context("create_buffer 失败")?;
-
-        for chunk in canvas.chunks_exact_mut(4) {
-            // Argb8888 little-endian: [B, G, R, A]
-            chunk[0] = 0xFF;
-            chunk[1] = 0xFF;
-            chunk[2] = 0xFF;
-            chunk[3] = 0xFF;
+    /// 从 Connection / WlSurface 提取 libwayland 裸指针,初始化 wgpu Renderer,
+    /// 渲染一帧清屏。指针有效性依赖 `wayland-backend` 的 `client_system` feature
+    /// (在 `Cargo.toml` 中显式启用),否则 `as_ptr()` 会返回 null,构造会报错返回。
+    fn init_renderer_and_draw(&mut self) -> Result<()> {
+        let display_ptr = self.conn.backend().display_ptr() as *mut c_void;
+        if display_ptr.is_null() {
+            return Err(anyhow!(
+                "Connection::backend().display_ptr() == null —— \
+                 wayland-backend 的 `client_system` feature 未启用?"
+            ));
+        }
+        let surface_id = self.window.wl_surface().id();
+        let surface_ptr = surface_id.as_ptr() as *mut c_void;
+        if surface_ptr.is_null() {
+            return Err(anyhow!(
+                "wl_surface ObjectId::as_ptr() == null —— \
+                 wayland-backend 的 `client_system` feature 未启用?"
+            ));
         }
 
-        let surface = self.window.wl_surface();
-        buffer
-            .attach_to(surface)
-            .context("buffer 附加到 surface 失败")?;
-        surface.damage_buffer(0, 0, w, h);
-        self.window.commit();
-        self.buffer = Some(buffer);
+        // SAFETY: display_ptr / surface_ptr 来自本进程活跃的 Connection 与 Window。
+        // Window (及其 WlSurface) 与 Connection 都被 State 持有;`renderer` 字段
+        // 声明位置在 `window` / `conn` 之前,Rust 按声明顺序**正向**析构 →
+        // renderer(第 3 个)先于 window(第 4)/ conn(第 5)被 drop,两枚指针
+        // 在 Renderer 生命周期内始终指向活对象。见 docs/invariants.md。
+        #[allow(unsafe_code)]
+        let renderer =
+            unsafe { Renderer::new(display_ptr, surface_ptr, self.core.width, self.core.height)? };
+        self.renderer = Some(renderer);
+
+        if let Some(r) = self.renderer.as_mut() {
+            r.render().context("首帧渲染失败")?;
+        }
         Ok(())
     }
 }
@@ -337,22 +344,16 @@ impl WindowHandler for State {
             },
         );
 
-        // resize 处理是 T-0103 的范围:本 ticket 仅在首次 configure 真去画占位,
-        // 此后 `WindowCore::resize_dirty` 置位由 T-0103 消费并重建 SlotPool。
+        // resize 重配置是 T-0103 的范围:本 ticket 仅在首次 configure 建 renderer
+        // 并画一次;之后 `WindowCore::resize_dirty` 的消费者留给 T-0103。
         if was_first && action.needs_draw {
-            if let Err(err) = self.draw_placeholder() {
-                tracing::error!(?err, "首帧占位绘制失败");
+            if let Err(err) = self.init_renderer_and_draw() {
+                tracing::error!(?err, "wgpu renderer 初始化或首帧失败");
                 self.core.exit = true;
             } else {
                 self.core.resize_dirty = false;
             }
         }
-    }
-}
-
-impl ShmHandler for State {
-    fn shm_state(&mut self) -> &mut Shm {
-        &mut self.shm
     }
 }
 
@@ -365,7 +366,6 @@ impl ProvidesRegistryState for State {
 
 delegate_compositor!(State);
 delegate_output!(State);
-delegate_shm!(State);
 delegate_xdg_shell!(State);
 delegate_xdg_window!(State);
 delegate_registry!(State);
