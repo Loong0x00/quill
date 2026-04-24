@@ -20,7 +20,8 @@
 //! - T-0201:`spawn_shell` / `spawn_program`
 //! - T-0202:`raw_fd`(返回缓存的 master fd)
 //! - T-0203:`read`(包装 `try_clone_reader()` 的 reader)
-//! - `resize`(T-0204)/ `try_wait`(T-0205)仍为 `todo!()`。
+//! - T-0204:`resize`(包装 `master.resize(PtySize)`,接口预留给 Phase 3 T-0306)
+//! - `try_wait`(T-0205)仍为 `todo!()`。
 
 use std::io::{self, Read};
 use std::os::fd::RawFd;
@@ -152,13 +153,30 @@ impl PtyHandle {
         self.reader.read(buf)
     }
 
-    /// 把新尺寸推给 master,底层触发 TIOCSWINSZ + SIGWINCH 给前台进程组。
+    /// 把新尺寸推给 master,底层 `ioctl(TIOCSWINSZ)` + 给前台进程组发 `SIGWINCH`。
     ///
-    /// why:Phase 2 暂不接窗口 resize(T-0204 只开 API,Phase 3 T-0306 才接 Wayland
-    /// configure → cell 尺寸换算 → 此方法)。`&self` 而非 `&mut self` 是因为
-    /// `portable-pty::MasterPty::resize` 的签名就是这样。
+    /// why:**Phase 2 阶段本 crate 内部无调用方**(spawn 时 cols/rows 已在
+    /// `spawn_program` 写入 `PtySize`,本 Phase 不接窗口 resize)—— 接口预留给
+    /// **Phase 3 T-0306** 的 Wayland `configure` → 像素尺寸 → cell 尺寸 → 本方法
+    /// 那条通路。现在就开出来是为了让 `PtyHandle` 的公共 API 在 Phase 2 一次定
+    /// 稳;将来 Phase 3 直接调,不用改模块内部。
+    ///
+    /// `&self` 而非 `&mut self` 是因为 `portable-pty::MasterPty::resize` 签名就
+    /// `&self`(底层 ioctl 不改 Rust 侧状态,只改 kernel 的 winsize 元数据),
+    /// 照抄减少无谓变异。
+    ///
+    /// `pixel_width` / `pixel_height` 写死 0 —— 语义 "client 不关心 / 未知";
+    /// Phase 4 接 HiDPI 时可能要填 cell 像素尺寸给 terminal-side size-report
+    /// 用,到时再扩。
     pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
-        todo!("T-0204: master.resize(PtySize {{ rows: {rows}, cols: {cols}, .. }})")
+        self.master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .context("PTY resize ioctl 失败")
     }
 
     /// 非阻塞查子进程退出状态。`Ok(None)` = 仍在跑,`Ok(Some(code))` = 已退出。
