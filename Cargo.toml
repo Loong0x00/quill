@@ -5,6 +5,7 @@ edition = "2021"
 authors = ["Loong0x00 <loong.0x00@gmail.com>"]
 
 [dependencies]
+alacritty_terminal = "0.26"
 anyhow = "1"
 calloop = { version = "0.14", features = ["signals"] }
 libc = "0.2"

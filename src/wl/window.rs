@@ -160,13 +160,18 @@ pub fn handle_event(state: &mut WindowCore, ev: WindowEvent) -> WindowAction {
     action
 }
 
-/// 把 wayland `EventQueue<State>`、业务 `State`、calloop `LoopSignal` 三个
-/// 运行时对象捆成一个结构,让 `calloop::EventLoop<'_, LoopData>` 一把 own。
-/// 回调签名得到 `&mut LoopData`,在里面做字段级 split borrow:
-/// - wayland source 回调:需要同时 `&mut event_queue` + `&mut state` 跑
-///   `dispatch_pending`
-/// - pty source 回调:`&mut state.pty` + `&loop_signal`(EOF 触发 stop)
+/// 把 wayland `EventQueue<State>`、业务 `State`、T-0301 的 `TermState`、
+/// calloop `LoopSignal` 四个运行时对象捆成一个结构,让
+/// `calloop::EventLoop<'_, LoopData>` 一把 own。回调签名得到 `&mut LoopData`,
+/// 在里面做字段级 split borrow:
+/// - wayland source 回调:`&mut event_queue` + `&mut state` 跑 `dispatch_pending`
+/// - pty source 回调:`&mut state.pty` + `&mut term` + `&loop_signal`
 /// - signal source 回调:只需 `&loop_signal`
+///
+/// `term` 放 LoopData 而非 State 的理由:wayland `Dispatch` 回调(compositor /
+/// output / xdg-window)不需要 term,放 State 里会污染 Dispatch 的 mental model;
+/// PTY callback 需要跟 pty **同时** borrow term(喂字节),LoopData 级的字段
+/// split borrow 刚好覆盖这对。
 ///
 /// `loop_signal` 放这里而非全局,因为业务退出(compositor close、shell 死、
 /// SIGINT/SIGTERM、read 错)有多条触发路径,都从 `&mut LoopData` 拿同一把
@@ -174,6 +179,7 @@ pub fn handle_event(state: &mut WindowCore, ev: WindowEvent) -> WindowAction {
 struct LoopData {
     event_queue: EventQueue<State>,
     state: State,
+    term: Option<crate::term::TermState>,
     loop_signal: LoopSignal,
 }
 
@@ -263,7 +269,11 @@ pub(crate) fn pty_readable_action(result: &std::io::Result<usize>) -> PtyAction 
 /// EOF / EIO 分支仍是 `pty.try_wait()` 尝试 reap 一下并 `tracing::info!` 一个
 /// exit_code;`Ok(None)` (race) 不 sleep 重试,接受延迟,zombie 由 `PtyHandle::Drop`
 /// / init-adopt 兜底。
-fn pty_read_tick(pty: &mut PtyHandle, loop_signal: &LoopSignal) -> std::io::Result<PostAction> {
+fn pty_read_tick(
+    pty: &mut PtyHandle,
+    term: &mut Option<crate::term::TermState>,
+    loop_signal: &LoopSignal,
+) -> std::io::Result<PostAction> {
     // INV-009 sanity check:master fd 必须 O_NONBLOCK。由 T-0201 的 `spawn_program`
     // 在构造时 fcntl 一次设好,本 ticket **不重复** F_SETFL(会覆盖其它 flag 破
     // 坏不变式)。debug build panic 拦回归;release build 0 开销。
@@ -286,7 +296,8 @@ fn pty_read_tick(pty: &mut PtyHandle, loop_signal: &LoopSignal) -> std::io::Resu
         let result = pty.read(&mut buf);
         match pty_readable_action(&result) {
             PtyAction::ContinueReading => {
-                // Ok(n>0) 路径:trace 字节。Err(EINTR) 路径:不 trace,沉默重试。
+                // Ok(n>0) 路径:trace 字节 + T-0301 喂进 alacritty Term 状态机。
+                // Err(EINTR) 路径:不 trace,沉默重试。
                 if let Ok(n) = result {
                     debug_assert!(
                         n > 0,
@@ -299,6 +310,20 @@ fn pty_read_tick(pty: &mut PtyHandle, loop_signal: &LoopSignal) -> std::io::Resu
                         bytes = %preview,
                         "pty bytes"
                     );
+                    // T-0301: 喂 alacritty_terminal 的 `vte::ansi::Processor`。
+                    // Option<&mut TermState> 保险:正常路径 term 是 Some(ctor 设好),
+                    // None 跳过(未来可能 T-0305+ 在 resize 时临时 take/put)。
+                    if let Some(t) = term.as_mut() {
+                        t.advance(&buf[..n]);
+                        let (col, line) = t.cursor_point();
+                        tracing::trace!(
+                            target: "quill::term",
+                            n,
+                            col,
+                            line,
+                            "term advanced"
+                        );
+                    }
                 }
                 continue;
             }
@@ -533,13 +558,23 @@ pub fn run_window() -> Result<()> {
         .insert_source(
             Generic::new(pty_borrowed, Interest::READ, Mode::Level),
             |_readiness, _fd, data: &mut LoopData| {
-                let pty = match data.state.pty.as_mut() {
+                // split borrow: pty 藏在 data.state.pty,term 是 data.term 自己,
+                // loop_signal 也是 data 自己的字段 —— 三个字段互相不冲突,
+                // 可同时 &mut 拿出来。`&mut *data` 强制重借用,让编译器看见
+                // 字段级 split。
+                let LoopData {
+                    state,
+                    term,
+                    loop_signal,
+                    ..
+                } = &mut *data;
+                let pty = match state.pty.as_mut() {
                     Some(p) => p,
                     // 极罕见:state.pty = None(spawn 后被谁 take 了)。为了不 panic,
                     // 跳过本轮。正常路径到不了这里。
                     None => return Ok(PostAction::Continue),
                 };
-                pty_read_tick(pty, &data.loop_signal)
+                pty_read_tick(pty, term, loop_signal)
             },
         )
         .map_err(|e| anyhow!("calloop insert_source(pty master fd) 失败: {e}"))?;
@@ -556,6 +591,9 @@ pub fn run_window() -> Result<()> {
     let mut loop_data = LoopData {
         event_queue,
         state,
+        // T-0301: 初始 80x24,与 `PtyHandle::spawn_shell(80, 24)` 对齐。
+        // Phase 3 T-0306 接窗口 resize 时会重建 Term 或调用 resize method。
+        term: Some(crate::term::TermState::new(80, 24)),
         loop_signal: loop_signal.clone(),
     };
     event_loop
