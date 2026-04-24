@@ -134,6 +134,67 @@ instance   ←  最后 drop (第 6)
 
 ---
 
+## INV-008: `PtyHandle` 字段声明顺序决定 PTY / 子进程 drop 语义
+
+**位置**:`src/pty/mod.rs::PtyHandle`
+
+**约束**:字段声明顺序必须是
+```
+reader   ← 先 drop (第 1)
+master
+child    ← 最后 drop (第 3)
+```
+
+**为啥**:
+- `reader` 是 `try_clone_reader()` 拿的 dup fd,依赖 master fd 的 OFD 存活。
+  让它先 drop,把自己那份 dup fd 先归还内核。
+- `master` 拥有主 fd,drop 时关闭 master 端 → kernel 给 slave 端 EOF,
+  前台进程组收到 `SIGHUP`。必须在 `child` 之前发 SIGHUP,否则 child 还活着
+  却拿不到任何通知,形同 leak。
+- `child` 最后 drop。Drop 本身 **不阻塞 `wait()`**(单线程事件循环禁止
+  任意阻塞,见 INV-005);未 reap 的子进程靠本进程退出 / T-0205 的
+  `try_wait` 兜底。
+
+**违反后果**:
+- 若 `child` 在 `master` 前 drop,`portable_pty::Child::Drop` 只 drop 句柄、不
+  送 signal,子进程 detach 成 orphan,后续才被 SIGHUP,没有时间窗保证。
+- 若 `reader` 在 `master` 后 drop,reader 持有的 dup fd 指向一个已被关闭的
+  OFD,后续对 reader 的任意 `read` 会得到 EBADF,但这一问题通常只在
+  未来 T-0203 引入非 fd 级 close 顺序假设时才显现 —— 提前固化避免踩坑。
+
+**验证**:
+- Code review 时必须检查 `PtyHandle` 字段顺序
+- `src/pty/mod.rs::tests` 有 `spawn_program_true_succeeds_and_exits_cleanly`
+  等测试走完整 Drop 路径
+
+---
+
+## INV-009: PTY master fd 必须 `O_NONBLOCK`
+
+**位置**:`src/pty/mod.rs::PtyHandle::spawn_program`
+
+**约束**:`spawn_program` / `spawn_shell` 返回之前,**必须** 对 master fd 调
+`fcntl(F_SETFL, flags | O_NONBLOCK)`。未来 T-0202 把该 fd 接进 calloop、
+T-0203 调 `reader.read` 时,**默认假设** fd 是非阻塞的。
+
+**为啥**:calloop 单线程事件循环(INV-005)里任何阻塞 `read` 都会卡住
+全部 IO(Wayland / 渲染 / signal),正是 Ghostty / GTK4 踩过的 "event
+starvation" 坑的反面。非阻塞 read 得到 `WouldBlock` 时直接返回给 calloop
+等下一次 readiness。
+
+**违反后果**:终端会间歇性 freeze —— 子进程写得慢时整个 UI 不响应。最坏情况:
+子进程挂起但未退出,quill 拿不到输出也吃不到键盘 → 用户只能 SIGKILL。
+
+**验证**:
+- `src/pty/mod.rs::tests::master_fd_is_nonblocking_after_spawn` 用
+  `fcntl(F_GETFL)` 读 flags,按位断言 `O_NONBLOCK` 位为 1
+- Code review 时确认 `spawn_program` 在返回 `PtyHandle` 之前已调
+  `set_nonblocking`;若路径里有 `?` 提前返回,需在该分支也保证 fd 被关闭
+  (当前实现:`set_nonblocking` 失败时 `pair.master` 还在栈上,提前返回时
+  自动 drop 关闭,无 leak)
+
+---
+
 ## 条目编号规则
 
 - 顺序编号 `INV-001` `INV-002` ...
