@@ -21,14 +21,20 @@
 
 use std::ffi::c_void;
 use std::io::{ErrorKind, Read};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, BorrowedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use calloop::generic::Generic;
+use calloop::{Interest, Mode, PostAction};
 use rustix::event::{PollFd, PollFlags};
 use rustix::io::Errno;
+
+use crate::event_loop::Core;
+use crate::pty::PtyHandle;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     delegate_compositor, delegate_output, delegate_registry, delegate_xdg_shell,
@@ -211,8 +217,16 @@ fn install_signal_handlers(should_exit: &Arc<AtomicBool>, sig_w: &UnixStream) ->
 }
 
 /// 主循环单步:dispatch 已缓冲的 wayland 事件 → flush → 若已干净则 poll
-/// (wayland_fd + sig_pipe_fd)。信号 pipe 可读时 drain 字节,让下一轮
-/// `run_main_loop` 顶部的原子 check 观察到 flag。
+/// (wayland_fd + sig_pipe_fd + pty_fd)。信号 pipe 可读时 drain 字节,让下一轮
+/// `run_main_loop` 顶部的原子 check 观察到 flag。PTY 可读时通过
+/// `pty_core.dispatch(Duration::ZERO, ...)` 让 calloop 的 Generic source 回调
+/// 跑一次(T-0202:目前回调仅 `trace!("pty readable")`)。
+///
+/// **双 poll 是过渡设计**:wayland / signal 仍走 rustix poll(T-0104 遗留),
+/// PTY 经 calloop;两个机制都看 PTY fd,所以 rustix 的 poll 醒了 →
+/// `core.dispatch(ZERO)` 让 calloop 的内部 poll 也看到 ready → 触发回调。
+/// T-0105 的后续 refactor 会把 wayland / signal 也迁进同一个 Core,届时本函数
+/// 整体被 `EventLoop::run` 替换。
 ///
 /// 返回 [`StepResult::Stop`] 的唯一来源:`state.core.exit`(compositor 发
 /// `request_close`、compositor 断开、或 renderer 初始化失败)。
@@ -221,6 +235,8 @@ fn pump_once(
     event_queue: &mut EventQueue<State>,
     state: &mut State,
     sig_r: &mut UnixStream,
+    pty_core: &mut Core<'_, ()>,
+    pty_fd: RawFd,
 ) -> Result<StepResult> {
     // 1. 排空已缓冲的事件(首次 configure 就是在这里触发 init_renderer_and_draw)。
     let dispatched = event_queue
@@ -234,6 +250,8 @@ fn pump_once(
     conn.flush().context("Wayland flush 失败")?;
 
     // 刚刚 dispatch 过事件,缓冲区里可能已经有新货 —— 不 poll 直接回 top。
+    // 注意:即便走了快路径,下一轮 run_main_loop 又进 pump_once,会再走完整 poll,
+    // PTY readable 最多延迟一轮,Level-triggered 不会丢事件。
     if dispatched > 0 {
         return Ok(StepResult::Continue);
     }
@@ -246,12 +264,21 @@ fn pump_once(
         None => return Ok(StepResult::Continue),
     };
 
-    // 4. Poll wayland socket 和 signal pipe。
+    // 4. Poll wayland socket + signal pipe + PTY master。PTY 加进来是为了让单只
+    //    PTY 可读也能唤醒 poll(否则会卡在等 wayland 事件的 rustix poll 里,PTY
+    //    字节堆在内核缓冲)。
     let wayland_fd = guard.connection_fd();
     let sig_fd = sig_r.as_fd();
+    // SAFETY: pty_fd 来自 spawn_shell 返回值的 pty.raw_fd() 缓存(PtyHandle
+    // 的 master_fd 字段,由 spawn 时 as_raw_fd().ok_or_else 校验过),
+    // state.pty 持有该 PtyHandle 到 run_window 结束;pump_once 调用链完全
+    // 嵌套在 state 生命期内,BorrowedFd 不会在 master fd close 后残留。
+    #[allow(unsafe_code)]
+    let pty_borrowed: BorrowedFd<'_> = unsafe { BorrowedFd::borrow_raw(pty_fd) };
     let mut fds = [
         PollFd::new(&wayland_fd, PollFlags::IN | PollFlags::ERR),
         PollFd::new(&sig_fd, PollFlags::IN),
+        PollFd::new(&pty_borrowed, PollFlags::IN),
     ];
     match rustix::event::poll(&mut fds, None) {
         Ok(_) => {}
@@ -261,10 +288,19 @@ fn pump_once(
             drop(guard);
             return Ok(StepResult::Continue);
         }
-        Err(e) => return Err(anyhow!("poll(wayland + signal) 失败: {e}")),
+        Err(e) => return Err(anyhow!("poll(wayland + signal + pty) 失败: {e}")),
     }
 
-    // 5a. 信号 pipe 可读 → drain 字节(防止 pipe 满、下次 handler 写入被
+    // 5a. PTY 可读 → 让 calloop 的 Generic source 把 ready fd 传给回调(本 ticket
+    //      只 trace,不读字节)。Duration::ZERO = 非阻塞 tick,不影响后面的 wayland
+    //      处理节奏。
+    if fds[2].revents().contains(PollFlags::IN) {
+        pty_core
+            .dispatch(Some(Duration::ZERO), &mut ())
+            .context("pty_core.dispatch 失败")?;
+    }
+
+    // 5b. 信号 pipe 可读 → drain 字节(防止 pipe 满、下次 handler 写入被
     //     silently drop),然后回 top 让 atomic check 观察 flag。
     if fds[1].revents().contains(PollFlags::IN) {
         drain_pipe(sig_r);
@@ -272,11 +308,11 @@ fn pump_once(
         return Ok(StepResult::Continue);
     }
 
-    // 5b. Wayland 可读 / 报错 → 消耗 guard 真读取。出错走 err 分支。
+    // 5c. Wayland 可读 / 报错 → 消耗 guard 真读取。出错走 err 分支。
     if fds[0].revents().intersects(PollFlags::IN | PollFlags::ERR) {
         guard.read().context("Wayland ReadEventsGuard::read 失败")?;
     } else {
-        // 按理不会走到这里(poll 返回 Ok 意味着至少一个 fd 有事件),保险起见释放。
+        // 只 PTY 醒了(5a 已处理)或其他意外 — 释放 guard,让 wayland 源下轮再跑。
         drop(guard);
     }
     Ok(StepResult::Continue)
@@ -334,13 +370,16 @@ pub fn run_window() -> Result<()> {
     // 这是 xdg-shell 的 map 请求语义。
     window.commit();
 
+    // State 字段顺序固化 INV-001(renderer→window→conn)+ pty 放最后(T-0202 Lead + 审码)。
+    // 初始化时 pty 为 None,后面拿到 spawn_shell 结果再填 Some。
     let mut state = State {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
-        conn: conn.clone(),
-        window,
-        core: WindowCore::new(INITIAL_WIDTH, INITIAL_HEIGHT),
         renderer: None,
+        window,
+        conn: conn.clone(),
+        core: WindowCore::new(INITIAL_WIDTH, INITIAL_HEIGHT),
+        pty: None,
     };
 
     // Signal self-pipe + handlers 装在一起:
@@ -355,17 +394,80 @@ pub fn run_window() -> Result<()> {
     install_signal_handlers(&should_exit, &sig_w)?;
     drop(sig_w); // handler 各自持 dup,原件不再需要
 
+    // T-0202: spawn login shell + 把 master fd 注册进 calloop Core(INV-005:所有
+    // IO fd 同一 EventLoop)。初始尺寸 80x24 按 ticket scope 写死;Phase 3 T-0306
+    // 才接 Wayland configure → cell 尺寸换算。
+    let pty = PtyHandle::spawn_shell(80, 24).context("PtyHandle::spawn_shell(80, 24) 失败")?;
+    let pty_fd = pty.raw_fd();
+    state.pty = Some(pty);
+
+    // Core<()> 仅用作 PTY 源的承载:callback 无 state 依赖,占位 `trace!`,真读
+    // 字节是 T-0203。主控流仍由 [`run_main_loop`] / [`pump_once`] 驱动(T-0104
+    // 的手写 poll);pump_once 每轮 `core.dispatch(Duration::ZERO)` 把 calloop
+    // 的 PTY source 回调跑一次。待 wayland / signal 也迁入 calloop(遗留 T-0105
+    // refactor),本 Core 的 Data 会从 `()` 升级为 LoopState。
+    let mut pty_core: Core<'_, ()> = Core::new().context("calloop Core::new")?;
+    // SAFETY: pty_fd 来自 spawn_shell 返回值的 pty.raw_fd() 缓存(PtyHandle
+    // 的 master_fd 字段,spawn 时 as_raw_fd().ok_or_else 校验 Some 一次),
+    // state.pty 持有该 PtyHandle 到 run_window 结束;BorrowedFd 的生命周期
+    // (通过 borrow_raw 擦成 'static)被闭包捕获到 Source 里,但底层 fd 的
+    // 实际有效期 ≥ pty_core 与 event_loop 的生命周期,满足合约。
+    #[allow(unsafe_code)]
+    let pty_borrowed: BorrowedFd<'static> = unsafe { BorrowedFd::borrow_raw(pty_fd) };
+    pty_core
+        .handle()
+        .insert_source(
+            Generic::new(pty_borrowed, Interest::READ, Mode::Level),
+            |_readiness, fd, _data: &mut ()| -> std::io::Result<PostAction> {
+                tracing::trace!(target: "quill::pty", "pty readable");
+                // T-0202 stopgap:Level-triggered source 若不清 fd 的就绪位,
+                // 本 source 会在每次 dispatch 无限触发 —— `RUST_LOG=quill::pty=trace`
+                // 手测里曾测得 700K trace/sec。drain 字节让 fd not-ready,下一次
+                // 数据到达再触发一次 trace,回到"数据到 → 单次回调"的正常节奏。
+                //
+                // **不处理字节** —— 丢弃即可。T-0203 会替换为 `PtyHandle::read` +
+                // 字节级 `tracing::trace!("{bytes:?}")`,届时 drain 由真正的 read
+                // 承担,此处会一并删除。
+                let mut buf = [0u8; 4096];
+                loop {
+                    match rustix::io::read(fd.as_fd(), &mut buf) {
+                        // Ok(非零) 读到字节,继续 drain
+                        Ok(n) if n > 0 => continue,
+                        // Ok(0) slave 端关闭 → EOF;T-0205 的子进程退出检测路径
+                        // 才处理"EOF → 退出循环",本 ticket 仅停止 drain
+                        Ok(_) => return Ok(PostAction::Continue),
+                        // AGAIN = 没更多数据(master 已置 O_NONBLOCK,INV-009);
+                        // 在 Linux 上 WOULDBLOCK == AGAIN(单一 errno 42),rustix
+                        // 把两者合并成 AGAIN 一个变体,一条就覆盖。
+                        // Interrupted = signal 打断,重试
+                        Err(rustix::io::Errno::AGAIN) => return Ok(PostAction::Continue),
+                        Err(rustix::io::Errno::INTR) => continue,
+                        // 其他错误:转成 io::Error 让 calloop 的 error path 处理
+                        Err(e) => return Err(std::io::Error::from_raw_os_error(e.raw_os_error())),
+                    }
+                }
+            },
+        )
+        .map_err(|e| anyhow!("calloop insert_source(pty master fd) 失败: {e}"))?;
+
     tracing::info!(
         width = INITIAL_WIDTH,
         height = INITIAL_HEIGHT,
         "quill 窗口已请求创建"
     );
 
-    // 主循环:闭包借 &mut event_queue / &mut state / &conn / &mut sig_r(互不冲突
-    // 的字段借用)。run_main_loop 只看 should_exit 原子,不触碰 wayland 资源,
-    // 便于单测。
+    // 主循环:闭包借 &mut event_queue / &mut state / &conn / &mut sig_r /
+    // &mut pty_core(互不冲突的字段借用)。run_main_loop 只看 should_exit 原子,
+    // 不触碰 wayland / pty 资源,便于单测。
     run_main_loop(&should_exit, || {
-        pump_once(&conn, &mut event_queue, &mut state, &mut sig_r)
+        pump_once(
+            &conn,
+            &mut event_queue,
+            &mut state,
+            &mut sig_r,
+            &mut pty_core,
+            pty_fd,
+        )
     })?;
 
     tracing::info!("窗口关闭,退出事件循环");
@@ -379,11 +481,19 @@ struct State {
     // Rust 按字段声明顺序**正向**析构 —— 第一个声明的字段先 drop。所以 renderer
     // 必须排在 `window` / `conn` 之前,这样析构顺序是 renderer → window → conn,
     // renderer 先释放 GPU 资源,窗口与连接才关闭,指针在 Renderer 生命周期内
-    // 保持有效。若把 renderer 挪到 window/conn 后面会立刻 UB。见 docs/invariants.md。
+    // 保持有效。若把 renderer 挪到 window/conn 后面会立刻 UB。见 docs/invariants.md
+    // INV-001。
     renderer: Option<Renderer>,
     window: Window,
     conn: Connection,
     core: WindowCore,
+    // `pty` **位于 State 最后一位**(Lead + 审码 2026-04-25 拍板,见 T-0202 ticket):
+    // - PTY 持 Linux fd + 子进程句柄,与 wl / wgpu 资源生命周期正交,放最后避免
+    //   跟 INV-001 的 renderer→window→conn 链条耦合,不需要新建 INV。
+    // - 保证 wl / wgpu drop 先跑完,再 drop pty;PtyHandle 自身按 INV-008
+    //   (reader → master → child)正向 drop,master 关闭时 slave 端 SIGHUP 已
+    //   无风险打扰 wl 回调(wl 侧早没了)。
+    pty: Option<PtyHandle>,
 }
 
 impl State {

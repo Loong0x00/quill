@@ -35,14 +35,22 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize}
 /// 三者组合在一起保证:外界只能通过显式方法观察子进程状态(`try_wait` in T-0205);
 /// 丢失 handle 不会 leak fd 或 zombie(至少不会 leak **我们** 的引用)。
 //
-// `dead_code` 白名单:T-0201 scope 外的 `raw_fd` / `read` / `try_wait` 仍为
-// `todo!()`,从 release 构建的 CFG 视角看字段"只写不读"。一旦 T-0202 / T-0203 /
-// T-0205 把方法填实,这里会自然变 read,届时删白名单。
+// `dead_code` 白名单:`reader` 要等 T-0203 填 `read()` 才被消费;`child` 要等
+// T-0205 填 `try_wait()`。spawn 之后 `master` 仅持有以保证 drop 序(INV-008)
+// 与 resize 出口(T-0204 里 `&self` 方法),直接 read 不需要。
+// T-0203 / T-0205 填实后可去掉。
 #[allow(dead_code)]
 pub struct PtyHandle {
     reader: Box<dyn Read + Send>,
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
+    /// Master 端裸 fd,`spawn_program` 返回前由 `master.as_raw_fd()` 捕获并
+    /// 校验为 `Some`;之后 [`raw_fd`] 直接返回本字段,**不再**调用
+    /// `MasterPty::as_raw_fd()`(其签名 `Option<RawFd>` 迫使 unwrap,违反
+    /// CLAUDE.md 的无 `unwrap` / `expect` 准则)。
+    ///
+    /// `RawFd` 无 `Drop`,放在 `child` 之后(最末)不影响 INV-008 的资源释放序。
+    master_fd: RawFd,
 }
 
 impl PtyHandle {
@@ -105,11 +113,12 @@ impl PtyHandle {
             .try_clone_reader()
             .context("portable_pty try_clone_reader 失败")?;
 
-        // 字段顺序 = drop 序(INV-008):reader → master → child。
+        // 字段顺序 = drop 序(INV-008):reader → master → child → master_fd(i32,无 Drop)。
         Ok(Self {
             reader,
             master: pair.master,
             child,
+            master_fd,
         })
     }
 
@@ -118,8 +127,12 @@ impl PtyHandle {
     /// why:INV-005 要求所有 IO fd 进同一 `calloop::EventLoop`。本方法是 PTY 这
     /// 条 fd 接入事件循环的唯一入口。**所有权仍在 `PtyHandle`**,调用方不得 close
     /// 这个 fd,drop 由 `PtyHandle::drop` 负责。
+    ///
+    /// 语义担保:返回的 fd **已经** 置了 `O_NONBLOCK`(由 [`spawn_program`] 在
+    /// 构造时 `fcntl` 一次,见 INV-009)。[`spawn_program`] 会在 fd 为 `None`
+    /// 时提前返错,这里不需要处理 `Option`,不引入 `unwrap` / `expect`。
     pub fn raw_fd(&self) -> RawFd {
-        todo!("T-0202: return master.as_raw_fd() and assert O_NONBLOCK has been set")
+        self.master_fd
     }
 
     /// 从 master 端非阻塞读字节。返回读到的字节数;0 表示 EOF(通常意味着子进程退出)。
@@ -187,12 +200,10 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
 
 #[cfg(test)]
 impl PtyHandle {
-    /// 测试专用:拿 master fd 来跑 `fcntl(F_GETFL)` 验证 INV-009。
-    pub(crate) fn master_raw_fd_for_test(&self) -> Option<RawFd> {
-        self.master.as_raw_fd()
-    }
-
     /// 测试专用:阻塞 wait 子进程退出,防止单测跑完后残留僵尸。
+    ///
+    /// T-0205 会把正式的 `try_wait()` 填实(非阻塞,返回 `Option<i32>`);
+    /// 但 T-0205 之前,单测要在测试末尾收僵尸,只能用这个阻塞版本。
     pub(crate) fn wait_child_for_test(&mut self) -> io::Result<u32> {
         let status = self.child.wait()?;
         Ok(status.exit_code())
@@ -226,13 +237,11 @@ mod tests {
     }
 
     /// T-0201 acceptance:"单测验证 O_NONBLOCK:spawn 后 fcntl(F_GETFL) 返回值与
-    /// O_NONBLOCK 按位与非零"。对应 INV-009。
+    /// O_NONBLOCK 按位与非零"。对应 INV-009。T-0202 起 fd 通过 `raw_fd()` 获取。
     #[test]
     fn master_fd_is_nonblocking_after_spawn() {
         let mut handle = PtyHandle::spawn_program("true", &[], 80, 24).expect("spawn");
-        let fd = handle
-            .master_raw_fd_for_test()
-            .expect("unix backend 应该返回 Some(fd)");
+        let fd = handle.raw_fd();
 
         // SAFETY: fd 仍由 handle 持有,未被 close;本次 fcntl 只读 flag,不影响 drop 序。
         #[allow(unsafe_code)]
@@ -247,6 +256,21 @@ mod tests {
             "INV-009: master fd 必须 O_NONBLOCK, 实际 flags = {flags:#x}"
         );
 
+        let _ = handle.wait_child_for_test();
+    }
+
+    /// T-0202 acceptance:`raw_fd()` 返回的 fd 与 `MasterPty::as_raw_fd()` 实时
+    /// 查询一致 —— 保证 `spawn_program` 缓存的 fd 没偏离真实 master fd。这一致性
+    /// 被 calloop Generic source 的注册隐式依赖,断错会发生向错误 fd 注册的灾难。
+    #[test]
+    fn raw_fd_matches_master_live_fd() {
+        let mut handle = PtyHandle::spawn_program("true", &[], 80, 24).expect("spawn");
+        let cached = handle.raw_fd();
+        let live = handle
+            .master
+            .as_raw_fd()
+            .expect("unix backend 应返回 Some(fd)");
+        assert_eq!(cached, live, "raw_fd() 缓存应与 master.as_raw_fd() 一致");
         let _ = handle.wait_child_for_test();
     }
 
