@@ -16,7 +16,7 @@
 
 - In:
   - 修改 `src/pty/mod.rs`:实装 `PtyHandle::raw_fd(&self) -> RawFd`,返回 master 端的 `as_raw_fd()`
-  - 修改 `src/wl/window.rs`(或 `src/main.rs` / 下文决议的 `src/app.rs`):让 `State` 新增 `pub pty: Option<PtyHandle>` 字段,**位置放在 `renderer` 之前**(INV-001 约束 —— renderer 最先 drop,pty 可以更早,但不能在 conn 之后),或独立放在 `conn`/`window` 之后;关键是 pty 的 drop 不和 wl 指针生命周期冲突。写码 审阅后决定放哪,但必须在 PR 里写明理由,审码 会对照 INV-001/002
+  - 修改 `src/wl/window.rs`(或 `src/main.rs` / 下文决议的 `src/app.rs`):让 `State` 新增 `pub pty: Option<PtyHandle>` 字段, **位置放在 `conn` 之后 (State 最后一位)**。理由: pty 持有 Linux fd, 与 wl 指针 / wgpu 资源生命周期**正交** —— 放最后 drop (1) 不与 INV-001 的 renderer→window→conn 链条耦合, 不需要新增 INV; (2) 保证 wl 侧资源先释放干净, 避免 pty drop 触发 SIGHUP 时 wl 回调还在飞。**此决策由 Lead + 审码 2026-04-25 拍板, 写码不需重新论证, 若你的实现路径不符必须先 SendMessage Lead 讨论**
   - 在 `run_window`(或事件循环入口)处构造 `PtyHandle::spawn_shell(80, 24)`,失败用 `?` 向上传
   - 用 `calloop::generic::Generic::new(fd, Interest::READ, Mode::Level)` 包装 raw fd,通过 `Core::handle().insert_source(...)` 注册;回调里 **暂时只** 打 `tracing::trace!(target: "quill::pty", "pty readable")` 占位,**不读字节**
   - 修改 `Cargo.toml`:若 `calloop::generic` feature 未启用则添加

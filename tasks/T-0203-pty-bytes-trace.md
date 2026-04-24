@@ -20,8 +20,9 @@
     - `WouldBlock` → `Ok(PostAction::Continue)`,正常
     - `io::ErrorKind::Interrupted` → continue 循环再读
     - 其它错误(EIO 等子进程挂了)→ `tracing::warn!`,并把 state 置 `exit`(或等 T-0205 补,本 ticket 可先只 warn 不退出,在 Implementation 里标 TODO link T-0205)
-  - 确保 master fd 为 **non-blocking** —— `portable-pty` 默认是 blocking,读会阻塞整个事件循环 →
-    本 ticket **必须** 在 `PtyHandle::spawn_*` 或 `raw_fd()` 返回前 `fcntl(F_SETFL, O_NONBLOCK)` 给 master fd(或者把这步归到 T-0201 并开子 commit 补;二选一,由写码决定并在 PR 中写明)
+  - master fd 的 **O_NONBLOCK 已由 T-0201 置位并登记为 INV-009**, 本 ticket 仅需:
+    - 在读循环入口 `debug_assert!(fcntl(F_GETFL) & O_NONBLOCK != 0, "T-0201 未设置 O_NONBLOCK, INV-009 破坏")`, debug build 破则 panic, release 无开销
+    - **不重复** `F_SETFL` (误设会覆盖其它 flag, 破坏 T-0201 的不变式)
 - Out:
   - 把字节喂 `alacritty_terminal::Term`(Phase 3 T-0302)
   - 关窗口(T-0205)
@@ -36,13 +37,13 @@
 - [ ] 审码 放行
 - [ ] 手测:`RUST_LOG=quill::pty=trace cargo run` 启动后 2 秒内日志至少出现 1 行包含字节流的 "pty bytes" trace(典型内容:`bash-5.x$` 或 `\x1b[...`)
 - [ ] 回调里读到 `WouldBlock` 能正确跳出,`cargo run` 后 CPU 不 100%(busy loop 自查)
-- [ ] master fd 的 `O_NONBLOCK` 在 `raw_fd()` 返回前一定置位,并有 trace 日志确认
+- [ ] 读循环入口 `debug_assert!` 检查 O_NONBLOCK 已置位 (T-0201 设置, 本 ticket 只 sanity check; INV-009)
 - [ ] 单元测试(可在 `src/pty/mod.rs` 内或新 `tests/pty_read_nonblocking.rs`):spawn `echo hi`,循环 `read` 到 EOF,聚合 buffer 断言 `b"hi\n"` 或 `b"hi\r\n"`(PTY 会把 \n 转 \r\n)
 
 ## Context
 
 - `CLAUDE.md` —— 禁 `println!`,用 `tracing`;禁 `unwrap`;架构不变式 3:PTY 读取必须非阻塞,否则 event loop starve
-- `docs/invariants.md` —— INV-005(唯一调度器);本 ticket 将 **新增** 一条关于 "PTY master 必须 O_NONBLOCK" 的 invariant(INV-008 或当时编号)
+- `docs/invariants.md` —— INV-005(唯一调度器), INV-009 (PTY master O_NONBLOCK, T-0201 已加; 本 ticket 只引用)
 - `ROADMAP.md` Phase 2 T-0203
 - 上游 bug 参考:Ghostty 的 event starvation(CLAUDE.md "为什么存在"章节)—— 本 ticket 是反面避坑
 

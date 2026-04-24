@@ -28,6 +28,7 @@
     5. 从 `pair.master` 拿 reader,组装 `PtyHandle`
   - 实装 `spawn_program(program: &str, args: &[&str], cols: u16, rows: u16)`:与 `spawn_shell` 共用 openpty + slave drop 逻辑,只是 `CommandBuilder` 不同。`spawn_shell` 内部可以直接调 `spawn_program("bash", &["-l"], cols, rows)`
   - 字段声明顺序要让 `Drop` 按"reader → master → child"顺序跑(reader 依赖 master fd,master drop 会触发 SIGHUP 给 child)—— 或显式 `impl Drop` 控制
+  - **设置 master fd `O_NONBLOCK`**:在 `PtyHandle` 返回前调 `libc::fcntl(raw_fd, libc::F_SETFL, libc::O_NONBLOCK)`。用 `#[allow(unsafe_code)]` + `// SAFETY:` 注释块(参照 `src/wl/render.rs` 风格)。**不引入 nix crate**(ADR 0002 未锁 nix,加 crate 要 ADR,不值这一个调用)。理由:fd flag 必须随 fd 创建立即设,否则 T-0203 读字节时阻塞整个 event loop (Ghostty starve 坑的反面)
   - 单元 / doc 测试:构造 `PtyHandle::spawn_program("true", &[], 80, 24)`,`drop`,断言不 panic(不断字节;那是 T-0206 的事)
 - Out:
   - master fd 注册 calloop(T-0202)
@@ -45,7 +46,9 @@
 - [ ] 审码 放行
 - [ ] 单测:调 `PtyHandle::spawn_program("true", &[], 80, 24)` 成功返回,立即 drop 后 `pgrep -f "true$"` 无残留(测试内可走 `child.wait()` 等回收)
 - [ ] `spawn_shell` 的错误路径走 `anyhow::Context`,非 `unwrap/expect`(遵守 CLAUDE.md 开发准则)
-- [ ] drop 顺序在注释里明写,并在 `docs/invariants.md` 追加一条 INV-008(或等号)记录该约束
+- [ ] drop 顺序在注释里明写,并在 `docs/invariants.md` 追加 INV-008 "PtyHandle 内部字段 drop 顺序 reader → master → child"
+- [ ] `docs/invariants.md` 另追加 INV-009 "PTY master fd 必须 O_NONBLOCK"(或等号,按当时最大 INV 编号 +1)
+- [ ] 单测验证 O_NONBLOCK:spawn 后 `fcntl(F_GETFL)` 返回值与 O_NONBLOCK 按位与非零
 
 ## Context
 

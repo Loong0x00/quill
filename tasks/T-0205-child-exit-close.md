@@ -32,6 +32,7 @@
 
 ## Acceptance
 
+- [ ] **T-0104 已合并到 main**, `should_exit` / `LoopSignal::stop()` 机制可用 (审码 2026-04-25 要求显式登记)
 - [ ] `cargo build` 通过
 - [ ] `cargo test` 通过
 - [ ] `cargo clippy --all-targets -- -D warnings` 通过
