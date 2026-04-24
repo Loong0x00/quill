@@ -39,6 +39,99 @@ const INITIAL_HEIGHT: u32 = 600;
 const APP_ID: &str = "io.github.loong0x00.quill";
 const WINDOW_TITLE: &str = "quill";
 
+/// 纯逻辑的窗口状态机核心(T-0107 抽离)。
+///
+/// 从 Wayland 回调里剥出四个 scalar 字段,使 headless 测试不需要真实 compositor
+/// 就能驱动状态转移。活动回调持有一份 [`WindowCore`] 并通过 [`handle_event`]
+/// 推进,确保测试路径和真路径是同一条。
+#[derive(Debug, Clone)]
+pub struct WindowCore {
+    pub width: u32,
+    pub height: u32,
+    pub first_configure: bool,
+    pub exit: bool,
+    /// 尺寸变更后置位,调用方(当前是 [`State::configure`],未来是 T-0103 的
+    /// swapchain 重建路径)读取后自行清零。布尔而非队列,天然把连续 resize
+    /// 合并到单次脏标记。
+    pub resize_dirty: bool,
+}
+
+impl WindowCore {
+    pub fn new(initial_width: u32, initial_height: u32) -> Self {
+        Self {
+            width: initial_width,
+            height: initial_height,
+            first_configure: true,
+            exit: false,
+            resize_dirty: false,
+        }
+    }
+}
+
+/// 从 Wayland 层抽象出来的窗口事件。
+///
+/// `Configure` 的尺寸拍扁为 `Option<u32>`:compositor 未给新尺寸时对应 `None`,
+/// 由 client 保留旧值;显式 0 由 client 侧防守吞掉(见 [`handle_event`])。
+/// `Disconnect` 对应实际跑起来时 `blocking_dispatch` 返回 `Err` 的情形,headless
+/// 测试里模拟 compositor 掉线,语义上等价于 `Close`——都应触发退出。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowEvent {
+    Configure {
+        new_width: Option<u32>,
+        new_height: Option<u32>,
+    },
+    Close,
+    Disconnect,
+}
+
+/// 状态机转移的副作用描述。告诉上层"要不要重画"——真回调据此决定要不要
+/// 重绘占位 buffer / 重建 swapchain。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WindowAction {
+    pub needs_draw: bool,
+}
+
+/// 单步状态转移。纯逻辑、无副作用,是所有 Wayland 事件改状态的唯一入口。
+///
+/// 行为约定(由 `tests/state_machine.rs` 固化):
+/// - 首次 Configure:吃下尺寸,清 `first_configure`,置 `resize_dirty`,要求重画。
+/// - 后续 Configure 尺寸变化:更新尺寸,置 `resize_dirty`,要求重画。
+/// - 后续 Configure 尺寸不变:不置脏,不重画(幂等)。
+/// - 任一轴为 0:整条事件吞掉,保留旧尺寸(xdg-shell 语义里 0x0 是 client 决定,
+///   到这层已经保底一次,防御性写法)。
+/// - Close / Disconnect:置 `exit`。
+pub fn handle_event(state: &mut WindowCore, ev: WindowEvent) -> WindowAction {
+    let mut action = WindowAction::default();
+    match ev {
+        WindowEvent::Configure {
+            new_width,
+            new_height,
+        } => {
+            let w = new_width.unwrap_or(state.width);
+            let h = new_height.unwrap_or(state.height);
+            if w == 0 || h == 0 {
+                return action;
+            }
+            if state.first_configure {
+                state.width = w;
+                state.height = h;
+                state.first_configure = false;
+                state.resize_dirty = true;
+                action.needs_draw = true;
+            } else if w != state.width || h != state.height {
+                state.width = w;
+                state.height = h;
+                state.resize_dirty = true;
+                action.needs_draw = true;
+            }
+        }
+        WindowEvent::Close | WindowEvent::Disconnect => {
+            state.exit = true;
+        }
+    }
+    action
+}
+
 /// 启动 Wayland 连接、创建 xdg toplevel、阻塞 dispatch 直到窗口被关闭。
 ///
 /// 本函数在用户点关闭时返回 `Ok(())`。T-0105 会替换内部循环到 calloop。
@@ -73,11 +166,8 @@ pub fn run_window() -> Result<()> {
         shm,
         pool,
         window,
-        width: INITIAL_WIDTH,
-        height: INITIAL_HEIGHT,
-        first_configure: true,
+        core: WindowCore::new(INITIAL_WIDTH, INITIAL_HEIGHT),
         buffer: None,
-        exit: false,
     };
 
     tracing::info!(
@@ -86,7 +176,7 @@ pub fn run_window() -> Result<()> {
         "quill 窗口已请求创建"
     );
 
-    while !state.exit {
+    while !state.core.exit {
         event_queue
             .blocking_dispatch(&mut state)
             .context("Wayland blocking_dispatch 失败")?;
@@ -102,11 +192,8 @@ struct State {
     shm: Shm,
     pool: SlotPool,
     window: Window,
-    width: u32,
-    height: u32,
-    first_configure: bool,
+    core: WindowCore,
     buffer: Option<Buffer>,
-    exit: bool,
 }
 
 impl State {
@@ -114,15 +201,12 @@ impl State {
     /// 在 toplevel 从未附 buffer 时会认为 surface 未就绪、不把窗口 map 出来,所以这里
     /// 填一次白,保证窗口真正可见。T-0102 会用 wgpu 画实际终端内容。
     fn draw_placeholder(&mut self) -> Result<()> {
-        let stride = self.width as i32 * 4;
+        let w = self.core.width as i32;
+        let h = self.core.height as i32;
+        let stride = w * 4;
         let (buffer, canvas) = self
             .pool
-            .create_buffer(
-                self.width as i32,
-                self.height as i32,
-                stride,
-                wl_shm::Format::Argb8888,
-            )
+            .create_buffer(w, h, stride, wl_shm::Format::Argb8888)
             .context("create_buffer 失败")?;
 
         for chunk in canvas.chunks_exact_mut(4) {
@@ -137,7 +221,7 @@ impl State {
         buffer
             .attach_to(surface)
             .context("buffer 附加到 surface 失败")?;
-        surface.damage_buffer(0, 0, self.width as i32, self.height as i32);
+        surface.damage_buffer(0, 0, w, h);
         self.window.commit();
         self.buffer = Some(buffer);
         Ok(())
@@ -224,7 +308,7 @@ impl OutputHandler for State {
 impl WindowHandler for State {
     fn request_close(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &Window) {
         tracing::info!("compositor 请求关闭窗口");
-        self.exit = true;
+        let _ = handle_event(&mut self.core, WindowEvent::Close);
     }
 
     fn configure(
@@ -235,19 +319,32 @@ impl WindowHandler for State {
         configure: WindowConfigure,
         _serial: u32,
     ) {
-        let new_w = configure.new_size.0.map(|v| v.get()).unwrap_or(self.width);
-        let new_h = configure.new_size.1.map(|v| v.get()).unwrap_or(self.height);
-        tracing::debug!(new_w, new_h, first = self.first_configure, "configure");
+        let new_w = configure.new_size.0.map(|v| v.get());
+        let new_h = configure.new_size.1.map(|v| v.get());
+        tracing::debug!(
+            ?new_w,
+            ?new_h,
+            first = self.core.first_configure,
+            "configure"
+        );
 
-        // resize 处理是 T-0103 的范围。本 ticket 只在第一次 configure 时画一次占位,
-        // 尺寸也不跟着后续 configure 改(避免 SlotPool 容量越界)。
-        if self.first_configure {
-            self.width = new_w;
-            self.height = new_h;
-            self.first_configure = false;
+        let was_first = self.core.first_configure;
+        let action = handle_event(
+            &mut self.core,
+            WindowEvent::Configure {
+                new_width: new_w,
+                new_height: new_h,
+            },
+        );
+
+        // resize 处理是 T-0103 的范围:本 ticket 仅在首次 configure 真去画占位,
+        // 此后 `WindowCore::resize_dirty` 置位由 T-0103 消费并重建 SlotPool。
+        if was_first && action.needs_draw {
             if let Err(err) = self.draw_placeholder() {
                 tracing::error!(?err, "首帧占位绘制失败");
-                self.exit = true;
+                self.core.exit = true;
+            } else {
+                self.core.resize_dirty = false;
             }
         }
     }
