@@ -5,3 +5,8 @@
 mod window;
 
 pub use window::run_window;
+
+// T-0107 为让 headless 测试能直接单测状态转移,把纯逻辑状态机
+// ([`WindowCore`] + [`WindowEvent`] + [`handle_event`])公开,内部活动回调
+// 也走同一条路径(见 `window.rs::State::configure`)。
+pub use window::{handle_event, WindowAction, WindowCore, WindowEvent};

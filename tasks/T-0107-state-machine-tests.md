@@ -1,8 +1,8 @@
 # T-0107 窗口状态机测试
 
 **Phase**: 1
-**Assigned**:
-**Status**: open
+**Assigned**: impl-t0107
+**Status**: merged
 **Budget**: tokenBudget=100k, walltime=3600s, cost=$5
 **Dependencies**: T-0101, T-0103, T-0104, T-0105
 
