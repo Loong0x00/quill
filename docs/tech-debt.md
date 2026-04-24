@@ -19,26 +19,27 @@
 
 ---
 
-## TD-001: T-0203 走 A 方案 Core<&mut PtyHandle>, T-0105 refactor 会推翻
+## TD-001: T-0203 走 A 方案 Core<PtyHandle>, T-0105 refactor 会推翻
 
 **识别日期**: 2026-04-25
 **识别者**: Lead + 审码-opus (T-0202 audit 报告 "给 T-0203 的前置要求")
 
 **代码位置**:
-- `src/event_loop.rs` — Core<Data> 泛型当前 `Data = ()` (T-0105) → T-0203 升到 `&mut PtyHandle`
-- `src/wl/window.rs:pump_once` — calloop 回调拿到 `&mut PtyHandle` 后用 `PtyHandle::read` 取代 T-0202 stopgap 的 `rustix::io::read(master_fd)`
+- `src/event_loop.rs::Core<'l, State>` — T-0105 已泛型化, T-0202 用 `Core<()>`, T-0203 改为 `Core<PtyHandle>` (event_loop.rs 本体零改动, 只换 instantiate)
+- `src/wl/window.rs::pump_once` — calloop 回调从 `fn(event, metadata, &mut ())` 换成 `fn(event, metadata, &mut PtyHandle)`, 回调里走 `pty.read(&mut buf)` 取代 T-0202 stopgap 的 `rustix::io::read(master_fd)`
 
 **当前状态**: 不修
-- B 方案 (T-0203 合并 T-0105 refactor, Core Data 直接升 `&mut State`) 超出单 ticket 预算, 违反 "一次 commit 做一件事"
-- A 方案代价: T-0105 refactor 时 Data type 从 `&mut PtyHandle` 再升 `&mut State`, 回调签名改一次
+- B 方案 (T-0203 合并 T-0105 refactor, Core Data 直接升 `State`) 超出单 ticket 预算, 违反 "一次 commit 做一件事"
+- A 方案代价: T-0105 refactor 时把 Data type 从 `PtyHandle` 再升到 `State` (或 `&mut State`), 回调签名改一次
+- 注 (2026-04-25 Lead 实际 派单措辞不准确): 原派单写 `Core<&mut PtyHandle>`, 但 T-0105 的 `Core<'l, State>` 泛型 + calloop 原生 `dispatch(timeout, &mut Data)` 签名下, 直接 instantiate `State = PtyHandle` 更干净, 借用期限于单次 dispatch 调用。写码-close 选对了, Lead 确认批准
 
 **触发修理的条件**:
 - T-0105 refactor 动作 (把 wayland event_queue + signal pipe 也注册进 calloop, 消除双 poll)
 - 计划节点: Phase 2 结束或 Phase 3 前评估
 
 **解决路径**:
-- T-0105 refactor 单开 ticket (编号 T-0108 或类似, 待命名)
-- 改 Core<Data> 泛型为 `&mut State`, 回调从 `&mut state.pty` 拿 PtyHandle
+- T-0105 refactor 单开 ticket (编号待命名)
+- 把 Core instantiate 从 `PtyHandle` 改为 `State` (或设计一个 EventLoopCtx 聚合 wayland/signal/pty), 回调从 `&mut state.pty` 拿 PtyHandle
 - 删掉 `src/wl/window.rs` 里的 `rustix::event::poll` 手写循环 (T-0104 建, 当前与 calloop 并存)
 - signal 处理从 signal-hook self-pipe 改 `calloop::signals::Signals` (signalfd 路径, 消除 T-0104 ADR 0003 承认的纳秒级竞态窗口)
 
