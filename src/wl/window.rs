@@ -269,8 +269,10 @@ fn pump_once(
     //    字节堆在内核缓冲)。
     let wayland_fd = guard.connection_fd();
     let sig_fd = sig_r.as_fd();
-    // SAFETY: pty_fd 来自 state.pty.as_ref().unwrap().raw_fd();state 持有
-    // PtyHandle 到 run_window 结束,pump_once 调用链完全嵌套在 state 生命期内。
+    // SAFETY: pty_fd 来自 spawn_shell 返回值的 pty.raw_fd() 缓存(PtyHandle
+    // 的 master_fd 字段,由 spawn 时 as_raw_fd().ok_or_else 校验过),
+    // state.pty 持有该 PtyHandle 到 run_window 结束;pump_once 调用链完全
+    // 嵌套在 state 生命期内,BorrowedFd 不会在 master fd close 后残留。
     #[allow(unsafe_code)]
     let pty_borrowed: BorrowedFd<'_> = unsafe { BorrowedFd::borrow_raw(pty_fd) };
     let mut fds = [
@@ -405,10 +407,11 @@ pub fn run_window() -> Result<()> {
     // 的 PTY source 回调跑一次。待 wayland / signal 也迁入 calloop(遗留 T-0105
     // refactor),本 Core 的 Data 会从 `()` 升级为 LoopState。
     let mut pty_core: Core<'_, ()> = Core::new().context("calloop Core::new")?;
-    // SAFETY: pty_fd 来自 state.pty.as_ref().unwrap().raw_fd(),state 持有
-    // PtyHandle 直到 run_window 返回;BorrowedFd 的生命周期(通过
-    // borrow_raw 擦成 'static)被闭包捕获到 Source 里,但底层 fd 的实际
-    // 有效期 ≥ event_loop 的生命周期,满足合约。
+    // SAFETY: pty_fd 来自 spawn_shell 返回值的 pty.raw_fd() 缓存(PtyHandle
+    // 的 master_fd 字段,spawn 时 as_raw_fd().ok_or_else 校验 Some 一次),
+    // state.pty 持有该 PtyHandle 到 run_window 结束;BorrowedFd 的生命周期
+    // (通过 borrow_raw 擦成 'static)被闭包捕获到 Source 里,但底层 fd 的
+    // 实际有效期 ≥ pty_core 与 event_loop 的生命周期,满足合约。
     #[allow(unsafe_code)]
     let pty_borrowed: BorrowedFd<'static> = unsafe { BorrowedFd::borrow_raw(pty_fd) };
     pty_core

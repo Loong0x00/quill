@@ -61,10 +61,12 @@ fn master_fd_becomes_readable_after_child_writes() {
         "500ms 内 echo 子进程应已写 stdout,master fd 应 readable"
     );
 
-    // 不显式 wait:`wait_child_for_test` 是 `pub(crate)`,集成测试拿不到;但 echo
-    // 已退出,drop(handle) 后 master 关闭,子进程变 zombie,待本测试进程退出后
-    // 被 init 收养回收。cargo test 的 harness 行为里不残留可观察进程。
-    drop(handle);
+    // 不显式 drop(handle):Generic source 持有 `BorrowedFd<'static>` 对 master fd
+    // 的"语法上 static"借用,若函数末尾前主动 drop(handle) 会让 BorrowedFd outlive
+    // 真实 owner,违反 `BorrowedFd` 合约(实际不 UB—— calloop 不对该 fd 做 syscall,
+    // 只转给回调;审码 2026-04-25 P3-1 明确放行逻辑但提示改注释)。让 Rust 按反序
+    // drop:event_loop(持 source)先 drop → handle 后 drop,顺序正确。
+    // 子进程 zombie 由 init 在本测试进程退出时收养回收。
 }
 
 /// 对称回归:若 **没人** 写字节,dispatch 在超时窗口内不应误报 readable。
@@ -104,7 +106,7 @@ fn master_fd_stays_unreadable_when_nothing_written() {
         "sleep 期间 master 不应 readable;若触发说明误报 / 注册路径有毛病"
     );
 
-    // sleep 还在跑。drop(handle) 触发 master close → slave EOF + SIGHUP 给 sleep,
-    // sleep 几乎立刻退出;zombie 由 init 在本测试进程退出后收养回收。
-    drop(handle);
+    // 同上一 case:让 Rust 反序 drop(event_loop 先、handle 后),避免 BorrowedFd
+    // 合约被主动 drop(handle) 破坏。sleep 在函数返回时 master close → SIGHUP →
+    // sleep 退出 → zombie 被 init 在测试进程退出后收养。
 }
