@@ -73,16 +73,16 @@ Lead 决定:**T-0104 + Phase 2 PTY 并行推进**。理由:
 
 ---
 
-## Phase 3 — VT 解析 + 屏幕状态 1/7 (2026-04-25)
+## Phase 3 — VT 解析 + 屏幕状态 2/7 (2026-04-25)
 
 **产出**:屏幕上看见 ASCII 字符,哪怕丑。
 
-**实装验证已通过** 2026-04-25: T-0301 完成, `cargo run` 启动后 170ms 内 bash prompt 经 alacritty Processor 解析, cursor 精准停在 `col=17 line=0` (匹配 `[user@userPC ~]$ ` 长度), 证 ANSI/OSC/DECSET 转义正确吞入。
+**实装验证已通过** 2026-04-25: T-0301 + T-0302 完成。`cargo run` 启动后 170ms 内 bash prompt 经 alacritty Processor 解析, cursor 精准停在 `col=17 line=0`。T-0302 建立了 T-0305 色块渲染需要的 API 底盘 (cells_iter + CellPos + is_dirty + dimensions + cursor_visible), alacritty 类型彻底锁在 `src/term/mod.rs` 内部, 公共 API 零类型渗透。
 
 关键 ticket 状态:
 - [x] `T-0301` `alacritty_terminal` Term 集成 + PTY → Term grid 端到端通路 ✅ merged (含 T-0108 calloop 统一 refactor)
-- [ ] `T-0302` PTY bytes → `term.advance()` 深化 (cursor 行为 / DECSET 模式 / 多字节处理)
-- [ ] `T-0303` 光标位置追踪 (cursor shape / blink / position API)
+- [x] `T-0302` Term 渲染 API 准备 (cells_iter / CellPos / is_dirty / dimensions / cursor_visible) ✅ merged
+- [ ] `T-0303` 光标形状 / 位置追踪 (cursor_shape + cursor_pos 返 CellPos 替代现 i32 line)
 - [ ] `T-0304` 滚动 buffer 基础
 - `T-0305` **每 cell 一色块**先渲染(无字体,`█` 式 block 填 cell 背景色)
 - `T-0306` resize → term.resize + ioctl TIOCSWINSZ 同步 PTY
@@ -175,4 +175,5 @@ Lead 决定:**T-0104 + Phase 2 PTY 并行推进**。理由:
 - 2026-04-25 T-0301: alacritty_terminal 0.26 + TermState 薄封装 (Term<VoidListener> + Processor), PTY → Term grid 端到端通路通, bash prompt col=17 精准匹配
 - 2026-04-25 ADR 0004 建立 (calloop 统一), ADR 0003 Superseded by 0004
 - 2026-04-25 TD-001/005/006 三条 ✅ RESOLVED
+- 2026-04-25 T-0302 Term 渲染 API 准备 merged. 4 轮反复 (初版路 A → 路 B 回改 → fixup1 From trait regression → fixup2 私有 fn + saturating cast), 写码 + 审码 + Lead 独立复判抓出 229f5da 是 regression, 合前 double-check 未盲合. 最终版 Option C squash 成单一 commit 保留决策 trail 在 audit 报告和 ROADMAP 里. 这是消息错位/判决版本漂移 (分布式系统 CAP 中选 AP 的必然后果) 在 orchestration 层被缓解架构 (audit + tech-debt + ADR + worktree optimistic concurrency) 捕获的典型案例
 - (后续每个阶段起止在这追加)
