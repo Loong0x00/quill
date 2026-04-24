@@ -1,8 +1,8 @@
 # T-0205 子进程退出 → 窗口关闭
 
 **Phase**: 2
-**Assigned**:
-**Status**: open
+**Assigned**: 写码-close
+**Status**: claimed
 **Budget**: tokenBudget=100k, walltime=3600s, cost=$5
 **Dependencies**: T-0201(`PtyHandle` 存在)、T-0202(calloop 已注册 PTY fd)、T-0104(`should_exit` / 优雅退出路径已落地)
 
