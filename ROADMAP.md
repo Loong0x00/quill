@@ -17,8 +17,8 @@
 关键 ticket 状态:
 - [x] `T-0101` Wayland 窗口(xdg-toplevel + 占位 wl_shm 白 buffer)✅ merged
 - [x] `T-0102` wgpu surface 绑 WlSurface + 深蓝 clear pass ✅ merged
-- [ ] `T-0103` resize 动态重建 wgpu swapchain — **未开**,Phase 3+ 渲染文本时才真有用
-- [ ] `T-0104` close 事件优雅退出(wgpu resources 有序释放)— **未开**,当前 Ctrl+C 粗退
+- [ ] `T-0103` resize 动态重建 wgpu swapchain — **推迟到 Phase 3+**, 文本渲染接入才有视觉可验
+- [x] `T-0104` close 事件优雅退出(SIGINT/SIGTERM/xdg close 统一路径, ADR 0003 signal-hook + rustix)✅ merged
 - [x] `T-0105` `calloop::EventLoop` 骨架(`Core<State>`)✅ merged
 - [x] `T-0106` frame stats(tracing 每 60 帧一行)✅ merged
 - [x] `T-0107` state machine headless 测试(抽出 WindowCore/WindowEvent/handle_event)✅ merged
@@ -45,19 +45,31 @@ Lead 决定:**T-0104 + Phase 2 PTY 并行推进**。理由:
 
 ---
 
-## Phase 2 — PTY 接入 (3-5 天)
+## Phase 2 — PTY 接入 ✅ 6/6 (2026-04-25)
 
-**产出**:窗口打开后 spawn shell,PTY 输出能进 ppoll,还不渲染。
+**实装验证已通过** 2026-04-25 晚。PtyHandle 五方法全实装, calloop 接入, 端到端字节通路通, 59 tests 绿。
 
-关键 ticket:
-- `T-0201` `portable-pty` spawn(优先用 `bash -l`)
-- `T-0202` PTY master fd 注册进 `calloop`
-- `T-0203` 字节流 `tracing::trace!` 打印出来(不渲染)
-- `T-0204` SIGWINCH 正确转发(Phase 1 没 resize 所以先 hardcode 80x24)
-- `T-0205` 子进程退出 → 窗口关闭
-- `T-0206` 集成测试:spawn `echo hello`,检查 stdout 捕获到
+关键 ticket 状态:
+- [x] `T-0201` `portable-pty` spawn (bash -l + O_NONBLOCK + INV-008/009) ✅ merged
+- [x] `T-0202` PTY master fd 注册进 `calloop::generic::Generic` (drain stopgap) ✅ merged
+- [x] `T-0203` 字节流 tracing (PtyHandle::read + Core<PtyHandle> Data 升级 + escape_ascii) ✅ merged
+- [x] `T-0204` PtyHandle::resize API (Phase 2 只开 API, Wayland 接入 Phase 3) ✅ merged
+- [x] `T-0205` 子进程退出 → 窗口关闭 (方案 3 Arc<AtomicBool> 复用 T-0104 + POLLHUP bug fix) ✅ merged
+- [x] `T-0206` 集成测试 spawn echo hello + drop 清理验证 ✅ merged
 
-**里程碑**:`cargo run` 后能看见 shell 启动日志,但屏幕还是纯色背景。
+**里程碑达成**:`cargo run` 启动窗口 → bash 起 → PTY 字节经 calloop 进 trace → 退 shell / SIGINT / SIGTERM / xdg close 任一都 <1s 干净退, 深蓝窗口不渲染。
+
+**Phase 2 产出**:
+- `PtyHandle` 公共 API 完备 (spawn_shell / spawn_program / raw_fd / read / resize / try_wait)
+- calloop Generic source 注册 + pump_once 三源 poll (wayland + signal + pty)
+- 统一退出机制 `Arc<AtomicBool> should_exit` 从 T-0104 复用, 不新建退出变量
+- POLLHUP 检测修复 (Linux pty master slave 关闭 + 缓冲空时只发 POLLHUP 无 POLLIN)
+- INV-008 (PtyHandle drop 序) + INV-009 (O_NONBLOCK) 登记到 `docs/invariants.md`
+- ADR 0003 (signal-hook + rustix, T-0104 时加)
+- 7 份 audit 报告 (phase2-planning / T-0104 / T-0201-T-0206) 归档 `docs/audit/`
+- 13 条 tech-debt 登记 `docs/tech-debt.md` (TD-001..TD-013, 主要是 T-0105 refactor 的累积前置)
+
+**Phase 2 里程碑打勾, 进 Phase 3**。
 
 ---
 
@@ -148,4 +160,12 @@ Lead 决定:**T-0104 + Phase 2 PTY 并行推进**。理由:
 - 2026-04-24 docs/invariants.md 建立, INV-001..007 登记硬约束
 - 2026-04-25 Lead 决定 T-0104 + Phase 2 并行(src/wl/ 和 src/pty/ 无交集)
 - 2026-04-25 T-0103 推迟到 Phase 3+(当前一块深蓝,resize 无视觉可验)
+- 2026-04-25 T-0104 完工合并, ADR 0003 signal-hook + rustix, 手写 poll 绕 wayland-client 0.31 的 EINTR 吞咽 bug
+- 2026-04-25 Phase 2 team quill-phase2 起, 规划-phase2 一次性交付 6 ticket + pty 骨架后退
+- 2026-04-25 Phase 2 全程写码-close + 审码-opus 搭档, 审码中途 Haiku → Opus 1M context 换将
+- 2026-04-25 T-0202 写码发现 Level + 不 drain = busy loop, 选 drain stopgap 伏笔 T-0203 替换
+- 2026-04-25 T-0203 Core Data 从 `()` 升到 `PtyHandle` (A 方案, TD-001 登记)
+- 2026-04-25 T-0205 顺手修 POLLHUP 检测 bug (T-0202/T-0203 残留, EOF 场景漏侦)
+- 2026-04-25 Phase 2 6/6 闭环, PtyHandle 五方法全实装, 端到端字节通路通
+- 2026-04-25 docs/tech-debt.md 建立, TD-001..TD-013 登记已识别未修风险点
 - (后续每个阶段起止在这追加)
