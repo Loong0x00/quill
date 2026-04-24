@@ -1,8 +1,8 @@
 # T-0206 集成测试:spawn echo hello 捕获 stdout
 
 **Phase**: 2
-**Assigned**:
-**Status**: open
+**Assigned**: 写码-close
+**Status**: claimed
 **Budget**: tokenBudget=60k, walltime=1800s, cost=$3
 **Dependencies**: T-0201(spawn)、T-0203(`read` 非阻塞 + O_NONBLOCK)
 
