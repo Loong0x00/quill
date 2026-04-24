@@ -16,12 +16,14 @@
 //!   内部调后者。分两个出口是为了让 T-0206 的集成测试能直接 spawn `echo`
 //!   而不需要经过 shell。
 //!
-//! 填实进度:
+//! 填实进度(Phase 2 结):
 //! - T-0201:`spawn_shell` / `spawn_program`
 //! - T-0202:`raw_fd`(返回缓存的 master fd)
 //! - T-0203:`read`(包装 `try_clone_reader()` 的 reader)
 //! - T-0204:`resize`(包装 `master.resize(PtySize)`,接口预留给 Phase 3 T-0306)
-//! - `try_wait`(T-0205)仍为 `todo!()`。
+//! - T-0205:`try_wait`(包装 `child.try_wait()`,非阻塞收尸)
+//!
+//! `PtyHandle` 的五个 pub 方法全部填实。
 
 use std::io::{self, Read};
 use std::os::fd::RawFd;
@@ -38,12 +40,7 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize}
 ///
 /// 三者组合在一起保证:外界只能通过显式方法观察子进程状态(`try_wait` in T-0205);
 /// 丢失 handle 不会 leak fd 或 zombie(至少不会 leak **我们** 的引用)。
-//
-// `dead_code` 白名单:`child` 要等 T-0205 填 `try_wait()` 才被公开读;spawn
-// 之后 `master` 仅持有以保证 drop 序(INV-008)与 resize 出口(T-0204 里
-// `&self` 方法),直接 read 走 `reader`(T-0203 起已填实)不需要 `master`。
-// T-0205 填实后可去掉。
-#[allow(dead_code)]
+// T-0205 起所有字段都被 public 方法直接/间接消费,不再需要 `#[allow(dead_code)]`。
 pub struct PtyHandle {
     reader: Box<dyn Read + Send>,
     master: Box<dyn MasterPty + Send>,
@@ -181,10 +178,20 @@ impl PtyHandle {
 
     /// 非阻塞查子进程退出状态。`Ok(None)` = 仍在跑,`Ok(Some(code))` = 已退出。
     ///
-    /// why:T-0205 需要在 PTY EOF / EIO 时把子进程收尸并往 `should_exit` 置位。
-    /// 禁止阻塞 `wait()`,否则整个事件循环卡死(INV-005)。
+    /// why:T-0205 在 PTY EOF / EIO 时把子进程收尸并往主循环 `should_exit` 置位。
+    /// **禁止阻塞 `wait()`**,否则整个事件循环卡死(INV-005)。
+    ///
+    /// 返回 code 的语义:取 `ExitStatus::exit_code() as i32`。若子进程被 signal
+    /// 杀死,`portable-pty` 的 `ExitStatus::exit_code()` 通常返 0,真正 signal
+    /// 信息在 `ExitStatus::signal() -> Option<&str>` 里 —— 本 API 故意**不**暴露
+    /// signal 细节(T-0205 scope 只要"是否退出 + 数字 code",消费方当前只 tracing
+    /// 一下,不做 shell-style `128+signum` 编码;Phase 6 加 config 时再扩)。
     pub fn try_wait(&mut self) -> Result<Option<i32>> {
-        todo!("T-0205: child.try_wait() -> Option<ExitStatus> -> Option<i32>")
+        let status = self
+            .child
+            .try_wait()
+            .context("portable-pty Child::try_wait 失败")?;
+        Ok(status.map(|s| s.exit_code() as i32))
     }
 }
 
