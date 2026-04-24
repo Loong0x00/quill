@@ -1,8 +1,8 @@
 # T-0202 PTY master fd 注册进 calloop
 
 **Phase**: 2
-**Assigned**:
-**Status**: open
+**Assigned**: 写码-close
+**Status**: claimed
 **Budget**: tokenBudget=100k, walltime=3600s, cost=$5
 **Dependencies**: T-0201(需要 `PtyHandle::raw_fd()` 可用)
 
