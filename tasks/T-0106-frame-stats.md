@@ -1,8 +1,8 @@
 # T-0106 帧率日志
 
 **Phase**: 1
-**Assigned**:
-**Status**: open
+**Assigned**: impl-t0106
+**Status**: in-review
 **Budget**: tokenBudget=100k, walltime=3600s, cost=$5
 **Dependencies**: T-0105
 
