@@ -1,8 +1,8 @@
 # T-0101 创建 Wayland 窗口
 
 **Phase**: 1
-**Assigned**:
-**Status**: open
+**Assigned**: 写码 A
+**Status**: claimed
 **Budget**: tokenBudget=100k, walltime=3600s, cost=$5
 **Dependencies**: 无
 
