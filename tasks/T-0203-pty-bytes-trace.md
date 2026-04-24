@@ -1,8 +1,8 @@
 # T-0203 PTY 字节流 tracing::trace! 打印
 
 **Phase**: 2
-**Assigned**:
-**Status**: open
+**Assigned**: 写码-close
+**Status**: claimed
 **Budget**: tokenBudget=100k, walltime=3600s, cost=$5
 **Dependencies**: T-0202(calloop 已能监听 readable)
 
