@@ -1,0 +1,14 @@
+/target
+
+.idea/
+.vscode/
+*.swp
+*~
+*.rs.bk
+
+.DS_Store
+Thumbs.db
+
+perf.data*
+flamegraph.svg
+heaptrack.*
