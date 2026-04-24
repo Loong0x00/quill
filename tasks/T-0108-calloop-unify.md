@@ -2,7 +2,7 @@
 
 **Phase**: 1 (refactor)
 **Assigned**: 写码-close
-**Status**: in-review
+**Status**: merged
 **Budget**: tokenBudget=100k(与 T-0301 共享)
 **Dependencies**: T-0104 / T-0105 / T-0206 已 merged
 
