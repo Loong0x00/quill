@@ -9,6 +9,8 @@ anyhow = "1"
 calloop = { version = "0.14", features = ["signals"] }
 pollster = "0.4"
 raw-window-handle = "0.6"
+rustix = { version = "1", features = ["event"] }
+signal-hook = { version = "0.4", default-features = false }
 smithay-client-toolkit = "0.19"
 thiserror = "2"
 tracing = "0.1"
