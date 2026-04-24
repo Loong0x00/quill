@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted, 2026-04-25
+**Superseded by ADR 0004 (2026-04-25)** — T-0108 refactor 后 wayland/signal/pty 三源统一进 calloop, signal 通过 `calloop::signals::Signals` (signalfd) 捕获, self-pipe + 手写 poll + signal-hook 依赖全部下岗。本 ADR 保留作为 T-0104 时代的历史决策说明, 不再作为当前架构的指导。
+
+Accepted, 2026-04-25 → Superseded by ADR 0004, 2026-04-25
 
 ## Context
 

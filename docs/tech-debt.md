@@ -19,7 +19,11 @@
 
 ---
 
-## TD-001: T-0203 走 A 方案 Core<PtyHandle>, T-0105 refactor 会推翻
+## TD-001: T-0203 走 A 方案 Core<PtyHandle>, T-0105 refactor 会推翻 ✅ RESOLVED 2026-04-25
+
+**状态**: ✅ **已解决** (T-0108 refactor, commit `0ffabea`) — 以不同方式解决: 走 LoopData 而非 State 升级。`Core<PtyHandle>` 的 stopgap 被 `calloop::EventLoop<LoopData>` 整体取代, pty_read_callback 从 LoopData split borrow 拿 `&mut state + &mut term + &loop_signal`, 比原计划的 State 升级更干净。audit 报告: `docs/audit/2026-04-25-T-0108-T-0301-review.md`。
+
+---
 
 **识别日期**: 2026-04-25
 **识别者**: Lead + 审码-opus (T-0202 audit 报告 "给 T-0203 的前置要求")
@@ -99,7 +103,11 @@
 
 ---
 
-## TD-005: T-0104 + T-0202 双 poll 共存 — wayland 高频事件下 PTY 数据堆积
+## TD-005: T-0104 + T-0202 双 poll 共存 — wayland 高频事件下 PTY 数据堆积 ✅ RESOLVED 2026-04-25
+
+**状态**: ✅ **已解决** (T-0108 refactor, commit `0ffabea`) — 彻底消除: `rustix::event::poll` 手写循环整段删除, wayland / signal / pty 全部进 `calloop::EventLoop`, 所有 fd 由 calloop 内部 epoll 公平调度。`grep 'rustix::event::poll' src/` 零命中 (仅历史注释)。audit: `docs/audit/2026-04-25-T-0108-T-0301-review.md`。
+
+---
 
 **识别日期**: 2026-04-25
 **识别者**: 审码-opus (T-0202 audit 报告 P2-2 退化风险段)
@@ -119,7 +127,11 @@
 
 ---
 
-## TD-006: ADR 0003 纳秒级竞态窗口 — signal 投递到响应的 poll 阻塞 gap
+## TD-006: ADR 0003 纳秒级竞态窗口 — signal 投递到响应的 poll 阻塞 gap ✅ RESOLVED 2026-04-25
+
+**状态**: ✅ **已解决** (T-0108 refactor, commit `0ffabea`) — 彻底消除: signal 处理从 signal-hook self-pipe 改 `calloop::signals::Signals`, 走 signalfd。"signal → kernel signalfd → poll 立刻见 fd ready → callback stop()" 无用户空间 gap, 竞态窗口从纳秒级降为"不存在"。ADR 0003 被 ADR 0004 Supersede。audit: `docs/audit/2026-04-25-T-0108-T-0301-review.md`。
+
+---
 
 **识别日期**: 2026-04-24 (T-0104 写码-close 自揭)
 **识别者**: 写码-close (ADR 0003 Consequences 段)

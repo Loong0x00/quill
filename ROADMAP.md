@@ -73,15 +73,17 @@ Lead 决定:**T-0104 + Phase 2 PTY 并行推进**。理由:
 
 ---
 
-## Phase 3 — VT 解析 + 屏幕状态 (3-5 天)
+## Phase 3 — VT 解析 + 屏幕状态 1/7 (2026-04-25)
 
 **产出**:屏幕上看见 ASCII 字符,哪怕丑。
 
-关键 ticket:
-- `T-0301` `alacritty_terminal` 集成,`Term` 对象持有 grid
-- `T-0302` PTY bytes → `term.process_byte()`
-- `T-0303` 光标位置追踪
-- `T-0304` 滚动 buffer 基础
+**实装验证已通过** 2026-04-25: T-0301 完成, `cargo run` 启动后 170ms 内 bash prompt 经 alacritty Processor 解析, cursor 精准停在 `col=17 line=0` (匹配 `[user@userPC ~]$ ` 长度), 证 ANSI/OSC/DECSET 转义正确吞入。
+
+关键 ticket 状态:
+- [x] `T-0301` `alacritty_terminal` Term 集成 + PTY → Term grid 端到端通路 ✅ merged (含 T-0108 calloop 统一 refactor)
+- [ ] `T-0302` PTY bytes → `term.advance()` 深化 (cursor 行为 / DECSET 模式 / 多字节处理)
+- [ ] `T-0303` 光标位置追踪 (cursor shape / blink / position API)
+- [ ] `T-0304` 滚动 buffer 基础
 - `T-0305` **每 cell 一色块**先渲染(无字体,`█` 式 block 填 cell 背景色)
 - `T-0306` resize → term.resize + ioctl TIOCSWINSZ 同步 PTY
 - `T-0307` 测试:`ls -la` 输出,检查 grid 里字符位置
@@ -168,4 +170,9 @@ Lead 决定:**T-0104 + Phase 2 PTY 并行推进**。理由:
 - 2026-04-25 T-0205 顺手修 POLLHUP 检测 bug (T-0202/T-0203 残留, EOF 场景漏侦)
 - 2026-04-25 Phase 2 6/6 闭环, PtyHandle 五方法全实装, 端到端字节通路通
 - 2026-04-25 docs/tech-debt.md 建立, TD-001..TD-013 登记已识别未修风险点
+- 2026-04-25 Phase 3 起手: T-0108 + T-0301 合并 ticket (B 方案), 一次清掉 TD-001/005/006 三条技术债
+- 2026-04-25 T-0108 refactor: wayland/signal/pty 三源统一进 calloop::EventLoop, LoopData 聚合 + LoopSignal::stop 统一出口, signal-hook + rustix direct dep 删除
+- 2026-04-25 T-0301: alacritty_terminal 0.26 + TermState 薄封装 (Term<VoidListener> + Processor), PTY → Term grid 端到端通路通, bash prompt col=17 精准匹配
+- 2026-04-25 ADR 0004 建立 (calloop 统一), ADR 0003 Superseded by 0004
+- 2026-04-25 TD-001/005/006 三条 ✅ RESOLVED
 - (后续每个阶段起止在这追加)
