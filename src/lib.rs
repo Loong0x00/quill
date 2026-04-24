@@ -4,4 +4,5 @@
 pub mod event_loop;
 pub mod frame_stats;
 pub mod pty;
+pub mod term;
 pub mod wl;

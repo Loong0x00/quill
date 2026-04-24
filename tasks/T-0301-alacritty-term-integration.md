@@ -2,7 +2,7 @@
 
 **Phase**: 3
 **Assigned**: 写码-close
-**Status**: claimed
+**Status**: in-review
 **Budget**: tokenBudget=100k(与 T-0108 共享)
 **Dependencies**: T-0108(Core<State> 已就绪,可在 pty callback 里 &mut state.term)
 

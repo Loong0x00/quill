@@ -1,39 +1,42 @@
-//! xdg-toplevel 最小窗口 + wgpu 清屏。
+//! xdg-toplevel 最小窗口 + wgpu 清屏 + 单 calloop 主循环。
 //!
 //! 演进脉络:
 //! - T-0101 用 wl_shm 填一帧白占位。
-//! - T-0107 抽出 [`WindowCore`] / [`WindowEvent`] / [`handle_event`] 纯逻辑,
-//!   headless 测试覆盖。
-//! - T-0102 把占位绘制从 wl_shm 换成 wgpu `Surface` + `LoadOp::Clear(深蓝)`
-//!   —— 单色帧走真渲染通路,为后续字形 pass 铺骨架。状态机仍由 `handle_event`
-//!   驱动,只把"needs_draw 时要做什么"由 shm 换成 wgpu。
-//! - T-0104(本 ticket)关闭路径优雅退出:
-//!   1. compositor 发 xdg close / disconnect → `WindowHandler::request_close`
-//!      驱动 [`handle_event`] 置 `core.exit`。
-//!   2. `SIGINT` / `SIGTERM` → signal-hook 把同步置位 `Arc<AtomicBool>` 并写
-//!      一个字节到 self-pipe,唤醒主循环的 poll。
-//!   3. 主循环 `blocking_dispatch` 拆成手写 `flush + prepare_read + poll +
-//!      read + dispatch_pending`,把 wayland fd 与 signal pipe fd 一起 poll,
-//!      消除"信号在 flag-check 与 poll 进入之间到达"的竞态。
-//!   4. 循环退出后按 INV-001 字段声明顺序正向 drop(renderer → window → conn)。
+//! - T-0107 抽出 [`WindowCore`] / [`WindowEvent`] / [`handle_event`] 纯逻辑。
+//! - T-0102 wgpu surface + `LoadOp::Clear(深蓝)`,单色帧走真渲染通路。
+//! - T-0104 关闭路径优雅退出:xdg close / SIGINT / SIGTERM 统一退出位。**最初**
+//!   用手写 `rustix::event::poll` + signal-hook self-pipe(ADR 0003)—— **T-0108
+//!   已推翻**,见下。
+//! - T-0202..T-0206 PTY 接入(`PtyHandle` 五方法、calloop 一部分)。
+//! - **T-0108(当前)事件循环统一**:TD-001 / TD-005 / TD-006 一次清掉。wayland fd、
+//!   signal、pty fd 全部注册到同一 `calloop::EventLoop<LoopData>`,真正落实
+//!   INV-005 "所有 IO fd 同一调度器"。三条 source:
+//!   1. `calloop::generic::Generic` 包 wayland fd,callback `prepare_read → read →
+//!      dispatch_pending → flush`
+//!   2. `calloop::signals::Signals` 包 SIGINT/SIGTERM(signalfd 路径,消除
+//!      TD-006 的 nanos 竞态)
+//!   3. `Generic` 包 pty master fd,callback `pty_read_tick` 拿 `&mut LoopData`
+//!      读字节 / 触发退出
 //!
-//!   决策:signal-hook vs ctrlc 取舍见 `docs/adr/0003-signal-hook.md`。
+//!   不再有手写 rustix poll、signal-hook、self-pipe、`Arc<AtomicBool>`。退出统一
+//!   走 `LoopSignal::stop()`。
+//! - T-0301(同分支后续 commit)接入 `alacritty_terminal::Term`,pty callback
+//!   里把字节 `term.advance(...)` 喂进去。渲染还是留给 Phase 3 后续 ticket。
+//!
+//! 关键不变式仍守:
+//! - INV-001 `State` 字段声明顺序决定 wl 指针生命周期(renderer→window→conn)
+//! - INV-005 所有 IO fd 同一 calloop::EventLoop(本 ticket 真做到了)
+//! - INV-008 `PtyHandle` 内部 drop 序
+//! - INV-009 master fd O_NONBLOCK
 
 use std::ffi::c_void;
-use std::io::{ErrorKind, Read};
-use std::os::fd::{AsFd, BorrowedFd, RawFd};
-use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::os::fd::{AsRawFd, BorrowedFd};
 
 use anyhow::{anyhow, Context, Result};
 use calloop::generic::Generic;
-use calloop::{Interest, Mode, PostAction};
-use rustix::event::{PollFd, PollFlags};
-use rustix::io::Errno;
+use calloop::signals::{Signal, Signals};
+use calloop::{EventLoop, Interest, LoopSignal, Mode, PostAction};
 
-use crate::event_loop::Core;
 use crate::pty::PtyHandle;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
@@ -50,6 +53,7 @@ use smithay_client_toolkit::{
         WaylandSurface,
     },
 };
+use wayland_backend::client::WaylandError;
 use wayland_client::{
     globals::registry_queue_init,
     protocol::{wl_output, wl_surface},
@@ -156,183 +160,38 @@ pub fn handle_event(state: &mut WindowCore, ev: WindowEvent) -> WindowAction {
     action
 }
 
-/// 主循环单步的显式结果。由闭包返回,让循环外壳决定是否继续。
+/// 把 wayland `EventQueue<State>`、业务 `State`、T-0301 的 `TermState`、
+/// calloop `LoopSignal` 四个运行时对象捆成一个结构,让
+/// `calloop::EventLoop<'_, LoopData>` 一把 own。回调签名得到 `&mut LoopData`,
+/// 在里面做字段级 split borrow:
+/// - wayland source 回调:`&mut event_queue` + `&mut state` 跑 `dispatch_pending`
+/// - pty source 回调:`&mut state.pty` + `&mut term` + `&loop_signal`
+/// - signal source 回调:只需 `&loop_signal`
 ///
-/// 刻意不复用 `WindowAction`:后者描述**状态转移的副作用**(要不要重画),
-/// 而 `StepResult` 描述**控制流**(要不要再跑一轮),语义正交,合在一起
-/// 会诱发调用方反复 double-check 字段的反模式。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StepResult {
-    /// 还有活要干,跑下一轮。
-    Continue,
-    /// 业务告知退出(例如窗口被关闭、compositor 断开)。
-    Stop,
+/// `term` 放 LoopData 而非 State 的理由:wayland `Dispatch` 回调(compositor /
+/// output / xdg-window)不需要 term,放 State 里会污染 Dispatch 的 mental model;
+/// PTY callback 需要跟 pty **同时** borrow term(喂字节),LoopData 级的字段
+/// split borrow 刚好覆盖这对。
+///
+/// `loop_signal` 放这里而非全局,因为业务退出(compositor close、shell 死、
+/// SIGINT/SIGTERM、read 错)有多条触发路径,都从 `&mut LoopData` 拿同一把
+/// 停机把手,不重复创建。
+struct LoopData {
+    event_queue: EventQueue<State>,
+    state: State,
+    term: Option<crate::term::TermState>,
+    loop_signal: LoopSignal,
 }
 
-/// 主循环外壳。每轮先原子检查 `should_exit` 标志(signal handler 会置位),
-/// 若已置位则直接退出;否则调 `step`,按其返回决定是否继续。
-///
-/// 该函数不触碰 Wayland / wgpu / 任何 IO,纯逻辑 —— 便于 headless 单测
-/// "信号标志被置位后主循环应立即退出"这条 T-0104 acceptance(见
-/// `tests/state_machine.rs` 里对 `run_main_loop` 的注入测试)。
-pub(crate) fn run_main_loop<F>(should_exit: &AtomicBool, mut step: F) -> Result<()>
-where
-    F: FnMut() -> Result<StepResult>,
-{
-    loop {
-        if should_exit.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        match step()? {
-            StepResult::Continue => {}
-            StepResult::Stop => return Ok(()),
-        }
-    }
-}
+// T-0108 删除:`run_main_loop` / `StepResult` / `install_signal_handlers` /
+// `pump_once` / `drain_pipe` —— wayland / signal / pty 三条 source 现在都由
+// `calloop::EventLoop` 统一 poll,不再手写 rustix poll 循环 + signal-hook
+// self-pipe。退出统一走 `LoopSignal::stop()` 一个出口。TD-001 / TD-005 / TD-006
+// 随之归档。
 
-/// 安装 SIGINT / SIGTERM 捕获:同时置位 `should_exit` 原子标志,并写一字节到
-/// `sig_w` self-pipe。两条路各有用:
-/// - `flag::register` 让 [`run_main_loop`] 每轮一个原子 load 就能观察到,
-///   无需等 poll 返回。
-/// - `pipe::register` 让主循环 poll 的对侧 `sig_r` 变可读,立刻从阻塞 poll
-///   里醒来;消除"信号在 flag-check 与 poll 进入之间到达"的竞态。
-///
-/// 两个 signal 号各 `try_clone` 一份写端,drop 原写端后让 handler 自持 fd。
-fn install_signal_handlers(should_exit: &Arc<AtomicBool>, sig_w: &UnixStream) -> Result<()> {
-    for sig in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
-        let w = sig_w
-            .try_clone()
-            .context("复制 signal self-pipe 写端失败")?;
-        // 注册顺序 = handler 触发顺序(signal-hook 内部 chain)。按 signal-hook
-        // docs(`low_level::pipe` 模块):先置 flag,再写 pipe,这样读端从 poll
-        // 醒来 → drain pipe → 读 flag 的流程里,读 flag 时一定能看到已置位。
-        // 本项目单线程,pipe 写完才会回用户空间,理论上顺序对错都看不到差别;
-        // 但遵循 docs 可读,后续若有多线程 /  多端订阅 flag 也不踩坑。
-        signal_hook::flag::register(sig, Arc::clone(should_exit))
-            .with_context(|| format!("注册 signal {sig} → flag 失败"))?;
-        signal_hook::low_level::pipe::register(sig, w)
-            .with_context(|| format!("注册 signal {sig} → pipe 失败"))?;
-    }
-    Ok(())
-}
-
-/// 主循环单步:dispatch 已缓冲的 wayland 事件 → flush → 若已干净则 poll
-/// (wayland_fd + sig_pipe_fd + pty_fd)。信号 pipe 可读时 drain 字节,让下一轮
-/// `run_main_loop` 顶部的原子 check 观察到 flag。PTY 可读时通过
-/// `pty_core.dispatch(Duration::ZERO, ...)` 让 calloop 的 Generic source 回调
-/// 跑一次(T-0202:目前回调仅 `trace!("pty readable")`)。
-///
-/// **双 poll 是过渡设计**:wayland / signal 仍走 rustix poll(T-0104 遗留),
-/// PTY 经 calloop;两个机制都看 PTY fd,所以 rustix 的 poll 醒了 →
-/// `core.dispatch(ZERO)` 让 calloop 的内部 poll 也看到 ready → 触发回调。
-/// T-0105 的后续 refactor 会把 wayland / signal 也迁进同一个 Core,届时本函数
-/// 整体被 `EventLoop::run` 替换。
-///
-/// 返回 [`StepResult::Stop`] 的唯一来源:`state.core.exit`(compositor 发
-/// `request_close`、compositor 断开、或 renderer 初始化失败)。
-fn pump_once(
-    conn: &Connection,
-    event_queue: &mut EventQueue<State>,
-    state: &mut State,
-    sig_r: &mut UnixStream,
-    pty_core: &mut Core<'_, PtyHandle>,
-    pty_fd: RawFd,
-) -> Result<StepResult> {
-    // 1. 排空已缓冲的事件(首次 configure 就是在这里触发 init_renderer_and_draw)。
-    let dispatched = event_queue
-        .dispatch_pending(state)
-        .context("Wayland dispatch_pending 失败")?;
-    if state.core.exit {
-        return Ok(StepResult::Stop);
-    }
-
-    // 2. 把 client 的 request 真推到 socket。
-    conn.flush().context("Wayland flush 失败")?;
-
-    // 刚刚 dispatch 过事件,缓冲区里可能已经有新货 —— 不 poll 直接回 top。
-    // 注意:即便走了快路径,下一轮 run_main_loop 又进 pump_once,会再走完整 poll,
-    // PTY readable 最多延迟一轮,Level-triggered 不会丢事件。
-    if dispatched > 0 {
-        return Ok(StepResult::Continue);
-    }
-
-    // 3. 准备读:None 表示别的线程已 prepare/read,我们也不该走 poll 路径,
-    //    回 top 让 dispatch_pending 收尾。本项目单线程,`None` 基本对应
-    //    "已有事件在 queue 里,无需再读 socket" 的情况。
-    let guard = match conn.prepare_read() {
-        Some(g) => g,
-        None => return Ok(StepResult::Continue),
-    };
-
-    // 4. Poll wayland socket + signal pipe + PTY master。PTY 加进来是为了让单只
-    //    PTY 可读也能唤醒 poll(否则会卡在等 wayland 事件的 rustix poll 里,PTY
-    //    字节堆在内核缓冲)。
-    let wayland_fd = guard.connection_fd();
-    let sig_fd = sig_r.as_fd();
-    // SAFETY: pty_fd 来自 spawn_shell 返回值的 pty.raw_fd() 缓存(PtyHandle
-    // 的 master_fd 字段,由 spawn 时 as_raw_fd().ok_or_else 校验过),
-    // state.pty 持有该 PtyHandle 到 run_window 结束;pump_once 调用链完全
-    // 嵌套在 state 生命期内,BorrowedFd 不会在 master fd close 后残留。
-    #[allow(unsafe_code)]
-    let pty_borrowed: BorrowedFd<'_> = unsafe { BorrowedFd::borrow_raw(pty_fd) };
-    let mut fds = [
-        PollFd::new(&wayland_fd, PollFlags::IN | PollFlags::ERR),
-        PollFd::new(&sig_fd, PollFlags::IN),
-        PollFd::new(&pty_borrowed, PollFlags::IN),
-    ];
-    match rustix::event::poll(&mut fds, None) {
-        Ok(_) => {}
-        Err(Errno::INTR) => {
-            // SIGINT handler 已跑过(置 flag + 写 pipe),poll 返回 EINTR 前
-            // 就释放 guard —— 下轮 run_main_loop 顶 atomic 观察到 flag 后 Stop。
-            drop(guard);
-            return Ok(StepResult::Continue);
-        }
-        Err(e) => return Err(anyhow!("poll(wayland + signal + pty) 失败: {e}")),
-    }
-
-    // 5a. PTY 可读 → 把 &mut PtyHandle 从 state.pty 借给 calloop 的 Generic
-    //      source 回调。T-0203 起 Data 从 `()` 升级为 PtyHandle,回调走 pty_read_tick
-    //      读字节 / trace / (T-0205) 触发退出。Duration::ZERO = 非阻塞 tick。
-    //
-    //      **revents 要看 IN | HUP | ERR**(T-0205 修的 bug):Linux 在 slave 端
-    //      关闭时给 master 设 POLLHUP,没有 POLLIN 的情况下 `.contains(IN)` 漏过
-    //      → callback 不跑 → pty_read_tick 永远看不到 EOF/EIO → should_exit 永远
-    //      不置位,bash 被 kill 也关不了 quill。intersects(IN|HUP|ERR) 覆盖全部
-    //      "master 有事发生" 的可能信号,交给 pty_read_tick 用 read 的返回值
-    //      精细分类(走 pty_readable_action)。
-    //
-    //      `if let` 守卫:正常路径 state.pty 必 Some(run_window 里 spawn_shell 成功
-    //      才组装 pump_once 闭包);这里防御式 `None` 跳过,不 panic 不 expect,
-    //      符合 CLAUDE.md "非 main/tests 禁用 unwrap/expect"。
-    if fds[2]
-        .revents()
-        .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR)
-    {
-        if let Some(pty) = state.pty.as_mut() {
-            pty_core
-                .dispatch(Some(Duration::ZERO), pty)
-                .context("pty_core.dispatch(pty bytes read) 失败")?;
-        }
-    }
-
-    // 5b. 信号 pipe 可读 → drain 字节(防止 pipe 满、下次 handler 写入被
-    //     silently drop),然后回 top 让 atomic check 观察 flag。
-    if fds[1].revents().contains(PollFlags::IN) {
-        drain_pipe(sig_r);
-        drop(guard);
-        return Ok(StepResult::Continue);
-    }
-
-    // 5c. Wayland 可读 / 报错 → 消耗 guard 真读取。出错走 err 分支。
-    if fds[0].revents().intersects(PollFlags::IN | PollFlags::ERR) {
-        guard.read().context("Wayland ReadEventsGuard::read 失败")?;
-    } else {
-        // 只 PTY 醒了(5a 已处理)或其他意外 — 释放 guard,让 wayland 源下轮再跑。
-        drop(guard);
-    }
-    Ok(StepResult::Continue)
-}
+// T-0108 删除 pump_once —— 双 poll 过渡设计废弃,wayland/signal/pty 各自的
+// source 现在都挂在同一 EventLoop 上,由 calloop 内部 poll 统一调度。参见
+// `drive_wayland` / `drive_pty` / signal handler 闭包。
 
 /// 单次 calloop 回调里的 PTY read buffer 大小。4 KiB 覆盖 Linux PTY master 的典型
 /// 内核缓冲,一次 read 基本能吞完 bash prompt / ANSI escape;满了就循环再读一次。
@@ -401,16 +260,20 @@ pub(crate) fn pty_readable_action(result: &std::io::Result<usize>) -> PtyAction 
 /// [`PtyAction`] → 处理。一个 tick 要么读尽(ReturnContinue)要么触发退出
 /// (RequestExit)。
 ///
-/// T-0203 实装 trace,T-0205 接入 `should_exit` + `try_wait`:EOF / EIO 时
-/// - `should_exit.store(true, Relaxed)` —— 复用 T-0104 的统一退出路径,
-///   不新建机制。主循环 [`run_main_loop`] 下一轮 atomic load 命中后干净 Stop
-/// - `pty.try_wait()` 把子进程收尸并 `tracing::info!` 它的 exit code。
-///   `Ok(None)`(race:刚退还没被 kernel 标记)不 sleep 重试,接受延迟;进程
-///   将被 `PtyHandle::Drop` / init-adopt 兜底
+/// T-0203 实装 trace。T-0205 接入 `try_wait`(EOF / EIO 时)。**T-0108 改签名**:
+/// 原来走 `&AtomicBool` 置位 T-0104 的 `Arc<AtomicBool>` 走主循环顶的
+/// `run_main_loop` 检查;现在 `Arc<AtomicBool>` 整个 scheme 没了,退出统一经
+/// `LoopSignal::stop()` —— 本函数收 `&LoopSignal`(由外层 closure `&data.loop_signal`
+/// 传入)。行为等价:`stop()` 后 `EventLoop::run` 当前或下一次 dispatch 结束返回。
 ///
-/// `should_exit` 以 `&AtomicBool` 传入(外层闭包 move `Arc<AtomicBool>` 进
-/// 来时 deref 一下),本函数不 own Arc,也就不需要强 Arc clone。
-fn pty_read_tick(pty: &mut PtyHandle, should_exit: &AtomicBool) -> std::io::Result<PostAction> {
+/// EOF / EIO 分支仍是 `pty.try_wait()` 尝试 reap 一下并 `tracing::info!` 一个
+/// exit_code;`Ok(None)` (race) 不 sleep 重试,接受延迟,zombie 由 `PtyHandle::Drop`
+/// / init-adopt 兜底。
+fn pty_read_tick(
+    pty: &mut PtyHandle,
+    term: &mut Option<crate::term::TermState>,
+    loop_signal: &LoopSignal,
+) -> std::io::Result<PostAction> {
     // INV-009 sanity check:master fd 必须 O_NONBLOCK。由 T-0201 的 `spawn_program`
     // 在构造时 fcntl 一次设好,本 ticket **不重复** F_SETFL(会覆盖其它 flag 破
     // 坏不变式)。debug build panic 拦回归;release build 0 开销。
@@ -433,7 +296,8 @@ fn pty_read_tick(pty: &mut PtyHandle, should_exit: &AtomicBool) -> std::io::Resu
         let result = pty.read(&mut buf);
         match pty_readable_action(&result) {
             PtyAction::ContinueReading => {
-                // Ok(n>0) 路径:trace 字节。Err(EINTR) 路径:不 trace,沉默重试。
+                // Ok(n>0) 路径:trace 字节 + T-0301 喂进 alacritty Term 状态机。
+                // Err(EINTR) 路径:不 trace,沉默重试。
                 if let Ok(n) = result {
                     debug_assert!(
                         n > 0,
@@ -446,6 +310,20 @@ fn pty_read_tick(pty: &mut PtyHandle, should_exit: &AtomicBool) -> std::io::Resu
                         bytes = %preview,
                         "pty bytes"
                     );
+                    // T-0301: 喂 alacritty_terminal 的 `vte::ansi::Processor`。
+                    // Option<&mut TermState> 保险:正常路径 term 是 Some(ctor 设好),
+                    // None 跳过(未来可能 T-0305+ 在 resize 时临时 take/put)。
+                    if let Some(t) = term.as_mut() {
+                        t.advance(&buf[..n]);
+                        let (col, line) = t.cursor_point();
+                        tracing::trace!(
+                            target: "quill::term",
+                            n,
+                            col,
+                            line,
+                            "term advanced"
+                        );
+                    }
                 }
                 continue;
             }
@@ -495,43 +373,88 @@ fn pty_read_tick(pty: &mut PtyHandle, should_exit: &AtomicBool) -> std::io::Resu
                         );
                     }
                 }
-                // 触发主循环退出:复用 T-0104 的 should_exit 原子标志,不建
-                // 第二套机制。Relaxed 足够 —— run_main_loop 顶每轮 load 都看
-                // 到同 thread 的置位(单线程 loop)。
-                should_exit.store(true, Ordering::Relaxed);
+                // 触发主循环退出:统一路径是 `calloop::LoopSignal::stop()`,
+                // run_window 尾 `event_loop.run` 见到 stop 信号后当前 dispatch
+                // 结束就返回,进入 state Drop(INV-001 正向:renderer → window
+                // → conn → core → pty)。不建第二套机制。
+                loop_signal.stop();
                 return Ok(PostAction::Continue);
             }
         }
     }
 }
 
-/// 非阻塞地把 signal pipe 里堆积的字节读干净。pipe 已被 `set_nonblocking(true)`,
-/// 返回 `WouldBlock` 即停;`Interrupted` 继续重试;0 字节(EOF)也停。
-fn drain_pipe(sig_r: &mut UnixStream) {
-    let mut buf = [0u8; 32];
-    loop {
-        match sig_r.read(&mut buf) {
-            Ok(0) => return,
-            Ok(_) => continue,
-            Err(ref e) if e.kind() == ErrorKind::WouldBlock => return,
-            Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
-            // 其它错误极罕见(fd 被关之类),吞掉 —— 下轮 atomic flag 仍会让
-            // run_main_loop 干净退出。不抛 error 是因为信号路径本身就是"退出
-            // 在即"的节奏,没有可挽回行为。
-            Err(_) => return,
+// T-0108 删除 drain_pipe —— self-pipe signal 机制废弃,calloop::signals::Signals
+// 走 signalfd 由 calloop 内部 source 直接读。
+
+/// calloop wayland source 的回调:**prepare_read → read → dispatch_pending →
+/// flush** 四步拆清楚,之间有若干退出 / 错误分支要处理。
+///
+/// T-0108 把这段从 `pump_once` 的 rustix poll 手写循环搬到 calloop `Generic`
+/// source 的回调里,主循环的调度权交给 `EventLoop::run`。
+///
+/// 关键点:
+/// - `prepare_read` 返回 `None` 不 panic,表示 queue 里已有事件或别的线程
+///   在读(本项目单线程,`None` = 已有事件缓冲,直接 dispatch_pending 消化)
+/// - `guard.read()` 的 `WouldBlock` 不是错:level-triggered fd 刚被 epoll 唤
+///   醒,但 socket 真正 read 时可能已被上一轮消化干净;跳过即可
+/// - `dispatch_pending` 的错走上抛(io::Error 转换);其他正常路径返回 Continue
+/// - `state.core.exit` 由 `WindowHandler::request_close` 置(compositor 发
+///   xdg close)—— dispatch 完后检查一下,`true` 则 `loop_signal.stop()`
+/// - 结尾 `conn.flush()` 把我们响应 configure 产生的 ack_configure / surface
+///   commit 真推到 compositor
+fn drive_wayland(data: &mut LoopData) -> std::io::Result<PostAction> {
+    // Step 1:如果当前 queue 里已经有缓冲事件,prepare_read 返回 None,跳过 read
+    // 直接 dispatch。否则拿 guard 读 socket。
+    if let Some(guard) = data.state.conn.prepare_read() {
+        match guard.read() {
+            Ok(_) => {}
+            Err(WaylandError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // level-triggered fd 刚唤醒,但数据已经被上一轮 read 吃完 ——
+                // 正常情况。继续 dispatch_pending 看有没有事情可做。
+            }
+            Err(e) => {
+                return Err(std::io::Error::other(format!("wayland read: {e}")));
+            }
         }
     }
+
+    // Step 2:split borrow event_queue + state,跑 Dispatch 回调。handle_event /
+    // WindowHandler / CompositorHandler 们都在这里 fire。
+    let LoopData {
+        event_queue, state, ..
+    } = &mut *data;
+    if let Err(e) = event_queue.dispatch_pending(state) {
+        return Err(std::io::Error::other(format!(
+            "wayland dispatch_pending: {e}"
+        )));
+    }
+
+    // Step 3:若 xdg close 或其它路径置了 core.exit,触发停机。保持与 signal /
+    // PTY EOF 同一个出口(loop_signal.stop()),不建第二套标志。
+    if data.state.core.exit {
+        data.loop_signal.stop();
+    }
+
+    // Step 4:把 ack_configure / surface commit 这些响应真推给 compositor。
+    if let Err(e) = data.state.conn.flush() {
+        return Err(std::io::Error::other(format!("wayland flush: {e}")));
+    }
+
+    Ok(PostAction::Continue)
 }
 
-/// 启动 Wayland 连接、创建 xdg toplevel、首次 configure 后建 wgpu renderer、
-/// 安装 SIGINT / SIGTERM 捕获,跑主循环直到窗口被关闭或信号到达。
+/// 启动 Wayland 连接、创建 xdg toplevel、spawn login shell、把 wayland / signal
+/// / pty 三条 source 注册到同一 `calloop::EventLoop`,跑主循环直到有任一路径
+/// 触发 `LoopSignal::stop()`。
 ///
-/// 退出路径(ticket T-0104 acceptance):
-/// - 用户点关闭十字 → `WindowHandler::request_close` → `core.exit = true` →
-///   下一轮 [`pump_once`] 返回 [`StepResult::Stop`]
-/// - `SIGINT` / `SIGTERM` → signal handler 置 `should_exit` + 写 pipe 唤醒 poll →
-///   下一轮 [`run_main_loop`] 顶部 atomic check 退出
-/// - compositor 断开(读 socket 返回 IO 错)→ err 从 [`pump_once`] 抛回
+/// 退出路径(T-0108 统一后):
+/// - 用户点关闭十字 → `WindowHandler::request_close` 置 `core.exit = true`
+///   → 下一轮 wayland source 回调 [`drive_wayland`] 检查 `core.exit` → `stop()`
+/// - `SIGINT` / `SIGTERM` → `calloop::signals::Signals` source 回调 → `stop()`
+///   (signalfd 路径,TD-006 竞态消除)
+/// - shell 退出(PTY EOF / EIO)→ PTY source 回调 [`pty_read_tick`]
+///   `pty_readable_action == RequestExit` → `stop()`
 ///
 /// 退出后按 INV-001 声明顺序(renderer → window → conn)正向 drop,保证 wgpu
 /// surface 先放掉 wl_surface 裸指针再关连接,不给 compositor 留 "client didn't
@@ -539,7 +462,7 @@ fn drain_pipe(sig_r: &mut UnixStream) {
 pub fn run_window() -> Result<()> {
     let conn = Connection::connect_to_env()
         .context("连接 Wayland compositor 失败(是否在 Wayland session 下?)")?;
-    let (globals, mut event_queue) =
+    let (globals, event_queue) =
         registry_queue_init(&conn).context("初始化 Wayland registry 失败")?;
     let qh = event_queue.handle();
 
@@ -558,7 +481,6 @@ pub fn run_window() -> Result<()> {
     window.commit();
 
     // State 字段顺序固化 INV-001(renderer→window→conn)+ pty 放最后(T-0202 Lead + 审码)。
-    // 初始化时 pty 为 None,后面拿到 spawn_shell 结果再填 Some。
     let mut state = State {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
@@ -569,47 +491,91 @@ pub fn run_window() -> Result<()> {
         pty: None,
     };
 
-    // Signal self-pipe + handlers 装在一起:
-    // - `should_exit` 传入 [`run_main_loop`],signal-hook flag 端置位。
-    // - `sig_r` 留给 [`pump_once`] poll;`sig_w` handler dup 后丢弃,防止 read
-    //   端永远收到 EOF。
-    let should_exit = Arc::new(AtomicBool::new(false));
-    let (mut sig_r, sig_w) = UnixStream::pair().context("创建 signal self-pipe 失败")?;
-    sig_r
-        .set_nonblocking(true)
-        .context("signal pipe read 端设非阻塞失败")?;
-    install_signal_handlers(&should_exit, &sig_w)?;
-    drop(sig_w); // handler 各自持 dup,原件不再需要
-
-    // T-0202: spawn login shell + 把 master fd 注册进 calloop Core(INV-005:所有
-    // IO fd 同一 EventLoop)。初始尺寸 80x24 按 ticket scope 写死;Phase 3 T-0306
-    // 才接 Wayland configure → cell 尺寸换算。
+    // T-0202/T-0108:spawn login shell + 把 master fd 注册进 calloop(INV-005)。
+    // 初始尺寸 80x24 按 ticket scope 写死;Phase 3 T-0306 才接 Wayland
+    // configure → cell 尺寸换算。
     let pty = PtyHandle::spawn_shell(80, 24).context("PtyHandle::spawn_shell(80, 24) 失败")?;
     let pty_fd = pty.raw_fd();
     state.pty = Some(pty);
 
-    // T-0203:Core 的 Data 从 `()` 升级为 `PtyHandle` —— 回调现在真读字节
-    // 需要 `PtyHandle::read` 的出口,计数转给调用方。Lead 2026-04-25 拍板走
-    // 方案 A(独立 Data 升级),不把 wayland / signal 也合并进来(那是 T-0105
-    // refactor 的 scope)。dispatch 时从 state.pty 拿 `&mut PtyHandle` 传进去。
-    let mut pty_core: Core<'_, PtyHandle> = Core::new().context("calloop Core::new")?;
-    // SAFETY: pty_fd 来自 spawn_shell 返回值的 pty.raw_fd() 缓存(PtyHandle
-    // 的 master_fd 字段,spawn 时 as_raw_fd().ok_or_else 校验 Some 一次),
-    // state.pty 持有该 PtyHandle 到 run_window 结束;BorrowedFd 的生命周期
-    // (通过 borrow_raw 擦成 'static)被闭包捕获到 Source 里,但底层 fd 的
-    // 实际有效期 ≥ pty_core 与 event_loop 的生命周期,满足合约。
+    // 在进 event_loop 之前把 initial request 推给 compositor,否则第一次唤醒等不到
+    // configure。registry_queue_init 里已经 flush 过 wl_display.get_registry,但
+    // window.commit() 之后还有 toplevel / app_id 等需要落到 socket。
+    conn.flush().context("Wayland 初始 flush 失败")?;
+
+    // 构造 calloop EventLoop。Data = LoopData 把 event_queue + state + loop_signal
+    // 三样拎一块儿,callback 拿 `&mut LoopData` 走字段 split borrow。
+    let mut event_loop: EventLoop<'_, LoopData> =
+        EventLoop::try_new().context("calloop EventLoop::try_new 失败")?;
+    let loop_handle = event_loop.handle();
+    let loop_signal = event_loop.get_signal();
+
+    // Source 1:wayland fd。用 conn.backend().poll_fd() 拿 BorrowedFd。生命周期
+    // 擦成 'static 由 drop 序保障(event_loop 本地变量在 state 之前 drop,
+    // 其内持有的 Generic source 也随之 drop,之后 state.conn 才关闭)。
+    // SAFETY:
+    // - poll_fd 返回的 fd 是 wayland_backend Connection 内部 socket,state.conn
+    //   持有该 Connection 的 Arc 引用到 run_window 结束 → fd 活
+    // - Rust 反向 drop 保证 event_loop(以及它拥有的 source)先于 state 被 drop;
+    //   BorrowedFd<'static> 的生命期在代码流上不超过 event_loop 本身
+    // - poll_fd.as_raw_fd() 只取 int,不涉资源转移
+    #[allow(unsafe_code)]
+    let wayland_fd: BorrowedFd<'static> = unsafe {
+        let raw = conn.backend().poll_fd().as_raw_fd();
+        BorrowedFd::borrow_raw(raw)
+    };
+    loop_handle
+        .insert_source(
+            Generic::new(wayland_fd, Interest::READ, Mode::Level),
+            |_readiness, _fd, data: &mut LoopData| drive_wayland(data),
+        )
+        .map_err(|e| anyhow!("calloop insert_source(wayland fd) 失败: {e}"))?;
+
+    // Source 2:SIGINT + SIGTERM。calloop::signals::Signals 内部起一个 signalfd,
+    // 信号通过 fd 进 calloop 统一 poll —— 消除 TD-006 的 "handler 跑完 vs poll
+    // 进入" 的 nanos 竞态。
+    let signals = Signals::new(&[Signal::SIGINT, Signal::SIGTERM])
+        .context("calloop Signals::new(SIGINT, SIGTERM) 失败")?;
+    loop_handle
+        .insert_source(signals, |event, _meta, data: &mut LoopData| {
+            tracing::info!(
+                signal = ?event.signal(),
+                "received termination signal, stopping event loop"
+            );
+            data.loop_signal.stop();
+        })
+        .map_err(|e| anyhow!("calloop insert_source(signals) 失败: {e}"))?;
+
+    // Source 3:PTY master fd。回调在 pty_read_tick 里做 read + trace + 退出判定。
+    // SAFETY: pty_fd 来自 state.pty.as_ref().raw_fd()(PtyHandle 构造时
+    // as_raw_fd().ok_or_else 校验 Some 一次);state.pty 持有 PtyHandle 到
+    // run_window 结束,Rust 反向 drop 保证 event_loop(含 Generic source)先
+    // 于 state.pty 被 drop,BorrowedFd<'static> 的实际生命期被 drop 序约束在
+    // state.pty 寿命内。fcntl / read 都不涉所有权转移。
     #[allow(unsafe_code)]
     let pty_borrowed: BorrowedFd<'static> = unsafe { BorrowedFd::borrow_raw(pty_fd) };
-    // T-0205:`pty_read_tick` 需要 `Arc<AtomicBool>` 共享的退出标志,但 calloop
-    // 回调签名只接受 `&mut Data`(= `&mut PtyHandle`)。解法:move 一份 Arc 进
-    // 闭包,闭包里 deref 成 `&AtomicBool` 传给 tick。不新建退出机制,复用
-    // T-0104 的 should_exit,Lead 2026-04-25 拍板方案 3(TD-012)。
-    let pty_exit_flag = Arc::clone(&should_exit);
-    pty_core
-        .handle()
+    loop_handle
         .insert_source(
             Generic::new(pty_borrowed, Interest::READ, Mode::Level),
-            move |_readiness, _fd, pty: &mut PtyHandle| pty_read_tick(pty, &pty_exit_flag),
+            |_readiness, _fd, data: &mut LoopData| {
+                // split borrow: pty 藏在 data.state.pty,term 是 data.term 自己,
+                // loop_signal 也是 data 自己的字段 —— 三个字段互相不冲突,
+                // 可同时 &mut 拿出来。`&mut *data` 强制重借用,让编译器看见
+                // 字段级 split。
+                let LoopData {
+                    state,
+                    term,
+                    loop_signal,
+                    ..
+                } = &mut *data;
+                let pty = match state.pty.as_mut() {
+                    Some(p) => p,
+                    // 极罕见:state.pty = None(spawn 后被谁 take 了)。为了不 panic,
+                    // 跳过本轮。正常路径到不了这里。
+                    None => return Ok(PostAction::Continue),
+                };
+                pty_read_tick(pty, term, loop_signal)
+            },
         )
         .map_err(|e| anyhow!("calloop insert_source(pty master fd) 失败: {e}"))?;
 
@@ -619,21 +585,26 @@ pub fn run_window() -> Result<()> {
         "quill 窗口已请求创建"
     );
 
-    // 主循环:闭包借 &mut event_queue / &mut state / &conn / &mut sig_r /
-    // &mut pty_core(互不冲突的字段借用)。run_main_loop 只看 should_exit 原子,
-    // 不触碰 wayland / pty 资源,便于单测。
-    run_main_loop(&should_exit, || {
-        pump_once(
-            &conn,
-            &mut event_queue,
-            &mut state,
-            &mut sig_r,
-            &mut pty_core,
-            pty_fd,
-        )
-    })?;
+    // 组装 LoopData 塞进 event_loop.run。run 阻塞直到三源中任一触发 `stop()`。
+    // idle 回调用作"每轮 dispatch 之间顺带检查一下 core.exit",兜底 drive_wayland
+    // 里万一没命中到的边界(目前应该总是覆盖,留着防回归)。
+    let mut loop_data = LoopData {
+        event_queue,
+        state,
+        // T-0301: 初始 80x24,与 `PtyHandle::spawn_shell(80, 24)` 对齐。
+        // Phase 3 T-0306 接窗口 resize 时会重建 Term 或调用 resize method。
+        term: Some(crate::term::TermState::new(80, 24)),
+        loop_signal: loop_signal.clone(),
+    };
+    event_loop
+        .run(None, &mut loop_data, |data| {
+            if data.state.core.exit {
+                data.loop_signal.stop();
+            }
+        })
+        .context("calloop EventLoop::run 失败")?;
 
-    tracing::info!("窗口关闭,退出事件循环");
+    tracing::info!("quill 事件循环退出(INV-001 drop: renderer → window → conn → core → pty)");
     Ok(())
 }
 
@@ -861,140 +832,15 @@ mod tests {
         assert!(APP_ID.contains('.'), "app_id 应为反向域名格式");
     }
 
-    // ---------- T-0104 run_main_loop 注入式单测 ----------
-    // ticket acceptance:"should_exit 标志被置位后主循环应立即退出"。这里通过给
-    // [`run_main_loop`] 注入一个假 step 闭包,把真正的 wayland / wgpu / signal
-    // 依赖全绕开,单纯验证控制流。每个 case 用不同的 step 行为覆盖一条路径。
-
-    #[test]
-    fn run_main_loop_exits_immediately_when_flag_already_set() {
-        // flag 在进入前就已经 true —— step 绝不该被调一次,避免做任何 IO。
-        let flag = AtomicBool::new(true);
-        let mut called = 0u32;
-        let result = run_main_loop(&flag, || {
-            called += 1;
-            Ok(StepResult::Continue)
-        });
-        assert!(result.is_ok());
-        assert_eq!(called, 0, "flag 已置位时不应进入 step");
-    }
-
-    #[test]
-    fn run_main_loop_exits_after_signal_raises_flag_mid_run() {
-        // 模拟 signal handler:step 跑到第 3 次把 flag 置位,第 4 次进入
-        // run_main_loop 循环顶时原子 check 命中,应干净退出。
-        let flag = Arc::new(AtomicBool::new(false));
-        let flag_step = Arc::clone(&flag);
-        let mut iters = 0u32;
-        run_main_loop(&flag, || {
-            iters += 1;
-            if iters == 3 {
-                flag_step.store(true, Ordering::Relaxed);
-            }
-            Ok(StepResult::Continue)
-        })
-        .expect("run_main_loop 应干净返回");
-        assert_eq!(
-            iters, 3,
-            "第 3 次 step 置 flag;第 4 次不该进来,循环顶 atomic check 拦住"
-        );
-    }
-
-    #[test]
-    fn run_main_loop_exits_when_step_returns_stop() {
-        // compositor 发 close → WindowHandler 置 state.core.exit → pump_once
-        // 返回 Stop 这条路径。flag 永远没被置位。
-        let flag = AtomicBool::new(false);
-        let mut iters = 0u32;
-        run_main_loop(&flag, || {
-            iters += 1;
-            if iters >= 2 {
-                Ok(StepResult::Stop)
-            } else {
-                Ok(StepResult::Continue)
-            }
-        })
-        .expect("run_main_loop 应干净返回");
-        assert_eq!(iters, 2);
-        assert!(!flag.load(Ordering::Relaxed), "stop 路径不依赖 flag");
-    }
-
-    #[test]
-    fn run_main_loop_propagates_step_error_verbatim() {
-        // pump_once 内 anyhow 错误必须透传,否则 IO 失败被吞会让上层误以为干净退出。
-        let flag = AtomicBool::new(false);
-        let err =
-            run_main_loop(&flag, || Err::<StepResult, _>(anyhow!("boom"))).expect_err("错误应上抛");
-        assert!(
-            err.to_string().contains("boom"),
-            "错误消息应保留 (got: {err})"
-        );
-    }
-
-    #[test]
-    fn run_main_loop_flag_atomic_can_be_raised_from_another_thread() {
-        // signal handler 实际上跑在同线程(POSIX signal 语义),但 signal-hook
-        // 的 flag::register 承诺 SeqCst 原子写,我们的 loader 用 Relaxed 是因为
-        // step 每轮都会 yield 让出观察机会。这里用多线程冒烟:另一个 thread 置
-        // flag,主 thread 在有限 step 内观察到并退出,保证 Relaxed load 至少能
-        // 跨 loom-free 的 x86/ARM 常见 memory model 看到变化。
-        use std::thread;
-        use std::time::Duration;
-
-        let flag = Arc::new(AtomicBool::new(false));
-        let flag_thread = Arc::clone(&flag);
-        let handle = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(10));
-            flag_thread.store(true, Ordering::SeqCst);
-        });
-
-        let mut iters = 0u32;
-        run_main_loop(&flag, || {
-            iters += 1;
-            // 让出一点时间给 wake thread,但不要无限忙转。
-            thread::sleep(Duration::from_millis(1));
-            if iters > 1000 {
-                // 保险丝:万一 flag 没被看到也不死锁测试。
-                return Ok(StepResult::Stop);
-            }
-            Ok(StepResult::Continue)
-        })
-        .expect("应干净返回");
-        handle.join().expect("wake thread 应干净结束");
-
-        assert!(flag.load(Ordering::SeqCst), "wake thread 最终置 flag");
-        assert!(
-            iters <= 1000,
-            "应被 atomic flag 拦下,而非走保险丝 (iters={iters})"
-        );
-    }
-
-    #[test]
-    fn drain_pipe_consumes_all_bytes() {
-        // drain_pipe 的两条退出路径:读到 0(EOF,本测试通过 drop writer 触发)
-        // 与 WouldBlock(空 pipe 非阻塞 read)。两条都该让 pipe 净空。
-        use std::io::Write;
-
-        let (mut r, mut w) = UnixStream::pair().expect("UnixStream pair");
-        r.set_nonblocking(true).expect("set_nonblocking");
-
-        // 写入一些字节,然后 drop writer → 再 drain 应读到 0 字节后返回。
-        w.write_all(b"wakeupX3").expect("write");
-        drop(w);
-
-        drain_pipe(&mut r);
-
-        // 二次 drain 应立刻 return(EOF / WouldBlock),不卡住。
-        drain_pipe(&mut r);
-    }
-
-    #[test]
-    fn drain_pipe_returns_on_wouldblock_without_writer_closed() {
-        // writer 还开着、pipe 没数据 —— 非阻塞 read 立即 WouldBlock,drain 应返回。
-        let (mut r, _w) = UnixStream::pair().expect("UnixStream pair");
-        r.set_nonblocking(true).expect("set_nonblocking");
-        drain_pipe(&mut r); // 不卡住即过
-    }
+    // T-0108 删除 7 个单测:`run_main_loop_*` × 5 + `drain_pipe_*` × 2。
+    // 这两个函数已随 T-0108 calloop 统一 refactor 一并删除 ——
+    // wayland/signal/pty 三条 source 现在全由 `calloop::EventLoop` 统一 poll,
+    // 退出走 `LoopSignal::stop()`,不再有手写控制流外壳 `run_main_loop`,也
+    // 不再有 signal self-pipe 的 `drain_pipe` 路径。对 calloop 本身的测试
+    // 由 calloop 上游负责;本项目只保留**业务逻辑**(`handle_event` /
+    // `pty_readable_action`)的 headless 单测。
+    //
+    // 对应记录:tech-debt.md TD-001 / TD-005 / TD-006 随本 refactor 归档。
 
     // ---------- T-0205 pty_readable_action 纯逻辑单测 ----------
     // T-0205 acceptance:对"read 返回 0 字节 → 触发 should_exit"这条路径有单测。
