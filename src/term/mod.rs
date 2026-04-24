@@ -97,6 +97,19 @@ impl TermState {
         let point = self.term.grid().cursor.point;
         (point.column.0, point.line.0)
     }
+
+    /// 读取指定行(screen-line `0..screen_lines`)的字符,作为 `String` 返回。
+    /// 末尾空白不 trim,调用方自己判断。主要给集成测试 / 调试查 grid 内容。
+    ///
+    /// 给 T-0302 写字节 → grid 断言时用;Phase 3 T-0305 真渲染时会走
+    /// 更直接的 cell-level API,不调本方法。
+    pub fn line_text(&self, line: usize) -> String {
+        use alacritty_terminal::index::{Column, Line};
+        let grid = self.term.grid();
+        let row = &grid[Line(line as i32)];
+        let cols = grid.columns();
+        (0..cols).map(|c| row[Column(c)].c).collect()
+    }
 }
 
 #[cfg(test)]
