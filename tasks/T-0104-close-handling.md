@@ -1,8 +1,8 @@
 # T-0104 关闭窗口时优雅退出
 
 **Phase**: 1
-**Assigned**:
-**Status**: open
+**Assigned**: 写码-close
+**Status**: claimed
 **Budget**: tokenBudget=100k, walltime=3600s, cost=$5
 **Dependencies**: T-0101
 
