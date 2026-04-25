@@ -1151,6 +1151,10 @@ mod tests {
 
     /// T-0407: shape ASCII 后 atlas_key.face_id == TextSystem.primary_face_id
     /// (端到端 verify face 锁定 + atlas key face_id 维度同源)。
+    ///
+    /// **T-0404 rebase 改**: shape_line Metrics 17.0 → 17.0 × HIDPI_SCALE = 34.0
+    /// (HiDPI 物理像素 raster), 故 font_size_quantized 期望值同步 × HIDPI_SCALE。
+    /// 引 [`crate::wl::HIDPI_SCALE`] 让 HIDPI_SCALE 一处定义, 改此常数本测试自跟随。
     #[test]
     fn atlas_key_face_id_matches_primary_for_ascii() {
         let mut ts = TextSystem::new().expect("TextSystem::new on user machine");
@@ -1162,11 +1166,14 @@ mod tests {
             key.face_id, primary,
             "ASCII 'a' atlas_key.face_id should == primary_face_id"
         );
+        let expected_font_size = 17.0 * crate::wl::HIDPI_SCALE as f32;
         assert_eq!(
             key.font_size_quantized,
-            f32::to_bits(17.0),
-            "shape_line uses Metrics(17.0, 25.0), font_size_quantized should be \
-             f32::to_bits(17.0)"
+            f32::to_bits(expected_font_size),
+            "shape_line uses Metrics(17.0 × HIDPI_SCALE = {}, ...), font_size_quantized \
+             should be f32::to_bits({})",
+            expected_font_size,
+            expected_font_size
         );
     }
 }
