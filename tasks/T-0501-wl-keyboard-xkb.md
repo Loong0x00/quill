@@ -2,7 +2,7 @@
 
 **Phase**: 5
 **Assigned**: writer-T0501
-**Status**: claimed
+**Status**: in-review
 **Budget**: tokenBudget=120k (中型, 跨 wl protocol + xkbcommon + PTY write + 测试)
 **Dependencies**: Phase 1-4 全合 (window + PTY + render 都已有)
 **Priority**: P0 (没键盘 quill 不能 daily drive)
