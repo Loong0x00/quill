@@ -1,8 +1,8 @@
 # T-0503 xdg-decoration server-side (最小化/最大化/关闭)
 
 **Phase**: 5
-**Assigned**: (open)
-**Status**: open
+**Assigned**: writer-T0503
+**Status**: claimed
 **Budget**: tokenBudget=70k (小中, 单 protocol 接入 + 单文件 src/wl/window.rs)
 **Dependencies**: Phase 1-4 全合
 **Priority**: P1 (没装饰窗口拖不动 / 关不掉, 但功能不影响)
