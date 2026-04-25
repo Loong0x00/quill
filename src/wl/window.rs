@@ -417,6 +417,22 @@ pub(crate) fn cells_from_surface_px(width: u32, height: u32) -> (usize, usize) {
     (cols.max(1), rows.max(1))
 }
 
+/// 纯逻辑决策:看 `core.resize_dirty` 决定 [`propagate_resize_if_dirty`]
+/// 是否真要消费一轮 (renderer/term/pty 三方同步) 还是早返。
+///
+/// 抽出来理由 (T-0399 P2-6, conventions §3 抽状态机模式):
+/// `propagate_resize_if_dirty` 含 wgpu Surface / PtyHandle / TermState 三大
+/// owned 资源, headless 单测构造 LoopData 成本 = 起真 wayland 连接 + spawn
+/// 子进程, 不可行。**抽决策点为纯 bool fn 单独测**, 副作用链 (renderer/term/
+/// pty 三方 resize 顺序 + 清 dirty) 由 `tests/resize_chain.rs` 集成测试 +
+/// `cells_from_surface_px_*` 4 个单测覆盖。
+///
+/// 与 [`pty_readable_action`] / [`handle_event`] 同款套路:决策与副作用分离,
+/// 决策 headless 测, 副作用 trace + 集成测试覆盖。
+pub(crate) fn should_propagate_resize(resize_dirty: bool) -> bool {
+    resize_dirty
+}
+
 /// 把 `core.resize_dirty` 触发的 resize 同步推给 renderer / term / pty 三方。
 /// `drive_wayland` 在 `dispatch_pending` 之后调一次 —— configure event 在 dispatch
 /// 时跑 `WindowHandler::configure` → `handle_event` 置 dirty,本 fn 紧接消费。
@@ -441,7 +457,7 @@ pub(crate) fn cells_from_surface_px(width: u32, height: u32) -> (usize, usize) {
 /// `&mut state.pty / &mut state.renderer / &mut state.core / &mut term` 四份;
 /// LoopData 不同字段间 NLL OK,且 state.* 与 term 是独立 LoopData 字段。
 fn propagate_resize_if_dirty(data: &mut LoopData) {
-    if !data.state.core.resize_dirty {
+    if !should_propagate_resize(data.state.core.resize_dirty) {
         return;
     }
     let LoopData { state, term, .. } = &mut *data;
@@ -1136,6 +1152,34 @@ mod tests {
             cells_from_surface_px(805, 612),
             (80, 24),
             "余数 5px / 12px 应被截断, 不上取"
+        );
+    }
+
+    // ---------- T-0399 P2-6 should_propagate_resize 纯逻辑单测 ----------
+    // propagate_resize_if_dirty 含 wgpu/PtyHandle/TermState 三大 owned 资源,
+    // headless 单测构造成本太高 (审码 P2-6 派单允许抽决策点纯 fn 测)。本组
+    // 锁住"dirty 决定是否消费一轮"这条 INV-006 关键不变式 — 上层 (T-0306
+    // propagate_resize_if_dirty) 改 early-return 条件时, 这两条单测会拦回归。
+
+    #[test]
+    fn should_propagate_resize_returns_true_when_dirty() {
+        // INV-006 置位路径:handle_event(Configure) 在尺寸变化时置 dirty=true,
+        // 紧接 propagate_resize_if_dirty 应消费一轮 (renderer/term/pty 三方
+        // resize + 清 dirty)。
+        assert!(
+            should_propagate_resize(true),
+            "dirty=true 时应消费一轮"
+        );
+    }
+
+    #[test]
+    fn should_propagate_resize_returns_false_when_clean() {
+        // INV-006 早返路径:无 resize event 时 dirty=false, propagate 应早返
+        // 不动 renderer/term/pty (避免空跑 wgpu surface.configure / TIOCSWINSZ
+        // ioctl, 与 INV-006 "布尔脏标记不是队列" 语义对齐)。
+        assert!(
+            !should_propagate_resize(false),
+            "dirty=false 时应早返不消费"
         );
     }
 
