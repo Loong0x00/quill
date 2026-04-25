@@ -1477,6 +1477,695 @@ impl Renderer {
     }
 }
 
+/// **T-0408 加** — 离屏渲染入口。**不接 Wayland surface**, 直接 wgpu 渲染到内存
+/// `Texture`, readback 像素返 RGBA8 `Vec<u8>`。
+///
+/// **why** (派单 trigger): T-0403 字形 bug 一周内 3 次诊断错位 (emoji / atlas key
+/// / cell+glyph 同色) 全部 because **agent 没法看屏幕** — 每次靠 user 手动跑
+/// `cargo run` + 截图发回, Lead 读图推根因, writer 修, 反复极慢。一次性投入
+/// `render_headless` 永久收益: 后续每个视觉 ticket reviewer + Phase 5/6 视觉
+/// 改动均可走 `cargo run -- --headless-screenshot=/tmp/x.png` + Read PNG 自动
+/// verify, 不依赖 GNOME / Wayland / portal / 任何 GUI 工具。
+///
+/// **why 完全独立于 [`Renderer`] struct** (派单"INV-002 字段顺序如有动 → 不破
+/// 不动最好"): `Renderer` 持 [`wgpu::Surface`] (Wayland-bound), 离屏路径不需
+/// Surface, 也不能挂 `Renderer` 字段 (否则 INV-002 14 字段链需扩展)。本 fn
+/// 自建 Instance/Adapter/Device/Queue + 离屏 Texture + 自有 atlas/pipeline,
+/// 函数返回时全部 drop, 不污染 [`Renderer`]。GPU 资源逻辑与 [`Renderer`] 内
+/// 部 `ensure_*` 方法相似但 **inline 不 share** — 派单 "抽 draw_frame 公共逻辑"
+/// 我读为指核心算法 (cell pass + glyph pass + WGSL shader + atlas shelf packing),
+/// 实装走"复用常量与 free fn ([`CELL_WGSL`] / [`GLYPH_WGSL`] / [`ATLAS_W`] /
+/// [`CELL_W_PX`] / [`srgb_to_linear`] / [`clear_color_for`]), pipeline / atlas /
+/// 顶点生成 inline" 防与 `Renderer` struct 耦合 + 防 T-0407 并行分支合并冲突
+/// (T-0407 改 [`GlyphAtlas`] HashMap key 类型, 离屏路径走自有 local atlas state)。
+///
+/// **流程** (与 [`Renderer::draw_frame`] 同骨架, target 换离屏 Texture):
+/// 1. wgpu Instance/Adapter/Device/Queue (无 Surface, headless 路径)
+/// 2. 离屏 Texture: 入参 `width × height` 是 **logical**, 内部 ×
+///    [`HIDPI_SCALE`] 算 physical (与 [`Renderer::resize`] 同套路, T-0404 适配)
+///    -- texture 实创建于 `width × HIDPI_SCALE` × `height × HIDPI_SCALE`
+///    physical 像素, format `Rgba8UnormSrgb`, usage `RENDER_ATTACHMENT |
+///    COPY_SRC`
+/// 3. cell pipeline + glyph atlas + glyph pipeline (本地构造, 不挂 [`Renderer`])
+/// 4. cell vertex bytes (走 `cell.bg` 染色, 与 [`Renderer::draw_frame`] T-0407
+///    fix 同源) + glyph vertex bytes (shape / raster / atlas allocate)。
+///    cell px 用 `CELL_W_PX × HIDPI_SCALE` / `CELL_H_PX × HIDPI_SCALE`,
+///    BASELINE_Y_PX 同乘 (与 draw_frame 同, T-0404)。glyph 来自 shape_line 已
+///    是 physical px (cosmic-text Metrics × HIDPI_SCALE), 直接相加无需再乘
+/// 5. 单 RenderPass: clear + cells (`BlendState::REPLACE`) + glyphs
+///    (`BlendState::ALPHA_BLENDING`)
+/// 6. `copy_texture_to_buffer` → `MAP_READ` 暂存 buffer (`bytes_per_row` 256
+///    对齐, [`wgpu::COPY_BYTES_PER_ROW_ALIGNMENT`])
+/// 7. `buffer.slice().map_async` + `Device::poll(PollType::wait_indefinitely())`
+///    阻塞等待。INV-005 calloop 单线程禁阻塞 — 但本 fn **不在 calloop 路径**,
+///    headless 路径独立 (`src/main.rs` 走 main fn 直接调, 不挂 EventLoop), 无冲突
+/// 8. 去除 padding (每行 physical_width × 4 字节, `padded_bytes_per_row` 取
+///    256 对齐)
+/// 9. 返 `(rgba_bytes, physical_width, physical_height)` —— 长度
+///    `physical_w × physical_h × 4`, 行优先 row-major, 第 0 行在 PNG 顶部。
+///    **why 返 tuple 不只 Vec<u8>** (T-0404 适配): physical 尺寸是 HIDPI_SCALE
+///    × logical, 调用方写 PNG 需要这两值。返 tuple 让调用方不依赖
+///    `crate::wl::HIDPI_SCALE` 常量推导, decoupling 清晰。`(width, height)` 入参
+///    单位变化 (logical) 不破坏 caller — 之前没用 `(width, height)` 写 PNG
+///    (旧 API 直接用 width 写) 的 caller 现在编译失败 (返回类型变), 显式提示
+///    迁移
+///
+/// **PNG encoding** 在调用方 (`src/main.rs::run_headless_screenshot`) 走
+/// [`image::PngEncoder::write_image`] (见 ADR 0005), 用 tuple 返回的
+/// physical_w / physical_h 作 PNG header 尺寸。
+///
+/// **错误处理**: wgpu `request_adapter` / `request_device` / `device.poll` /
+/// buffer mapping 失败时 [`anyhow::Error`] 抛出, 调用方退出 code != 0。
+///
+/// **集成测试**: `tests/headless_screenshot.rs` 3 测试覆盖 PNG 文件存在 / 尺寸
+/// / 字像素 / 无 emoji artifact (派单 In #D)。
+pub fn render_headless(
+    text_system: &mut TextSystem,
+    cells: &[CellRef],
+    cols: usize,
+    rows: usize,
+    row_texts: &[String],
+    width: u32,
+    height: u32,
+) -> Result<(Vec<u8>, u32, u32)> {
+    if width == 0 || height == 0 {
+        return Err(anyhow!(
+            "render_headless: width 与 height 必须 > 0 (got {}×{} logical)",
+            width,
+            height
+        ));
+    }
+
+    // T-0404: surface backing 像素 = logical × HIDPI_SCALE。Renderer::resize
+    // 同套路 — 入参 logical, 内部乘 HIDPI_SCALE 算 physical 给 wgpu Texture
+    // / NDC 换算分母用。saturating_mul 防 overflow (HIDPI_SCALE = 2 + max
+    // logical = 6K = 6144 仍远低于 u32::MAX, 防御性写法)。
+    let physical_w = width.saturating_mul(HIDPI_SCALE);
+    let physical_h = height.saturating_mul(HIDPI_SCALE);
+
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::default(),
+        force_fallback_adapter: false,
+        compatible_surface: None,
+    }))
+    .map_err(|e| anyhow!("wgpu request_adapter (headless) 失败: {e}"))?;
+
+    let info = adapter.get_info();
+    tracing::info!(backend = ?info.backend, name = %info.name, "wgpu adapter (headless) 选中");
+
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("quill-headless-device"),
+        required_features: wgpu::Features::empty(),
+        required_limits: wgpu::Limits::downlevel_defaults(),
+        experimental_features: wgpu::ExperimentalFeatures::default(),
+        memory_hints: wgpu::MemoryHints::default(),
+        trace: wgpu::Trace::Off,
+    }))
+    .context("wgpu request_device (headless) 失败")?;
+
+    // why Rgba8UnormSrgb 锁死: PNG output 是 RGBA byte 顺序, 选 Rgba8 避免 BGRA
+    // swizzle; sRGB encoding 与用户屏幕 (Bgra8UnormSrgb 主流 path) 同 gamma
+    // 处理, 视觉一致。RENDER_ATTACHMENT | COPY_SRC: render pass write + 后续
+    // copy_texture_to_buffer 读出。
+    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let target_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("quill-headless-target"),
+        // T-0404: physical_w/h = logical × HIDPI_SCALE。target 与窗口 surface
+        // (Renderer::resize 内部走 width × HIDPI_SCALE) 同尺寸语义, 视觉对齐。
+        size: wgpu::Extent3d {
+            width: physical_w,
+            height: physical_h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let target_view = target_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+    let clear = clear_color_for(format);
+    let is_srgb = format.is_srgb();
+
+    let cell_pipeline = create_headless_cell_pipeline(&device, format);
+
+    // glyph atlas (local, R8Unorm 2048×2048 — 与 Renderer::ensure_glyph_atlas
+    // 同尺寸), 函数返回时全部 drop, 不影响 Renderer
+    let glyph_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("quill-headless-glyph-atlas"),
+        size: wgpu::Extent3d {
+            width: ATLAS_W,
+            height: ATLAS_H,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let glyph_view = glyph_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let glyph_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("quill-headless-glyph-sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Nearest,
+        min_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        ..Default::default()
+    });
+    let glyph_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("quill-headless-glyph-bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                count: None,
+            },
+        ],
+    });
+    let glyph_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("quill-headless-glyph-bg"),
+        layout: &glyph_bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&glyph_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&glyph_sampler),
+            },
+        ],
+    });
+    let glyph_pipeline = create_headless_glyph_pipeline(&device, &glyph_bgl, format);
+
+    // local atlas state (与 GlyphAtlas struct 字段同语义, 但不复用 struct 防
+    // T-0407 合并冲突 — T-0407 改 HashMap key 类型 GlyphKey, 此处用 _ 类型推导
+    // 跟 ShapedGlyph::atlas_key() 当前 (u16, u32) 自动对齐, T-0407 合并后零改动)
+    let mut allocations: HashMap<_, AtlasSlot> = HashMap::new();
+    let mut atlas_cursor_x: u32 = 0;
+    let mut atlas_cursor_y: u32 = 0;
+    let mut atlas_row_height: u32 = 0;
+
+    // T-0404: NDC 换算分母用 physical (与 target_texture 同尺寸); cell_w/h_px
+    // / baseline_y_px 同乘 HIDPI_SCALE — 与 Renderer::draw_frame 同套路。
+    // glyph 已是 physical (cosmic-text shape_line Metrics × HIDPI_SCALE,
+    // rasterize bitmap 也 physical), 后面直接相加无需再乘。
+    let surface_w = physical_w as f32;
+    let surface_h = physical_h as f32;
+    let cell_w_px = CELL_W_PX * HIDPI_SCALE as f32;
+    let cell_h_px = CELL_H_PX * HIDPI_SCALE as f32;
+    let baseline_y_px = BASELINE_Y_PX * HIDPI_SCALE as f32;
+
+    let mut cell_vertex_bytes: Vec<u8> =
+        Vec::with_capacity(cells.len() * VERTS_PER_CELL * VERTEX_BYTES);
+    for cell in cells {
+        if cell.c == ' ' {
+            continue;
+        }
+        let x0_px = cell.pos.col as f32 * cell_w_px;
+        let y0_px = cell.pos.line as f32 * cell_h_px;
+        let x1_px = x0_px + cell_w_px;
+        let y1_px = y0_px + cell_h_px;
+        let left = x0_px / surface_w * 2.0 - 1.0;
+        let right = x1_px / surface_w * 2.0 - 1.0;
+        let top = 1.0 - y0_px / surface_h * 2.0;
+        let bottom = 1.0 - y1_px / surface_h * 2.0;
+        // T-0407 D fix 同源: 走 cell.bg 让 glyph fg 在 bg 块上 alpha-blend 可见;
+        // 走 fg 会致 glyph (fg) 与 cell (fg) 同色 alpha mask 涂同色等于不可见
+        // (T-0403 真因)。
+        let color = color_for_vertex_with_srgb(cell.bg, is_srgb);
+        let verts: [[f32; 2]; 6] = [
+            [left, top],
+            [left, bottom],
+            [right, bottom],
+            [left, top],
+            [right, bottom],
+            [right, top],
+        ];
+        for v in verts {
+            cell_vertex_bytes.extend_from_slice(&v[0].to_ne_bytes());
+            cell_vertex_bytes.extend_from_slice(&v[1].to_ne_bytes());
+            cell_vertex_bytes.extend_from_slice(&color[0].to_ne_bytes());
+            cell_vertex_bytes.extend_from_slice(&color[1].to_ne_bytes());
+            cell_vertex_bytes.extend_from_slice(&color[2].to_ne_bytes());
+        }
+    }
+    let cell_vertex_count = (cell_vertex_bytes.len() / VERTEX_BYTES) as u32;
+
+    let effective_rows = row_texts.len().min(rows);
+    // 默认 fg #d3d3d3 light gray (与 Renderer::draw_frame 同源, term::Color
+    // ::DEFAULT_FG 模块私有不能引用, 内联值, T-0405 后续 per-glyph cell.fg
+    // 时改)。
+    let fg_default = crate::term::Color {
+        r: 0xd3,
+        g: 0xd3,
+        b: 0xd3,
+    };
+    let glyph_color = color_for_vertex_with_srgb(fg_default, is_srgb);
+
+    let mut glyph_vertex_bytes: Vec<u8> = Vec::new();
+    for (row_idx, row_text) in row_texts.iter().take(effective_rows).enumerate() {
+        if row_text.is_empty() {
+            continue;
+        }
+        let glyphs = text_system.shape_line(row_text);
+        for glyph in &glyphs {
+            if !glyph.x_advance.is_finite() || !glyph.x_offset.is_finite() {
+                continue;
+            }
+            let key = glyph.atlas_key();
+            let slot_opt = if let Some(slot) = allocations.get(&key).copied() {
+                Some(slot)
+            } else if let Some(raster) = text_system.rasterize(glyph) {
+                if raster.width == 0 || raster.height == 0 {
+                    let slot = AtlasSlot {
+                        uv_min: [0.0, 0.0],
+                        uv_max: [0.0, 0.0],
+                        width: 0,
+                        height: 0,
+                        bearing_x: raster.bearing_x,
+                        bearing_y: raster.bearing_y,
+                    };
+                    allocations.insert(key, slot);
+                    Some(slot)
+                } else {
+                    if atlas_cursor_x + raster.width > ATLAS_W {
+                        atlas_cursor_y += atlas_row_height;
+                        atlas_cursor_x = 0;
+                        atlas_row_height = 0;
+                    }
+                    if atlas_cursor_y + raster.height > ATLAS_H {
+                        return Err(anyhow!(
+                            "headless glyph atlas overflow at ({}, {}); atlas {}×{} 满 — \
+                             Phase 4 ASCII 路径不应触发, allocations.len = {}",
+                            atlas_cursor_x,
+                            atlas_cursor_y,
+                            ATLAS_W,
+                            ATLAS_H,
+                            allocations.len()
+                        ));
+                    }
+                    let x = atlas_cursor_x;
+                    let y = atlas_cursor_y;
+                    queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &glyph_texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d { x, y, z: 0 },
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        &raster.bitmap,
+                        wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(raster.width),
+                            rows_per_image: Some(raster.height),
+                        },
+                        wgpu::Extent3d {
+                            width: raster.width,
+                            height: raster.height,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                    let slot = AtlasSlot {
+                        uv_min: [x as f32 / ATLAS_W as f32, y as f32 / ATLAS_H as f32],
+                        uv_max: [
+                            (x + raster.width) as f32 / ATLAS_W as f32,
+                            (y + raster.height) as f32 / ATLAS_H as f32,
+                        ],
+                        width: raster.width,
+                        height: raster.height,
+                        bearing_x: raster.bearing_x,
+                        bearing_y: raster.bearing_y,
+                    };
+                    allocations.insert(key, slot);
+                    atlas_cursor_x += raster.width;
+                    if raster.height > atlas_row_height {
+                        atlas_row_height = raster.height;
+                    }
+                    Some(slot)
+                }
+            } else {
+                None
+            };
+            let Some(slot) = slot_opt else { continue };
+            if slot.width == 0 || slot.height == 0 {
+                continue;
+            }
+
+            let x_left = glyph.x_offset + slot.bearing_x as f32;
+            // T-0404: baseline_y_px 已 × HIDPI_SCALE (与 cell_h_px 同单位 physical),
+            // glyph.x_offset / bearing_x / bearing_y / slot.width / slot.height
+            // 都 physical (shape_line Metrics × HIDPI_SCALE), 单位一致直接相加
+            let y_top = (row_idx as f32) * cell_h_px + baseline_y_px - slot.bearing_y as f32;
+            let x_right = x_left + slot.width as f32;
+            let y_bot = y_top + slot.height as f32;
+            let ndc_left = x_left / surface_w * 2.0 - 1.0;
+            let ndc_right = x_right / surface_w * 2.0 - 1.0;
+            let ndc_top = 1.0 - y_top / surface_h * 2.0;
+            let ndc_bot = 1.0 - y_bot / surface_h * 2.0;
+            let uv_l = slot.uv_min[0];
+            let uv_r = slot.uv_max[0];
+            let uv_t = slot.uv_min[1];
+            let uv_b = slot.uv_max[1];
+            let verts: [([f32; 2], [f32; 2]); 6] = [
+                ([ndc_left, ndc_top], [uv_l, uv_t]),
+                ([ndc_left, ndc_bot], [uv_l, uv_b]),
+                ([ndc_right, ndc_bot], [uv_r, uv_b]),
+                ([ndc_left, ndc_top], [uv_l, uv_t]),
+                ([ndc_right, ndc_bot], [uv_r, uv_b]),
+                ([ndc_right, ndc_top], [uv_r, uv_t]),
+            ];
+            for (pos, uv) in verts {
+                glyph_vertex_bytes.extend_from_slice(&pos[0].to_ne_bytes());
+                glyph_vertex_bytes.extend_from_slice(&pos[1].to_ne_bytes());
+                glyph_vertex_bytes.extend_from_slice(&uv[0].to_ne_bytes());
+                glyph_vertex_bytes.extend_from_slice(&uv[1].to_ne_bytes());
+                glyph_vertex_bytes.extend_from_slice(&glyph_color[0].to_ne_bytes());
+                glyph_vertex_bytes.extend_from_slice(&glyph_color[1].to_ne_bytes());
+                glyph_vertex_bytes.extend_from_slice(&glyph_color[2].to_ne_bytes());
+            }
+        }
+    }
+    let glyph_vertex_count = (glyph_vertex_bytes.len() / GLYPH_VERTEX_BYTES) as u32;
+
+    let cell_vbuf = if cell_vertex_count > 0 {
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("quill-headless-cell-vertex"),
+            size: cell_vertex_bytes.len() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&buf, 0, &cell_vertex_bytes);
+        Some(buf)
+    } else {
+        None
+    };
+
+    let glyph_vbuf = if glyph_vertex_count > 0 {
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("quill-headless-glyph-vertex"),
+            size: glyph_vertex_bytes.len() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&buf, 0, &glyph_vertex_bytes);
+        Some(buf)
+    } else {
+        None
+    };
+
+    tracing::debug!(
+        target: "quill::wl::render",
+        cols, rows,
+        logical_w = width, logical_h = height,
+        physical_w, physical_h,
+        cell_vertex_count, glyph_vertex_count,
+        atlas_count = allocations.len(),
+        "render_headless stats"
+    );
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("quill-headless-encoder"),
+    });
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("quill-headless-pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &target_view,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(clear),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        if let Some(buf) = cell_vbuf.as_ref() {
+            pass.set_pipeline(&cell_pipeline);
+            pass.set_vertex_buffer(0, buf.slice(..));
+            pass.draw(0..cell_vertex_count, 0..1);
+        }
+        if let Some(buf) = glyph_vbuf.as_ref() {
+            pass.set_pipeline(&glyph_pipeline);
+            pass.set_bind_group(0, &glyph_bg, &[]);
+            pass.set_vertex_buffer(0, buf.slice(..));
+            pass.draw(0..glyph_vertex_count, 0..1);
+        }
+    }
+
+    // bytes_per_row 必须 256 对齐 (wgpu COPY_BYTES_PER_ROW_ALIGNMENT)。
+    // 例: physical 1600 px × 4 bytes = 6400, 已 256 对齐; 1366 × 4 = 5464 不
+    // 对齐 → padded = 5632。每行尾部 padding 在 readback 后剥除。
+    // T-0404: readback 用 physical 尺寸 (target_texture 的真尺寸)。
+    let unpadded_bytes_per_row = physical_w
+        .checked_mul(4)
+        .ok_or_else(|| anyhow!("physical_w × 4 溢出 u32 (physical_w = {})", physical_w))?;
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(align) * align;
+    let buffer_size = u64::from(padded_bytes_per_row) * u64::from(physical_h);
+    let readback_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("quill-headless-readback"),
+        size: buffer_size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &target_texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &readback_buf,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded_bytes_per_row),
+                rows_per_image: Some(physical_h),
+            },
+        },
+        wgpu::Extent3d {
+            width: physical_w,
+            height: physical_h,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(std::iter::once(encoder.finish()));
+
+    // map_async + Device::poll(Wait): 阻塞等 GPU 完成 + buffer 内存映射就绪。
+    // INV-005 calloop 单线程禁阻塞 — 但本 fn 不在 calloop 路径 (headless 路径
+    // 走 main.rs 直接调, 无 EventLoop)。
+    let slice = readback_buf.slice(..);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        // 发送失败 (receiver 早已 drop) 接受静默 — 调用方已经退出 readback 路径
+        let _ = sender.send(result);
+    });
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .map_err(|e| anyhow!("device poll wait 失败: {e:?}"))?;
+    receiver
+        .recv()
+        .context("readback receiver recv 失败 (sender 已 drop?)")?
+        .map_err(|e| anyhow!("buffer map_async 失败: {e:?}"))?;
+
+    let mapped = slice.get_mapped_range();
+    let mut out: Vec<u8> =
+        Vec::with_capacity((unpadded_bytes_per_row as usize) * (physical_h as usize));
+    let row_stride = padded_bytes_per_row as usize;
+    let row_unpadded = unpadded_bytes_per_row as usize;
+    for row in 0..(physical_h as usize) {
+        let row_start = row * row_stride;
+        let row_end = row_start + row_unpadded;
+        out.extend_from_slice(&mapped[row_start..row_end]);
+    }
+    drop(mapped);
+    readback_buf.unmap();
+
+    Ok((out, physical_w, physical_h))
+}
+
+/// [`render_headless`] 用的 sRGB-aware 色彩转换 (`Color` → linear `[f32; 3]`)。
+/// 与 [`Renderer::color_for_vertex`] 等价但 free fn (无 `&self`), 让 headless
+/// 路径不挂 `Renderer` 实例。`is_srgb=true` 时走 [`srgb_to_linear`] 预补偿
+/// (sRGB 表面把写入值当 linear, GPU 编码回 sRGB 显示, 跟 [`clear_color_for`]
+/// 同套路)。
+fn color_for_vertex_with_srgb(c: crate::term::Color, is_srgb: bool) -> [f32; 3] {
+    let r = f64::from(c.r) / 255.0;
+    let g = f64::from(c.g) / 255.0;
+    let b = f64::from(c.b) / 255.0;
+    if is_srgb {
+        [
+            srgb_to_linear(r) as f32,
+            srgb_to_linear(g) as f32,
+            srgb_to_linear(b) as f32,
+        ]
+    } else {
+        [r as f32, g as f32, b as f32]
+    }
+}
+
+/// [`render_headless`] 用的 cell render pipeline (与 [`Renderer::ensure_cell_pipeline`]
+/// 同骨架, 只多 `format` 入参让 headless 路径锁 [`wgpu::TextureFormat::Rgba8UnormSrgb`])。
+fn create_headless_cell_pipeline(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("quill-headless-cells-shader"),
+        source: wgpu::ShaderSource::Wgsl(CELL_WGSL.into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("quill-headless-cells-pipeline-layout"),
+        bind_group_layouts: &[],
+        immediate_size: 0,
+    });
+    let vertex_attrs = [
+        wgpu::VertexAttribute {
+            offset: 0,
+            shader_location: 0,
+            format: wgpu::VertexFormat::Float32x2,
+        },
+        wgpu::VertexAttribute {
+            offset: (2 * std::mem::size_of::<f32>()) as u64,
+            shader_location: 1,
+            format: wgpu::VertexFormat::Float32x3,
+        },
+    ];
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("quill-headless-cells-pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: VERTEX_BYTES as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &vertex_attrs,
+            }],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            unclipped_depth: false,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            conservative: false,
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// [`render_headless`] 用的 glyph render pipeline (与 [`Renderer::ensure_glyph_pipeline`]
+/// 同骨架, `format` 锁 [`wgpu::TextureFormat::Rgba8UnormSrgb`], `bgl` 由调用方
+/// 传入 — 与 atlas 的 bind_group_layout 匹配)。
+fn create_headless_glyph_pipeline(
+    device: &wgpu::Device,
+    bgl: &wgpu::BindGroupLayout,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("quill-headless-glyph-shader"),
+        source: wgpu::ShaderSource::Wgsl(GLYPH_WGSL.into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("quill-headless-glyph-pipeline-layout"),
+        bind_group_layouts: &[Some(bgl)],
+        immediate_size: 0,
+    });
+    let vertex_attrs = [
+        wgpu::VertexAttribute {
+            offset: 0,
+            shader_location: 0,
+            format: wgpu::VertexFormat::Float32x2,
+        },
+        wgpu::VertexAttribute {
+            offset: (2 * std::mem::size_of::<f32>()) as u64,
+            shader_location: 1,
+            format: wgpu::VertexFormat::Float32x2,
+        },
+        wgpu::VertexAttribute {
+            offset: (4 * std::mem::size_of::<f32>()) as u64,
+            shader_location: 2,
+            format: wgpu::VertexFormat::Float32x3,
+        },
+    ];
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("quill-headless-glyph-pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: GLYPH_VERTEX_BYTES as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &vertex_attrs,
+            }],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            unclipped_depth: false,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            conservative: false,
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -17,3 +17,9 @@ pub use window::{handle_event, WindowAction, WindowCore, WindowEvent};
 // `mod render` 自身保持私有 (INV-010: wgpu 类型不出本模块), 仅 const u32 通过
 // 此 re-export 以 `crate::wl::HIDPI_SCALE` 路径暴露给 text 模块。
 pub use render::HIDPI_SCALE;
+
+// T-0408 离屏渲染入口 (offscreen render → RGBA8 Vec<u8>)。`src/main.rs`
+// `--headless-screenshot` CLI flag + `tests/headless_screenshot.rs` 集成测试
+// 都走此 fn。入参 / 出参全 quill 自有类型, 不漏 wgpu 内部 (INV-010 类型隔离),
+// 详见 `render.rs::render_headless` 文档头。
+pub use render::render_headless;
