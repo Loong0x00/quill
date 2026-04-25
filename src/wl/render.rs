@@ -242,6 +242,21 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 /// 留 Phase 6 soak 验证有需要再说。
 const VERTS_PER_CELL: usize = 6;
 
+/// (T-0407) cell 矩形染色源选择 — fg 还是 bg。
+///
+/// **why 引入**: T-0305 cell pass 只染 fg 色, T-0403 加 glyph pass 后字形也用 fg
+/// 色 — 同色致 glyph alpha mask "涂同色等于不可见", 用户实测看到一片连续 fg 色
+/// 矩形不见字 (T-0407 D 修)。draw_frame (Phase 4) 走 Bg 让字形可见, draw_cells
+/// (Phase 3 fallback, text_system 未建好时降级) 走 Fg 维持原色块视觉契约。
+///
+/// T-0305 doc 早就预言此路径: "Phase 4 字形渲染时 fg 切回 glyph 色 + bg 画 cell
+/// 全色块, API 已就位"。本 enum 把当时遗留的 fixup 1 行落地。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CellColorSource {
+    Fg,
+    Bg,
+}
+
 /// **cell 像素宽度** —— Phase 3 临时常数(T-0306)。Phase 4 字形渲染时改为
 /// `cosmic-text` 测出的字体 advance 宽度替换。
 ///
@@ -543,8 +558,16 @@ impl Renderer {
         let cell_w_px = CELL_W_PX;
         let cell_h_px = CELL_H_PX;
 
-        let vertex_bytes =
-            self.build_vertex_bytes(cells, cell_w_px, cell_h_px, surface_w, surface_h);
+        let vertex_bytes = self.build_vertex_bytes(
+            cells,
+            cell_w_px,
+            cell_h_px,
+            surface_w,
+            surface_h,
+            // Phase 3 fallback 路径 (text_system 未建好时降级): cell 染 fg 色作
+            // 视觉锚点 (T-0305 acceptance "看见 prompt 字符位置以色块画出")。
+            CellColorSource::Fg,
+        );
         let vertex_count = (vertex_bytes.len() / VERTEX_BYTES) as u32;
         // 给手测 / 日志排障一个固定锚点:每次 draw_cells 报本帧 cell 矩形数。
         // debug 级,不污染默认 info 日志。空白 frame (vertex_count == 0) 也报,
@@ -752,6 +775,7 @@ impl Renderer {
         cell_h_px: f32,
         surface_w: f32,
         surface_h: f32,
+        color_source: CellColorSource,
     ) -> Vec<u8> {
         let mut out: Vec<u8> = Vec::with_capacity(cells.len() * VERTS_PER_CELL * VERTEX_BYTES);
         for cell in cells {
@@ -770,7 +794,17 @@ impl Renderer {
             let top = 1.0 - y0_px / surface_h * 2.0;
             let bottom = 1.0 - y1_px / surface_h * 2.0;
 
-            let color = self.color_for_vertex(cell.fg);
+            // T-0407 D fix: cell pass 走 fg 还是 bg 决定 visual 与 glyph 共存:
+            // - Fg (Phase 3 draw_cells fallback): 没字形, 单纯色块给 acceptance 看
+            // - Bg (Phase 4 draw_frame): 字形覆盖在 cell 之上, 必须 cell 用 bg 色,
+            //   glyph 用 fg 色, 否则同色 (T-0403 bug 真因) — 字 alpha mask 在 fg
+            //   色块上"涂同色"等于不可见, 用户实测看到一片连续 fg 矩形不见字。
+            //   T-0305 doc 早就预言此路径 ("Phase 4 字形渲染时 fg 切回 glyph 色 +
+            //   bg 画 cell 全色块")。
+            let color = match color_source {
+                CellColorSource::Fg => self.color_for_vertex(cell.fg),
+                CellColorSource::Bg => self.color_for_vertex(cell.bg),
+            };
 
             // CCW 三角顺序: TL → BL → BR(下三角), TL → BR → TR(上三角)
             let verts: [[f32; 2]; 6] = [
@@ -861,9 +895,17 @@ impl Renderer {
         let cell_w_px = CELL_W_PX;
         let cell_h_px = CELL_H_PX;
 
-        // Step 3: cell vertex bytes (Phase 3 既有 fg 着色色块路径)。
-        let cell_vertex_bytes =
-            self.build_vertex_bytes(cells, cell_w_px, cell_h_px, surface_w, surface_h);
+        // Step 3: cell vertex bytes (T-0407 D fix: 走 bg 色, 让 glyph fg 字形
+        // 在 cell bg 块上可见; T-0403 用 fg 致字形被 cell fg 块"涂同色"不可见,
+        // 用户实测看到一片连续 fg 色矩形不见字)。
+        let cell_vertex_bytes = self.build_vertex_bytes(
+            cells,
+            cell_w_px,
+            cell_h_px,
+            surface_w,
+            surface_h,
+            CellColorSource::Bg,
+        );
         let cell_vertex_count = (cell_vertex_bytes.len() / VERTEX_BYTES) as u32;
 
         // Step 4: shape + raster + atlas allocate + build glyph vertex bytes。
