@@ -605,13 +605,19 @@ pub fn run_window() -> Result<()> {
     let loop_signal = event_loop.get_signal();
 
     // Source 1:wayland fd。用 conn.backend().poll_fd() 拿 BorrowedFd。生命周期
-    // 擦成 'static 由 drop 序保障(event_loop 本地变量在 state 之前 drop,
-    // 其内持有的 Generic source 也随之 drop,之后 state.conn 才关闭)。
+    // 擦成 'static 由 drop 序 + calloop 内部对已关 fd 容忍保障。
     // SAFETY:
-    // - poll_fd 返回的 fd 是 wayland_backend Connection 内部 socket,state.conn
-    //   持有该 Connection 的 Arc 引用到 run_window 结束 → fd 活
-    // - Rust 反向 drop 保证 event_loop(以及它拥有的 source)先于 state 被 drop;
-    //   BorrowedFd<'static> 的生命期在代码流上不超过 event_loop 本身
+    // - poll_fd 返回的 fd 是 wayland_backend Connection 内部 socket;state.conn
+    //   持有该 Connection 的 Arc 引用,在 run_window scope 内一直活
+    // - 实际 drop 序 (T-0108 重构后, T-0399 housekeeping 校正): event_loop 在
+    //   line 602 声明、loop_data 在 line 685 声明 → Rust 反向声明顺序 →
+    //   loop_data 先 drop (loop_data.state.conn 关 wayland fd) → event_loop
+    //   后 drop (event_loop 内 Generic source 的 epoll_ctl(EPOLL_CTL_DEL)
+    //   对此时已关闭的 fd 调用)。Linux kernel 对 EPOLL_CTL_DEL 已关 fd 返
+    //   EBADF, calloop 0.14 内部容忍 (silent ignore / log), **非 UB**
+    // - 即 `BorrowedFd<'static>` 的"语法 'static"不依赖 fd 实际活到 event_loop
+    //   drop 那一刻;依赖 calloop 内部 syscall 容忍 EBADF (drop-time race
+    //   safe by design of epoll API + calloop)
     // - poll_fd.as_raw_fd() 只取 int,不涉资源转移
     #[allow(unsafe_code)]
     let wayland_fd: BorrowedFd<'static> = unsafe {
@@ -641,11 +647,19 @@ pub fn run_window() -> Result<()> {
         .map_err(|e| anyhow!("calloop insert_source(signals) 失败: {e}"))?;
 
     // Source 3:PTY master fd。回调在 pty_read_tick 里做 read + trace + 退出判定。
-    // SAFETY: pty_fd 来自 state.pty.as_ref().raw_fd()(PtyHandle 构造时
-    // as_raw_fd().ok_or_else 校验 Some 一次);state.pty 持有 PtyHandle 到
-    // run_window 结束,Rust 反向 drop 保证 event_loop(含 Generic source)先
-    // 于 state.pty 被 drop,BorrowedFd<'static> 的实际生命期被 drop 序约束在
-    // state.pty 寿命内。fcntl / read 都不涉所有权转移。
+    // SAFETY:
+    // - pty_fd 来自 state.pty.as_ref().raw_fd()(PtyHandle 构造时
+    //   as_raw_fd().ok_or_else 校验 Some 一次)。state.pty 持有 PtyHandle 在
+    //   run_window scope 内一直活
+    // - 实际 drop 序 (T-0108 重构后, T-0399 housekeeping 校正): event_loop 在
+    //   line 602 声明、loop_data 在 line 685 声明, state 已被 move 进
+    //   loop_data.state → Rust 反向声明顺序 → loop_data 先 drop (按字段顺序
+    //   关 state.pty 的 master fd) → event_loop 后 drop (Generic source 的
+    //   epoll_ctl(EPOLL_CTL_DEL) 对此时已关闭的 pty fd 调用)。Linux kernel
+    //   对 EPOLL_CTL_DEL 已关 fd 返 EBADF, calloop 0.14 内部容忍, **非 UB**
+    // - 即 `BorrowedFd<'static>` 的"语法 'static"不依赖 fd 实际活到 event_loop
+    //   drop 那一刻;依赖 calloop 内部 syscall 容忍 EBADF。fcntl / read 都不
+    //   涉所有权转移
     #[allow(unsafe_code)]
     let pty_borrowed: BorrowedFd<'static> = unsafe { BorrowedFd::borrow_raw(pty_fd) };
     loop_handle
