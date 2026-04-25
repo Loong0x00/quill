@@ -2,7 +2,7 @@
 
 **Phase**: 6 (daily-drive polish)
 **Assigned**: writer-T0601
-**Status**: claimed
+**Status**: in-review
 **Budget**: tokenBudget=80k (单文件 src/wl/render.rs + Term::cursor 接入)
 **Dependencies**: T-0301 (alacritty_terminal Term) / T-0407 (cell pipeline) / T-0408 (headless screenshot)
 **Priority**: P0 (user 实测反馈窗口缺光标, daily-drive 体感不对)
