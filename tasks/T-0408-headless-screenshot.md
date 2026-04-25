@@ -2,7 +2,7 @@
 
 **Phase**: 4 (基建, 跟字形并行)
 **Assigned**: writer-T0408
-**Status**: claimed
+**Status**: in-review
 **Budget**: tokenBudget=100k (中型, 跨 wgpu offscreen + PNG + CLI + 测试)
 **Dependencies**: T-0403 (glyph_pipeline + draw_frame) / T-0407 (face lock 锁定后视觉稳定)
 **Priority**: P1 (Phase 4 后续 ticket reviewer 安全网)
