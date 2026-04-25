@@ -97,12 +97,13 @@ Lead 决定:**T-0104 + Phase 2 PTY 并行推进**。理由:
 
 ---
 
-## Phase 4 — cosmic-text + CJK 3/6 (T-0407 fix 已合, T-0404 待 rebase, T-0408 基建并行)
+## Phase 4 — cosmic-text + CJK 5/8 (T-0408 待审, T-0405 简化 + T-0406 待派)
 
 - [x] `T-0401` cosmic-text 字体子系统初始化 (TextSystem + ShapedGlyph + INV-010 第 7 次应用) ✅ merged
 - [x] `T-0402` shaping pipeline (shape_line + ShapedGlyph x_offset/y_offset, INV-010 第 8 次) ✅ merged
 - [x] `T-0403` glyph 光栅化 + wgpu atlas (RasterizedGlyph + GlyphAtlas + draw_frame, INV-010 第 9 次, INV-002 字段 10→14) ✅ merged (字形渲染框架, 但有 cell+glyph 同色 bug)
 - [x] `T-0407` 字形 bug fix (face lock + emoji 黑名单 + GlyphKey + cell.bg cellColorSource) ✅ merged 🎉 **Phase 4 视觉里程碑真达成**: user 实测 5090 + Wayland cargo run 真显示 `[user@userPC ~]$` 完整 ASCII prompt (浅灰字 + 深蓝 + 黑 cursor, 截图 18-47-00)
+- [x] `T-0404` HiDPI 2x scale hardcode (HIDPI_SCALE=2 const + font 17→34 + Renderer surface ×2, 用户 224 ppi 单显示器固定) ✅ merged
 - [ ] `T-0404` 2x HiDPI 整数缩放 (`wl_output.scale` 接入)
 - [ ] `T-0405` CJK fallback 正确 (ASCII 用 mono, 中文 fallback CJK)
 - [ ] `T-0406` glyph cache + LRU 驱逐
@@ -192,5 +193,7 @@ Lead 决定:**T-0104 + Phase 2 PTY 并行推进**。理由:
 - 2026-04-25 **T-0402 merged**: shape_line API + ShapedGlyph 加 x_offset/y_offset, 99 tests (+4), src/text/mod.rs +201 单文件. INV-010 第 8 次零违规 (cosmic-text Attrs/Buffer/Family/Metrics/Shaping/LayoutGlyph 6 类型全锁 fn body 内). writer 主动告知 ShapedGlyph x_offset/y_offset 与 cosmic-text LayoutGlyph::x_offset 命名歧义 + Metrics 17/25 vs shape_one_char 14/20 不一致, reviewer 独立 grep cosmic-text 0.12.1 源 verify physical() 计算公式 (self.x + font_size * self.x_offset) 表明两组字段语义不同, 接受 spec 选择 + P2 登记 "Phase 5+ sub-pixel rendering 时 rename". Phase 4 进度 2/6
 - 2026-04-25 **T-0403 merged**: 5 文件 +1110 跨 src/text + src/wl/render + src/wl/window + docs/invariants.md, 105 tests (+6), INV-010 第 9 次 + INV-002 字段 10→14. **但有 cell+glyph 同色 bug**: T-0305 fg-vs-bg 决策遗留 cell.fg 着色 cell 矩形, T-0403 加 glyph 后没改回 cell.bg, glyph alpha mask 在 fg 浅灰 cell 上不可见, user 实测看到一个连续浅灰大矩形而非独立字符. writer + reviewer 都用 trace 数学闭环 verify "实跑达成", 但都没真视觉确认 — 教训: agent 数学 verify ≠ 视觉 verify, 必须 user 实跑或 T-0408 headless screenshot 验
 - 2026-04-25 **T-0407 merged → 🎉 Phase 4 视觉里程碑真达成**: T-0403 字形 bug 一周内 3 次诊断错位 (emoji fallback / atlas key 撞 / cell+glyph 同色), 全部 because agent 没法看屏幕。最终 Lead 读代码静态推理找出真因 cell.fg vs cell.bg 染色源错位。修法: enum CellColorSource { Fg, Bg } draw_cells 仍 Fg (T-0305 fallback 视觉契约保留) draw_frame 走 Bg (Phase 4 主路径). 同时 T-0407 主体修复 reviewer T-0403 早警告的 atlas key Phase 4 假设 (升 GlyphKey 加 face_id) + Family::Monospace generic 自挑 (改 PREFERRED_MONOSPACE_FACES Family::Name) + emoji face 黑名单 post-process. **user 实测 cargo run --release 真显示 `[user@userPC ~]$` 完整 ASCII prompt** (浅灰 #d3d3d3 / 深蓝 #0a1030 / 黑色 cell.bg / 黑 cursor block, 截图 2026-04-25 18-47-00). 4 文件 +491/-61, 110 tests (+5), INV-010 第 10 次. Phase 4 进度 3/6 (T-0404 待 rebase, T-0405 cascading 简化, T-0406 LRU)
-- 2026-04-25 派 T-0408 headless screenshot test (基建): quill 内置 offscreen render → PNG, agent 直接读 PNG 像素 verify 不依赖 GNOME / Wayland / portal — 治 T-0403 一周 3 次诊断错位的根因 (agent 没法看屏幕). 引 image crate (写 ADR), 跨 main.rs CLI flag --headless-screenshot. T-0408 跟 T-0407 改动文件不重叠并行实装
+- 2026-04-25 派 T-0408 headless screenshot test (基建): quill 内置 offscreen render → PNG, agent 直接读 PNG 像素 verify 不依赖 GNOME / Wayland / portal — 治 T-0403 一周 3 次诊断错位的根因 (agent 没法看屏幕). 引 image crate (写 ADR 0005), 跨 main.rs CLI flag --headless-screenshot. T-0408 跟 T-0407 改动文件不重叠并行实装
+- 2026-04-25 **T-0404 merged**: HiDPI 2x scale hardcode 简化版 (用户 224 ppi 单显示器偏好). HIDPI_SCALE=2 const 一处定义全 codebase 引用 35+ 次. Renderer::new/resize × HIDPI_SCALE + shape_line Metrics 17→34 / 25→50. writer 主动告知 Renderer::new 必需补 (派单未列, T-0306 P0-2 模式). T-0407 fix 后 rebase 干净 1 处冲突 (atlas_key 测试期望 hardcode 17 → HIDPI_SCALE 单一来源). 112 tests (+2). INV-010 守 (HIDPI_SCALE 是 u32 const 不暴露上游类型). Phase 4 进度 5/8
+- 2026-04-25 **T-0408 完工实测 agent 自验视觉成功** (待 reviewer-T0408 完成审码合并). writer-T0408 跑 `cargo run --release -- --headless-screenshot=/tmp/quill_t0408.png`, Lead 直接 Read PNG 看到完整 quill 渲染 (深蓝清屏 + `[user@userPC ~]$` 浅灰字 + ~ 反色 cursor), **agent 第一次不依赖 user 自己 verify quill 视觉输出**. T-0408 治 T-0403 字形 bug 一周 3 次诊断错位的根因. rebase 干净零冲突 (writer 设计预防性避开 Renderer::ensure_*). 7 文件 +965 含 ADR 0005 + image crate dep. 118 tests (+5)
 - (后续每个阶段起止在这追加)
