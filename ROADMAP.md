@@ -73,17 +73,18 @@ Lead 决定:**T-0104 + Phase 2 PTY 并行推进**。理由:
 
 ---
 
-## Phase 3 — VT 解析 + 屏幕状态 4/7 (2026-04-25)
+## Phase 3 — VT 解析 + 屏幕状态 5/7 (2026-04-25)
 
 **产出**:屏幕上看见 ASCII 字符,哪怕丑。
 
-**实装验证已通过** 2026-04-25: T-0301..T-0304 完成。`cargo run` 启动后 170ms 内 bash prompt 经 alacritty Processor 解析, cursor 精准停在 `CellPos { col: 17, line: 0 }`。T-0302 建立了 T-0305 色块渲染需要的 API 底盘 (cells_iter + CellPos + is_dirty + dimensions + cursor_visible), T-0303 加 cursor_pos / cursor_shape (CursorShape 自定义 5 variants) 完整渲染调用链 type-consistent, T-0304 加 ScrollbackPos 独立类型 + scrollback_size / scrollback_line_text / scrollback_cells_iter 三方法暴露历史行 (默认 10000 行)。alacritty 类型彻底锁在 `src/term/mod.rs` 内部, 公共 API 零类型渗透。
+**实装验证已通过** 2026-04-25: T-0301..T-0305 完成。`cargo run` 启动后 170ms 内 bash prompt 经 alacritty Processor 解析, cursor 精准停在 `CellPos { col: 17, line: 0 }`。T-0305 色块渲染上线: 5090 + Wayland + Vulkan backend 跑起来后, 深蓝清屏 #0a1030 上看到 15 个浅灰矩形 (#d3d3d3) 排成 `[user@userPC ~]$` prompt 一行 (cell 10×25 px @ 80×24 grid)。alacritty 类型彻底锁在 `src/term/mod.rs` 内部, 公共 API 零类型渗透。
 
 关键 ticket 状态:
 - [x] `T-0301` `alacritty_terminal` Term 集成 + PTY → Term grid 端到端通路 ✅ merged (含 T-0108 calloop 统一 refactor)
 - [x] `T-0302` Term 渲染 API 准备 (cells_iter / CellPos / is_dirty / dimensions / cursor_visible) ✅ merged
 - [x] `T-0303` 光标追踪 (cursor_pos -> CellPos + cursor_shape + CursorShape enum) ✅ merged
 - [x] `T-0304` 滚动 buffer 基础 (ScrollbackPos + scrollback_size/line_text/cells_iter) ✅ merged
+- [x] `T-0305` 色块渲染 (Color + CellRef fg/bg + draw_cells wgpu pipeline + idle callback) ✅ merged
 - `T-0305` **每 cell 一色块**先渲染(无字体,`█` 式 block 填 cell 背景色)
 - `T-0306` resize → term.resize + ioctl TIOCSWINSZ 同步 PTY
 - `T-0307` 测试:`ls -la` 输出,检查 grid 里字符位置
@@ -179,4 +180,5 @@ Lead 决定:**T-0104 + Phase 2 PTY 并行推进**。理由:
 - 2026-04-25 T-0303 光标追踪 merged 一次过. 写码 commit message 主动引用 T-0302 决策 3 原话 "比 From trait 建议更严更好", T-0302 类型隔离范式二次应用零偏差. cursor_shape / cursor_visible 拆两层 API 比 alacritty 上游更干净, exhaustive match catches 上游加 variant 的回归. Phase 3 进度 3/7
 - 2026-04-25 用户提出 orchestration 重构方向: per-ticket fresh agent + 结构化 docs handoff (替代长 session agent), 强制 single-source-of-truth 纪律, 配套 400k 腐烂规则. T-0303 是当前长 session 最后一审, T-0304 起切换新模式
 - 2026-04-25 T-0304 scrollback merged. **per-ticket fresh agent 范式首跑**. 写码-T0304 30 min 完工 73 tests 全绿派单 100% 对齐. 中间踩到 Claude Code routing bug: 中文 agent name (写码-T0304/审码-T0304) 触发 SendMessage swap (to=A 实际投到 B), 审码空 idle 没收到 spawn prompt. 写码 fresh agent 完全靠 conventions.md + handoff §5 内化, 准确识别 self-review 灾难拒绝执行. kill 重 spawn ASCII name (reviewer-T0304) 后审码顺利 +1. Phase 3 进度 4/7. 教训: agent name 强制 ASCII (memory ⭐⭐⭐ feedback_agent_name_ascii_only)
+- 2026-04-25 T-0305 色块渲染 merged. Phase 3 视觉里程碑达成: 跑 cargo run 第一次"看见东西". writer-T0305 943 行 diff 跨 src/term + src/wl/render + src/wl/window 三模块 + WGSL inline shader, 77 tests 全绿. fg vs bg 决策 goal-driven 偏离派单 (派单写 bg, 实际用 fg 因 bg 在深蓝清屏不可见违反 goal "看见 prompt 字符位置"), writer 主动告知, reviewer 独立判 ✅ 接受 (Goal binding > Scope wording). Lead 跟进同步更新 INV-002 加 cell_pipeline / cell_vertex_buffer 字段说明. Phase 3 进度 5/7
 - (后续每个阶段起止在这追加)
