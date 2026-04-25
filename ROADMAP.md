@@ -97,7 +97,7 @@ Lead 决定:**T-0104 + Phase 2 PTY 并行推进**。理由:
 
 ---
 
-## Phase 4 — cosmic-text + CJK 7/8 (T-0406 待派)
+## Phase 4 — cosmic-text + CJK 8/8 ✅ 收尾完成
 
 - [x] `T-0401` cosmic-text 字体子系统初始化 (TextSystem + ShapedGlyph + INV-010 第 7 次应用) ✅ merged
 - [x] `T-0402` shaping pipeline (shape_line + ShapedGlyph x_offset/y_offset, INV-010 第 8 次) ✅ merged
@@ -106,7 +106,7 @@ Lead 决定:**T-0104 + Phase 2 PTY 并行推进**。理由:
 - [x] `T-0404` HiDPI 2x scale hardcode (HIDPI_SCALE=2 const + font 17→34 + Renderer surface ×2, 用户 224 ppi 单显示器固定) ✅ merged
 - [x] `T-0408` headless screenshot (offscreen render → PNG, agent 自验视觉, ADR 0005 image crate, INV-010 第 11 次) ✅ merged 🎯 **agent 自验视觉模式启动**: cargo run -- --headless-screenshot=PATH 写 1600×1200 PNG, agent Read PNG 直接 verify 不依赖 GNOME / Wayland / portal
 - [x] `T-0405` CJK fallback verify (集成测试 printf 你好 hello → PNG + 双宽 advance assert + T-0408 三源 PNG verify SOP 首用) ✅ merged 🎯 **agent 自验视觉首战**: writer + Lead + reviewer 三方独立 Read /tmp/cjk_test.png 验 "你 好  hello" 浅灰深蓝, 跨 face fallback ratio=1.67 自然落值, 全程零 user 截图依赖
-- [ ] `T-0406` glyph cache + LRU 驱逐
+- [x] `T-0406` glyph atlas clear-on-full (KISS, 替代 T-0403 panic 路径, 非真 LRU; allocate_glyph_slot + render_headless 双源同改 + tracing::warn + fall through shelf packing) ✅ merged 🎉 **Phase 4 8/8 收尾**: 124 tests, INV-010 第 12 次, 三源 PNG verify 一致, atlas baseline 路径不破
 
 **产出**:真字形渲染,中文英文都对。
 
@@ -199,4 +199,5 @@ Lead 决定:**T-0104 + Phase 2 PTY 并行推进**。理由:
 - 2026-04-25 **T-0408 R2 merged (HIDPI 适配 + tuple API)**: T-0404 提前合让 T-0408 fork-point 落后, writer-T0408 二次 rebase + 适配 HIDPI_SCALE × 2 (physical_w/h / cell px / baseline 全 ×2 + bytes_per_row 256 对齐基于 physical). API 签名 Result<Vec<u8>> → Result<(Vec<u8>, u32, u32)> caller decoupling. PNG /tmp/quill_t0408_v2.png 1600×1200 / 47KB, Lead + reviewer 双源 Read PNG verify 视觉 (字号 ×2 真放大). 8 文件 +1375 (+57 vs R1). 120 tests (+2 from T-0404). INV-010 第 11 次. **教训** (Lead orchestration): 视觉验证基建 (T-0408 类) 应比依赖它的功能 ticket 优先合, 否则后到 ticket 必 rebase
 - 2026-04-25 Phase 4 进度 6/8: T-0405 CJK fallback simplify (T-0407 face lock 已部分覆盖, 缩简为 verify 中文 fallback 1 单) + T-0406 LRU cache 待派
 - 2026-04-25 **T-0405 merged (CJK verify, T-0408 三源 PNG verify SOP 首战)**: 集成测试 cjk_chars_render_to_png_via_noto_fallback (PtyHandle::spawn_program("printf", &["你好 hello\n"]) → render_headless 800×600 logical → PngEncoder 写 /tmp/cjk_test.png) + cjk_glyph_uses_fallback_face_not_primary (shape "你" face_id ≠ primary_face_id verify CJK fallback 真触发到 Noto CJK / Source Han Sans). shape_line_mixed_cjk 双宽 advance 软性 assert range [1.4, 2.4] (跨 face fallback 实测 ratio=1.67, 严 2:1 仅同 face 内才命中). **三源 PNG verify SOP 全程零 user 截图依赖**: writer Read PNG 自验 + Lead Read PNG 验 "你 好  hello" 浅灰深蓝 + reviewer Read PNG 第三源验, 三源全一致. 3 文件 +283/-5, 122 tests (+2). INV-001..010 全维持, 派单 Out 清单全未动 (零 src/wl/src/pty/main.rs/invariants/Cargo.toml 改). reviewer audit 4 项偏离全接受 (ratio range 跨 face 设计真相 + test 2 face_id verify 是 T-0407 audit P3-4 落地). **agent 自验视觉模式实战首战**: 不依赖 user 截图反馈循环, 1 单走完 5 步流程 + 三源 audit 1 round pass. Phase 4 进度 7/8 (T-0406 LRU 最后一单)
+- 2026-04-25 **T-0406 merged → 🎉 Phase 4 8/8 收尾完成**: glyph atlas clear-on-full (KISS, 替代 T-0403 panic 遗留路径). 改 src/wl/render.rs::allocate_glyph_slot + render_headless 双源同改 (writer 主动告知偏离 #1 跨函数同改, reviewer accept), atlas 满 → tracing::warn! + 清 allocations + reset shelf cursor (cursor_x/cursor_y/row_height) → fall through shelf packing 当帧重 raster (1 帧 hiccup, 用户基本看不见). **不真 LRU**: ROADMAP "T-0406 LRU" 命名沿用历史, 真 LRU 需 slab + 单槽位驱逐 + free-list 跟当前 shelf packing 不兼容; clear-on-full KISS 等价 (终端字符集稳定). 零 GPU resource churn (texture/bind_group/view/sampler 全保留). 3 文件 +259/-24 (含集成测试 atlas_clear_on_full.rs 2 测试: full → clear no panic + clear 后视觉像素 ≥300). 124 tests (+2). 三源 PNG verify atlas baseline /tmp/T-0406-baseline.png 一致 (cell 90 / glyph 90 / atlas 12 与 T-0405/0407/0408 同源). INV-010 第 12 次零真违规. **Phase 4 全收尾**: T-0401-0408 (8/8) 全合, ASCII prompt 真显示 + HiDPI 2x + headless screenshot + CJK fallback verify + atlas full-safe 全到位. 下阶段 Phase 5 fcitx5 输入法
 - (后续每个阶段起止在这追加)
