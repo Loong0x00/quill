@@ -2,7 +2,7 @@
 
 **Phase**: 4
 **Assigned**: writer-T0404
-**Status**: in-review
+**Status**: merged
 **Budget**: tokenBudget=30k (小单)
 **Dependencies**: T-0306 (cell 常数化) / T-0403 (glyph atlas + draw_frame)
 
