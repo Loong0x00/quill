@@ -214,7 +214,11 @@ impl PtyHandle {
             // 直到 drop, 此处 write 是只调 syscall 不动 fd 所有权.
             #[allow(unsafe_code)]
             let n = unsafe {
-                libc::write(self.raw_fd(), bytes.as_ptr() as *const libc::c_void, bytes.len())
+                libc::write(
+                    self.raw_fd(),
+                    bytes.as_ptr() as *const libc::c_void,
+                    bytes.len(),
+                )
             };
             if n >= 0 {
                 return Ok(n as usize);

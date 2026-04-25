@@ -69,6 +69,7 @@ fn render_headless_with_shell_prompt() -> (Vec<u8>, u32, u32) {
         &row_texts,
         LOGICAL_W,
         LOGICAL_H,
+        None,
     )
     .expect("render_headless failed")
 }
