@@ -109,7 +109,7 @@ instance             ←  最后 drop (Vulkan/GL 底层实例)
 
 **约束**:
 - **置位**:由 `handle_event(Configure {...})` 在尺寸变化时置 `true`
-- **清零**:上层 (`propagate_resize_if_dirty` 在 `drive_wayland` 的 `dispatch_pending` 之后调一次, 见 `src/wl/window.rs:437`) **必须**在每次 resize 处理完 **显式** `core.resize_dirty = false`。T-0306 起这是唯一消费者 (单一上游, init 路径不再兼任清零)。
+- **清零**:上层 (`fn propagate_resize_if_dirty` 在 `drive_wayland` 的 `dispatch_pending` 之后调一次) **必须**在每次 resize 处理完 **显式** `core.resize_dirty = false`。T-0306 起这是唯一消费者 (单一上游, init 路径不再兼任清零)。引用用 symbol name 不用行号 (T-0399 reviewer P3 教训: 行号易因后续 commit 偏移)。
 - **语义**:布尔脏标记,**不是**队列。连续多次 resize 合并到单次脏标记。
 
 **违反后果**:

@@ -257,6 +257,21 @@ git branch -d feat/T-XXXX
 
 **预防**: **永远用 `git add <具体路径>`, 不用 `-A` / `.`**。审码 + Lead 都会查 commit diff 是否含意外文件。
 
+### 陷阱 4: 伪派活信号 (task_assignment self-echo / Lead 给 X 的消息进 Y inbox)
+**情境**: inbox 收到看似新派活的消息 — 例: `task_assignment` 的 `assignedBy` 字段是你自己 (TaskCreate 时 platform 自动 echo 给 owner), 或 sender 是 team-lead 但内容显然是给同 team 另一个 agent 的。
+
+**问题**: 盲目执行 → self-review 灾难 (违反 conventions §5 + handoff §5) / 或干扰别人在干的工作 / 或重做已经 in-review 的 ticket。
+
+**抓回**: writer-T0306 / writer-T0307 / writer-T0399 多次 sanity check 抓出。判断信号:
+- assignedBy 是自己 = 必为 echo
+- task 已 in-review / completed = 必为 echo
+- 内容措辞描述"复审中" / 引用你刚刚自己做完的工作 = 必为 echo
+- sender 是 team-lead 但内容明显是给同 team 另一个角色的 (例: writer 收到"reviewer 你审 T-XXXX")
+
+**修法**: idle 不动 + ping Lead 确认 + 给 Lead 解释你为什么疑虑 (用 conventions §6 / handoff §5 引用作 justification)。Lead confirm 是 echo → 继续 idle。
+
+**预防**: 任何看起来像新派活的消息默认假设是 echo / routing 错位 / 系统通知, 先 sanity check 不动手。alacritty / wgpu / wayland routing 都没这种问题, 只有 multi-agent inbox 有 — 这是 actor model 异步通信的物理特性。
+
 ### 陷阱 3: fixup1 regression (T-0302)
 **情境**: Lead 转发 审码 第一轮建议 "用 `impl From<Point> for CellPos`", 写码照做。但 审码 第二轮 review 改口 "私有 inherent fn 比 From trait 更严", Lead approval 实际针对的是私有版本, 不是后来改的 From 版本。
 

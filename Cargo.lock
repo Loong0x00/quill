@@ -970,7 +970,6 @@ dependencies = [
  "portable-pty",
  "raw-window-handle",
  "smithay-client-toolkit",
- "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
  "wayland-backend",
