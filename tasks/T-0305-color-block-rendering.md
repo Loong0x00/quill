@@ -1,8 +1,8 @@
 # T-0305 色块渲染 (每 cell 一色块, 无字体)
 
 **Phase**: 3
-**Assigned**: (open)
-**Status**: open
+**Assigned**: writer-T0305
+**Status**: claimed
 **Budget**: tokenBudget=80k (lead 派单)
 **Dependencies**: T-0302 (cells_iter / CellRef) / T-0303 (cursor_pos / cursor_shape) / T-0102 (wgpu Renderer) / T-0108 (LoopData calloop)
 
