@@ -1,8 +1,8 @@
 # T-0401 cosmic-text 字体加载初始化 (Phase 4 起手)
 
 **Phase**: 4
-**Assigned**: (open)
-**Status**: open
+**Assigned**: writer-T0401
+**Status**: claimed
 **Budget**: tokenBudget=80k (lead 派单)
 **Dependencies**: T-0305 (Color + draw_cells) / T-0306 (cell px 常数化)
 
