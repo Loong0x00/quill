@@ -25,6 +25,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 wayland-backend = { version = "0.3", features = ["client_system"] }
 wayland-client = "0.31"
 wgpu = "29"
+# T-0501: Wayland wl_keyboard 协议给 client 的是 evdev scan code, 必须经
+# libxkbcommon 翻译 keymap (compositor 推 fd) + modifier mask → keysym + UTF-8。
+# 手写 keymap parser 不可行 (~5K 行 X.Org DSL), 唯一现实路径是 FFI binding。
+# 详见 docs/adr/0006-xkbcommon-keyboard-decoder.md。
+xkbcommon = "0.8"
 
 [profile.dev]
 opt-level = 1

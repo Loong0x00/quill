@@ -25,7 +25,7 @@
 //!
 //! `PtyHandle` 的五个 pub 方法全部填实。
 
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::fd::RawFd;
 
 use anyhow::{anyhow, Context, Result};
@@ -174,6 +174,44 @@ impl PtyHandle {
                 pixel_height: 0,
             })
             .context("PTY resize ioctl 失败")
+    }
+
+    /// 非阻塞写字节到 master。返回实际写入字节数;`io::ErrorKind::WouldBlock`
+    /// 表示内核 PTY 缓冲满, 调用方按背压策略丢字节或排队。
+    ///
+    /// **why**: T-0501 wl_keyboard event → UTF-8 → 本方法 → 子 shell stdin。
+    /// master fd 已置 `O_NONBLOCK` (INV-009, 由 `spawn_program` 设), 因此
+    /// `take_writer().write` 在 buffer 满时**立即返 WouldBlock 不阻塞**, 与
+    /// INV-005 calloop 单线程要求兼容。
+    ///
+    /// **背压策略**: WouldBlock 由调用方处理。当前 `wl/window.rs` 的
+    /// `Dispatch<WlKeyboard>` 路径见 WouldBlock → `tracing::warn!` + 丢字节
+    /// (派单 In #D "背压: write returns Err WouldBlock → 丢弃, daily drive
+    /// 罕见")。Phase 6 若加 `--paste-throttle` 类 feature 再扩排队路径。
+    ///
+    /// **why `&self` 而非 `&mut self`**: master 是 `Box<dyn MasterPty + Send>`,
+    /// `take_writer(&self)` 返 `Box<dyn Write + Send>` (新 dup fd, 与
+    /// `try_clone_reader` 同套路)。每次 write 拿一个临时 writer 写完就 drop —
+    /// dup fd 关闭不影响 master 端 OFD (INV-008 reader/master/child 序保持)。
+    /// 不缓存 writer 是因为 portable-pty 的 `MasterPty::take_writer` 内部已
+    /// dup, 多次调用各得独立 fd, 且 `Write::write` 自身不持状态; 缓存 writer
+    /// 反而需要 `&mut self` 与 keyboard event 路径的 split borrow 不友好。
+    ///
+    /// **不重试**: WouldBlock 不在内部重试 (会在单线程事件循环内忙等 → 违反
+    /// INV-005)。`Interrupted` (EINTR) 内部立即重试一次 — 与 stdlib 的
+    /// `write_all` 一致风格, signal 期间偶发 syscall 中断不应让用户看到。
+    pub fn write(&self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        let mut writer = self.master.take_writer().map_err(io::Error::other)?;
+        loop {
+            match writer.write(bytes) {
+                Ok(n) => return Ok(n),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// 非阻塞查子进程退出状态。`Ok(None)` = 仍在跑,`Ok(Some(code))` = 已退出。
