@@ -2,7 +2,7 @@
 
 **Phase**: 4
 **Assigned**: writer-T0403
-**Status**: in-review
+**Status**: merged
 **Budget**: tokenBudget=120k (Phase 4 最大单)
 **Dependencies**: T-0401 (TextSystem + SwashCache 字段) / T-0402 (shape_line + ShapedGlyph 含 x_offset/y_offset) / T-0305 (draw_cells wgpu pipeline)
 
