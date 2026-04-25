@@ -181,6 +181,12 @@ struct LoopData {
     state: State,
     term: Option<crate::term::TermState>,
     loop_signal: LoopSignal,
+    /// T-0399 P1-1 接入: idle callback 每次成功 draw 后调 `record_and_log`,
+    /// 满 [`crate::frame_stats::FRAME_WINDOW`] 帧通过 `tracing::info!`
+    /// (target=`quill::frame`) 打一行 — Phase 6 soak 用此采集点观察帧卡顿
+    /// 与 RSS 漂移。POD (无 GPU 引用), drop 顺序无关, 放尾部不与 INV-001
+    /// 链条 (renderer→window→conn) 耦合。
+    frame_stats: crate::frame_stats::FrameStats,
 }
 
 // T-0108 删除:`run_main_loop` / `StepResult` / `install_signal_handlers` /
@@ -703,6 +709,10 @@ pub fn run_window() -> Result<()> {
         // Phase 3 T-0306 接窗口 resize 时会重建 Term 或调用 resize method。
         term: Some(crate::term::TermState::new(80, 24)),
         loop_signal: loop_signal.clone(),
+        // T-0399 P1-1: FrameStats 接采集点。空 stats, idle callback 每次成功
+        // draw_cells 后调 record_and_log; Phase 6 soak 通过 `quill::frame`
+        // target 观察帧间隔聚合。
+        frame_stats: crate::frame_stats::FrameStats::new(),
     };
     event_loop
         .run(None, &mut loop_data, |data| {
@@ -717,9 +727,14 @@ pub fn run_window() -> Result<()> {
             // draw_cells 一帧 + clear_dirty。term 不 dirty 则 no-op 不画(避免
             // 空跑 GPU,与 INV-006 resize_dirty 同思路)。
             //
-            // borrow split: data.term 与 data.state.renderer 是 LoopData 不同字段,
-            // 一次解构同时拿两个 &mut 不冲突。
-            let LoopData { state, term, .. } = &mut *data;
+            // borrow split: data.term / data.state.renderer / data.frame_stats
+            // 都是 LoopData 不同字段, 一次解构同时拿三个 &mut 不冲突。
+            let LoopData {
+                state,
+                term,
+                frame_stats,
+                ..
+            } = &mut *data;
             let Some(t) = term.as_mut() else {
                 return;
             };
@@ -743,6 +758,11 @@ pub fn run_window() -> Result<()> {
                     "draw_cells 失败, 跳过本帧 (dirty 仍清, 避免下轮再撞同样错)"
                 );
             }
+            // T-0399 P1-1: 记录本帧 present 时间; 每满 FRAME_WINDOW (60) 帧
+            // 走一次 tracing::info! (target=quill::frame), Phase 6 soak 用此
+            // 信号观察帧间隔聚合 + RSS 漂移。失败路径也记 — 帧"尝试"算一次
+            // present (与 dirty 清零节奏对齐, 一次 idle 一次 record)。
+            frame_stats.record_and_log(std::time::Instant::now());
             t.clear_dirty();
         })
         .context("calloop EventLoop::run 失败")?;
