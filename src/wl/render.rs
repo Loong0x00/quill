@@ -274,6 +274,32 @@ pub const CELL_W_PX: f32 = 10.0;
 /// **cell 像素高度** —— Phase 3 临时常数。配套见 [`CELL_W_PX`]。
 pub const CELL_H_PX: f32 = 25.0;
 
+/// **HiDPI 整数缩放常数** (T-0404 简化版, hardcode 2x)。
+///
+/// **why hardcode 而非 wl_output.scale event**: 用户硬偏好 (派单 Out 段),
+/// 单显示器 224 ppi 固定 2x 不变。多显示器 / 不同 ppi 切换是 Phase 5+ scope。
+/// `wl_output.scale` 协议接入需要 wl_output Dispatch + per-output 状态机, 复杂度
+/// 与本 ticket "字看清楚" 这条 acceptance 严重不匹配。
+///
+/// **数值含义**: surface backing 物理像素 = logical 像素 × HIDPI_SCALE。
+/// - [`Renderer::resize`] / [`Renderer::new`] 接收 logical px (调用方
+///   `cells_from_surface_px` 等仍用 logical), 内部 surface.configure 用
+///   logical × HIDPI_SCALE
+/// - shape / rasterize 走 `font_size × HIDPI_SCALE` (logical 17pt → physical 34pt),
+///   bitmap 也按物理像素出, 上 atlas 后渲染清晰
+/// - 顶点 NDC 计算用 `cell_w_px × HIDPI_SCALE` / `cell_h_px × HIDPI_SCALE`
+///   (NDC 公式 `pos_px / surface_w × 2 - 1` 中 surface_w 已是 physical, cell px
+///   也必须是 physical 才对齐)
+///
+/// **224 ppi 单显示器 1:1 显示**: Wayland compositor (mutter) 在 HiDPI 输出上
+/// 把 client surface 的物理像素直接映射屏幕物理 px (1:1 不缩放), 字形清晰。
+/// 96 ppi 屏幕上字会过大 — 派单 Out 段允许 (用户单一显示器场景)。
+///
+/// 测试覆盖: [`tests::hidpi_scale_is_2`] (常数 lock) +
+/// [`crate::text::tests::rasterize_at_2x_font_size_doubles_bitmap_width`]
+/// (raster 真翻倍验证)。
+pub const HIDPI_SCALE: u32 = 2;
+
 /// 每顶点字节数:`pos[2 f32] + color[3 f32]` = 20 字节。手算固化,WGSL 端
 /// 与本常量必须一致(见 [`CELL_WGSL`])。
 const VERTEX_BYTES: usize = 5 * std::mem::size_of::<f32>();
@@ -383,11 +409,17 @@ impl Renderer {
             .copied()
             .ok_or_else(|| anyhow!("surface 无可用 alpha mode"))?;
 
+        // T-0404: surface backing 像素 = logical × HIDPI_SCALE。Renderer 内部
+        // self.config.width / height 始终是 physical px, NDC 换算 / cell 像素都
+        // 走 physical (与 [`Self::resize`] 同语义)。`cells_from_surface_px` 在
+        // window.rs 用 logical px 算 cols/rows, 不经过本配置。
+        let physical_w = width.max(1).saturating_mul(HIDPI_SCALE);
+        let physical_h = height.max(1).saturating_mul(HIDPI_SCALE);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
-            width: width.max(1),
-            height: height.max(1),
+            width: physical_w,
+            height: physical_h,
             present_mode: wgpu::PresentMode::Fifo,
             desired_maximum_frame_latency: 2,
             alpha_mode,
@@ -438,17 +470,33 @@ impl Renderer {
     ///
     /// **draw_cells 的 NDC 换算**(`x / surface_w * 2 - 1`)读 `self.config.width
     /// / height`,所以 resize 后下一次 draw_cells 自动用新尺寸,不需要额外通知。
+    ///
+    /// **T-0404 HiDPI**: 接收的 `width / height` 是 **logical** 像素
+    /// (Wayland compositor configure 给的尺寸, `WindowCore` 也存 logical),
+    /// surface.configure 实际用 `width × HIDPI_SCALE / height × HIDPI_SCALE`
+    /// (physical 像素 = backing buffer)。Wayland compositor (mutter) 在 HiDPI
+    /// 输出上把 surface 物理像素 1:1 映射到屏幕, 字形清晰。
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
         }
-        if width == self.config.width && height == self.config.height {
+        // T-0404: physical = logical × HIDPI_SCALE; saturating_mul 防 overflow
+        // (虽然 logical px 实际不会溢出, defense-in-depth)。
+        let physical_w = width.saturating_mul(HIDPI_SCALE);
+        let physical_h = height.saturating_mul(HIDPI_SCALE);
+        if physical_w == self.config.width && physical_h == self.config.height {
             return;
         }
-        self.config.width = width;
-        self.config.height = height;
+        self.config.width = physical_w;
+        self.config.height = physical_h;
         self.surface.configure(&self.device, &self.config);
-        tracing::debug!(width, height, "wgpu surface reconfigured (resize)");
+        tracing::debug!(
+            logical_w = width,
+            logical_h = height,
+            physical_w,
+            physical_h,
+            "wgpu surface reconfigured (HIDPI scaled)"
+        );
     }
 
     /// 拿到下一帧 texture,清屏,present。Acquire 失败(Outdated / Lost /
@@ -553,10 +601,17 @@ impl Renderer {
         // 调用方(window.rs configure callback)按 `cols = surface_w / CELL_W_PX`
         // 算 cols 推给 term.resize,cells 数量与 cell px 自然匹配 surface,
         // 余下边距(surface_w % CELL_W_PX)Phase 4 再细化(派单允许)。
+        //
+        // T-0404 HiDPI: self.config.width 是 physical px (Renderer::resize 已乘
+        // HIDPI_SCALE), 所以 cell px 在 NDC 换算里也必须是 physical (× HIDPI_SCALE)
+        // 才与 surface_w 单位一致 — 否则 80×24 cells 只占 surface 一半 (logical px
+        // 数对上 physical px 分母)。cols/rows 由 window.rs cells_from_surface_px
+        // 用 logical px 算, 与本处 physical 解耦 (logical_w / CELL_W_PX ==
+        // physical_w / (CELL_W_PX × HIDPI_SCALE), 两侧自洽)。
         let surface_w = self.config.width.max(1) as f32;
         let surface_h = self.config.height.max(1) as f32;
-        let cell_w_px = CELL_W_PX;
-        let cell_h_px = CELL_H_PX;
+        let cell_w_px = CELL_W_PX * HIDPI_SCALE as f32;
+        let cell_h_px = CELL_H_PX * HIDPI_SCALE as f32;
 
         let vertex_bytes = self.build_vertex_bytes(
             cells,
@@ -890,10 +945,13 @@ impl Renderer {
         self.ensure_glyph_pipeline();
 
         // Step 2: cell pixel size (与 draw_cells 同源)。
+        // T-0404: physical px (× HIDPI_SCALE), 见 draw_cells 同段注释解释 cell
+        // px 与 surface_w 单位必须同 (physical) 的理由。
         let surface_w = self.config.width.max(1) as f32;
         let surface_h = self.config.height.max(1) as f32;
-        let cell_w_px = CELL_W_PX;
-        let cell_h_px = CELL_H_PX;
+        let cell_w_px = CELL_W_PX * HIDPI_SCALE as f32;
+        let cell_h_px = CELL_H_PX * HIDPI_SCALE as f32;
+        let baseline_y_px = BASELINE_Y_PX * HIDPI_SCALE as f32;
 
         // Step 3: cell vertex bytes (T-0407 D fix: 走 bg 色, 让 glyph fg 字形
         // 在 cell bg 块上可见; T-0403 用 fg 致字形被 cell fg 块"涂同色"不可见,
@@ -950,8 +1008,13 @@ impl Renderer {
                 // 世界坐标 (像素): cell 顶部 + baseline_y - bearing_y, cell 左 +
                 // bearing_x。x_offset 是 line-relative 累积位置 (cosmic-text g.x),
                 // 单行 shape 时等价于 col * cell_w_px (monospace 对齐), 直接用。
+                //
+                // T-0404: glyph.x_offset / bearing_x / bearing_y / slot.width /
+                // slot.height 都已经是 physical px (shape_line 用 17 × HIDPI_SCALE
+                // metrics, rasterize 出的 bitmap 也是 physical 尺寸), 与 cell_h_px /
+                // baseline_y_px (× HIDPI_SCALE) 单位一致, 直接相加无需再乘。
                 let x_left = glyph.x_offset + slot.bearing_x as f32;
-                let y_top = (row_idx as f32) * cell_h_px + BASELINE_Y_PX - slot.bearing_y as f32;
+                let y_top = (row_idx as f32) * cell_h_px + baseline_y_px - slot.bearing_y as f32;
                 let x_right = x_left + slot.width as f32;
                 let y_bot = y_top + slot.height as f32;
 
@@ -1459,5 +1522,18 @@ mod tests {
         assert!(c.r < 10.0 / 255.0);
         assert!(c.g < 16.0 / 255.0);
         assert!(c.b < 48.0 / 255.0);
+    }
+
+    /// T-0404: HIDPI_SCALE 是 hardcode 2x 简化版 (派单 In #A 模块顶部 const)。
+    /// 锁住此常数防 Phase 4+ 顺手改回 1 (字会糊) / 改成 1.5 (cosmic-text raster
+    /// 尺寸非整数, atlas 装载浮点 trade-off 复杂)。Phase 5+ 真接 wl_output.scale
+    /// 时本测试改为 dynamic 路径 + 删此常数。
+    #[test]
+    fn hidpi_scale_is_2() {
+        assert_eq!(
+            HIDPI_SCALE, 2,
+            "T-0404 hardcode 2x 简化版 — 派单 Out 段明示不接 wl_output.scale event \
+             (用户硬偏好); 改此常数前先看 docs/audit/2026-04-25-T-0404-review.md"
+        );
     }
 }
