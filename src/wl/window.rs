@@ -181,6 +181,12 @@ struct LoopData {
     state: State,
     term: Option<crate::term::TermState>,
     loop_signal: LoopSignal,
+    /// T-0399 P1-1 接入: idle callback 每次成功 draw 后调 `record_and_log`,
+    /// 满 [`crate::frame_stats::FRAME_WINDOW`] 帧通过 `tracing::info!`
+    /// (target=`quill::frame`) 打一行 — Phase 6 soak 用此采集点观察帧卡顿
+    /// 与 RSS 漂移。POD (无 GPU 引用), drop 顺序无关, 放尾部不与 INV-001
+    /// 链条 (renderer→window→conn) 耦合。
+    frame_stats: crate::frame_stats::FrameStats,
 }
 
 // T-0108 删除:`run_main_loop` / `StepResult` / `install_signal_handlers` /
@@ -411,6 +417,22 @@ pub(crate) fn cells_from_surface_px(width: u32, height: u32) -> (usize, usize) {
     (cols.max(1), rows.max(1))
 }
 
+/// 纯逻辑决策:看 `core.resize_dirty` 决定 [`propagate_resize_if_dirty`]
+/// 是否真要消费一轮 (renderer/term/pty 三方同步) 还是早返。
+///
+/// 抽出来理由 (T-0399 P2-6, conventions §3 抽状态机模式):
+/// `propagate_resize_if_dirty` 含 wgpu Surface / PtyHandle / TermState 三大
+/// owned 资源, headless 单测构造 LoopData 成本 = 起真 wayland 连接 + spawn
+/// 子进程, 不可行。**抽决策点为纯 bool fn 单独测**, 副作用链 (renderer/term/
+/// pty 三方 resize 顺序 + 清 dirty) 由 `tests/resize_chain.rs` 集成测试 +
+/// `cells_from_surface_px_*` 4 个单测覆盖。
+///
+/// 与 [`pty_readable_action`] / [`handle_event`] 同款套路:决策与副作用分离,
+/// 决策 headless 测, 副作用 trace + 集成测试覆盖。
+pub(crate) fn should_propagate_resize(resize_dirty: bool) -> bool {
+    resize_dirty
+}
+
 /// 把 `core.resize_dirty` 触发的 resize 同步推给 renderer / term / pty 三方。
 /// `drive_wayland` 在 `dispatch_pending` 之后调一次 —— configure event 在 dispatch
 /// 时跑 `WindowHandler::configure` → `handle_event` 置 dirty,本 fn 紧接消费。
@@ -435,7 +457,7 @@ pub(crate) fn cells_from_surface_px(width: u32, height: u32) -> (usize, usize) {
 /// `&mut state.pty / &mut state.renderer / &mut state.core / &mut term` 四份;
 /// LoopData 不同字段间 NLL OK,且 state.* 与 term 是独立 LoopData 字段。
 fn propagate_resize_if_dirty(data: &mut LoopData) {
-    if !data.state.core.resize_dirty {
+    if !should_propagate_resize(data.state.core.resize_dirty) {
         return;
     }
     let LoopData { state, term, .. } = &mut *data;
@@ -605,13 +627,19 @@ pub fn run_window() -> Result<()> {
     let loop_signal = event_loop.get_signal();
 
     // Source 1:wayland fd。用 conn.backend().poll_fd() 拿 BorrowedFd。生命周期
-    // 擦成 'static 由 drop 序保障(event_loop 本地变量在 state 之前 drop,
-    // 其内持有的 Generic source 也随之 drop,之后 state.conn 才关闭)。
+    // 擦成 'static 由 drop 序 + calloop 内部对已关 fd 容忍保障。
     // SAFETY:
-    // - poll_fd 返回的 fd 是 wayland_backend Connection 内部 socket,state.conn
-    //   持有该 Connection 的 Arc 引用到 run_window 结束 → fd 活
-    // - Rust 反向 drop 保证 event_loop(以及它拥有的 source)先于 state 被 drop;
-    //   BorrowedFd<'static> 的生命期在代码流上不超过 event_loop 本身
+    // - poll_fd 返回的 fd 是 wayland_backend Connection 内部 socket;state.conn
+    //   持有该 Connection 的 Arc 引用,在 run_window scope 内一直活
+    // - 实际 drop 序 (T-0108 重构后, T-0399 housekeeping 校正): event_loop 在
+    //   line 602 声明、loop_data 在 line 685 声明 → Rust 反向声明顺序 →
+    //   loop_data 先 drop (loop_data.state.conn 关 wayland fd) → event_loop
+    //   后 drop (event_loop 内 Generic source 的 epoll_ctl(EPOLL_CTL_DEL)
+    //   对此时已关闭的 fd 调用)。Linux kernel 对 EPOLL_CTL_DEL 已关 fd 返
+    //   EBADF, calloop 0.14 内部容忍 (silent ignore / log), **非 UB**
+    // - 即 `BorrowedFd<'static>` 的"语法 'static"不依赖 fd 实际活到 event_loop
+    //   drop 那一刻;依赖 calloop 内部 syscall 容忍 EBADF (drop-time race
+    //   safe by design of epoll API + calloop)
     // - poll_fd.as_raw_fd() 只取 int,不涉资源转移
     #[allow(unsafe_code)]
     let wayland_fd: BorrowedFd<'static> = unsafe {
@@ -641,11 +669,19 @@ pub fn run_window() -> Result<()> {
         .map_err(|e| anyhow!("calloop insert_source(signals) 失败: {e}"))?;
 
     // Source 3:PTY master fd。回调在 pty_read_tick 里做 read + trace + 退出判定。
-    // SAFETY: pty_fd 来自 state.pty.as_ref().raw_fd()(PtyHandle 构造时
-    // as_raw_fd().ok_or_else 校验 Some 一次);state.pty 持有 PtyHandle 到
-    // run_window 结束,Rust 反向 drop 保证 event_loop(含 Generic source)先
-    // 于 state.pty 被 drop,BorrowedFd<'static> 的实际生命期被 drop 序约束在
-    // state.pty 寿命内。fcntl / read 都不涉所有权转移。
+    // SAFETY:
+    // - pty_fd 来自 state.pty.as_ref().raw_fd()(PtyHandle 构造时
+    //   as_raw_fd().ok_or_else 校验 Some 一次)。state.pty 持有 PtyHandle 在
+    //   run_window scope 内一直活
+    // - 实际 drop 序 (T-0108 重构后, T-0399 housekeeping 校正): event_loop 在
+    //   line 602 声明、loop_data 在 line 685 声明, state 已被 move 进
+    //   loop_data.state → Rust 反向声明顺序 → loop_data 先 drop (按字段顺序
+    //   关 state.pty 的 master fd) → event_loop 后 drop (Generic source 的
+    //   epoll_ctl(EPOLL_CTL_DEL) 对此时已关闭的 pty fd 调用)。Linux kernel
+    //   对 EPOLL_CTL_DEL 已关 fd 返 EBADF, calloop 0.14 内部容忍, **非 UB**
+    // - 即 `BorrowedFd<'static>` 的"语法 'static"不依赖 fd 实际活到 event_loop
+    //   drop 那一刻;依赖 calloop 内部 syscall 容忍 EBADF。fcntl / read 都不
+    //   涉所有权转移
     #[allow(unsafe_code)]
     let pty_borrowed: BorrowedFd<'static> = unsafe { BorrowedFd::borrow_raw(pty_fd) };
     loop_handle
@@ -689,6 +725,10 @@ pub fn run_window() -> Result<()> {
         // Phase 3 T-0306 接窗口 resize 时会重建 Term 或调用 resize method。
         term: Some(crate::term::TermState::new(80, 24)),
         loop_signal: loop_signal.clone(),
+        // T-0399 P1-1: FrameStats 接采集点。空 stats, idle callback 每次成功
+        // draw_cells 后调 record_and_log; Phase 6 soak 通过 `quill::frame`
+        // target 观察帧间隔聚合。
+        frame_stats: crate::frame_stats::FrameStats::new(),
     };
     event_loop
         .run(None, &mut loop_data, |data| {
@@ -703,9 +743,14 @@ pub fn run_window() -> Result<()> {
             // draw_cells 一帧 + clear_dirty。term 不 dirty 则 no-op 不画(避免
             // 空跑 GPU,与 INV-006 resize_dirty 同思路)。
             //
-            // borrow split: data.term 与 data.state.renderer 是 LoopData 不同字段,
-            // 一次解构同时拿两个 &mut 不冲突。
-            let LoopData { state, term, .. } = &mut *data;
+            // borrow split: data.term / data.state.renderer / data.frame_stats
+            // 都是 LoopData 不同字段, 一次解构同时拿三个 &mut 不冲突。
+            let LoopData {
+                state,
+                term,
+                frame_stats,
+                ..
+            } = &mut *data;
             let Some(t) = term.as_mut() else {
                 return;
             };
@@ -729,6 +774,11 @@ pub fn run_window() -> Result<()> {
                     "draw_cells 失败, 跳过本帧 (dirty 仍清, 避免下轮再撞同样错)"
                 );
             }
+            // T-0399 P1-1: 记录本帧 present 时间; 每满 FRAME_WINDOW (60) 帧
+            // 走一次 tracing::info! (target=quill::frame), Phase 6 soak 用此
+            // 信号观察帧间隔聚合 + RSS 漂移。失败路径也记 — 帧"尝试"算一次
+            // present (与 dirty 清零节奏对齐, 一次 idle 一次 record)。
+            frame_stats.record_and_log(std::time::Instant::now());
             t.clear_dirty();
         })
         .context("calloop EventLoop::run 失败")?;
@@ -1102,6 +1152,31 @@ mod tests {
             cells_from_surface_px(805, 612),
             (80, 24),
             "余数 5px / 12px 应被截断, 不上取"
+        );
+    }
+
+    // ---------- T-0399 P2-6 should_propagate_resize 纯逻辑单测 ----------
+    // propagate_resize_if_dirty 含 wgpu/PtyHandle/TermState 三大 owned 资源,
+    // headless 单测构造成本太高 (审码 P2-6 派单允许抽决策点纯 fn 测)。本组
+    // 锁住"dirty 决定是否消费一轮"这条 INV-006 关键不变式 — 上层 (T-0306
+    // propagate_resize_if_dirty) 改 early-return 条件时, 这两条单测会拦回归。
+
+    #[test]
+    fn should_propagate_resize_returns_true_when_dirty() {
+        // INV-006 置位路径:handle_event(Configure) 在尺寸变化时置 dirty=true,
+        // 紧接 propagate_resize_if_dirty 应消费一轮 (renderer/term/pty 三方
+        // resize + 清 dirty)。
+        assert!(should_propagate_resize(true), "dirty=true 时应消费一轮");
+    }
+
+    #[test]
+    fn should_propagate_resize_returns_false_when_clean() {
+        // INV-006 早返路径:无 resize event 时 dirty=false, propagate 应早返
+        // 不动 renderer/term/pty (避免空跑 wgpu surface.configure / TIOCSWINSZ
+        // ioctl, 与 INV-006 "布尔脏标记不是队列" 语义对齐)。
+        assert!(
+            !should_propagate_resize(false),
+            "dirty=false 时应早返不消费"
         );
     }
 

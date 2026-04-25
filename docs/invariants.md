@@ -109,7 +109,7 @@ instance             ←  最后 drop (Vulkan/GL 底层实例)
 
 **约束**:
 - **置位**:由 `handle_event(Configure {...})` 在尺寸变化时置 `true`
-- **清零**:上层(T-0103 wgpu swapchain 重建者)**必须**在每次 resize 处理完 **显式** `core.resize_dirty = false`
+- **清零**:上层 (`propagate_resize_if_dirty` 在 `drive_wayland` 的 `dispatch_pending` 之后调一次, 见 `src/wl/window.rs:437`) **必须**在每次 resize 处理完 **显式** `core.resize_dirty = false`。T-0306 起这是唯一消费者 (单一上游, init 路径不再兼任清零)。
 - **语义**:布尔脏标记,**不是**队列。连续多次 resize 合并到单次脏标记。
 
 **违反后果**:
@@ -196,6 +196,45 @@ starvation" 坑的反面。非阻塞 read 得到 `WouldBlock` 时直接返回给
   `set_nonblocking`;若路径里有 `?` 提前返回,需在该分支也保证 fd 被关闭
   (当前实现:`set_nonblocking` 失败时 `pair.master` 还在栈上,提前返回时
   自动 drop 关闭,无 leak)
+
+---
+
+## INV-010: 上游 crate 类型不出公共 API 边界 (类型隔离)
+
+**位置**:`src/term/mod.rs` (alacritty_terminal),未来 `src/text/mod.rs` (cosmic-text),
+`src/ime/mod.rs` (fcitx5 / wayland-protocols),`src/wl/render.rs` (wgpu)。
+
+**约束**:凡是上游 crate 暴露的 enum / struct (例: `alacritty_terminal::index::Point`,
+`alacritty_terminal::vte::ansi::CursorShape`, `cosmic_text::Buffer`,
+`wgpu::TextureFormat`, `wayland_protocols::xdg::*`),一律**不得**作为本 crate
+`pub` 类型 (函数参数 / 返回值 / 字段) 直接暴露。转换走**模块私有 inherent fn**
+`fn from_<crate>(p: UpstreamType) -> Self`,**不**用 `impl From` trait
+(trait impl 会让下游 `p.into()` 反向构造,等同公开类型路径偷渡):
+
+- ❌ `pub use alacritty_terminal::index::Point;`
+- ❌ `pub fn cells_iter() -> impl Iterator<Item = alacritty_terminal::Cell>`
+- ❌ `impl From<alacritty_terminal::index::Point> for CellPos` ← trait 公开 = 偷渡
+- ✅ `pub struct CellPos { col: usize, line: usize }` + `fn from_alacritty(p: AlacPoint) -> Self` (模块私有 inherent)
+- ✅ enum 转换用 **exhaustive match 无 `_ =>`**,编译期 catches 上游加新 variant
+
+**为啥**:上游 crate 主版本 (alacritty 0.x / wgpu 0.x / cosmic-text 0.x) 内部类型
+不稳定 (例 alacritty `Point = {Line(i32), Column(usize)}` 不对称, scrollback 用
+负 i32 line; wgpu 0.20 → 0.29 多次破坏性 API 变更)。一旦上游类型外泄到 quill
+公共 API,换 VT 库 (kitty / termwiz) / wgpu 主版本升级 / wayland-protocols 大
+版本时**必须 cascade 改下游所有调用点**,且类型外泄一次后续永远撤不回 (semver-major break)。
+T-0302 `From<Point> for CellPos` 试错 4 commit 是这条规则的代价证据。
+
+**违反后果**:换 VT / wgpu / cosmic-text / wayland-protocols 上游主版本时 cascade
+refactor,从单点 `from_alacritty` body 改一处变成跨模块改十处 + 公共 API
+semver-major break,quill 用户被迫跟随。
+
+**验证**:
+- `grep -nE 'pub use (alacritty|wgpu|wayland|cosmic)' src/` 应零命中
+- `grep -nE 'impl From<(alacritty|wgpu|wayland|cosmic)' src/` 应零命中
+- 所有 enum 转换 `from_alacritty` / `from_cosmic` / `from_wgpu` 写 exhaustive
+  match 无 `_ =>` arm — 上游加 variant 时 compile error 拦截
+- conventions.md §5 类型隔离 SOP 是日常实施手册;Phase 1-3 已连续 6 个 ticket
+  (T-0302 / T-0303 / T-0304 / T-0305 / T-0306 / T-0307) 零违规
 
 ---
 
