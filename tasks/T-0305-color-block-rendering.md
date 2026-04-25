@@ -2,7 +2,7 @@
 
 **Phase**: 3
 **Assigned**: writer-T0305
-**Status**: claimed
+**Status**: in-review
 **Budget**: tokenBudget=80k (lead 派单)
 **Dependencies**: T-0302 (cells_iter / CellRef) / T-0303 (cursor_pos / cursor_shape) / T-0102 (wgpu Renderer) / T-0108 (LoopData calloop)
 

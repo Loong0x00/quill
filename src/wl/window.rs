@@ -603,7 +603,42 @@ pub fn run_window() -> Result<()> {
         .run(None, &mut loop_data, |data| {
             if data.state.core.exit {
                 data.loop_signal.stop();
+                return;
             }
+            // T-0305: 渲染触发点。`event_loop.run` 的第三参数是每轮 dispatch 之
+            // 后的 idle / post-tick callback (calloop 称 "before next iter"),正是
+            // "wayland fd / pty fd / signalfd 任一 ready 跑完 dispatch 后" 的时
+            // 机 —— PTY 字节进 term.advance 触发 dirty,本闭包看到 dirty 就
+            // draw_cells 一帧 + clear_dirty。term 不 dirty 则 no-op 不画(避免
+            // 空跑 GPU,与 INV-006 resize_dirty 同思路)。
+            //
+            // borrow split: data.term 与 data.state.renderer 是 LoopData 不同字段,
+            // 一次解构同时拿两个 &mut 不冲突。
+            let LoopData { state, term, .. } = &mut *data;
+            let Some(t) = term.as_mut() else {
+                return;
+            };
+            if !t.is_dirty() {
+                return;
+            }
+            let Some(r) = state.renderer.as_mut() else {
+                // renderer 还没建好(首次 configure 之前的 idle tick)。dirty
+                // 留着,等首次 configure 走 init_renderer_and_draw 完成后下一轮
+                // 再画。
+                return;
+            };
+            // T-0305: 全量 cells 收集喂 draw_cells。1920 cell × CellRef(~32 字节
+            // pos+c+fg+bg)= 60 KiB,Vec 分配开销 << wgpu submit 一次的开销,
+            // Phase 6 soak 验 bench 再决定是否 reuse Vec(目前简单胜过聪明)。
+            let cells: Vec<crate::term::CellRef> = t.cells_iter().collect();
+            let (cols, rows) = t.dimensions();
+            if let Err(err) = r.draw_cells(&cells, cols, rows) {
+                tracing::warn!(
+                    ?err,
+                    "draw_cells 失败, 跳过本帧 (dirty 仍清, 避免下轮再撞同样错)"
+                );
+            }
+            t.clear_dirty();
         })
         .context("calloop EventLoop::run 失败")?;
 

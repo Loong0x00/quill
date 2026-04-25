@@ -20,6 +20,8 @@ use raw_window_handle::{
     RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle,
 };
 
+use crate::term::CellRef;
+
 /// 目标深蓝色,sRGB 空间的 `#0a1030`。本 ticket 的 acceptance 把它钉死:
 /// ```text
 /// R = 0x0a = 10, G = 0x10 = 16, B = 0x30 = 48
@@ -57,18 +59,77 @@ fn clear_color_for(format: wgpu::TextureFormat) -> wgpu::Color {
 
 pub struct Renderer {
     // 字段声明顺序即 drop 顺序(Rust 按声明**正向**析构):
-    // surface(第 1)先释放,instance(第 6)最后。surface 依赖 instance 保持
+    // surface(第 1)先释放,instance(最后)最后。surface 依赖 instance 保持
     // Vulkan/GL 实例存活;device/queue 依赖 adapter(已被构造完 drop,device
     // 自带引用保持 GPU context)。见 docs/invariants.md。
+    //
+    // T-0305:`cell_pipeline` / `cell_vertex_buffer` 持 wgpu device 内部引用,
+    // 必须**先于** `device` drop —— 放 surface 之后、device 之前。lazy 初始化
+    // (Option),首次 [`draw_cells`] 时建好 pipeline + 预分配 vertex buffer,
+    // 之后每帧 reuse(`queue.write_buffer` 写新 vertex 数据,不重建)。
+    // 派单 "wgpu Pipeline / Layout / BindGroup 创建一次复用" 的硬约束。
     surface: wgpu::Surface<'static>,
+    cell_pipeline: Option<wgpu::RenderPipeline>,
+    cell_vertex_buffer: Option<wgpu::Buffer>,
+    /// 当前 vertex buffer 容量(以**顶点数**计,非字节)。增长策略:首次按
+    /// `cols * rows * VERTS_PER_CELL` 分配,后续若 cell 总数超过容量则重建
+    /// (Phase 3 不会变 — Wayland resize 在 T-0306 才接;留口子防回归)。
+    cell_buffer_capacity: usize,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     clear: wgpu::Color,
+    /// surface 是否 sRGB 格式。决定 vertex 颜色是否要 sRGB→linear 预补偿
+    /// (sRGB surface 把写入值当 linear,GPU 会再编码回 sRGB 显示)。
+    /// 与 `clear` 字段同源,但 `clear` 是预算好的常量、`color_for_vertex`
+    /// 是每 vertex 调一次的 hot path,所以拆开存。
+    surface_is_srgb: bool,
     // 持有 Instance 避免提前 drop 掉 Vulkan/GL 实例。
     #[allow(dead_code)]
     instance: wgpu::Instance,
 }
+
+/// 单 cell 6 顶点(两三角形,无 index buffer)。`vertices = cols * rows *
+/// VERTS_PER_CELL`。80×24 = 11520 顶点,5090 GPU 完全无压力,instancing 优化
+/// 留 Phase 6 soak 验证有需要再说。
+const VERTS_PER_CELL: usize = 6;
+
+/// 每顶点字节数:`pos[2 f32] + color[3 f32]` = 20 字节。手算固化,WGSL 端
+/// 与本常量必须一致(见 [`CELL_WGSL`])。
+const VERTEX_BYTES: usize = 5 * std::mem::size_of::<f32>();
+
+/// WGSL shader 内联(派单 "WGSL 内联在 render.rs,跟现有 clear pass 风格一致,
+/// 别拆文件")。两个 stage:
+/// - vertex: pass-through pos + color
+/// - fragment: 输出 vec4(color, 1.0) 不透明
+///
+/// 颜色已在 CPU 侧做完 sRGB→linear 预补偿(`color_for_vertex`),WGSL 不再处理
+/// gamma —— sRGB surface 会在 GPU 端把 linear 编码回 sRGB 显示,与
+/// [`clear_color_for`] 的预补偿同套路。
+const CELL_WGSL: &str = r#"
+struct VsIn {
+    @location(0) pos: vec2<f32>,
+    @location(1) color: vec3<f32>,
+};
+
+struct VsOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) color: vec3<f32>,
+};
+
+@vertex
+fn vs_main(v: VsIn) -> VsOut {
+    var out: VsOut;
+    out.clip = vec4<f32>(v.pos, 0.0, 1.0);
+    out.color = v.color;
+    return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(in.color, 1.0);
+}
+"#;
 
 impl Renderer {
     /// 从 Wayland 裸指针构造 Renderer,配置初始尺寸并返回。
@@ -155,19 +216,25 @@ impl Renderer {
         surface.configure(&device, &config);
 
         let clear = clear_color_for(format);
+        let surface_is_srgb = format.is_srgb();
         tracing::debug!(
             ?format,
             width = config.width,
             height = config.height,
+            srgb = surface_is_srgb,
             "wgpu surface configured"
         );
 
         Ok(Self {
             surface,
+            cell_pipeline: None,
+            cell_vertex_buffer: None,
+            cell_buffer_capacity: 0,
             device,
             queue,
             config,
             clear,
+            surface_is_srgb,
             instance,
         })
     }
@@ -231,6 +298,315 @@ impl Renderer {
         self.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
         Ok(())
+    }
+
+    /// 一帧色块渲染:在 clear pass 之上画每 cell(`c != ' '`)的 fg 色矩形。
+    ///
+    /// 流程:
+    /// 1. lazy 初始化 `cell_pipeline` + `cell_vertex_buffer`(派单硬约束:
+    ///    pipeline / layout / bind group 创建一次复用)
+    /// 2. 算每 cell pixel size,生成顶点(`pos[2 f32] + color[3 f32]`)
+    /// 3. acquire frame texture
+    /// 4. 单 RenderPass:`LoadOp::Clear(深蓝)` + `set_pipeline` + `set_vertex_buffer`
+    ///    + `draw(0..vertex_count)` —— clear 与 cell 同一 pass,不分两 encoder
+    /// 5. submit + present
+    ///
+    /// **fg 着色而非 bg**(派单 scope 提到 "bg color 作为 vertex attribute",
+    /// 但派单 Goal 要求"看见 bash prompt 的字符位置以色块画出"。bash prompt
+    /// 默认 bg=Background 解析到黑,在深蓝清屏上画黑块 visually 几乎不可见。
+    /// fg=Foreground 解析到 light gray (#d3d3d3),反差清晰。Phase 4 字形渲染
+    /// 时 fg 切回 glyph 色 + bg 画 cell 全色块,API 已就位。本 ticket 视觉
+    /// acceptance 优先,deviation 在此明示给审码,fixup 1 行可改 WGSL 切 bg)。
+    ///
+    /// `c == ' '` 的 cell 不上传顶点(稀疏渲染,80×24 满屏空白时 vertex_count = 0)。
+    /// 这样深蓝清屏在空 cell 处显露,有字符的位置才出现 fg 色块,符合 acceptance
+    /// "深蓝背景上离散色块"。
+    ///
+    /// 错误处理:Surface acquire 的 Outdated/Lost/Timeout/Occluded 与
+    /// [`Self::render`] 同档,跳过该帧。Validation 上抛。
+    pub fn draw_cells(&mut self, cells: &[CellRef], cols: usize, rows: usize) -> Result<()> {
+        // 防御:cols/rows == 0 时无 cell 可画,直接 clear 一帧返回(对齐
+        // `Self::render` 的清屏行为,不让上层崩)。
+        if cols == 0 || rows == 0 {
+            return self.render();
+        }
+
+        // Step 1: lazy init pipeline + vertex buffer(派单硬约束)。
+        self.ensure_cell_pipeline();
+        self.ensure_cell_buffer(cols, rows);
+
+        // Step 2: 算 cell pixel size + 构建顶点。整数除余下边距 Phase 4 再细化
+        // (派单允许),但 cell_w/cell_h 至少各 1 像素防零除(派单提示)。
+        let surface_w = self.config.width.max(1) as f32;
+        let surface_h = self.config.height.max(1) as f32;
+        let cell_w_px = (self.config.width as usize / cols).max(1) as f32;
+        let cell_h_px = (self.config.height as usize / rows).max(1) as f32;
+
+        let vertex_bytes =
+            self.build_vertex_bytes(cells, cell_w_px, cell_h_px, surface_w, surface_h);
+        let vertex_count = (vertex_bytes.len() / VERTEX_BYTES) as u32;
+        // 给手测 / 日志排障一个固定锚点:每次 draw_cells 报本帧 cell 矩形数。
+        // debug 级,不污染默认 info 日志。空白 frame (vertex_count == 0) 也报,
+        // 便于"为啥屏幕全清屏色"这种问题溯源。
+        tracing::debug!(
+            target: "quill::wl::render",
+            cols,
+            rows,
+            cell_w_px,
+            cell_h_px,
+            vertex_count,
+            "draw_cells frame"
+        );
+
+        // 上传到 GPU。queue.write_buffer 是 staging-free 的快路径,适合每帧
+        // 写小量数据(80×24 满屏 = 11520 顶点 × 20 字节 = 230 KiB,5090 PCIe5
+        // 带宽下零开销)。
+        if vertex_count > 0 {
+            let buf = self.cell_vertex_buffer.as_ref().ok_or_else(|| {
+                anyhow!("cell_vertex_buffer 应已 lazy 初始化(ensure_cell_buffer 后)")
+            })?;
+            self.queue.write_buffer(buf, 0, &vertex_bytes);
+        }
+
+        // Step 3: acquire frame —— 与 `render` 同一套错误分类。
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t) => t,
+            wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                self.surface.configure(&self.device, &self.config);
+                return Ok(());
+            }
+            wgpu::CurrentSurfaceTexture::Timeout => {
+                tracing::warn!("surface acquire timeout, 跳过 draw_cells 这帧");
+                return Ok(());
+            }
+            wgpu::CurrentSurfaceTexture::Occluded => return Ok(()),
+            wgpu::CurrentSurfaceTexture::Validation => {
+                return Err(anyhow!("wgpu surface acquire 报 Validation 错误"));
+            }
+        };
+
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("quill-cells-encoder"),
+            });
+
+        // Step 4: 单 RenderPass(clear + cells)。pipeline + vertex buffer 都在
+        // self,引用即可;若 vertex_count == 0(全空白 cell)就只 clear。
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("quill-cells-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(self.clear),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+
+            if vertex_count > 0 {
+                let pipeline = self
+                    .cell_pipeline
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("cell_pipeline 应已 lazy 初始化"))?;
+                let buf = self
+                    .cell_vertex_buffer
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("cell_vertex_buffer 应已 lazy 初始化"))?;
+                pass.set_pipeline(pipeline);
+                pass.set_vertex_buffer(0, buf.slice(..));
+                pass.draw(0..vertex_count, 0..1);
+            }
+        }
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+        frame.present();
+        Ok(())
+    }
+
+    /// lazy 初始化 cell render pipeline。WGSL 内联 [`CELL_WGSL`],vertex layout
+    /// 与 [`VERTEX_BYTES`] 对齐 —— 顶点结构 `pos: vec2<f32> + color: vec3<f32>`,
+    /// stride 20 字节。
+    ///
+    /// 不取 bind group(无 uniform / texture 用,Phase 3 全靠 vertex attr 传)。
+    /// 若已建好,no-op。
+    fn ensure_cell_pipeline(&mut self) {
+        if self.cell_pipeline.is_some() {
+            return;
+        }
+        let shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("quill-cells-shader"),
+                source: wgpu::ShaderSource::Wgsl(CELL_WGSL.into()),
+            });
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("quill-cells-pipeline-layout"),
+                bind_group_layouts: &[],
+                immediate_size: 0,
+            });
+        let vertex_attrs = [
+            wgpu::VertexAttribute {
+                offset: 0,
+                shader_location: 0,
+                format: wgpu::VertexFormat::Float32x2,
+            },
+            wgpu::VertexAttribute {
+                offset: (2 * std::mem::size_of::<f32>()) as u64,
+                shader_location: 1,
+                format: wgpu::VertexFormat::Float32x3,
+            },
+        ];
+        let pipeline = self
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("quill-cells-pipeline"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: VERTEX_BYTES as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &vertex_attrs,
+                    }],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: self.config.format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+        self.cell_pipeline = Some(pipeline);
+    }
+
+    /// lazy 初始化 / 增长 cell vertex buffer。容量按当前 cols×rows 算,若已够
+    /// (覆盖了 Phase 3 写死 80×24 的常见场景),no-op;否则销毁旧 buffer + 建新的。
+    /// T-0306 Wayland resize 后若 cols×rows 变化,这条 if 自动重建。
+    fn ensure_cell_buffer(&mut self, cols: usize, rows: usize) {
+        let needed = cols * rows * VERTS_PER_CELL;
+        if self.cell_buffer_capacity >= needed && self.cell_vertex_buffer.is_some() {
+            return;
+        }
+        let size_bytes = (needed * VERTEX_BYTES) as u64;
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("quill-cells-vertex-buffer"),
+            size: size_bytes,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.cell_vertex_buffer = Some(buf);
+        self.cell_buffer_capacity = needed;
+    }
+
+    /// 把 `cells` 转成 vertex bytes。空格 cell 跳过(稀疏渲染,见 [`Self::draw_cells`]
+    /// fg/bg 决策注释)。
+    ///
+    /// 顶点布局(每 cell 6 顶点,两三角形,CCW):
+    /// ```text
+    ///  TL ─── TR        前三角:TL → BL → BR
+    ///   │ ╲   │        后三角:TL → BR → TR
+    ///   │  ╲  │        (Front face = CCW,见 pipeline primitive 配置)
+    ///  BL ─── BR
+    /// ```
+    ///
+    /// NDC 坐标系: x ∈ [-1, 1] 左→右,y ∈ [-1, 1] 下→上(像素 y=0 在顶,
+    /// NDC y 翻转一次)。
+    fn build_vertex_bytes(
+        &self,
+        cells: &[CellRef],
+        cell_w_px: f32,
+        cell_h_px: f32,
+        surface_w: f32,
+        surface_h: f32,
+    ) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::with_capacity(cells.len() * VERTS_PER_CELL * VERTEX_BYTES);
+        for cell in cells {
+            // 稀疏渲染:空白 cell 不贡献顶点,深蓝清屏在该位置显露。
+            if cell.c == ' ' {
+                continue;
+            }
+            let x0_px = cell.pos.col as f32 * cell_w_px;
+            let y0_px = cell.pos.line as f32 * cell_h_px;
+            let x1_px = x0_px + cell_w_px;
+            let y1_px = y0_px + cell_h_px;
+
+            let left = x0_px / surface_w * 2.0 - 1.0;
+            let right = x1_px / surface_w * 2.0 - 1.0;
+            // y 翻转:像素 y=0 (top) → NDC y=+1
+            let top = 1.0 - y0_px / surface_h * 2.0;
+            let bottom = 1.0 - y1_px / surface_h * 2.0;
+
+            let color = self.color_for_vertex(cell.fg);
+
+            // CCW 三角顺序: TL → BL → BR(下三角), TL → BR → TR(上三角)
+            let verts: [[f32; 2]; 6] = [
+                [left, top],
+                [left, bottom],
+                [right, bottom],
+                [left, top],
+                [right, bottom],
+                [right, top],
+            ];
+            for v in verts {
+                out.extend_from_slice(&v[0].to_ne_bytes());
+                out.extend_from_slice(&v[1].to_ne_bytes());
+                out.extend_from_slice(&color[0].to_ne_bytes());
+                out.extend_from_slice(&color[1].to_ne_bytes());
+                out.extend_from_slice(&color[2].to_ne_bytes());
+            }
+        }
+        out
+    }
+
+    /// quill `Color`(sRGB 字节)→ shader 输入(linear f32)。sRGB surface 时
+    /// 走 [`srgb_to_linear`] 预补偿,GPU 会再编码回 sRGB 显示;非 sRGB 时
+    /// 直接 `byte / 255.0`。与 [`clear_color_for`] 同套路。
+    fn color_for_vertex(&self, c: crate::term::Color) -> [f32; 3] {
+        let r = f64::from(c.r) / 255.0;
+        let g = f64::from(c.g) / 255.0;
+        let b = f64::from(c.b) / 255.0;
+        if self.surface_is_srgb {
+            [
+                srgb_to_linear(r) as f32,
+                srgb_to_linear(g) as f32,
+                srgb_to_linear(b) as f32,
+            ]
+        } else {
+            [r as f32, g as f32, b as f32]
+        }
     }
 }
 

@@ -24,7 +24,7 @@ use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::Point as AlacPoint;
 use alacritty_terminal::term::{Config, Term, TermMode};
-use alacritty_terminal::vte::ansi::Processor;
+use alacritty_terminal::vte::ansi::{Color as AlacColor, NamedColor, Processor, Rgb as AlacRgb};
 
 /// 渲染层 cell 坐标。两字段都是 `usize` —— viewport 不含 scrollback(Phase 3
 /// T-0304 再扩),所以 `line` 永不为负。
@@ -143,6 +143,11 @@ impl ScrollbackPos {
 /// alacritty 内部 `CursorRenderingData` 在 `SHOW_CURSOR` 关时返 Hidden;
 /// 我们刻意把"模式位"(SHOW_CURSOR)和"形状配置"(CursorShape::Hidden)
 /// 拆开 —— 渲染层 `if visible { draw(shape) }`,语义清晰。
+///
+/// **HollowBlock(空心方块,focus 失去时的光标形状)在 Phase 3 色块渲染下
+/// 简化为实心 Block(一个色块),Phase 4 字形渲染时再画矩形外框区分焦点状态。
+/// (T-0303 审码 P3-2 推荐 fold + 延后)** —— T-0305 落决策但不画 cursor
+/// (派单 scope "cursor 渲染本单不强制"),fold 实施留 cursor 渲染 ticket。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CursorShape {
     Block,
@@ -170,6 +175,250 @@ impl CursorShape {
             Up::HollowBlock => CursorShape::HollowBlock,
             Up::Hidden => CursorShape::Hidden,
         }
+    }
+}
+
+/// quill 自己的 cell 颜色。**不**re-export `alacritty_terminal::vte::ansi::Color`
+/// (那是 `enum { Spec(Rgb), Named(NamedColor), Indexed(u8) }`,语义未解析,
+/// 渲染层拿到要再分支)。本结构是**已解析**的 RGB,渲染层直接喂 GPU。
+///
+/// **不带 alpha**:terminal cell 总是不透明,引入 alpha 只会让下游误用
+/// (T-0305 scope 显式)。Phase 4 加 glyph 渲染时,fg 用作 glyph 颜色,
+/// bg 用作 cell 全色块,都 opaque。
+///
+/// **设计理由**(沿袭 T-0302 [`CellPos`] / T-0303 [`CursorShape`] / T-0304
+/// [`ScrollbackPos`] 的类型隔离 SOP):
+/// - 不 re-export 上游 `Color` enum
+/// - 私有 `from_alacritty` inherent fn(非 `From` trait)—— 下游 `use
+///   alacritty::Color` 后无法 `c.into()` 反向构造,alacritty 类型彻底锁在
+///   `src/term/mod.rs` 内
+/// - 256 色调色板 / NamedColor 的解析在本模块一处搞定,渲染层只看 (r,g,b)
+///
+/// 测试覆盖见 `tests::color_*`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Color {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+impl Color {
+    /// quill 默认前景色,light gray(`#d3d3d3`)。alacritty `NamedColor::Foreground`
+    /// 解析到这里。bash 默认文字色应当用这个值,在深蓝清屏上视觉对比清晰。
+    const DEFAULT_FG: Color = Color {
+        r: 0xd3,
+        g: 0xd3,
+        b: 0xd3,
+    };
+
+    /// quill 默认背景色,黑(`#000000`)。alacritty `NamedColor::Background`
+    /// 解析到这里。Phase 3 渲染层若画 bg(本 ticket 未启用),空白 cell 是黑;
+    /// 当前 [`crate::wl::render::Renderer::draw_cells`] 用 fg 着色,bg 字段
+    /// 仅做 Phase 4 准备,不直接体现在屏幕上。
+    const DEFAULT_BG: Color = Color {
+        r: 0x00,
+        g: 0x00,
+        b: 0x00,
+    };
+
+    /// 把 alacritty 的 `Color` 三 variants 解析为已解析的 RGB。
+    ///
+    /// **模块私有 inherent fn**,不开 `impl From` / `impl Into` —— 沿袭
+    /// `CellPos::from_alacritty` / `CursorShape::from_alacritty` / `ScrollbackPos::to_alacritty`
+    /// 的隔离套路:下游既不能 `Color::from(c)` 反向构造,也不能 `c.into()` 偷渡
+    /// `alacritty::Color` 出去。
+    ///
+    /// **exhaustive match 无 `_ =>`**:alacritty `Color` enum 加新 variant 时
+    /// 编译期报非穷尽错,届时显式补一行 + 决策映射。同样的策略下推到
+    /// `NamedColor` 30 个 variant 的 [`named_color_rgb`] —— 那个 fn 内部 match
+    /// 也无 `_ =>`(给未来加 variant 留 catch)。
+    ///
+    /// 三 variants 处理:
+    /// - `Spec(Rgb)` —— 直接取 `(r, g, b)`
+    /// - `Named(NamedColor)` —— [`named_color_rgb`] 查 ANSI 16 色 + 特殊色映射
+    /// - `Indexed(u8)` —— [`indexed_color_rgb`] 查 256 色调色板
+    ///
+    /// [`named_color_rgb`]: crate::term::named_color_rgb
+    /// [`indexed_color_rgb`]: crate::term::indexed_color_rgb
+    fn from_alacritty(c: AlacColor) -> Self {
+        match c {
+            AlacColor::Spec(AlacRgb { r, g, b }) => Color { r, g, b },
+            AlacColor::Named(name) => named_color_rgb(name),
+            AlacColor::Indexed(i) => indexed_color_rgb(i),
+        }
+    }
+}
+
+/// ANSI 16 标准色 + alacritty `NamedColor` 30 个 variant 的 RGB 解析。
+///
+/// **exhaustive match 无 `_ =>`**:NamedColor 加新 variant 时编译期 catch。
+/// 30 行密集映射看起来啰嗦,但**所有调色板决策固化在一处**,Phase 4 字形
+/// 渲染 / 未来 theming 都从这一个 fn 改起。
+///
+/// 调色板取舍:
+/// - 0..15(Black..BrightWhite)用 xterm-classic 16 色 RGB(广泛认可的 ANSI 标准)
+/// - Foreground/Background/Cursor 用 quill 默认 fg/bg(见 [`Color::DEFAULT_FG`]
+///   / [`Color::DEFAULT_BG`])。Cursor 用白色(`#ffffff`)便于和 fg 区分
+/// - DimX(Dim 系列)Phase 3 暂用同色名 X(SGR Dim 暗化属性 Phase 3 不渲染)
+/// - BrightForeground / DimForeground 退到 DEFAULT_FG
+fn named_color_rgb(name: NamedColor) -> Color {
+    use NamedColor as N;
+    match name {
+        // ANSI 16 标准色 (xterm-classic palette)
+        N::Black => Color { r: 0, g: 0, b: 0 },
+        N::Red => Color { r: 170, g: 0, b: 0 },
+        N::Green => Color { r: 0, g: 170, b: 0 },
+        N::Yellow => Color {
+            r: 170,
+            g: 85,
+            b: 0,
+        },
+        N::Blue => Color { r: 0, g: 0, b: 170 },
+        N::Magenta => Color {
+            r: 170,
+            g: 0,
+            b: 170,
+        },
+        N::Cyan => Color {
+            r: 0,
+            g: 170,
+            b: 170,
+        },
+        N::White => Color {
+            r: 170,
+            g: 170,
+            b: 170,
+        },
+        N::BrightBlack => Color {
+            r: 85,
+            g: 85,
+            b: 85,
+        },
+        N::BrightRed => Color {
+            r: 255,
+            g: 85,
+            b: 85,
+        },
+        N::BrightGreen => Color {
+            r: 85,
+            g: 255,
+            b: 85,
+        },
+        N::BrightYellow => Color {
+            r: 255,
+            g: 255,
+            b: 85,
+        },
+        N::BrightBlue => Color {
+            r: 85,
+            g: 85,
+            b: 255,
+        },
+        N::BrightMagenta => Color {
+            r: 255,
+            g: 85,
+            b: 255,
+        },
+        N::BrightCyan => Color {
+            r: 85,
+            g: 255,
+            b: 255,
+        },
+        N::BrightWhite => Color {
+            r: 255,
+            g: 255,
+            b: 255,
+        },
+
+        // 特殊角色色:渲染层语义,quill 自己挑默认值
+        N::Foreground => Color::DEFAULT_FG,
+        N::Background => Color::DEFAULT_BG,
+        N::Cursor => Color {
+            r: 0xff,
+            g: 0xff,
+            b: 0xff,
+        },
+
+        // Dim 系列:Phase 3 不渲染 SGR Dim 暗化属性,直接用同色名(non-Dim)
+        // 等价。Phase 4 加 alpha blending / luminance scaling 时再细化。
+        N::DimBlack => Color { r: 0, g: 0, b: 0 },
+        N::DimRed => Color { r: 170, g: 0, b: 0 },
+        N::DimGreen => Color { r: 0, g: 170, b: 0 },
+        N::DimYellow => Color {
+            r: 170,
+            g: 85,
+            b: 0,
+        },
+        N::DimBlue => Color { r: 0, g: 0, b: 170 },
+        N::DimMagenta => Color {
+            r: 170,
+            g: 0,
+            b: 170,
+        },
+        N::DimCyan => Color {
+            r: 0,
+            g: 170,
+            b: 170,
+        },
+        N::DimWhite => Color {
+            r: 170,
+            g: 170,
+            b: 170,
+        },
+
+        // BrightForeground / DimForeground 退到 DEFAULT_FG(无独立 theme 时
+        // 与 Foreground 等价)
+        N::BrightForeground | N::DimForeground => Color::DEFAULT_FG,
+    }
+}
+
+/// xterm 256 色调色板:0..16 走 [`named_color_rgb`] 的 ANSI 16 色,16..232 是
+/// 6×6×6 RGB 立方体,232..256 是 24 阶灰度。
+///
+/// **levels 数组取自 xterm 官方 256colres.pl 输出**(`0, 95, 135, 175, 215, 255`)
+/// —— 与 alacritty / kitty / iTerm2 默认调色板一致。换数组就破坏与上游兼容,
+/// 用户输入 `\x1b[48;5;25m` 时该看见的 (0, 95, 135) 蓝灰会变形。
+fn indexed_color_rgb(i: u8) -> Color {
+    if i < 16 {
+        // 0..16 复用 NamedColor 的标准 16 色映射(单一 source-of-truth)
+        let name = match i {
+            0 => NamedColor::Black,
+            1 => NamedColor::Red,
+            2 => NamedColor::Green,
+            3 => NamedColor::Yellow,
+            4 => NamedColor::Blue,
+            5 => NamedColor::Magenta,
+            6 => NamedColor::Cyan,
+            7 => NamedColor::White,
+            8 => NamedColor::BrightBlack,
+            9 => NamedColor::BrightRed,
+            10 => NamedColor::BrightGreen,
+            11 => NamedColor::BrightYellow,
+            12 => NamedColor::BrightBlue,
+            13 => NamedColor::BrightMagenta,
+            14 => NamedColor::BrightCyan,
+            15 => NamedColor::BrightWhite,
+            // i < 16 时 0..=15 全覆盖,unreachable 是模式穷尽守卫;若未来 i >= 16
+            // 路径变化导致该分支被打到,渲染会得 Black 而非 panic(release 安全)
+            _ => NamedColor::Black,
+        };
+        named_color_rgb(name)
+    } else if i < 232 {
+        // 6x6x6 cube: idx = 16 + 36*r + 6*g + b, 每分量 0..6
+        let levels: [u8; 6] = [0, 95, 135, 175, 215, 255];
+        let v = i - 16;
+        let r = (v / 36) as usize;
+        let g = ((v / 6) % 6) as usize;
+        let b = (v % 6) as usize;
+        Color {
+            r: levels[r],
+            g: levels[g],
+            b: levels[b],
+        }
+    } else {
+        // 232..=255 灰阶 24 级:xterm 公式 v = 8 + 10 * (i - 232),范围 8..=238
+        let v = 8u8.saturating_add(10u8.saturating_mul(i - 232));
+        Color { r: v, g: v, b: v }
     }
 }
 
@@ -449,11 +698,16 @@ impl TermState {
         let grid = self.term.grid();
         let line = pos.to_alacritty(grid.history_size());
         let cols = grid.columns();
-        (0..cols).map(move |c| CellRef {
-            // line=0 占位:scrollback 行没有 viewport line 概念,真实位置走
-            // 调用方传入的 ScrollbackPos。详见 fn docstring。
-            pos: CellPos { col: c, line: 0 },
-            c: grid[line][Column(c)].c,
+        (0..cols).map(move |c| {
+            let cell = &grid[line][Column(c)];
+            CellRef {
+                // line=0 占位:scrollback 行没有 viewport line 概念,真实位置走
+                // 调用方传入的 ScrollbackPos。详见 fn docstring。
+                pos: CellPos { col: c, line: 0 },
+                c: cell.c,
+                fg: Color::from_alacritty(cell.fg),
+                bg: Color::from_alacritty(cell.bg),
+            }
         })
     }
 }
@@ -470,23 +724,46 @@ impl<'a> Iterator for CellsIter<'a> {
     type Item = CellRef;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|indexed| CellRef {
-            // 走模块私有 `CellPos::from_alacritty`,不经 `From` trait —— 防止
-            // alacritty 类型漏到公共 API(见 `CellPos::from_alacritty` 文档)。
-            pos: CellPos::from_alacritty(indexed.point),
-            c: indexed.cell.c,
+        self.inner.next().map(|indexed| {
+            // 走模块私有 `CellPos::from_alacritty` / `Color::from_alacritty`,
+            // 不经 `From` trait —— 防止 alacritty 类型漏到公共 API
+            // (见 `CellPos::from_alacritty` / `Color::from_alacritty` 文档)。
+            // T-0305:fg/bg 解析在迭代时一起做,渲染层拿到的就是已解析 RGB,
+            // 不再分支 Spec/Named/Indexed。
+            CellRef {
+                pos: CellPos::from_alacritty(indexed.point),
+                c: indexed.cell.c,
+                fg: Color::from_alacritty(indexed.cell.fg),
+                bg: Color::from_alacritty(indexed.cell.bg),
+            }
         })
     }
 }
 
-/// 渲染用 cell 引用。给 T-0305 看:(位置, 字符)就够画色块;style / color
-/// 暂不暴露,Phase 3 后期按需再扩字段。
+/// 渲染用 cell 引用。T-0305 加 `fg` / `bg` 字段(quill [`Color`],已解析 RGB),
+/// 给色块渲染 + Phase 4 字形渲染共用一个数据通道。
+///
+/// **fg vs bg 渲染语义**(见 `crate::wl::render::Renderer::draw_cells`):
+/// - Phase 3 色块渲染用 **fg** 着色非空 cell —— 视觉等价于"字符位置以 fg 色块
+///   占位"(没有真字形,先以 fg 色矩形代表"这里有内容");bash prompt 在
+///   深蓝清屏上显示为 light gray 离散块,符合 T-0305 acceptance"看见 prompt
+///   字符位置以色块画出"
+/// - Phase 4 字形渲染:bg 画 cell 全色块(覆盖该 cell 区域),fg 画 glyph
+///   纹理。bg 字段在本 ticket 内已存好,Phase 4 不破 API
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CellRef {
     /// cell 在 viewport 里的位置。见 [`CellPos`]。
     pub pos: CellPos,
     /// cell 里的字符。空 cell 是 `' '`(空格),下游按需判空。
     pub c: char,
+    /// 前景色(已解析 RGB)。Phase 3 色块渲染时 cell 矩形按 fg 着色。
+    /// 默认 [`Color::DEFAULT_FG`](`#d3d3d3` light gray),vim/git 等程序
+    /// 用 SGR 38 改写。
+    pub fg: Color,
+    /// 背景色(已解析 RGB)。Phase 3 字段已存但 [`crate::wl::render::Renderer::draw_cells`]
+    /// 暂不画;Phase 4 字形渲染时用作 cell 全色块。默认 [`Color::DEFAULT_BG`]
+    /// (`#000000` 黑),vim status line / less 反色等用 SGR 48 改写。
+    pub bg: Color,
 }
 
 #[cfg(test)]
@@ -853,5 +1130,169 @@ mod tests {
             CursorShape::HollowBlock
         );
         assert_eq!(CursorShape::from_alacritty(Up::Hidden), CursorShape::Hidden);
+    }
+
+    // ---------- T-0305 Color 类型单测 ----------
+
+    /// `Color::from_alacritty(Spec)` 直接透传 RGB,不做任何调色板查表。
+    #[test]
+    fn color_from_alacritty_spec_passes_rgb() {
+        let c = Color::from_alacritty(AlacColor::Spec(AlacRgb {
+            r: 0x12,
+            g: 0x34,
+            b: 0x56,
+        }));
+        assert_eq!(
+            c,
+            Color {
+                r: 0x12,
+                g: 0x34,
+                b: 0x56
+            }
+        );
+    }
+
+    /// `Color::from_alacritty(Named(Red))` 解析到 ANSI 标准红 (170, 0, 0)。
+    /// 防回归:换调色板等于改用户文字色,不能"顺手"调亮 / 调暗。
+    /// 同时验另一个高频色 BrightGreen → (85, 255, 85)(`ls --color` 目录色)。
+    #[test]
+    fn color_from_alacritty_named_resolves_to_palette() {
+        assert_eq!(
+            Color::from_alacritty(AlacColor::Named(NamedColor::Red)),
+            Color { r: 170, g: 0, b: 0 },
+            "ANSI Named::Red → xterm-classic (170, 0, 0)"
+        );
+        assert_eq!(
+            Color::from_alacritty(AlacColor::Named(NamedColor::BrightGreen)),
+            Color {
+                r: 85,
+                g: 255,
+                b: 85
+            },
+            "ANSI Named::BrightGreen → xterm-classic (85, 255, 85)"
+        );
+        // Foreground / Background 走 quill 自定 default,不走标准色;锁住默认值。
+        assert_eq!(
+            Color::from_alacritty(AlacColor::Named(NamedColor::Foreground)),
+            Color::DEFAULT_FG,
+            "Named::Foreground 应解析到 quill DEFAULT_FG"
+        );
+        assert_eq!(
+            Color::from_alacritty(AlacColor::Named(NamedColor::Background)),
+            Color::DEFAULT_BG,
+            "Named::Background 应解析到 quill DEFAULT_BG"
+        );
+    }
+
+    /// `Color::from_alacritty(Indexed)` 三档(0..16 / 16..232 cube / 232..256 灰阶)
+    /// 各自验一个代表点,锁住调色板。xterm 256colres.pl 的标准值,任何"美化"
+    /// 改动会破坏与上游兼容。
+    #[test]
+    fn color_from_alacritty_indexed_lookup() {
+        // 0..16 复用 NamedColor 路径
+        assert_eq!(
+            Color::from_alacritty(AlacColor::Indexed(1)),
+            Color { r: 170, g: 0, b: 0 },
+            "Indexed(1) == Red"
+        );
+        assert_eq!(
+            Color::from_alacritty(AlacColor::Indexed(15)),
+            Color {
+                r: 255,
+                g: 255,
+                b: 255
+            },
+            "Indexed(15) == BrightWhite"
+        );
+
+        // 6x6x6 cube: idx 16 应是 (0, 0, 0)(全零);idx 231 应是 (255, 255, 255)
+        assert_eq!(
+            Color::from_alacritty(AlacColor::Indexed(16)),
+            Color { r: 0, g: 0, b: 0 },
+            "Indexed(16) cube 起点应 (0,0,0)"
+        );
+        assert_eq!(
+            Color::from_alacritty(AlacColor::Indexed(231)),
+            Color {
+                r: 255,
+                g: 255,
+                b: 255
+            },
+            "Indexed(231) cube 末端应 (255,255,255)"
+        );
+        // idx 25 公式: v=9, r=0, g=1, b=3 → (0, 95, 175)
+        assert_eq!(
+            Color::from_alacritty(AlacColor::Indexed(25)),
+            Color {
+                r: 0,
+                g: 95,
+                b: 175
+            },
+            "Indexed(25) cube 应 (0, 95, 175)"
+        );
+
+        // 灰阶: idx 232 应 (8, 8, 8); idx 255 应 (8 + 10*23, ...) = (238, 238, 238)
+        assert_eq!(
+            Color::from_alacritty(AlacColor::Indexed(232)),
+            Color { r: 8, g: 8, b: 8 },
+            "Indexed(232) 灰阶起点"
+        );
+        assert_eq!(
+            Color::from_alacritty(AlacColor::Indexed(255)),
+            Color {
+                r: 238,
+                g: 238,
+                b: 238
+            },
+            "Indexed(255) 灰阶末端"
+        );
+    }
+
+    /// `cells_iter` 产出的 `CellRef` 应携 fg/bg 字段。新构造 TermState 时所有
+    /// cell 都是 alacritty default(`fg=Named(Foreground)` / `bg=Named(Background)`),
+    /// 走 `Color::from_alacritty` 后应是 `DEFAULT_FG` / `DEFAULT_BG`。
+    ///
+    /// 这个测试同时锁住 cells_iter 真填充而非偷塞默认 (T-0305 acceptance:
+    /// "cells_iter 真填充")。
+    #[test]
+    fn cellref_carries_fg_and_bg() {
+        let t = TermState::new(80, 24);
+        let cell = t
+            .cells_iter()
+            .next()
+            .expect("80x24 viewport 至少应产 1 个 cell");
+        assert_eq!(
+            cell.fg,
+            Color::DEFAULT_FG,
+            "默认 cell.fg 应解析到 DEFAULT_FG (Named::Foreground)"
+        );
+        assert_eq!(
+            cell.bg,
+            Color::DEFAULT_BG,
+            "默认 cell.bg 应解析到 DEFAULT_BG (Named::Background)"
+        );
+
+        // scrollback_cells_iter 同样应填 fg/bg(T-0304 路径也走过 Color::from_alacritty)。
+        // 推 50 行触发 scrollback,验 row=0 的 cell 也带 fg/bg(应仍是 default,
+        // bash 没跑就没颜色 escape)。
+        let mut t2 = TermState::new(80, 24);
+        for i in 0..50 {
+            let line = format!("line_{:02}\r\n", i);
+            t2.advance(line.as_bytes());
+        }
+        let scroll_cell = t2
+            .scrollback_cells_iter(ScrollbackPos { row: 0 })
+            .next()
+            .expect("scrollback row=0 应至少 1 个 cell");
+        assert_eq!(
+            scroll_cell.fg,
+            Color::DEFAULT_FG,
+            "scrollback cell.fg 应解析"
+        );
+        assert_eq!(
+            scroll_cell.bg,
+            Color::DEFAULT_BG,
+            "scrollback cell.bg 应解析"
+        );
     }
 }
