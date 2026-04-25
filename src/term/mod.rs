@@ -432,6 +432,18 @@ struct TermSize {
     screen_lines: usize,
 }
 
+impl TermSize {
+    /// 构造 `TermSize`。`new(cols, rows)` 比字段字面量易读,也防止两个 `usize`
+    /// 顺序写反(`columns` / `screen_lines` 同类型不报错)。
+    /// T-0306 [`TermState::resize`] 内复用,与 [`TermState::new`] 同一构造路径。
+    fn new(cols: usize, rows: usize) -> Self {
+        Self {
+            columns: cols,
+            screen_lines: rows,
+        }
+    }
+}
+
 impl Dimensions for TermSize {
     fn total_lines(&self) -> usize {
         // 无 scrollback:total_lines == screen_lines
@@ -478,16 +490,42 @@ impl TermState {
     ///
     /// [`clear_dirty`]: Self::clear_dirty
     pub fn new(cols: u16, rows: u16) -> Self {
-        let size = TermSize {
-            columns: cols as usize,
-            screen_lines: rows as usize,
-        };
+        let size = TermSize::new(cols as usize, rows as usize);
         let config = Config::default();
         Self {
             term: Term::new(config, &size, VoidListener),
             processor: Processor::new(),
             dirty: true,
         }
+    }
+
+    /// 改 grid 尺寸为 `cols × rows`。Wayland configure 事件后由
+    /// [`crate::wl::window`] 调用,把"surface 像素 → cell 计数"换算结果推给
+    /// 终端状态机;同时 [`crate::pty::PtyHandle::resize`] 把同一对 cols/rows
+    /// 推给 PTY master(TIOCSWINSZ → SIGWINCH 通知 shell)。两条同步是 T-0306
+    /// 的契约。
+    ///
+    /// **`max(1)` 防 0**:窗口被拖到极小时 surface 像素 / cell px 可能算出 0;
+    /// alacritty `Term::resize` 在 cols=0 / rows=0 时内部走除零或越界路径会
+    /// panic。1×1 是 grid 不可见但状态机仍合法的最小尺寸,优于 panic 让 quill
+    /// 跟着崩。
+    ///
+    /// **副作用**:置 `self.dirty = true`(沿袭 [`Self::advance`] 模式)。resize
+    /// 后即使没新字节,viewport 内容也变了(cells 重新布局,cursor 可能被 alacritty
+    /// 内部 clamp),下游 idle callback 看到 dirty 就 [`Self::cells_iter`] +
+    /// [`crate::wl::render::Renderer::draw_cells`] 重画一帧。
+    ///
+    /// **cursor / scrollback 自动跟随**:alacritty `Term::resize` 内部对 grid /
+    /// inactive_grid / vi_mode_cursor / selection / scroll_region / damage 都做
+    /// 一致更新(参 alacritty_terminal 0.26 `term/mod.rs::resize`),光标缩小时
+    /// 自动 clamp 到 `(target - 1)`,scrollback 历史保留。本 fn 不再二次干预。
+    ///
+    /// 测试覆盖见 `tests::resize_*`(4 单测:dimensions / cursor clamp / zero
+    /// clamp / dirty)。
+    pub fn resize(&mut self, cols: usize, rows: usize) {
+        let size = TermSize::new(cols.max(1), rows.max(1));
+        self.term.resize(size);
+        self.dirty = true;
     }
 
     /// 把一批 PTY 字节推进解析器,驱动 grid 更新。
@@ -1293,6 +1331,116 @@ mod tests {
             scroll_cell.bg,
             Color::DEFAULT_BG,
             "scrollback cell.bg 应解析"
+        );
+    }
+
+    // ---------- T-0306 resize 单测 ----------
+
+    /// `resize(cols, rows)` 后 `dimensions()` 应反映新尺寸。是 T-0306 与
+    /// `crate::wl::window` configure callback 之间最小契约 ——
+    /// "调 resize 后 cells_iter 数量 = 新 cols × 新 rows"。
+    #[test]
+    fn resize_changes_dimensions() {
+        let mut t = TermState::new(80, 24);
+        assert_eq!(t.dimensions(), (80, 24), "前置: ctor 80x24");
+
+        t.resize(100, 30);
+        assert_eq!(t.dimensions(), (100, 30), "resize 后应反映新尺寸");
+        // 二次复验:cells_iter 数量也应跟随
+        assert_eq!(
+            t.cells_iter().count(),
+            100 * 30,
+            "cells_iter 应产 100 × 30 = {} cells",
+            100 * 30
+        );
+
+        // 反向(变小)
+        t.resize(40, 12);
+        assert_eq!(t.dimensions(), (40, 12));
+        assert_eq!(t.cells_iter().count(), 40 * 12);
+    }
+
+    /// 缩小到光标当前位置之外时,alacritty `Term::resize` 内部 `grid.shrink_*`
+    /// 自动 clamp 光标到 `(target_cols - 1, target_rows - 1)`。本测试锁住
+    /// "resize 后 cursor 不会留在越界位置"—— 渲染层假设 `cursor_pos.col <
+    /// cols && cursor_pos.line < rows`,违反会画到屏幕外。
+    ///
+    /// 推 11 行字 (line 0..10 各写若干字符),cursor 落在 (col≈3, line=10)
+    /// 附近;resize 到 30×5 后,line ≤ 4 + col ≤ 29 必须成立。
+    #[test]
+    fn resize_to_smaller_clamps_cursor() {
+        let mut t = TermState::new(80, 24);
+        // 11 行后 cursor 落在 line=10。每行写 'X' 一次再换行,行号定值。
+        for _ in 0..11 {
+            t.advance(b"X\r\n");
+        }
+        let pre = t.cursor_pos();
+        assert!(
+            pre.line >= 10,
+            "前置: 11 行后 cursor.line 应 >= 10, 实际 {}",
+            pre.line
+        );
+
+        t.resize(30, 5);
+        let post = t.cursor_pos();
+        assert!(
+            post.col < 30,
+            "resize(30, 5) 后 cursor.col 必须 < 30, 实际 {}",
+            post.col
+        );
+        assert!(
+            post.line < 5,
+            "resize(30, 5) 后 cursor.line 必须 < 5, 实际 {}",
+            post.line
+        );
+    }
+
+    /// `resize(0, 0)` 不该 panic —— compositor 极端情况下拍来 0×0 surface
+    /// (窗口被拖到极小 / 隐藏前一瞬)。`max(1)` 防 0 兜底,落到 1×1 而非
+    /// 让 alacritty `Term::resize` 内部除零 / 越界 panic。
+    ///
+    /// 同时验 (0, 5) / (5, 0) 单维度为 0 的边界(派单原文"cols/rows 至少 1
+    /// (max(1) 防 0 panic)")。
+    #[test]
+    fn resize_zero_clamped_to_one() {
+        let mut t = TermState::new(80, 24);
+        t.resize(0, 0);
+        assert_eq!(t.dimensions(), (1, 1), "(0,0) 应 clamp 到 (1,1)");
+
+        let mut t2 = TermState::new(80, 24);
+        t2.resize(0, 5);
+        assert_eq!(t2.dimensions(), (1, 5), "(0,5) 应 clamp 到 (1,5)");
+
+        let mut t3 = TermState::new(80, 24);
+        t3.resize(5, 0);
+        assert_eq!(t3.dimensions(), (5, 1), "(5,0) 应 clamp 到 (5,1)");
+    }
+
+    /// `resize` 后必须置 `dirty=true`(沿袭 [`advance`] 模式)。clear → resize
+    /// → is_dirty == true。下游 idle callback 看到 dirty 才会 [`draw_cells`]
+    /// 重画一帧;若忘了置,resize 后屏幕保持旧布局直到下次字节进 term 才更新,
+    /// 视觉上看着像"resize 没反应"。
+    ///
+    /// [`advance`]: TermState::advance
+    /// [`draw_cells`]: crate::wl::render::Renderer::draw_cells
+    #[test]
+    fn resize_sets_dirty() {
+        let mut t = TermState::new(80, 24);
+        t.clear_dirty();
+        assert!(!t.is_dirty(), "前置: clear 后应 clean");
+
+        t.resize(100, 30);
+        assert!(t.is_dirty(), "resize 后应 dirty");
+
+        // 即使尺寸不变也置 dirty(保守, 与 advance 空切片同思路 —— 多画一帧
+        // 比漏画强)。alacritty Term::resize 在尺寸不变时内部 early return
+        // (debug log "Term::resize dimensions unchanged"), 但我们仍置 dirty
+        // 让调用方不必区分 "真 resize / 假 resize"。
+        t.clear_dirty();
+        t.resize(100, 30);
+        assert!(
+            t.is_dirty(),
+            "resize 到相同尺寸也应置 dirty (调用方一致语义)"
         );
     }
 }

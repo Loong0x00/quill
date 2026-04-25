@@ -390,6 +390,91 @@ fn pty_read_tick(
 // T-0108 删除 drain_pipe —— self-pipe signal 机制废弃,calloop::signals::Signals
 // 走 signalfd 由 calloop 内部 source 直接读。
 
+/// surface 像素 → grid cell 计数。Wayland configure 给的是 surface 像素尺寸,
+/// 终端 grid 用 cell 计数;两者通过 cell 像素常数 [`crate::wl::render::CELL_W_PX`]
+/// / [`crate::wl::render::CELL_H_PX`] 换算(Phase 4 字形测量后会改成字体真实
+/// metrics)。
+///
+/// **`max(1)` 防 0**:整数除在极小 surface(width < CELL_W_PX)时给 0;
+/// term / pty 都不接受 0 维度(alacritty `Term::resize` 内部除零 panic,
+/// `TIOCSWINSZ` 给 winsize.col=0 也 EINVAL),clamp 到 1 是不可见但合法的最小
+/// grid。
+///
+/// 抽成纯 fn(无副作用、不碰 LoopData)是 conventions §3 "复杂决策抽纯函数 +
+/// 单测" 套路的复用 —— resize 数学决策能 headless 单测覆盖,与
+/// `propagate_resize_if_dirty` 的真副作用解耦。
+///
+/// 测试覆盖见 `tests::cells_from_surface_px_*`。
+pub(crate) fn cells_from_surface_px(width: u32, height: u32) -> (usize, usize) {
+    let cols = ((width as f32) / crate::wl::render::CELL_W_PX) as usize;
+    let rows = ((height as f32) / crate::wl::render::CELL_H_PX) as usize;
+    (cols.max(1), rows.max(1))
+}
+
+/// 把 `core.resize_dirty` 触发的 resize 同步推给 renderer / term / pty 三方。
+/// `drive_wayland` 在 `dispatch_pending` 之后调一次 —— configure event 在 dispatch
+/// 时跑 `WindowHandler::configure` → `handle_event` 置 dirty,本 fn 紧接消费。
+///
+/// 三方同步顺序(无强约束,但顺序固定便于排障):
+/// 1. **renderer.resize**:重 configure wgpu surface (新 width/height);
+///    NDC 换算的 surface_w/h 也跟随更新,下一次 draw_cells 自动用新尺寸
+/// 2. **term.resize**:alacritty Term grid resize,内部 clamp cursor / 调
+///    selection / scroll_region / damage,置 dirty 触发下一次 idle 重画
+/// 3. **pty.resize**:`ioctl(TIOCSWINSZ)` 推新 winsize 给 PTY master,kernel
+///    给前台进程组发 `SIGWINCH`,bash / vim 重新 query winsize 自适应
+///
+/// **INV-006 消费者职责**:清 `state.core.resize_dirty = false`。本 fn 是 dirty
+/// 标记的唯一上游消费者(T-0306 改:原 `WindowHandler::configure` 的 init 路径
+/// 清零职责迁过来,使消费者单一)。
+///
+/// **错误处理**:pty.resize 走 ioctl 极少失败,失败仅 `tracing::warn` 不 panic /
+/// 不退出 —— terminal grid 已变,UI 仍能继续工作,shell 看不到新 winsize 是
+/// 退化但非致命。term/renderer.resize 自身是 infallible(panic-safe)。
+///
+/// **split borrow**:`LoopData { state, term, .. } = &mut *data;` 同时拿
+/// `&mut state.pty / &mut state.renderer / &mut state.core / &mut term` 四份;
+/// LoopData 不同字段间 NLL OK,且 state.* 与 term 是独立 LoopData 字段。
+fn propagate_resize_if_dirty(data: &mut LoopData) {
+    if !data.state.core.resize_dirty {
+        return;
+    }
+    let LoopData { state, term, .. } = &mut *data;
+
+    let width = state.core.width;
+    let height = state.core.height;
+    let (cols, rows) = cells_from_surface_px(width, height);
+
+    if let Some(r) = state.renderer.as_mut() {
+        r.resize(width, height);
+    }
+
+    if let Some(t) = term.as_mut() {
+        t.resize(cols, rows);
+    }
+
+    if let Some(p) = state.pty.as_ref() {
+        if let Err(err) = p.resize(cols as u16, rows as u16) {
+            // ioctl(TIOCSWINSZ) 极少失败,但 fd 提前关 / EBADF 时不 panic ——
+            // shell 收不到 SIGWINCH 是退化, UI 仍走 (term 已 resize, 渲染正常)。
+            tracing::warn!(
+                ?err,
+                cols,
+                rows,
+                "pty.resize ioctl 失败, shell 不会收 SIGWINCH"
+            );
+        }
+    }
+
+    state.core.resize_dirty = false;
+    tracing::debug!(
+        width,
+        height,
+        cols,
+        rows,
+        "propagated resize → renderer + term + pty"
+    );
+}
+
 /// calloop wayland source 的回调:**prepare_read → read → dispatch_pending →
 /// flush** 四步拆清楚,之间有若干退出 / 错误分支要处理。
 ///
@@ -438,6 +523,12 @@ fn drive_wayland(data: &mut LoopData) -> std::io::Result<PostAction> {
     if data.state.core.exit {
         data.loop_signal.stop();
     }
+
+    // Step 3.5(T-0306):dispatch_pending 期间 `WindowHandler::configure` 可能
+    // 已置 `core.resize_dirty`(尺寸变化)。在 flush 之前把 renderer / term /
+    // pty 三方同步推完,使本轮事件结束前一切就绪。flush 后下一次 idle callback
+    // 看到 term.is_dirty (resize 副作用) 会立刻 draw_cells 用新 cols/rows 重画。
+    propagate_resize_if_dirty(data);
 
     // Step 4:把 ack_configure / surface commit 这些响应真推给 compositor。
     if let Err(e) = data.state.conn.flush() {
@@ -815,14 +906,18 @@ impl WindowHandler for State {
             },
         );
 
-        // resize 重配置是 T-0103 的范围:本 ticket 仅在首次 configure 建 renderer
-        // 并画一次;之后 `WindowCore::resize_dirty` 的消费者留给 T-0103。
+        // 首次 configure 建 renderer 并画一次清屏占位帧;之后的 size 同步走
+        // [`propagate_resize_if_dirty`](`drive_wayland` 在 dispatch_pending 后
+        // 调一次)—— 那里同时推 renderer.resize / term.resize / pty.resize,
+        // 然后清 `core.resize_dirty`(INV-006 的"显式清零"由 propagate 承担)。
+        //
+        // T-0306 改:**不**在此处清 `resize_dirty`。原 T-0103 临时让 init 路径
+        // 清零,T-0306 把"resize → 三方同步"统一到 propagate, INV-006 的消费者
+        // 责任单一。init 失败仍 panic 退出(renderer 起不来 quill 没意义跑下去)。
         if was_first && action.needs_draw {
             if let Err(err) = self.init_renderer_and_draw() {
                 tracing::error!(?err, "wgpu renderer 初始化或首帧失败");
                 self.core.exit = true;
-            } else {
-                self.core.resize_dirty = false;
             }
         }
     }
@@ -951,6 +1046,63 @@ mod tests {
                 "errno {errno} 应保守触发退出"
             );
         }
+    }
+
+    // ---------- T-0306 cells_from_surface_px 纯逻辑单测 ----------
+    // surface 像素 → grid cell 计数的换算决策, 抽成纯 fn 让测试覆盖整数除 +
+    // max(1) clamp 两条分支, 不需要构造 LoopData / 真 wayland 连接。
+
+    #[test]
+    fn cells_from_surface_px_default_800x600_matches_80x24() {
+        // 初始尺寸 800×600 + cell 10×25 → 80×24 (与 spawn_shell(80, 24) 对齐)。
+        // 锁住"Phase 3 默认行为不变"——T-0306 接通 resize 后默认窗口仍 80×24。
+        assert_eq!(
+            cells_from_surface_px(super::INITIAL_WIDTH, super::INITIAL_HEIGHT),
+            (80, 24),
+            "默认 800×600 + cell 10×25 应给 80×24"
+        );
+    }
+
+    #[test]
+    fn cells_from_surface_px_grows_with_surface() {
+        // 拖大窗口能多显示 cells (T-0306 acceptance 核心)
+        assert_eq!(
+            cells_from_surface_px(1600, 1200),
+            (160, 48),
+            "1600×1200 应给 160×48 (双倍)"
+        );
+        assert_eq!(
+            cells_from_surface_px(1920, 1080),
+            (192, 43),
+            "1920×1080 typical → 192×43 (Phase 3 cell 常数)"
+        );
+    }
+
+    #[test]
+    fn cells_from_surface_px_clamps_zero_to_one() {
+        // 极小 surface 整数除给 0, max(1) 兜底。term/pty 都不接受 0 维度。
+        assert_eq!(cells_from_surface_px(0, 0), (1, 1), "0×0 应 clamp 到 1×1");
+        assert_eq!(
+            cells_from_surface_px(5, 10),
+            (1, 1),
+            "5px (< CELL_W_PX=10) 应 clamp col=1"
+        );
+        assert_eq!(
+            cells_from_surface_px(20, 5),
+            (2, 1),
+            "5px (< CELL_H_PX=25) 应 clamp row=1"
+        );
+    }
+
+    #[test]
+    fn cells_from_surface_px_truncates_partial_cells() {
+        // 整数除截断, 余下边距 Phase 4 再细化 (派单允许)。
+        // 805px / 10 = 80 cells (剩 5px 边距), 不向上取 81。
+        assert_eq!(
+            cells_from_surface_px(805, 612),
+            (80, 24),
+            "余数 5px / 12px 应被截断, 不上取"
+        );
     }
 
     #[test]

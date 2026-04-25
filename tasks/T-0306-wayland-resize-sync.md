@@ -2,7 +2,7 @@
 
 **Phase**: 3
 **Assigned**: writer-T0306
-**Status**: claimed
+**Status**: in-review
 **Budget**: tokenBudget=60k (lead 派单)
 **Dependencies**: T-0204 (PtyHandle::resize 已就绪) / T-0302 (TermState::dimensions) / T-0305 (draw_cells 用 cols/rows 参数)
 
