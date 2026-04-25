@@ -1,8 +1,8 @@
 # T-0402 shaping pipeline: grid cell → glyph run
 
 **Phase**: 4
-**Assigned**: (open)
-**Status**: open
+**Assigned**: writer-T0402
+**Status**: claimed
 **Budget**: tokenBudget=60k (lead 派单)
 **Dependencies**: T-0401 (TextSystem + ShapedGlyph) / T-0302 (CellRef + cells_iter)
 
