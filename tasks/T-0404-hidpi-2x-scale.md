@@ -1,8 +1,8 @@
 # T-0404 HiDPI 2x 缩放 (hardcode 简化版)
 
 **Phase**: 4
-**Assigned**: (open)
-**Status**: open
+**Assigned**: writer-T0404
+**Status**: claimed
 **Budget**: tokenBudget=30k (小单)
 **Dependencies**: T-0306 (cell 常数化) / T-0403 (glyph atlas + draw_frame)
 
