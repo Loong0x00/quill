@@ -35,7 +35,8 @@ use std::os::fd::{AsRawFd, BorrowedFd};
 use anyhow::{anyhow, Context, Result};
 use calloop::generic::Generic;
 use calloop::signals::{Signal, Signals};
-use calloop::{EventLoop, Interest, LoopSignal, Mode, PostAction};
+use calloop::timer::{TimeoutAction, Timer};
+use calloop::{EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction, RegistrationToken};
 
 use crate::pty::PtyHandle;
 use smithay_client_toolkit::{
@@ -175,6 +176,29 @@ pub fn handle_event(state: &mut WindowCore, ev: WindowEvent) -> WindowAction {
     action
 }
 
+/// T-0603: keyboard repeat 调度请求 — `Dispatch<WlKeyboard>` 把
+/// [`KeyboardAction::StartRepeat`] / [`KeyboardAction::StopRepeat`] 映射
+/// 为本 enum 写到 `state.pending_repeat`, 由 [`drive_wayland`] 在
+/// `dispatch_pending` 之后调 [`apply_repeat_request`] 真消费 (那里能拿到
+/// `&mut LoopData` → `loop_handle` + `repeat_token`, Dispatch 路径只能
+/// 拿到 `&mut State` 拿不到 LoopHandle, 所以分两阶段).
+///
+/// 与 `core.resize_dirty` (INV-006) 同套路: 协议事件路径只 set 单次延迟
+/// 请求, dispatch 之后单一上游消费者 propagate 到副作用.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RepeatScheduleRequest {
+    /// `StartRepeat` 收到: cancel 已注册 timer (若有) + insert 新
+    /// `Timer::from_duration(Duration::from_millis(delay))`. callback 走
+    /// [`tick_repeat`] (在 LoopData 维度) 拿字节写 PTY + 返
+    /// `TimeoutAction::ToDuration(Duration::from_millis(1000 / rate))` 自动
+    /// reschedule. rate=0 (compositor 禁 repeat) → 不 schedule (apply 时检查).
+    Start,
+    /// `StopRepeat` 收到: cancel 已注册 timer (若有). callback 即使下次仍
+    /// fire (race), `keyboard_state.tick_repeat()` 此时返 None 走
+    /// `TimeoutAction::Drop` 双保险.
+    Stop,
+}
+
 /// 把 wayland `EventQueue<State>`、业务 `State`、T-0301 的 `TermState`、
 /// calloop `LoopSignal` 四个运行时对象捆成一个结构,让
 /// `calloop::EventLoop<'_, LoopData>` 一把 own。回调签名得到 `&mut LoopData`,
@@ -212,6 +236,24 @@ struct LoopData {
     /// 不持 wgpu / wayland 句柄, 与 INV-001 / INV-002 资源链解耦, 放尾部 POD-like
     /// 顺序无关 (与 `frame_stats` 同位置)。
     text_system: Option<crate::text::TextSystem>,
+    /// T-0603 keyboard repeat: clone 自 `event_loop.handle()`, 用于在
+    /// [`apply_repeat_request`] 路径动态 insert / remove `Timer` source.
+    /// 单线程 calloop 下 `LoopHandle` 是 `!Send + !Sync`, 无并发问题.
+    /// `'static`: LoopData 自身 owned, 不引用任何外部生命周期, 与
+    /// `EventLoop<'static, LoopData>` 一致.
+    ///
+    /// **drop 顺序**: LoopHandle clone 内部是 `Rc` 引用计数, drop 时仅减计数,
+    /// 不影响 EventLoop 本体 (EventLoop 在 run_window scope 持本体), 放尾部
+    /// 与 frame_stats / text_system 同性质 — 无 wgpu / wayland 裸指针.
+    loop_handle: LoopHandle<'static, LoopData>,
+    /// T-0603: 当前注册的 keyboard repeat timer 句柄. None = 无 repeat 进行,
+    /// Some = 已 insert 一个 `Timer::from_duration` source, 需 remove 才停.
+    /// [`apply_repeat_request`] 在 Start 路径先 take 旧 token + remove, 再 insert
+    /// 新 timer; Stop 路径仅 take + remove. timer fire 时若 `tick_repeat=None`
+    /// 走 `TimeoutAction::Drop` 自然清, callback 内不能再 remove 自己 (calloop
+    /// 文档警告), token 仍留 Some 状态由下次 apply 清理 (race 安全 — 已 Drop
+    /// 的 token remove 返 Err 我们吞掉).
+    repeat_token: Option<RegistrationToken>,
 }
 
 // T-0108 删除:`run_main_loop` / `StepResult` / `install_signal_handlers` /
@@ -576,6 +618,213 @@ fn propagate_resize_if_dirty(data: &mut LoopData) {
     );
 }
 
+/// T-0603: 一次 keyboard repeat schedule 的最小子集决策 — 给定当前是否有
+/// 旧 token + 是否要 schedule 新 timer + (rate, delay), 算出应执行的 op 序列.
+///
+/// 抽 enum 而非直接在 [`apply_repeat_request`] 内 if-else 是 conventions §3
+/// 抽状态机模式 (T-0107 WindowAction / T-0205 PtyAction / T-0501 KeyboardAction
+/// 同套路). 真 LoopHandle / RegistrationToken 操作有副作用且需 LoopData 借用,
+/// 决策本身是纯逻辑 (输入: Option<bool>=有无旧 token, 是否 Start, rate),
+/// 单测覆盖 4 个 case (Stop+无旧 / Stop+有旧 / Start+rate=0 / Start+rate>0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RepeatScheduleOp {
+    /// 无操作 (例: Stop 但本来就没 timer; rate=0 时 Start 不 schedule 但也无旧).
+    Noop,
+    /// 仅 cancel 旧 timer (Stop 且有旧, 或 Start+rate=0 但有旧需先停).
+    CancelOnly,
+    /// cancel 旧 timer (若有) + insert 新 timer (Start + rate>0).
+    CancelAndStart,
+}
+
+/// T-0603: 决定一次 [`apply_repeat_request`] 调用要执行的操作.
+///
+/// 输入:
+/// - `request`: dispatch 期间 `Dispatch<WlKeyboard>` 写入的请求
+/// - `has_old_token`: LoopData 是否持有旧 RegistrationToken
+/// - `rate`: wl_keyboard `RepeatInfo` 给的 rate (keys/sec, 0=禁用)
+///
+/// rate=0 (compositor 禁 repeat, 例: 用户 GNOME 设置 disable repeat) 时
+/// Start 退化为 CancelOnly (清旧 timer 即可, 不 schedule 新).
+pub(crate) fn schedule_op_for_request(
+    request: &RepeatScheduleRequest,
+    has_old_token: bool,
+    rate: i32,
+) -> RepeatScheduleOp {
+    match request {
+        RepeatScheduleRequest::Stop => {
+            if has_old_token {
+                RepeatScheduleOp::CancelOnly
+            } else {
+                RepeatScheduleOp::Noop
+            }
+        }
+        RepeatScheduleRequest::Start => {
+            if rate <= 0 {
+                if has_old_token {
+                    RepeatScheduleOp::CancelOnly
+                } else {
+                    RepeatScheduleOp::Noop
+                }
+            } else {
+                RepeatScheduleOp::CancelAndStart
+            }
+        }
+    }
+}
+
+/// T-0603: 消费 `state.pending_repeat` (Dispatch<WlKeyboard> 写入), 把请求
+/// 真翻译成 calloop Timer source 的 insert / remove. 与
+/// [`propagate_resize_if_dirty`] 同套路 — 协议事件路径只 set 单次延迟请求,
+/// 单一上游消费者 (drive_wayland step 3.6) 推副作用.
+///
+/// **why 在 dispatch_pending 后**: Dispatch 路径只能拿到 `&mut State`, 拿
+/// 不到 `LoopHandle` (在 LoopData 里); LoopHandle insert_source 也不能在
+/// timer callback 内对自己 remove (calloop 文档警告). 把动作推迟到
+/// drive_wayland 的 step 3.6, `&mut LoopData` 字段 (loop_handle / repeat_token)
+/// 全可访问 — 单一消费者一次性处理.
+///
+/// **rate / delay 来源**: 走 `state.keyboard_state.repeat_info()`. wl_keyboard
+/// `RepeatInfo` 协议在 v4+ keymap 之后 fire (之前 protocol 无 repeat_info,
+/// 老 compositor 退化到 rate=0 不 schedule); 默认值 rate=0 / delay=0 起步,
+/// compositor 推 RepeatInfo 后更新. INV-005: Timer source 与其它 IO fd 同
+/// 一 EventLoop, 不起 thread.
+fn apply_repeat_request(data: &mut LoopData) {
+    let Some(request) = data.state.pending_repeat.take() else {
+        return;
+    };
+    let (rate, delay) = data.state.keyboard_state.repeat_info();
+    let has_old_token = data.repeat_token.is_some();
+    let op = schedule_op_for_request(&request, has_old_token, rate);
+    match op {
+        RepeatScheduleOp::Noop => {
+            tracing::trace!(
+                target: "quill::keyboard",
+                ?request,
+                rate,
+                "repeat schedule noop"
+            );
+        }
+        RepeatScheduleOp::CancelOnly => {
+            if let Some(tok) = data.repeat_token.take() {
+                data.loop_handle.remove(tok);
+                tracing::debug!(
+                    target: "quill::keyboard",
+                    ?request,
+                    "repeat timer cancelled"
+                );
+            }
+        }
+        RepeatScheduleOp::CancelAndStart => {
+            if let Some(tok) = data.repeat_token.take() {
+                data.loop_handle.remove(tok);
+            }
+            // delay <= 0 (协议怪异 / 测试边界): 用 1ms 兜底, 至少给一帧
+            // 缓冲不立即 fire.
+            let delay_ms = delay.max(1) as u64;
+            let timer = Timer::from_duration(std::time::Duration::from_millis(delay_ms));
+            match data
+                .loop_handle
+                .insert_source(timer, |_deadline, _meta, data: &mut LoopData| {
+                    repeat_timer_tick(data)
+                }) {
+                Ok(token) => {
+                    data.repeat_token = Some(token);
+                    tracing::debug!(
+                        target: "quill::keyboard",
+                        rate,
+                        delay_ms,
+                        "repeat timer scheduled"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        target: "quill::keyboard",
+                        ?err,
+                        "calloop insert_source(repeat timer) 失败 — repeat 不工作但 quill 继续跑"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// T-0603 calloop Timer callback: timer fire 时取当前 repeat 字节写 PTY,
+/// 返 `TimeoutAction::ToDuration(1000/rate ms)` 自动 reschedule 让 calloop
+/// 持续触发, 直到 `keyboard_state.tick_repeat() == None` 走 `TimeoutAction::Drop`.
+///
+/// **why 不在此处 remove repeat_token**: calloop 文档警告 "callback 内不能
+/// 对自己的 source 调 remove"; 改用 `TimeoutAction::Drop` 让 calloop 自己
+/// 清掉 source. `data.repeat_token` 仍留 Some, 下次 [`apply_repeat_request`]
+/// 路径若调 `loop_handle.remove(stale_token)` 会得到 Err (token 已被 calloop
+/// 自身 Drop), 代码内吞掉 — race 安全.
+///
+/// **PTY 错误处理**: 与 `Dispatch<WlKeyboard>` WriteToPty 路径一致 —
+/// WouldBlock 丢字节 (背压, INV-005), partial write 丢剩余, 其它 IO 错 warn.
+fn repeat_timer_tick(data: &mut LoopData) -> TimeoutAction {
+    let bytes = match data.state.keyboard_state.tick_repeat() {
+        Some(b) => b,
+        None => {
+            // Stop 已发但 timer 仍 fire (race): 自然 Drop 终止. apply 路径下次
+            // 会清 stale repeat_token (remove Err 吞掉).
+            tracing::trace!(
+                target: "quill::keyboard",
+                "repeat tick: tick_repeat=None, dropping timer"
+            );
+            return TimeoutAction::Drop;
+        }
+    };
+    // 写 PTY (复用 Dispatch<WlKeyboard> 的相同策略). pty=None 不应该发生
+    // (repeat 进入路径前 pty 已 spawn) — 防御性 warn 不 panic.
+    if let Some(pty) = data.state.pty.as_ref() {
+        match pty.write(&bytes) {
+            Ok(n) if n == bytes.len() => {
+                tracing::trace!(
+                    target: "quill::keyboard",
+                    n,
+                    "repeat tick wrote bytes to pty"
+                );
+            }
+            Ok(n) => {
+                tracing::warn!(
+                    target: "quill::keyboard",
+                    wrote = n,
+                    total = bytes.len(),
+                    "repeat tick partial write, 剩余字节丢弃 (背压)"
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                tracing::warn!(
+                    target: "quill::keyboard",
+                    n = bytes.len(),
+                    "repeat tick WouldBlock, 字节丢弃 (背压, INV-005 不重试)"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "quill::keyboard",
+                    error = %e,
+                    "repeat tick pty.write 失败 (非 WouldBlock)"
+                );
+            }
+        }
+    } else {
+        tracing::warn!(
+            target: "quill::keyboard",
+            n = bytes.len(),
+            "repeat tick 但 pty=None, 丢字节"
+        );
+    }
+    // reschedule 1000/rate ms 后再 fire. rate=0 兜底走 100ms (与 apply 路径
+    // 不 schedule 形成多重防御; 实战 rate 由协议给非 0).
+    let (rate, _delay) = data.state.keyboard_state.repeat_info();
+    let interval_ms = if rate > 0 {
+        (1000 / rate as u64).max(1)
+    } else {
+        100
+    };
+    TimeoutAction::ToDuration(std::time::Duration::from_millis(interval_ms))
+}
+
 /// calloop wayland source 的回调:**prepare_read → read → dispatch_pending →
 /// flush** 四步拆清楚,之间有若干退出 / 错误分支要处理。
 ///
@@ -630,6 +879,11 @@ fn drive_wayland(data: &mut LoopData) -> std::io::Result<PostAction> {
     // pty 三方同步推完,使本轮事件结束前一切就绪。flush 后下一次 idle callback
     // 看到 term.is_dirty (resize 副作用) 会立刻 draw_cells 用新 cols/rows 重画。
     propagate_resize_if_dirty(data);
+
+    // Step 3.6 (T-0603): dispatch_pending 期间 `Dispatch<WlKeyboard>` 可能
+    // 已置 `state.pending_repeat` (按键 Pressed → Start 或 Released / modifier
+    // 变化 → Stop). 在 flush 之前把 calloop Timer source 真 insert / remove.
+    apply_repeat_request(data);
 
     // Step 4:把 ack_configure / surface commit 这些响应真推给 compositor。
     if let Err(e) = data.state.conn.flush() {
@@ -757,6 +1011,7 @@ pub fn run_window() -> Result<()> {
         text_input_manager,
         text_input: None,
         ime_state: ImeState::new(),
+        pending_repeat: None,
         pty: None,
     };
 
@@ -898,6 +1153,12 @@ pub fn run_window() -> Result<()> {
         // target 观察帧间隔聚合。
         frame_stats: crate::frame_stats::FrameStats::new(),
         text_system,
+        // T-0603: clone LoopHandle 给 LoopData, 让 `apply_repeat_request` 在
+        // dispatch_pending 之后能动态 insert / remove Timer source.
+        // LoopHandle clone 内部 Rc, 与 event_loop 本体共享调度器, drop 时仅
+        // 减计数不影响 EventLoop.
+        loop_handle: loop_handle.clone(),
+        repeat_token: None,
     };
     event_loop
         .run(None, &mut loop_data, |data| {
@@ -1107,6 +1368,15 @@ struct State {
     text_input_manager: Option<ZwpTextInputManagerV3>,
     text_input: Option<ZwpTextInputV3>,
     ime_state: ImeState,
+    /// T-0603 keyboard repeat: `Dispatch<WlKeyboard>` 收到
+    /// `KeyboardAction::StartRepeat / StopRepeat` 时只能拿到 `&mut State`,
+    /// 拿不到 `LoopHandle` (在 LoopData 里). 把请求暂存到本字段, 让
+    /// [`drive_wayland`] 在 `dispatch_pending` 之后调
+    /// [`apply_repeat_request`] 真消费 (那里 `&mut LoopData` 字段可用).
+    /// 与 `core.resize_dirty` (INV-006) 同套路 — 协议事件 set 单次延迟请求,
+    /// 单一上游消费者推副作用. drop 顺序: `RepeatScheduleRequest` 是 POD enum,
+    /// 无 GPU / wayland 引用, 顺序无关.
+    pending_repeat: Option<RepeatScheduleRequest>,
     // `pty` **位于 State 最后一位**(Lead + 审码 2026-04-25 拍板,见 T-0202 ticket):
     // - PTY 持 Linux fd + 子进程句柄,与 wl / wgpu 资源生命周期正交,放最后避免
     //   跟 INV-001 的 renderer→window→conn 链条耦合,不需要新建 INV。
@@ -1747,54 +2017,73 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
         match action {
             KeyboardAction::Nothing => {}
             KeyboardAction::WriteToPty(bytes) => {
-                let Some(pty) = state.pty.as_ref() else {
-                    tracing::warn!(
-                        target: "quill::keyboard",
-                        n = bytes.len(),
-                        "WriteToPty 时 pty=None, 丢字节"
-                    );
-                    return;
-                };
-                match pty.write(&bytes) {
-                    Ok(n) if n == bytes.len() => {
-                        tracing::trace!(
-                            target: "quill::keyboard",
-                            n,
-                            "wrote keyboard bytes to pty"
-                        );
-                    }
-                    Ok(n) => {
-                        // partial write — PTY 内核 buffer 几乎满。剩余字节
-                        // **派单允许丢** (背压策略, 不阻塞主循环)。
-                        tracing::warn!(
-                            target: "quill::keyboard",
-                            wrote = n,
-                            total = bytes.len(),
-                            "pty.write 部分写入, 剩余字节丢弃 (背压)"
-                        );
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        // O_NONBLOCK fd buffer 满 — daily drive 罕见, paste 大
-                        // 段可能撞到。派单 In #D 接受丢字节, Phase 6 paste
-                        // throttle 解。
-                        tracing::warn!(
-                            target: "quill::keyboard",
-                            n = bytes.len(),
-                            "pty.write WouldBlock, 字节丢弃 (背压, INV-005 不重试)"
-                        );
-                    }
-                    Err(e) => {
-                        // 其它 IO 错 (EBADF / EIO 等) — pty 可能已死, 主循环
-                        // 由 pty_read_tick EOF 路径处理退出, 这里仅 warn。
-                        tracing::warn!(
-                            target: "quill::keyboard",
-                            error = %e,
-                            n = bytes.len(),
-                            "pty.write 失败 (非 WouldBlock)"
-                        );
-                    }
-                }
+                write_keyboard_bytes(state, &bytes);
             }
+            // T-0603: Pressed → 立即写一次 (即时回显) + 设 pending_repeat=Start
+            // 让 drive_wayland step 3.6 真 schedule timer.
+            KeyboardAction::StartRepeat { bytes } => {
+                write_keyboard_bytes(state, &bytes);
+                state.pending_repeat = Some(RepeatScheduleRequest::Start);
+            }
+            // T-0603: Released 同 keycode 或 modifier 变化 → 设 pending_repeat=Stop
+            // 让 drive_wayland step 3.6 真 cancel timer.
+            KeyboardAction::StopRepeat => {
+                state.pending_repeat = Some(RepeatScheduleRequest::Stop);
+            }
+        }
+    }
+}
+
+/// T-0603 + T-0501: 写 keyboard 字节到 PTY (Pressed 即时回显路径). 抽出来
+/// 让 `KeyboardAction::WriteToPty` 与 `KeyboardAction::StartRepeat` 共用 — 两
+/// 者都需要 "立即写一次" 语义, 与 INV-009 (master fd O_NONBLOCK) + INV-005
+/// (calloop 不重试 WouldBlock) 一致.
+fn write_keyboard_bytes(state: &State, bytes: &[u8]) {
+    let Some(pty) = state.pty.as_ref() else {
+        tracing::warn!(
+            target: "quill::keyboard",
+            n = bytes.len(),
+            "keyboard write 时 pty=None, 丢字节"
+        );
+        return;
+    };
+    match pty.write(bytes) {
+        Ok(n) if n == bytes.len() => {
+            tracing::trace!(
+                target: "quill::keyboard",
+                n,
+                "wrote keyboard bytes to pty"
+            );
+        }
+        Ok(n) => {
+            // partial write — PTY 内核 buffer 几乎满。剩余字节
+            // **派单允许丢** (背压策略, 不阻塞主循环)。
+            tracing::warn!(
+                target: "quill::keyboard",
+                wrote = n,
+                total = bytes.len(),
+                "pty.write 部分写入, 剩余字节丢弃 (背压)"
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            // O_NONBLOCK fd buffer 满 — daily drive 罕见, paste 大
+            // 段可能撞到。派单 In #D 接受丢字节, Phase 6 paste
+            // throttle 解。
+            tracing::warn!(
+                target: "quill::keyboard",
+                n = bytes.len(),
+                "pty.write WouldBlock, 字节丢弃 (背压, INV-005 不重试)"
+            );
+        }
+        Err(e) => {
+            // 其它 IO 错 (EBADF / EIO 等) — pty 可能已死, 主循环
+            // 由 pty_read_tick EOF 路径处理退出, 这里仅 warn。
+            tracing::warn!(
+                target: "quill::keyboard",
+                error = %e,
+                n = bytes.len(),
+                "pty.write 失败 (非 WouldBlock)"
+            );
         }
     }
 }
@@ -2185,5 +2474,62 @@ mod tests {
         assert!(samples.contains(&PtyAction::ContinueReading));
         assert!(samples.contains(&PtyAction::RequestExit));
         assert!(samples.contains(&PtyAction::ReturnContinue));
+    }
+
+    // ---------- T-0603 schedule_op_for_request 决策单测 ----------
+    // 与 pty_readable_action 同套路 — 决策抽纯函数, 副作用 (LoopHandle.remove
+    // / insert_source / Timer 真 fire) 由 tests/keyboard_repeat_e2e.rs 覆盖.
+
+    #[test]
+    fn schedule_op_stop_with_no_token_is_noop() {
+        assert_eq!(
+            schedule_op_for_request(&RepeatScheduleRequest::Stop, false, 25),
+            RepeatScheduleOp::Noop,
+            "Stop 但本来无 timer 应 Noop"
+        );
+    }
+
+    #[test]
+    fn schedule_op_stop_with_token_cancels_only() {
+        assert_eq!(
+            schedule_op_for_request(&RepeatScheduleRequest::Stop, true, 25),
+            RepeatScheduleOp::CancelOnly,
+            "Stop 有 timer 应 CancelOnly"
+        );
+    }
+
+    #[test]
+    fn schedule_op_start_rate_zero_no_token_is_noop() {
+        assert_eq!(
+            schedule_op_for_request(&RepeatScheduleRequest::Start, false, 0),
+            RepeatScheduleOp::Noop,
+            "Start 但 rate=0 (compositor 禁 repeat) 无旧 token 应 Noop"
+        );
+    }
+
+    #[test]
+    fn schedule_op_start_rate_zero_with_token_cancels() {
+        // 边界: 用户先按 'a' (rate>0 时 schedule 了 timer) 然后 RepeatInfo
+        // 改 rate=0 (用户改 GNOME 设置, 假设新 RepeatInfo 到达后再按一次键),
+        // 此时 Start 退化为 Cancel.
+        assert_eq!(
+            schedule_op_for_request(&RepeatScheduleRequest::Start, true, 0),
+            RepeatScheduleOp::CancelOnly,
+            "Start + rate=0 + 有旧 timer 应 CancelOnly (清旧不 schedule 新)"
+        );
+    }
+
+    #[test]
+    fn schedule_op_start_rate_positive_cancels_and_starts() {
+        assert_eq!(
+            schedule_op_for_request(&RepeatScheduleRequest::Start, false, 25),
+            RepeatScheduleOp::CancelAndStart,
+            "Start + rate>0 无旧 token 也走 CancelAndStart (cancel 是 no-op)"
+        );
+        assert_eq!(
+            schedule_op_for_request(&RepeatScheduleRequest::Start, true, 25),
+            RepeatScheduleOp::CancelAndStart,
+            "Start + rate>0 + 有旧 token 应 CancelAndStart (清旧 + schedule 新)"
+        );
     }
 }

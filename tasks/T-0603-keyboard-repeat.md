@@ -1,8 +1,8 @@
 # T-0603 keyboard repeat (长按重发字节)
 
 **Phase**: 6
-**Assigned**: (open)
-**Status**: open
+**Assigned**: writer-T0603
+**Status**: in-review
 **Budget**: tokenBudget=150k (timerfd + calloop 集成 + repeat 状态机)
 **Dependencies**: T-0501 (wl_keyboard + RepeatInfo 已记录 rate/delay)
 **Priority**: P1 (user 实测反馈长按 backspace 不连续, daily-drive 必需)

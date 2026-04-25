@@ -33,5 +33,9 @@ pub use render::{PreeditOverlay, PREEDIT_UNDERLINE_PX};
 
 // T-0601: 光标 quad 入参 (集成测试 tests/cursor_render_e2e.rs + window.rs
 // idle callback 用). quill 自有 struct + enum (INV-010, 不漏 alacritty
-// CursorShape). CURSOR_THICKNESS_PX 常数同步 re-export 给测试位置算用.
+// CursorShape).
 pub use render::{CursorInfo, CursorStyle, CURSOR_THICKNESS_PX};
+
+// T-0603: 集成测试 tests/keyboard_repeat_e2e.rs 用 KeyboardState +
+// wl_keyboard::Event + KeyboardAction. quill 自有类型 (INV-010).
+pub use keyboard::{handle_key_event, KeyboardAction, KeyboardState};
