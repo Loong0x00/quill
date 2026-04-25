@@ -130,6 +130,57 @@ impl TextSystem {
             .next()
             .and_then(|run| run.glyphs.first().map(ShapedGlyph::from_cosmic_glyph))
     }
+
+    /// 对一行纯文本走 cosmic-text shaping pipeline,返回按显示顺序的
+    /// [`ShapedGlyph`] 序列。空字符串返回空 [`Vec`]。
+    ///
+    /// **T-0403 渲染层主入口** —— 取代 [`Self::shape_one_char`] 单字符脚手架。
+    /// 输入一行 `&str`(不含 `\n`,多行调用方按 `\n` 切分),输出每个字形的
+    /// gid + advance + line-relative position,渲染层按 `x_offset` / `y_offset`
+    /// 直接 blit 到 atlas 槽位。
+    ///
+    /// **多 LayoutRun 拼接**: cosmic-text 在字体 fallback 切换时(例 ASCII
+    /// "abc" + CJK "中" 各自走不同 face)把单 line 拆成多 [`LayoutRun`],
+    /// `.flat_map(|run| run.glyphs)` 按显示顺序展平 —— 对 LTR 文本就是物理
+    /// 顺序。RTL / BiDi 留给 Phase 5+(派单 Out 段明示)。
+    ///
+    /// **Metrics 选择 (font_size=17.0, line_height=25.0)**: 与 T-0306
+    /// `CELL_W_PX=10` / `CELL_H_PX=25` 估算对齐 —— monospace 字体 17pt advance
+    /// ≈ 10px (DejaVu Sans Mono / Source Code Pro 实测), line_height 25 与
+    /// cell_h 一致。**临时常数**, Phase 4 后续 ticket 用字体真实 metrics 替换
+    /// (见 [`Self::shape_one_char`] 注释提到的 T-0306 P3-5 路径)。
+    ///
+    /// **shape_until_scroll(prune=true)**: 本 buffer 是单次 shape 后立即丢的
+    /// scratch, prune=true 告诉 cosmic-text 主动释放 shape buffer 中未用的
+    /// scroll-out 行存储 —— 对单行场景无差,但与未来"多行可滚动 buffer"调用
+    /// 模式对齐。`shape_one_char` 使用 `false` 是 T-0401 早期实现选择,本 fn
+    /// 不一并改 (out-of-scope; 该 fn 是 Phase 4 临时探测 API 即将退役).
+    ///
+    /// 测试覆盖:
+    /// - [`tests::shape_line_ascii_returns_per_char_glyphs`]
+    /// - [`tests::shape_line_mixed_cjk_returns_glyphs`]
+    /// - [`tests::shape_line_empty_returns_empty`]
+    /// - [`tests::shape_line_advance_sums_match_text_width`]
+    pub fn shape_line(&mut self, text: &str) -> Vec<ShapedGlyph> {
+        use cosmic_text::{Attrs, Buffer, Family, Metrics, Shaping};
+
+        let metrics = Metrics::new(17.0, 25.0);
+        let mut buffer = Buffer::new(&mut self.font_system, metrics);
+        let attrs = Attrs::new().family(Family::Monospace);
+
+        buffer.set_text(&mut self.font_system, text, attrs, Shaping::Advanced);
+        buffer.shape_until_scroll(&mut self.font_system, true);
+
+        buffer
+            .layout_runs()
+            .flat_map(|run| {
+                run.glyphs
+                    .iter()
+                    .map(ShapedGlyph::from_cosmic_glyph)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
 }
 
 /// 单个 shaped glyph 的几何信息(Phase 4 起步最小集)。
@@ -137,23 +188,33 @@ impl TextSystem {
 /// **类型隔离**: 不暴露 [`cosmic_text::LayoutGlyph`](其 15 字段含
 /// cosmic-text 内部 `font_id: ID` / `cache_key_flags` / `level: Level`
 /// 等不稳定布局状态)。本 struct 是渲染层真正用得上的最小子集,Phase 4
-/// 后续 ticket(T-0402..T-0406)会按需扩字段(`x_offset` / `y_offset` /
-/// `font_id_quill_local: u32` / `font_size_px: f32` 等),仍走
-/// [`Self::from_cosmic_glyph`] 模块私有 inherent fn 注入,**不**反向
-/// 构造或 `From` impl。
+/// 后续 ticket(T-0403..T-0406)会按需扩字段(`font_id_quill_local: u32` /
+/// `font_size_px: f32` 等),仍走 [`Self::from_cosmic_glyph`] 模块私有
+/// inherent fn 注入,**不**反向构造或 `From` impl。
 ///
 /// **字段语义**:
 /// - `glyph_id`: face 内 glyph index(u16, OpenType 标准 gid),光栅化阶段
 ///   (T-0403)用作 atlas key 一部分(配合 face id + size)
 /// - `x_advance`: 横向推进像素(已 layout,等价 HarfBuzz `x_advance`)。
-///   monospace 字体下应近似一致(例 14pt 约 8-10px),Phase 4 字形 ticket
+///   monospace 字体下应近似一致(例 17pt 约 10px),Phase 4 字形 ticket
 ///   用此值动态测量 cell pixel size 替换 T-0306 临时常数
 /// - `y_advance`: 竖向推进像素(横排恒 0;给未来竖排 hook)
+/// - `x_offset` / `y_offset` (T-0402 加): 字形左上角相对所在行起点的像素
+///   位置 —— 来自 [`cosmic_text::LayoutGlyph`] 的 `x` / `y` 字段(cosmic-text
+///   把这两个字段命名为 hitbox X/Y 但语义就是"glyph 位置")。**注意命名差**:
+///   cosmic-text 自己也有 `LayoutGlyph::x_offset` / `y_offset` 字段表达"逻辑
+///   坐标抖动",我们**不**用那两个 (Phase 4 不做 sub-pixel rendering),quill
+///   的 `x_offset` / `y_offset` 就是 cosmic-text 的 `x` / `y` 累积位置。
+///   T-0403 渲染层用这两值定位每个字形 atlas blit 的左上角。
+///   类型用 `f32` (而非 cosmic-text [`cosmic_text::PhysicalPosition`]),保持
+///   INV-010 类型隔离 —— 接班 reviewer 注意 PhysicalPosition 不出本模块。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ShapedGlyph {
     pub glyph_id: u16,
     pub x_advance: f32,
     pub y_advance: f32,
+    pub x_offset: f32,
+    pub y_offset: f32,
 }
 
 impl ShapedGlyph {
@@ -175,18 +236,30 @@ impl ShapedGlyph {
     ///   非"glyph bbox 宽度";cosmic-text 0.19+ 字段名仍为 `w`,升级稳)
     /// - `y_advance` ← `0.0`(横排, vertical advance 恒 0;cosmic-text 未
     ///   直接暴露 y_advance,Phase 4 不做竖排,0 是正确占位)
+    /// - `x_offset` ← `g.x` (T-0402 加, line-relative cumulative pixel X 位置;
+    ///   cosmic-text 把这字段命名 hitbox X 但实质就是 layout 后 X 坐标)
+    /// - `y_offset` ← `g.y` (T-0402 加, line-relative pixel Y 位置;单行场景
+    ///   通常 0, 留字段是为 Phase 4 后续多行 / 行内 super/subscript 扩展)
+    ///
+    /// **不映射 cosmic-text 自身 `x_offset` / `y_offset` 字段** (T-0402 决策):
+    /// cosmic-text 的同名字段表达"逻辑坐标 sub-pixel 抖动",Phase 4 不做
+    /// sub-pixel rendering(整数像素对齐 monospace cell),用 `g.x` / `g.y`
+    /// 累积位置即可。命名上虽然与 cosmic-text 撞名但语义不同 — 注释 + struct
+    /// 字段 doc 已显式区分。
     ///
     /// **跨版本升级路径**: cosmic-text 0.12 → 0.19 LayoutGlyph 字段稳定
-    /// (实测 0.19 Has `glyph_id` / `w` 同名同类型)。若未来 1.x 重命名 / 改
-    /// 类型,本 fn body 是唯一改动点。`LayoutGlyph` 是 struct 不是 enum,
-    /// 字段未消化时编译期不报警 —— 这是 INV-010 验证段对 struct 类型的已知
-    /// 边界(struct 靠"渲染层只用 glyph_id/x_advance/y_advance 三字段"约定锁住,
-    /// 而非 enum 的 exhaustive match catch).
+    /// (实测 0.19 Has `glyph_id` / `w` / `x` / `y` 同名同类型)。若未来 1.x
+    /// 重命名 / 改类型,本 fn body 是唯一改动点。`LayoutGlyph` 是 struct 不是
+    /// enum,字段未消化时编译期不报警 —— 这是 INV-010 验证段对 struct 类型
+    /// 的已知边界(struct 靠"渲染层只用 glyph_id/x_advance/y_advance/x_offset/
+    /// y_offset 五字段"约定锁住,而非 enum 的 exhaustive match catch).
     fn from_cosmic_glyph(g: &cosmic_text::LayoutGlyph) -> Self {
         Self {
             glyph_id: g.glyph_id,
             x_advance: g.w,
             y_advance: 0.0,
+            x_offset: g.x,
+            y_offset: g.y,
         }
     }
 }
@@ -272,5 +345,123 @@ mod tests {
                 sg.y_advance
             );
         }
+    }
+
+    /// "abc" 一行 ASCII 应得 3 个 ShapedGlyph,顺序与字符顺序一致;每个
+    /// glyph advance > 0 (monospace 17pt),offset 单调递增 (LTR 累积)。
+    #[test]
+    fn shape_line_ascii_returns_per_char_glyphs() {
+        let mut ts = TextSystem::new().expect("TextSystem::new on user machine");
+        let glyphs = ts.shape_line("abc");
+        assert_eq!(
+            glyphs.len(),
+            3,
+            "ASCII 'abc' must yield 3 glyphs in monospace (got {})",
+            glyphs.len()
+        );
+        // monospace 同字号下三个 advance 应相等(±0.5 浮点容差)
+        let first = glyphs[0].x_advance;
+        for (i, g) in glyphs.iter().enumerate() {
+            assert!(
+                g.x_advance > 0.0,
+                "glyph[{}] x_advance must be positive (got {})",
+                i,
+                g.x_advance
+            );
+            assert!(
+                (g.x_advance - first).abs() < 0.5,
+                "monospace ASCII glyphs should share advance: glyph[{}]={}, first={}",
+                i,
+                g.x_advance,
+                first
+            );
+            assert_eq!(g.y_advance, 0.0, "horizontal text y_advance is 0");
+            assert!(g.x_offset.is_finite(), "glyph[{}] x_offset finite", i);
+            assert!(g.y_offset.is_finite(), "glyph[{}] y_offset finite", i);
+        }
+        // LTR 显示顺序: x_offset 单调递增
+        assert!(
+            glyphs[0].x_offset <= glyphs[1].x_offset && glyphs[1].x_offset <= glyphs[2].x_offset,
+            "x_offset must be monotonic LTR: {} <= {} <= {}",
+            glyphs[0].x_offset,
+            glyphs[1].x_offset,
+            glyphs[2].x_offset
+        );
+    }
+
+    /// CJK + ASCII 混排 "你好abc" → 5 glyphs (cosmic-text fallback chain
+    /// 切换到 Noto CJK 处理 '你' '好',回到 Latin face 处理 'a' 'b' 'c')。
+    /// 用户机 noto-fonts-cjk 装齐;CI 无 CJK 字体 cosmic-text 仍走 .notdef
+    /// fallback 5 个 glyph 不少 — 关键是 `glyphs.len() == 5` + 不 panic。
+    /// CJK 双宽性质 (东亚字 advance ≈ 2x ASCII) 由字体设计保证, **本测试
+    /// 不做 advance 数值断言** (CI 退化到 tofu 时 advance 可能 ≈ ASCII 宽,
+    /// 不能用 advance 区分 CJK / ASCII)。
+    #[test]
+    fn shape_line_mixed_cjk_returns_glyphs() {
+        let mut ts = TextSystem::new().expect("TextSystem::new on user machine");
+        let glyphs = ts.shape_line("你好abc");
+        assert_eq!(
+            glyphs.len(),
+            5,
+            "'你好abc' must yield 5 glyphs (got {}; cosmic-text fallback 应展平多 run 拼回)",
+            glyphs.len()
+        );
+        for (i, g) in glyphs.iter().enumerate() {
+            assert!(
+                g.x_advance.is_finite() && g.x_advance >= 0.0,
+                "glyph[{}] x_advance must be finite >= 0 (got {})",
+                i,
+                g.x_advance
+            );
+            assert_eq!(g.y_advance, 0.0, "horizontal text y_advance is 0");
+        }
+    }
+
+    /// 空字符串: 派单显式要求 "返空 Vec, 不 panic"。
+    /// cosmic-text Buffer set_text("", ...) 后 layout_runs 可能返空迭代器
+    /// (无 layout line),也可能返一个空 glyphs run — `flat_map` 拼接后均
+    /// 给 `Vec::new()`。
+    #[test]
+    fn shape_line_empty_returns_empty() {
+        let mut ts = TextSystem::new().expect("TextSystem::new on user machine");
+        let glyphs = ts.shape_line("");
+        assert_eq!(
+            glyphs.len(),
+            0,
+            "empty input must yield empty Vec (got {} glyphs)",
+            glyphs.len()
+        );
+    }
+
+    /// 派单测试名 "advance_sums_match_text_width": monospace 一行字符 advance
+    /// 累加应等于 (per-char advance) × char_count, ±0.5 浮点误差接受。本测试锁
+    /// 的不变式是"所有 ASCII glyph advance 一致 (monospace 性质)",防 Phase 4
+    /// 后续 ticket 改 metrics / shape pipeline 时 monospace 这条契约破口。
+    #[test]
+    fn shape_line_advance_sums_match_text_width() {
+        let mut ts = TextSystem::new().expect("TextSystem::new on user machine");
+        let text = "abcdef";
+        let glyphs = ts.shape_line(text);
+        assert_eq!(
+            glyphs.len(),
+            text.chars().count(),
+            "glyph count must match char count for ASCII (text={:?}, glyphs={})",
+            text,
+            glyphs.len()
+        );
+        let per_char = glyphs[0].x_advance;
+        assert!(
+            per_char > 0.0,
+            "first glyph advance must be positive in monospace 17pt (got {})",
+            per_char
+        );
+        let total: f32 = glyphs.iter().map(|g| g.x_advance).sum();
+        let expected = per_char * (glyphs.len() as f32);
+        assert!(
+            (total - expected).abs() < 0.5,
+            "advance sum must equal per_char × count (±0.5): total={}, expected={}",
+            total,
+            expected
+        );
     }
 }
