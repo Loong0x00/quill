@@ -2,7 +2,7 @@
 
 **Phase**: 4
 **Assigned**: writer-T0402
-**Status**: claimed
+**Status**: in-review
 **Budget**: tokenBudget=60k (lead 派单)
 **Dependencies**: T-0401 (TextSystem + ShapedGlyph) / T-0302 (CellRef + cells_iter)
 
