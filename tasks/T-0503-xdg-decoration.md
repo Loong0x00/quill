@@ -2,7 +2,7 @@
 
 **Phase**: 5
 **Assigned**: writer-T0503
-**Status**: claimed
+**Status**: in-review
 **Budget**: tokenBudget=70k (小中, 单 protocol 接入 + 单文件 src/wl/window.rs)
 **Dependencies**: Phase 1-4 全合
 **Priority**: P1 (没装饰窗口拖不动 / 关不掉, 但功能不影响)
