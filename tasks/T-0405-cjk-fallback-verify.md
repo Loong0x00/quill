@@ -1,8 +1,8 @@
 # T-0405 CJK fallback verify (T-0407 已部分覆盖, 简化版)
 
 **Phase**: 4
-**Assigned**: (open)
-**Status**: open
+**Assigned**: writer-T0405
+**Status**: in-review
 **Budget**: tokenBudget=40k (简化版)
 **Dependencies**: T-0407 (face lock + emoji 黑名单 + GlyphKey) / T-0408 (headless screenshot 自验)
 
