@@ -227,7 +227,9 @@ mod tests {
     /// CJK fallback: '中' 在 Latin monospace 无 glyph 时 cosmic-text 应自动
     /// fall back 到 Noto CJK / Source Han Sans;用户机已装。若 CI 没装 CJK
     /// 字体,cosmic-text 给 tofu glyph(.notdef, gid 0)而非 panic —— 测试
-    /// 接受两种结果(有 glyph 且 advance > 0 / tofu glyph),只要不 panic 即合规。
+    /// `assert!(g.is_some())` 配 advance >= 0 — 既覆盖"用户机有 CJK 字体正常路径"
+    /// 又覆盖"CI 无 CJK 退化到 tofu" (tofu 也是 Some, gid=0 + advance >= 0)。
+    /// 真异常 = panic / None / advance < 0 / NaN, 这些会挂测试。审码 T-0401 P3-2。
     #[test]
     fn shape_chinese_zhong_returns_glyph() {
         let mut ts = TextSystem::new().expect("TextSystem::new on user machine");

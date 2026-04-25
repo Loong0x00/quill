@@ -97,18 +97,16 @@ Lead 决定:**T-0104 + Phase 2 PTY 并行推进**。理由:
 
 ---
 
-## Phase 4 — cosmic-text + CJK (3-5 天)
+## Phase 4 — cosmic-text + CJK 1/6 (2026-04-25)
+
+- [x] `T-0401` cosmic-text 字体子系统初始化 (TextSystem + ShapedGlyph + INV-010 第 7 次应用) ✅ merged
+- [ ] `T-0402` shaping pipeline: grid cell → glyph run
+- [ ] `T-0403` glyph 光栅化 → wgpu texture atlas
+- [ ] `T-0404` 2x HiDPI 整数缩放 (`wl_output.scale` 接入)
+- [ ] `T-0405` CJK fallback 正确 (ASCII 用 mono, 中文 fallback CJK)
+- [ ] `T-0406` glyph cache + LRU 驱逐
 
 **产出**:真字形渲染,中文英文都对。
-
-关键 ticket:
-- `T-0401` `cosmic-text` 初始化 + 字体加载(Noto Sans CJK + 思源黑)
-- `T-0402` shaping pipeline: grid cell → glyph run
-- `T-0403` glyph 光栅化 → wgpu texture atlas
-- `T-0404` 2x HiDPI 整数缩放(`wl_output.scale` 接入)
-- `T-0405` CJK fallback 正确(ASCII 用 mono,中文 fallback CJK)
-- `T-0406` glyph cache + LRU 驱逐
-- `T-0407` 测试:`echo 你好世界 hello` 像素级比对
 
 **里程碑**:能看 `git log` 正常显示中英混排。
 
@@ -188,5 +186,6 @@ Lead 决定:**T-0104 + Phase 2 PTY 并行推进**。理由:
 - 2026-04-25 T-0306 Wayland resize merged. 87 tests (+10), 427 行 diff 跨 4 文件. 关键决策 propagate_resize_if_dirty 抽到 drive_wayland (而非 WindowHandler::configure 派单原位置, 因 Dispatch trait 没 term 引用), reviewer 独立验证 trait signature + LoopData 拓扑 ✅ 接受. Renderer::resize 必需新增 (派单未列, writer 补正确 — Outdated/Lost 重配只用旧 self.config, 不显式 resize 拖窗口 surface 永远停 800×600). Lead 跟进 INV-002 全字段同步 (10 字段含 cell_buffer_capacity / surface_is_srgb 全列, 标 POD 顺序无关). Phase 3 进度 6/7, 剩 T-0307 ls -la e2e
 - 2026-04-25 **T-0307 merged → Phase 3 ✅ 7/7 完工**. 89 tests (+2 ls_la_e2e, 0.01s × 2). 单文件 +212 行, 零生产代码改动. 2 偏离主动告知 reviewer 独立判全接受: viewport++scrollback (Goal binding > Scope wording 第二次应用) + env LANG=C 包装 (POSIX setenv 非线程安全 + Rust 2024 unsafe). reviewer 还独立 verify "Rust 1.79+ unsafe set_var" writer 措辞略夸大 (实际 edition 2024 才 hard error, edition 2021 仍 warn), Lead 跟进修 module doc 更精确. Phase 3 → Phase 4 转折点 spawn auditor-mainline 跨 ticket 全局审计 (并发跑, 不阻塞)
 - 2026-04-25 auditor-mainline 完工 A- (P0=0 / P1=1 / P2=7 / P3=9), 找到跨 ticket 累积 bug per-ticket reviewer 看不到 (FrameStats T-0106→T-0305 漏接 / event_loop::Core T-0105→T-0108 漂移 / SAFETY 注释 T-0202→T-0108 未同步 / INV-006 doc 引用过时 / INV-010 类型隔离原则未登记 / thiserror 死 dep / propagate_resize_if_dirty 漏单测 / TD 漏标). 印证 Phase-end 全局 audit 必要性 (per-ticket reviewer 不看跨段)
-- 2026-04-25 **T-0399 merged**: 91 tests (+2 net), 10 commits 一单清 8 项 P1+P2. writer-T0399 自报未 verify P2-2 calloop EBADF 论点, reviewer 独立 grep calloop-0.14.4 + polling-3.11.0 源码 verify writer 论点准确 (Generic::Drop 调 poller.delete().ok() silent ignore + polling::delete 透传 EBADF). INV-010 类型隔离原则正式登记 (Phase 4 cosmic-text 接入前覆盖). Lead 跟进 INV-006 行号引用改 symbol name (P3 reviewer 教训: 行号易偏移)
+- 2026-04-25 **T-0399 merged**: 91 tests (+2 net), 10 commits 一单清 8 项 P1+P2. writer-T0399 自报未 verify P2-2 calloop EBADF 论点, reviewer 独立 grep calloop-0.14.4 + polling-3.11.0 源码 verify writer 论点准确 (Generic::Drop 调 poller.delete().ok() silent ignore + polling::delete 透传 EBADF). INV-010 类型隔离原则正式登记 (Phase 4 cosmic-text 接入前覆盖). Lead 跟进 INV-006 行号引用改 symbol name (P3 reviewer 教训: 行号易偏移). conventions §6 加陷阱 4 "伪派活信号" (writer-T0306/T0307/T0399 多次 sanity check 物理化)
+- 2026-04-25 **Phase 4 起手 T-0401 merged**: cosmic-text 0.12.1 引入, 95 tests (+4), src/text/ 新模块 274 行 (TextSystem + ShapedGlyph), INV-010 第 7 次应用 (writer 自审删 pub(crate).*cosmic_text 视为暴露). reviewer 独立 grep cosmic-text 0.12.1 源 (layout.rs:30 + shape.rs:1459-1474) verify x_advance ← g.w 字段映射准确. Lead 跟进 cargo audit 0 vulnerabilities + shape_chinese 注释 P3-2 微改更精确 (覆盖正常 vs CI 退化两路径). Phase 4 进度 1/6
 - (后续每个阶段起止在这追加)
