@@ -9,6 +9,10 @@ alacritty_terminal = "0.26"
 anyhow = "1"
 calloop = { version = "0.14", features = ["signals"] }
 cosmic-text = "0.12"
+# T-0408: PNG encoding for --headless-screenshot CLI flag (offscreen render →
+# PNG, agent 自验视觉)。default-features=false 关 jpg/webp/tiff 等不用 codec,
+# 仅留 png feature。详见 docs/adr/0005-image-crate-png-encoding.md。
+image = { version = "0.25", default-features = false, features = ["png"] }
 libc = "0.2"
 pollster = "0.4"
 portable-pty = "0.9"
