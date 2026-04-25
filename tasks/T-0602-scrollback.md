@@ -1,8 +1,8 @@
 # T-0602 scrollback 滚动 (滚轮 + PageUp/PageDown)
 
 **Phase**: 6
-**Assigned**: (open)
-**Status**: open
+**Assigned**: writer-T0602
+**Status**: claimed
 **Budget**: tokenBudget=150k (跨 wl_pointer Axis + keyboard PageUp/Down + Term::scroll_display + render rows 来源)
 **Dependencies**: T-0501 (wl_keyboard) / T-0504 (wl_pointer) / T-0408 (headless screenshot)
 **Priority**: P1 (user 实测反馈无法看历史, daily-drive 必需)
