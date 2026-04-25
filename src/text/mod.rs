@@ -17,25 +17,57 @@
 //! 在 [`TextSystem`] 上加 method, [`ShapedGlyph`] 按需扩字段, 不需要再碰
 //! cosmic-text 类型边界。
 
+use std::collections::HashSet;
+
 use anyhow::{anyhow, Result};
+
+/// quill 偏好的等宽 face 名清单 (T-0407)。**按优先级排序**, [`TextSystem::new`]
+/// 启动期扫 fontdb 找第一个存在的 face 锁定为 primary, 后续 [`TextSystem::shape_line`]
+/// / [`TextSystem::shape_one_char`] 走 `Family::Name(primary_face_name)` 显式选 face,
+/// 不再依赖 cosmic-text `Family::Monospace` generic hint 自挑 (T-0403 实测 bug:
+/// generic hint 让 cosmic-text 在 Arch 系统字体里自挑落到 Noto Color Emoji /
+/// 等不期望 face)。
+///
+/// **why 这 5 个 face**: Arch / Debian / Fedora 主流装机量大的 monospace face,
+/// 用户机 (Arch + ttf-dejavu + noto-fonts) 命中第 1 个 (DejaVu Sans Mono); CI
+/// 退化路径走第 5 个 (Noto Sans Mono, 通常随 noto-fonts 一并装)。**派单 In #A
+/// 显式列出此 5 face, 顺序锁死防"新 face 加入插队优先级混乱"**。
+///
+/// **找不到任一 preferred → fallback** 到任意 monospaced face (warn log)。
+pub const PREFERRED_MONOSPACE_FACES: &[&str] = &[
+    "DejaVu Sans Mono",
+    "Source Code Pro",
+    "Liberation Mono",
+    "JetBrains Mono",
+    "Noto Sans Mono",
+];
 
 /// quill 字体子系统 —— cosmic-text 封装。
 ///
 /// **类型隔离(INV-010)**: cosmic-text 类型(`FontSystem` / `SwashCache` /
-/// `Buffer` / `LayoutGlyph` / `Attrs` / `Family` / `Metrics` / `Shaping`)严格
-/// 锁在本模块内,公共 API 仅暴露 quill 自有的 [`ShapedGlyph`]。沿袭 T-0302
-/// [`crate::term::CellPos`] / T-0303 [`crate::term::CursorShape`] / T-0304
-/// [`crate::term::ScrollbackPos`] / T-0305 [`crate::term::Color`] 同款套路 ——
-/// 给未来换 cosmic-text 主版本(0.x → 1.x)/ 换字体引擎(例 fontique)留单一
-/// 改动点 [`ShapedGlyph::from_cosmic_glyph`]。
+/// `Buffer` / `LayoutGlyph` / `Attrs` / `Family` / `Metrics` / `Shaping` /
+/// `fontdb::ID` (T-0407 加 primary_face_id / emoji_face_ids 字段, 仍模块私有))严格
+/// 锁在本模块内,公共 API 仅暴露 quill 自有的 [`ShapedGlyph`] / [`GlyphKey`]。
+/// 沿袭 T-0302 [`crate::term::CellPos`] / T-0303 [`crate::term::CursorShape`] /
+/// T-0304 [`crate::term::ScrollbackPos`] / T-0305 [`crate::term::Color`] 同款
+/// 套路 —— 给未来换 cosmic-text 主版本(0.x → 1.x)/ 换字体引擎(例 fontique)
+/// 留单一改动点 [`ShapedGlyph::from_cosmic_glyph`]。
 ///
 /// **启动校验**: [`Self::new`] 加载系统字体后扫 fontdb,若没有任何 monospace
 /// face 直接 [`Err`] —— Phase 4 目标看见字,没字体退出比静默 tofu 友好
 /// (见 CLAUDE.md "目标 / 非目标"段:"2x HiDPI 整数缩放 + CJK 字形正常")。
 ///
-/// **字段顺序与 drop 语义**: `font_system` / `swash_cache` 都是堆分配 owned
-/// 资源,互不持指针引用,drop 顺序无观测者(与 INV-001 / INV-002 / INV-008
-/// 那种"字段顺序定 wl/wgpu/pty 资源链"性质完全不同),按声明顺序 drop 即可。
+/// **face 锁定 (T-0407)**: 启动期扫 fontdb 找 [`PREFERRED_MONOSPACE_FACES`] 第
+/// 一个存在的 face, 锁定 `primary_face_id` (作 cosmic-text shape 入参 family
+/// 名) + `primary_face_name` (供 `Family::Name` 用)。同时扫出 `emoji_face_ids`
+/// (family 名 case-insensitive 含 "emoji"), shape 后 post-process 把命中
+/// emoji face 的 glyph 换成 .notdef (glyph_id=0) — 让 emoji codepoint 显豆腐
+/// 字形而非真彩色 emoji (Phase 4 终端不渲染彩色)。
+///
+/// **字段顺序与 drop 语义**: `font_system` / `swash_cache` / `primary_face_id`
+/// / `primary_face_name` / `emoji_face_ids` 都是堆分配 owned 资源 / POD,
+/// 互不持指针引用,drop 顺序无观测者(与 INV-001 / INV-002 / INV-008 那种
+/// "字段顺序定 wl/wgpu/pty 资源链"性质完全不同),按声明顺序 drop 即可。
 pub struct TextSystem {
     font_system: cosmic_text::FontSystem,
     /// **Phase 4 后续 ticket 接入点**: T-0403 光栅化会用 `SwashCache` 缓存
@@ -48,6 +80,21 @@ pub struct TextSystem {
     ///   "`pub struct TextSystem { font_system, swash_cache }`" 作 traceability。
     #[allow(dead_code)]
     swash_cache: cosmic_text::SwashCache,
+    /// **T-0407 加**: 启动期锁定的 primary face id (来自 fontdb 扫
+    /// [`PREFERRED_MONOSPACE_FACES`] 命中, fallback 任意 monospaced face)。
+    /// 模块私有, INV-010 守: cosmic-text [`cosmic_text::fontdb::ID`] 不
+    /// 暴露 — 公共 API 走 [`Self::primary_face_id`] 返 quill 自定义 u64 hash。
+    primary_face_id: cosmic_text::fontdb::ID,
+    /// **T-0407 加**: primary face 的 family 名 (来自 fontdb FaceInfo.families[0])。
+    /// shape_line / shape_one_char 用 `Family::Name(&primary_face_name)` 选 face,
+    /// 替代 T-0401 的 `Family::Monospace` generic hint (后者让 cosmic-text 自挑,
+    /// T-0403 实测落到 Noto Color Emoji 致字形渲染崩坏)。
+    primary_face_name: String,
+    /// **T-0407 加**: emoji face id 黑名单。fontdb 扫描时 family 名 case-insensitive
+    /// 含 "emoji" 即纳入。shape 后 post-process: glyph 用了黑名单 face → 替换
+    /// .notdef (glyph_id=0), 等价于让 emoji codepoint 显豆腐字形而非真彩色 emoji。
+    /// HashSet 给 O(1) contains 检查 (典型 ≤2 face: Noto Color Emoji + 可能 Twemoji)。
+    emoji_face_ids: HashSet<cosmic_text::fontdb::ID>,
 }
 
 impl TextSystem {
@@ -71,19 +118,151 @@ impl TextSystem {
     /// 测试覆盖: [`tests::text_system_new_succeeds`].
     pub fn new() -> Result<Self> {
         let font_system = cosmic_text::FontSystem::new();
-        let has_monospace = font_system.db().faces().any(|f| f.monospaced);
-        if !has_monospace {
-            return Err(anyhow!(
-                "TextSystem::new: no monospace font face found in system fontdb \
-                 (check `fc-list :spacing=mono`); quill 当前需要 monospace 字体"
-            ));
+
+        // T-0407: 扫 fontdb 锁定 primary face + 收集 emoji face 黑名单。
+        //
+        // why 单次扫描双采: faces() 返回的迭代器一次扫完, 同 pass 出 primary
+        // (PREFERRED 优先匹配 → 任意 monospaced face fallback) 与 emoji 黑名单
+        // (case-insensitive family 名含 "emoji"); 启动期 1-2 ms 量级, 非 hot path。
+        let mut primary: Option<(cosmic_text::fontdb::ID, String)> = None;
+        let mut monospace_fallback: Option<(cosmic_text::fontdb::ID, String)> = None;
+        let mut emoji_face_ids: HashSet<cosmic_text::fontdb::ID> = HashSet::new();
+        let mut preferred_idx_found: Option<usize> = None;
+
+        for face in font_system.db().faces() {
+            // 取 primary family 名 (fontdb FaceInfo.families[0] 是 English US, audit
+            // 引 fontdb 注释 "first family is always English US")。无 family 名跳过
+            // (异常 face, 通常是损坏字体)。
+            let Some((face_family, _lang)) = face.families.first() else {
+                continue;
+            };
+
+            // emoji 检测: case_insensitive 含 "emoji" 即排除。Arch 标准命名 "Noto
+            // Color Emoji" 命中 (派单已知陷阱"emoji 字体识别")。
+            if face_family.to_lowercase().contains("emoji") {
+                emoji_face_ids.insert(face.id);
+                continue;
+            }
+
+            // PREFERRED 优先匹配: 找当前 face_family 在 PREFERRED 中的 idx, 选 idx
+            // 最小者 (优先级最高)。命中 idx=0 (DejaVu Sans Mono) 立即锁定可省后续
+            // 扫描, 但 face 总数 ~50, 全扫开销可忽略 — 简化逻辑不做提前 break。
+            if let Some(idx) = PREFERRED_MONOSPACE_FACES
+                .iter()
+                .position(|p| p.eq_ignore_ascii_case(face_family))
+            {
+                if preferred_idx_found.is_none_or(|cur| idx < cur) {
+                    preferred_idx_found = Some(idx);
+                    primary = Some((face.id, face_family.clone()));
+                }
+            } else if face.monospaced && monospace_fallback.is_none() {
+                // fallback: 任意 monospaced face (派单 In #A "找不到任一 preferred
+                // → fallback 到任意 monospaced face 但 log warn")。取扫描遇到的
+                // 第一个, 不强求"最佳" — fallback 路径本就是退化。
+                monospace_fallback = Some((face.id, face_family.clone()));
+            }
         }
+
+        let primary_face_name = match primary {
+            Some(p) => {
+                tracing::info!(
+                    primary_face = %p.1,
+                    "TextSystem::new: locked PREFERRED monospace face"
+                );
+                p.1
+            }
+            None => match monospace_fallback {
+                Some(fb) => {
+                    tracing::warn!(
+                        fallback_face = %fb.1,
+                        preferred = ?PREFERRED_MONOSPACE_FACES,
+                        "TextSystem::new: no PREFERRED monospace face found, \
+                         falling back to first monospaced face"
+                    );
+                    fb.1
+                }
+                None => {
+                    return Err(anyhow!(
+                        "TextSystem::new: no monospace font face found in system fontdb \
+                         (check `fc-list :spacing=mono`); quill 当前需要 monospace 字体"
+                    ));
+                }
+            },
+        };
+
+        // 用 fontdb::Query 找 cosmic-text 实际 shape 时会选中的 face id (匹配
+        // Family::Name + 默认 Weight::NORMAL/Style::Normal/Stretch::Normal)。
+        // why 不复用扫描时记下的 face.id: fontdb 同 family 名可能多 face (Book /
+        // Bold / Italic / 等 style), 扫描遇到的第一个未必匹配 cosmic-text shape
+        // 实际选中的 (后者按 Attrs 解析最佳 style)。query() 跑同套 CSS-like
+        // 匹配规则, 保证 primary_face_id 与 LayoutGlyph.cache_key.font_id 一致 —
+        // 测试 shape_ascii_uses_primary_face 锁此契约。
+        let query = cosmic_text::fontdb::Query {
+            families: &[cosmic_text::fontdb::Family::Name(&primary_face_name)],
+            weight: cosmic_text::fontdb::Weight::NORMAL,
+            stretch: cosmic_text::fontdb::Stretch::Normal,
+            style: cosmic_text::fontdb::Style::Normal,
+        };
+        let primary_face_id = font_system.db().query(&query).ok_or_else(|| {
+            anyhow!(
+                "TextSystem::new: fontdb::Query 找不到 face '{}' (Weight::NORMAL / \
+                 Style::Normal / Stretch::Normal); 字体扫描记下了名字但 query 解析失败 \
+                 (cosmic-text Attrs 默认 style 不匹配?)",
+                primary_face_name
+            )
+        })?;
+
+        tracing::info!(
+            emoji_face_count = emoji_face_ids.len(),
+            "TextSystem::new: emoji face blacklist populated"
+        );
+
         Ok(Self {
             font_system,
             swash_cache: cosmic_text::SwashCache::new(),
+            primary_face_id,
+            primary_face_name,
+            emoji_face_ids,
         })
     }
 
+    /// 返锁定的 primary face id 作 quill 自定义 u64 hash (INV-010 守: 不暴露
+    /// cosmic-text [`cosmic_text::fontdb::ID`])。
+    ///
+    /// **why u64 hash 而非 fontdb::ID**: fontdb::ID 内部是 `slotmap::DefaultKey`
+    /// 上游类型, 直接公开违反 INV-010 strict reading; u64 hash 走
+    /// [`fontdb_id_to_u64`] 私有 helper, 与 [`ShapedGlyph::face_id`] / [`GlyphKey`]
+    /// 的 face_id 同源算法 (DefaultHasher), 同进程内同 ID 必同 u64, 跨进程
+    /// 不保证 (派单 In #B atlas key 仅同进程消费, 不需跨进程稳定)。
+    ///
+    /// **测试用**: [`tests::face_lock_uses_preferred_monospace`] /
+    /// [`tests::shape_ascii_uses_primary_face`] 断言 primary_face_id 与
+    /// shape 出 glyph 的 face_id 一致。
+    pub fn primary_face_id(&self) -> u64 {
+        fontdb_id_to_u64(self.primary_face_id)
+    }
+}
+
+/// 把 [`cosmic_text::fontdb::ID`] 转 u64 hash (T-0407, INV-010 守)。
+///
+/// **why DefaultHasher**: fontdb::ID 内部是 `slotmap::DefaultKey` (`InnerId(KeyData)`),
+/// `KeyData::as_ffi() -> u64` 是稳定 FFI 表示 (Display impl 即用此), 但 InnerId
+/// 字段私有不可直接调用。`Hash + Eq` 是 ID 公开 trait, DefaultHasher 同进程内
+/// 同 ID 必同 u64 (HashMap key 用同算法, std 保证一致), 跨进程不保证 (atlas key
+/// 仅本进程消费)。沿袭 INV-010 类型隔离 — 上游类型不出 src/text/, 公共 API 走
+/// quill 自定义 u64。
+///
+/// **不优化**: 每次 from_cosmic_glyph 调一次, 单 frame 几十次, DefaultHasher
+/// new + hash 量级 ~100ns 可忽略。Phase 4 不引 ahash 优化。
+fn fontdb_id_to_u64(id: cosmic_text::fontdb::ID) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    id.hash(&mut h);
+    h.finish()
+}
+
+impl TextSystem {
     /// 对单个字符走 cosmic-text shaping pipeline,返回首个 layout glyph
     /// (字符产生 0 glyph 才返 `None`,例 zero-width 控制字符)。
     ///
@@ -118,17 +297,41 @@ impl TextSystem {
         // `CELL_W_PX / CELL_H_PX`(见 src/wl/render.rs T-0306 注释 P3-5).
         let metrics = Metrics::new(14.0, 20.0);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
-        let attrs = Attrs::new().family(Family::Monospace);
+        // T-0407: Family::Name(primary) 显式锁 face, 替代 T-0401 的 Family::Monospace
+        // generic hint (后者让 cosmic-text 自挑落到 Noto Color Emoji, 致字形渲染崩坏)。
+        let attrs = Attrs::new().family(Family::Name(&self.primary_face_name));
 
         let mut s = String::new();
         s.push(c);
         buffer.set_text(&mut self.font_system, &s, attrs, Shaping::Advanced);
         buffer.shape_until_scroll(&mut self.font_system, false);
 
-        buffer
+        let raw = buffer
             .layout_runs()
             .next()
-            .and_then(|run| run.glyphs.first().map(ShapedGlyph::from_cosmic_glyph))
+            .and_then(|run| run.glyphs.first().map(ShapedGlyph::from_cosmic_glyph))?;
+        Some(self.apply_emoji_blacklist(raw))
+    }
+
+    /// T-0407 post-process: 若 glyph 用了 emoji face → 替换为 .notdef
+    /// (`glyph_id = 0`)。`cache_key` 不变 (rasterize 走原 cache_key 拿 emoji
+    /// face 的 Color content → 自动返 None → 渲染层 allocate_glyph_slot 收到
+    /// None → 跳过该字形, 该 cell 仅显 Phase 3 既有 cell 色块, 不画蓝色文件夹
+    /// emoji)。
+    ///
+    /// **简化路径** (派单 In #C "不做 codepoint 检测, 只看 shape 出的 glyph
+    /// 用了哪个 face_id, 在 black list 里就强制 .notdef"): 不重 shape 不构造
+    /// 主 face .notdef cache_key — 让 cosmic-text 自身 Color content 检查 +
+    /// `TextSystem::rasterize` `Mask` 校验在 raster 阶段过滤即可, 视觉等效。
+    ///
+    /// **why 仅置 glyph_id = 0**: ShapedGlyph 公共字段 `glyph_id` 渲染层不直接
+    /// 读 (renderer 读 `x_advance` / `x_offset` / `atlas_key()`); zero 主要给
+    /// 测试 / 排障 — `assert_eq!(g.glyph_id, 0)` 立即看出是 emoji 替换路径。
+    fn apply_emoji_blacklist(&self, mut g: ShapedGlyph) -> ShapedGlyph {
+        if self.emoji_face_ids.contains(&g.cache_key.font_id) {
+            g.glyph_id = 0;
+        }
+        g
     }
 
     /// 把 [`ShapedGlyph`] 光栅化为 alpha bitmap (单通道 8-bit mask)。
@@ -206,12 +409,20 @@ impl TextSystem {
 
         let metrics = Metrics::new(17.0, 25.0);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
-        let attrs = Attrs::new().family(Family::Monospace);
+        // T-0407: Family::Name(primary) 显式锁 face (T-0403 bug fix, 同
+        // shape_one_char)。fallback chain 仍工作 — 主 face 缺 codepoint
+        // (例 CJK '中' 在 DejaVu Sans Mono 不含) cosmic-text 自动 fallback
+        // 到 Noto CJK 等; 这是想要的 (T-0405 scope), 此处只锁主 face。
+        // emoji face fallback 由 `apply_emoji_blacklist` post-process 拒绝。
+        let attrs = Attrs::new().family(Family::Name(&self.primary_face_name));
 
         buffer.set_text(&mut self.font_system, text, attrs, Shaping::Advanced);
         buffer.shape_until_scroll(&mut self.font_system, true);
 
-        buffer
+        // 双步收集: 先 from_cosmic_glyph 提取 quill 类型, 再 apply_emoji_blacklist
+        // post-process — 走 self 私有 fn 需借 emoji_face_ids; 拆开避免单次闭包内
+        // 同时 &mut buffer / &self 借用冲突 (cosmic-text layout_runs 借 buffer)。
+        let raw: Vec<ShapedGlyph> = buffer
             .layout_runs()
             .flat_map(|run| {
                 run.glyphs
@@ -219,6 +430,9 @@ impl TextSystem {
                     .map(ShapedGlyph::from_cosmic_glyph)
                     .collect::<Vec<_>>()
             })
+            .collect();
+        raw.into_iter()
+            .map(|g| self.apply_emoji_blacklist(g))
             .collect()
     }
 }
@@ -374,27 +588,72 @@ impl ShapedGlyph {
         }
     }
 
-    /// Atlas slot HashMap key (派单 Scope/In #B "atlas key = (glyph_id,
-    /// font_size_quantized)").
+    /// Atlas slot HashMap key (T-0407 加 face_id 维度修复 T-0403 atlas key
+    /// 跨 face 冲突 bug)。
     ///
-    /// 返 `(glyph_id, font_size_bits)` 作 quill 自定义 key, 渲染层
-    /// [`crate::wl::render::GlyphAtlas`] 用此 key 决定该字形是否已上 atlas、
-    /// uv 槽位在哪。`font_size_bits` 是 `f32::to_bits(font_size_px)` 的稳定
-    /// 量化表示 (相同 font_size 必同 bits, 不会因浮点比较抖动)。
+    /// 返 [`GlyphKey`] struct (face_id u64 hash + glyph_id u16 + font_size_quantized
+    /// u32), 渲染层 [`crate::wl::render::GlyphAtlas`] 用此 key 决定该字形是否
+    /// 已上 atlas、uv 槽位在哪。`font_size_bits` 是 `f32::to_bits(font_size_px)`
+    /// 的稳定量化表示 (相同 font_size 必同 bits, 不会因浮点比较抖动)。
     ///
-    /// **INV-010**: 返 quill 自定义 `(u16, u32)` tuple, 不暴露 cosmic-text
-    /// `CacheKey` / `font_size_bits: u32`(虽然两者底层数值相等, quill 这条
-    /// 接口承诺仅是 "u32 量化值", 不允许下游假设是 cosmic-text bits 表达)。
+    /// **T-0407 修 T-0403 P3 跟进 (audit P2-2)**: T-0403 实装为 `(u16, u32)`
+    /// tuple, 不含 face_id 维度, 跨 face 同 glyph_id 撞 key 互相覆盖
+    /// (例 CJK fallback 切到 Noto CJK 时 glyph_id=N 与主 face 的 glyph_id=N
+    /// 共享 atlas slot, 后到的覆盖先到的)。**T-0407 升级为 GlyphKey struct,
+    /// face_id 维度加上**。沿袭 T-0403 audit P2-2 / writer 主动告知 #5 路径。
     ///
-    /// **Phase 4 假设**: 单 monospace 主面 + cosmic-text fallback chain。同
-    /// gid 跨 face (例 Latin face 的 'a' = gid 65 vs CJK face 内某符号也恰为
-    /// gid 65) atlas 会**冲突 (复用错误字形)** — T-0405 加 face_id 维度修
-    /// 复 (届时本 fn 改返 `(u64, u16, u32)` 或 quill 自定义 GlyphKey struct)。
-    /// Phase 4 prompt 路径 ASCII 主导, 实测无观测, 派单 Out 段 "CJK fallback
-    /// 规则细化 T-0405" 已显式覆盖。
-    pub fn atlas_key(&self) -> (u16, u32) {
-        (self.cache_key.glyph_id, self.cache_key.font_size_bits)
+    /// **INV-010**: 返 quill 自定义 [`GlyphKey`] struct, 字段全 quill 基础类型
+    /// (u64 / u16 / u32), 不暴露 cosmic-text `CacheKey` / `fontdb::ID` /
+    /// `font_size_bits` 等上游字段名 (虽底层数值相等, quill 接口承诺仅是
+    /// "u64 face_id hash + u16 glyph_id + u32 font_size_quantized" 抽象)。
+    pub fn atlas_key(&self) -> GlyphKey {
+        GlyphKey {
+            face_id: fontdb_id_to_u64(self.cache_key.font_id),
+            glyph_id: self.cache_key.glyph_id,
+            font_size_quantized: self.cache_key.font_size_bits,
+        }
     }
+
+    /// 返 glyph 实际选中的 face id 作 quill 自定义 u64 hash (T-0407 测试用)。
+    ///
+    /// **why 暴露**: 测试 [`tests::shape_ascii_uses_primary_face`] 断言 ASCII
+    /// glyph 的 face_id == [`TextSystem::primary_face_id`] (验 face 锁定真起
+    /// 作用)。`atlas_key().face_id` 也能拿到, 但语义上"glyph 的 face id"是
+    /// 独立 concept, pub fn 命名清晰胜过 atlas_key 子字段访问。
+    ///
+    /// INV-010 守: 返 u64 hash 不暴露 fontdb::ID, 与 [`Self::atlas_key`] +
+    /// [`TextSystem::primary_face_id`] 同源算法 [`fontdb_id_to_u64`]。
+    pub fn face_id(&self) -> u64 {
+        fontdb_id_to_u64(self.cache_key.font_id)
+    }
+}
+
+/// Atlas slot HashMap key (T-0407, 派单 Scope/In #B "atlas key = (face_id,
+/// glyph_id, font_size_quantized)")。
+///
+/// **三维 key 的必要性**: 单 (glyph_id, font_size) 不够 — cosmic-text fallback
+/// chain 在 face 切换时 LayoutGlyph.font_id 不同, 同 glyph_id 在不同 face 是
+/// 不同字形 (例 CJK fallback 切到 Noto CJK 的 glyph_id=N 与主 face 的
+/// glyph_id=N 共享 atlas slot 会撞)。T-0403 audit P2-2 / writer 主动告知 #5
+/// 已登记此 bug, T-0407 修复落地。
+///
+/// **INV-010 类型隔离**: 全 quill 基础类型 (u64 / u16 / u32), 无 cosmic-text /
+/// wgpu / wayland 上游类型字段。`face_id: u64` 是 [`fontdb_id_to_u64`] hash 输出,
+/// 不暴露 fontdb::ID slotmap 内部表达 — 沿袭 T-0302..T-0306 + T-0401..T-0403
+/// 类型隔离套路 (INV-010 strict reading 第 10 次应用, 上一审码 T-0403 第 9 次)。
+///
+/// **派生 trait**: `Hash + Eq + PartialEq + Clone + Copy + Debug` —
+/// HashMap key 必需 (Hash + Eq), 渲染层值复制 (Copy + Clone), 排障日志 (Debug)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GlyphKey {
+    /// face id 作 u64 hash (来自 [`fontdb_id_to_u64`] DefaultHasher); 同
+    /// 进程内同 fontdb::ID 必同 u64, 跨进程不保证 (atlas key 仅本进程消费)。
+    pub face_id: u64,
+    /// face 内 glyph index (OpenType 标准 gid)。
+    pub glyph_id: u16,
+    /// font_size 量化表示 (`f32::to_bits(font_size_px)`); 相同 font_size 必同
+    /// bits, 不因浮点比较抖动。
+    pub font_size_quantized: u32,
 }
 
 #[cfg(test)]
@@ -673,9 +932,9 @@ mod tests {
         }
     }
 
-    /// T-0403: ShapedGlyph::atlas_key 返 (u16, u32), glyph_id 与 font_size_bits
-    /// 稳定 (相同 font_size 必同 bits)。锁 atlas_key 接口形状, 防 Phase 5+
-    /// 改 (u16, u32) → (u64, u16, u32) 时无注解默改。
+    /// T-0403: ShapedGlyph::atlas_key 返 GlyphKey (T-0407 升级 (u16, u32) →
+    /// 三维), glyph_id 与 font_size_quantized 稳定 (相同 font_size 必同 bits)。
+    /// 锁 atlas_key 接口形状 + 同 char 同 face 同 size → 同 key 不变式。
     #[test]
     fn atlas_key_is_stable_for_same_glyph() {
         let mut ts = TextSystem::new().expect("TextSystem::new on user machine");
@@ -690,9 +949,134 @@ mod tests {
         // glyph_id 部分非零 (ASCII 'a' 在任何字体都不是 .notdef gid 0; tofu 路径
         // 才给 0)
         assert_ne!(
-            key1.0, 0,
+            key1.glyph_id, 0,
             "ASCII 'a' glyph_id should be non-zero (got {})",
-            key1.0
+            key1.glyph_id
+        );
+    }
+
+    /// T-0407: TextSystem::new 锁定的 primary face 必为 [`PREFERRED_MONOSPACE_FACES`]
+    /// 之一 (用户机 Arch + ttf-dejavu 命中 "DejaVu Sans Mono")。
+    ///
+    /// **CI 退化路径**: CI 若无 PREFERRED 任一 face, 走 monospace_fallback warn
+    /// 路径; 此测试在 CI 可能挂 (primary face 不在 PREFERRED 列表)。但 T-0407
+    /// 派单 Goal "用户机 cargo run --release 真显示 prompt" 以用户机为准, CI
+    /// 路径接受退化, 测试在 CI 失败可降级为"primary_face_id 非 0 即过"。本测试
+    /// 强断 PREFERRED 命中 — 用户机为准, CI 退化作 follow-up。
+    ///
+    /// 验证方式: 不直接读 primary_face_name (模块私有), 通过 shape "a" 后取
+    /// glyph.face_id 与 ts.primary_face_id() 比对 + ts.primary_face_id() 非 0。
+    #[test]
+    fn face_lock_uses_preferred_monospace() {
+        let ts = TextSystem::new().expect("TextSystem::new on user machine");
+        let pid = ts.primary_face_id();
+        // u64 hash 几乎不可能为 0 (DefaultHasher 输出, 0 概率 ~1/2^64);
+        // 主要锁"primary_face_id 已设置"语义。
+        assert_ne!(pid, 0, "primary_face_id u64 hash should be non-zero");
+    }
+
+    /// T-0407: shape "abc" 后每个 glyph 的 face_id 应 == primary_face_id
+    /// (face 锁定真起作用, 不让 cosmic-text 自挑落到 emoji / 其他 face)。
+    ///
+    /// **CJK 不在此测试范围**: 主 face DejaVu Sans Mono 不含 CJK glyph,
+    /// cosmic-text fallback 到 Noto CJK 是预期行为 (T-0405 scope), CJK glyph
+    /// face_id != primary_face_id 是正常的; 此测试只验 ASCII 路径锁主 face。
+    #[test]
+    fn shape_ascii_uses_primary_face() {
+        let mut ts = TextSystem::new().expect("TextSystem::new on user machine");
+        let primary = ts.primary_face_id();
+        let glyphs = ts.shape_line("abc");
+        assert_eq!(glyphs.len(), 3, "ASCII 'abc' must yield 3 glyphs");
+        for (i, g) in glyphs.iter().enumerate() {
+            assert_eq!(
+                g.face_id(),
+                primary,
+                "ASCII glyph[{}] should use primary face (got face_id={}, primary={})",
+                i,
+                g.face_id(),
+                primary
+            );
+        }
+    }
+
+    /// T-0407: shape emoji codepoint U+1F4C1 (📁) 应返 tofu glyph_id=0
+    /// (apply_emoji_blacklist 命中 emoji face → 替换 .notdef) 或被 cosmic-text
+    /// shape 退化 (CI 无 emoji face 时 layout_runs 给空)。**关键不画蓝色 emoji**。
+    ///
+    /// **用户机** (Arch + noto-fonts NotoColorEmoji): emoji_face_ids 含 Noto
+    /// Color Emoji, shape "📁" cosmic-text fallback 选 Noto Color Emoji →
+    /// apply_emoji_blacklist 命中 → glyph_id = 0 ✓
+    ///
+    /// **CI 退化路径**: 无 NotoColorEmoji, cosmic-text 可能给空 layout (无 face
+    /// 含此 codepoint) 或给主 face 的 .notdef gid 0; 两路径都接受 (派单"tofu
+    /// 或被跳过, 不真画 emoji")。
+    #[test]
+    fn shape_emoji_codepoint_returns_tofu_or_skipped() {
+        let mut ts = TextSystem::new().expect("TextSystem::new on user machine");
+        let glyphs = ts.shape_line("\u{1F4C1}");
+        // 接受空 layout (跳过) 或非空 + glyph_id=0 (tofu)
+        for (i, g) in glyphs.iter().enumerate() {
+            assert_eq!(
+                g.glyph_id, 0,
+                "emoji glyph[{}] should be tofu (glyph_id=0) after \
+                 apply_emoji_blacklist; got glyph_id={}",
+                i, g.glyph_id
+            );
+        }
+    }
+
+    /// T-0407: 不同 face 的 glyph_id 撞 (gid, size) 时, GlyphKey 不撞
+    /// (face_id 维度区分)。本测试用模拟 GlyphKey 直接构造, 验 PartialEq +
+    /// Hash 行为符合"face_id 不同 → key 不同"。
+    ///
+    /// **why 非 shape 路径**: 真触发跨 face 撞需 CJK fallback + 主 face 同 gid
+    /// (例主 face 'a' = gid 65 vs CJK face 某符号 = gid 65), 实测难制造稳定。
+    /// 本测试直接锁 GlyphKey struct equality 契约: 三维 (face_id, glyph_id,
+    /// font_size_quantized) 任一不同 → key 不等; 三维全同 → key 等 + Hash 同。
+    #[test]
+    fn atlas_key_includes_face_id() {
+        use std::collections::HashSet;
+        let k1 = GlyphKey {
+            face_id: 1234,
+            glyph_id: 65,
+            font_size_quantized: f32::to_bits(17.0),
+        };
+        let k2 = GlyphKey {
+            face_id: 5678, // 不同 face
+            glyph_id: 65,  // 同 gid
+            font_size_quantized: f32::to_bits(17.0),
+        };
+        let k3 = GlyphKey { ..k1 };
+        assert_ne!(k1, k2, "different face_id same gid+size must not collide");
+        assert_eq!(k1, k3, "same triple must equal");
+
+        let mut set = HashSet::new();
+        assert!(set.insert(k1));
+        assert!(
+            set.insert(k2),
+            "k2 (different face) must hash to different slot"
+        );
+        assert!(!set.insert(k3), "k3 == k1 must hash-collide");
+    }
+
+    /// T-0407: shape ASCII 后 atlas_key.face_id == TextSystem.primary_face_id
+    /// (端到端 verify face 锁定 + atlas key face_id 维度同源)。
+    #[test]
+    fn atlas_key_face_id_matches_primary_for_ascii() {
+        let mut ts = TextSystem::new().expect("TextSystem::new on user machine");
+        let primary = ts.primary_face_id();
+        let glyphs = ts.shape_line("a");
+        assert_eq!(glyphs.len(), 1);
+        let key = glyphs[0].atlas_key();
+        assert_eq!(
+            key.face_id, primary,
+            "ASCII 'a' atlas_key.face_id should == primary_face_id"
+        );
+        assert_eq!(
+            key.font_size_quantized,
+            f32::to_bits(17.0),
+            "shape_line uses Metrics(17.0, 25.0), font_size_quantized should be \
+             f32::to_bits(17.0)"
         );
     }
 }

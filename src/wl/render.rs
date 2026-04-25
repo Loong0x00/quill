@@ -22,7 +22,7 @@ use raw_window_handle::{
 };
 
 use crate::term::CellRef;
-use crate::text::{ShapedGlyph, TextSystem};
+use crate::text::{GlyphKey, ShapedGlyph, TextSystem};
 
 /// 目标深蓝色,sRGB 空间的 `#0a1030`。本 ticket 的 acceptance 把它钉死:
 /// ```text
@@ -142,9 +142,14 @@ struct GlyphAtlas {
     #[allow(dead_code)]
     sampler: wgpu::Sampler,
     texture: wgpu::Texture,
-    /// (glyph_id, font_size_bits) → 已分配 atlas 槽位。HashMap 用 std::collections
-    /// (派单硬约束: 不引 ahash / fxhash)。
-    allocations: HashMap<(u16, u32), AtlasSlot>,
+    /// (T-0407) [`GlyphKey`] (face_id u64 + glyph_id u16 + font_size_quantized u32)
+    /// → 已分配 atlas 槽位。HashMap 用 std::collections (派单硬约束: 不引 ahash /
+    /// fxhash)。
+    ///
+    /// **T-0407 修 T-0403 P3 跟进 (audit P2-2)**: T-0403 实装 `(u16, u32)` 不含
+    /// face_id 维度, 跨 face 同 glyph_id 撞 key 互相覆盖 — 升级 [`GlyphKey`] 三维
+    /// struct, atlas slot 正确隔离每 face。
+    allocations: HashMap<GlyphKey, AtlasSlot>,
     cursor_x: u32,
     cursor_y: u32,
     row_height: u32,
