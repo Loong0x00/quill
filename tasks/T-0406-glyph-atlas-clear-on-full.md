@@ -1,8 +1,8 @@
 # T-0406 Glyph atlas clear-on-full (KISS, 替代 panic)
 
 **Phase**: 4 (收尾最后一单)
-**Assigned**: (open)
-**Status**: open
+**Assigned**: writer-T0406
+**Status**: in-review
 **Budget**: tokenBudget=50k (单文件 src/wl/render.rs + 集成测试)
 **Dependencies**: T-0403 (GlyphAtlas + shelf packing) / T-0407 (GlyphKey) / T-0408 (headless screenshot 用于验)
 **Priority**: P2 (Phase 4 完整收尾, 让 atlas 满不 panic)
