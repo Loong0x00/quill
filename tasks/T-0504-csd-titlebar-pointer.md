@@ -1,8 +1,8 @@
 # T-0504 CSD 自画 titlebar + 3 按钮 + wl_pointer 接入
 
 **Phase**: 5 (CSD, GNOME 不支持 SSD 必须自画)
-**Assigned**: (open)
-**Status**: open
+**Assigned**: writer-T0504
+**Status**: in-review
 **Budget**: tokenBudget=200k (跨 wl_pointer 协议 + CSD 渲染 + hit-test + 测试)
 **Dependencies**: T-0501 (wl_seat capabilities) / T-0503 (xdg-decoration ClientSide 路径) / T-0408 (headless screenshot)
 **Priority**: P1 (user 用 GNOME, 没装饰窗口拖不了 / 关不掉只能 SIGTERM)

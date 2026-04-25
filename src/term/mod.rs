@@ -633,6 +633,18 @@ impl TermState {
         self.dirty = false;
     }
 
+    /// 显式置位 dirty (T-0504). 用于 cell 内容未变但 presentation 状态
+    /// (CSD titlebar 三按钮 hover 高亮) 需要触发重画的场景 — `wl/window.rs`
+    /// `Dispatch<WlPointer>` 在 `PointerAction::HoverChange` 时调.
+    ///
+    /// **why 不开新 "presentation_dirty" 标志**: term.dirty 唯一作用是触发
+    /// idle callback 重画, hover 变化也走重画路径, 语义等价 — 复用既有标志
+    /// 不破 INV-006 / INV-007 (handle_event 仍纯逻辑, 本 fn 是对外副作用入口
+    /// 与 advance 同性质).
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
     /// 光标是否可见(`TermMode::SHOW_CURSOR` bit)。bash 启动后默认可见;
     /// 某些全屏程序(vim / less)会切 DECRST 25(`ESC[?25l`)隐藏,
     /// DECSET 25(`ESC[?25h`)恢复。T-0305 渲染判断"要不要画光标"。
