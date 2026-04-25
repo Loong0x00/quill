@@ -1,8 +1,8 @@
 # T-0403 glyph 光栅化 → wgpu texture atlas
 
 **Phase**: 4
-**Assigned**: (open)
-**Status**: open
+**Assigned**: writer-T0403
+**Status**: claimed
 **Budget**: tokenBudget=120k (Phase 4 最大单)
 **Dependencies**: T-0401 (TextSystem + SwashCache 字段) / T-0402 (shape_line + ShapedGlyph 含 x_offset/y_offset) / T-0305 (draw_cells wgpu pipeline)
 
