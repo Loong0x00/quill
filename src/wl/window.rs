@@ -1166,10 +1166,7 @@ mod tests {
         // INV-006 置位路径:handle_event(Configure) 在尺寸变化时置 dirty=true,
         // 紧接 propagate_resize_if_dirty 应消费一轮 (renderer/term/pty 三方
         // resize + 清 dirty)。
-        assert!(
-            should_propagate_resize(true),
-            "dirty=true 时应消费一轮"
-        );
+        assert!(should_propagate_resize(true), "dirty=true 时应消费一轮");
     }
 
     #[test]
