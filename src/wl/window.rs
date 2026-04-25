@@ -187,6 +187,16 @@ struct LoopData {
     /// 与 RSS 漂移。POD (无 GPU 引用), drop 顺序无关, 放尾部不与 INV-001
     /// 链条 (renderer→window→conn) 耦合。
     frame_stats: crate::frame_stats::FrameStats,
+    /// T-0403 加: cosmic-text 字体子系统 (T-0401), Phase 4 idle callback 调
+    /// `text_system.shape_line(row_text)` shape 每行 viewport 文本, 然后传给
+    /// `Renderer::draw_frame`。Lazy init (None 起步, 首次 idle draw 时建好);
+    /// 若 `TextSystem::new()` 失败 (CI 无 monospace 字体) 仍 None, idle callback
+    /// 退化到 [`Renderer::draw_cells`] 走色块 fallback (派单接受降级路径)。
+    ///
+    /// **drop 顺序无关**: cosmic-text `FontSystem` / `SwashCache` 是 owned 堆资源,
+    /// 不持 wgpu / wayland 句柄, 与 INV-001 / INV-002 资源链解耦, 放尾部 POD-like
+    /// 顺序无关 (与 `frame_stats` 同位置)。
+    text_system: Option<crate::text::TextSystem>,
 }
 
 // T-0108 删除:`run_main_loop` / `StepResult` / `install_signal_handlers` /
@@ -718,6 +728,21 @@ pub fn run_window() -> Result<()> {
     // 组装 LoopData 塞进 event_loop.run。run 阻塞直到三源中任一触发 `stop()`。
     // idle 回调用作"每轮 dispatch 之间顺带检查一下 core.exit",兜底 drive_wayland
     // 里万一没命中到的边界(目前应该总是覆盖,留着防回归)。
+    // T-0403: lazy init TextSystem。CI 无 monospace 字体 / 加载失败也允许 (warn
+    // + None), idle callback 退化到 draw_cells (色块 fallback) — 派单 In #C
+    // "lazy init, 第一次 draw 时建" 描述; 这里启动期建避免每帧检查。
+    let text_system = match crate::text::TextSystem::new() {
+        Ok(ts) => Some(ts),
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "TextSystem::new 失败 — Phase 4 字形渲染降级到 Phase 3 色块 (cargo run \
+                 仍可见深蓝清屏 + 浅灰色块)。check `fc-list :spacing=mono`."
+            );
+            None
+        }
+    };
+
     let mut loop_data = LoopData {
         event_queue,
         state,
@@ -729,6 +754,7 @@ pub fn run_window() -> Result<()> {
         // draw_cells 后调 record_and_log; Phase 6 soak 通过 `quill::frame`
         // target 观察帧间隔聚合。
         frame_stats: crate::frame_stats::FrameStats::new(),
+        text_system,
     };
     event_loop
         .run(None, &mut loop_data, |data| {
@@ -736,19 +762,21 @@ pub fn run_window() -> Result<()> {
                 data.loop_signal.stop();
                 return;
             }
-            // T-0305: 渲染触发点。`event_loop.run` 的第三参数是每轮 dispatch 之
-            // 后的 idle / post-tick callback (calloop 称 "before next iter"),正是
-            // "wayland fd / pty fd / signalfd 任一 ready 跑完 dispatch 后" 的时
-            // 机 —— PTY 字节进 term.advance 触发 dirty,本闭包看到 dirty 就
-            // draw_cells 一帧 + clear_dirty。term 不 dirty 则 no-op 不画(避免
-            // 空跑 GPU,与 INV-006 resize_dirty 同思路)。
+            // T-0305 / T-0403: 渲染触发点。`event_loop.run` 的第三参数是每轮
+            // dispatch 之后的 idle / post-tick callback (calloop 称 "before next
+            // iter"),正是 "wayland fd / pty fd / signalfd 任一 ready 跑完 dispatch
+            // 后" 的时机 —— PTY 字节进 term.advance 触发 dirty,本闭包看到 dirty
+            // 就 draw_frame 一帧 (含 clear + cells + glyphs, T-0403) 或 draw_cells
+            // (text_system 未建好时 fallback) + clear_dirty。
             //
-            // borrow split: data.term / data.state.renderer / data.frame_stats
-            // 都是 LoopData 不同字段, 一次解构同时拿三个 &mut 不冲突。
+            // borrow split: data.term / data.state.renderer / data.frame_stats /
+            // data.text_system 都是 LoopData 不同字段, 一次解构同时拿四个 &mut
+            // 不冲突。
             let LoopData {
                 state,
                 term,
                 frame_stats,
+                text_system,
                 ..
             } = &mut *data;
             let Some(t) = term.as_mut() else {
@@ -763,15 +791,28 @@ pub fn run_window() -> Result<()> {
                 // 再画。
                 return;
             };
-            // T-0305: 全量 cells 收集喂 draw_cells。1920 cell × CellRef(~32 字节
-            // pos+c+fg+bg)= 60 KiB,Vec 分配开销 << wgpu submit 一次的开销,
-            // Phase 6 soak 验 bench 再决定是否 reuse Vec(目前简单胜过聪明)。
+            // T-0305: 全量 cells 收集。1920 cell × CellRef(~32 字节 pos+c+fg+bg)
+            // = 60 KiB,Vec 分配开销 << wgpu submit 一次的开销, Phase 6 soak 验
+            // bench 再决定是否 reuse Vec(目前简单胜过聪明)。
             let cells: Vec<crate::term::CellRef> = t.cells_iter().collect();
             let (cols, rows) = t.dimensions();
-            if let Err(err) = r.draw_cells(&cells, cols, rows) {
+
+            // T-0403: 走 draw_frame (含字形); 若 text_system 未建好降级到
+            // draw_cells (Phase 3 色块路径)。
+            let draw_result = match text_system.as_mut() {
+                Some(ts) => {
+                    // 收集每行的文本快照, 喂给 draw_frame shape。t.line_text(row)
+                    // 给完整一行的 String (含末尾空白)。`rows` 行 × ~80 字符每行
+                    // = ~7 KiB Vec, 与 cells Vec 同数量级。
+                    let row_texts: Vec<String> = (0..rows).map(|row| t.line_text(row)).collect();
+                    r.draw_frame(ts, &cells, cols, rows, &row_texts)
+                }
+                None => r.draw_cells(&cells, cols, rows),
+            };
+            if let Err(err) = draw_result {
                 tracing::warn!(
                     ?err,
-                    "draw_cells 失败, 跳过本帧 (dirty 仍清, 避免下轮再撞同样错)"
+                    "draw_frame / draw_cells 失败, 跳过本帧 (dirty 仍清, 避免下轮再撞同样错)"
                 );
             }
             // T-0399 P1-1: 记录本帧 present 时间; 每满 FRAME_WINDOW (60) 帧
