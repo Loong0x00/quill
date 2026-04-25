@@ -25,3 +25,8 @@ pub use render::HIDPI_SCALE;
 // 都走此 fn。入参 / 出参全 quill 自有类型, 不漏 wgpu 内部 (INV-010 类型隔离),
 // 详见 `render.rs::render_headless` 文档头。
 pub use render::render_headless;
+
+// T-0505: PreeditOverlay 入参 (集成测试 tests/ime_preedit_render.rs 用), quill
+// 自有 struct (INV-010, 不漏 wayland-protocols 类型). PREEDIT_UNDERLINE_PX
+// 常数同步 re-export 给测试 / Phase 6 计算用。
+pub use render::{PreeditOverlay, PREEDIT_UNDERLINE_PX};

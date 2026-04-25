@@ -115,6 +115,7 @@ fn atlas_full_triggers_clear_no_panic() {
         &row_texts,
         LOGICAL_W,
         LOGICAL_H,
+        None,
     );
 
     let (rgba, physical_w, physical_h) =
@@ -158,6 +159,7 @@ fn atlas_clear_then_renders_visible_pixels() {
             &row_texts,
             LOGICAL_W,
             LOGICAL_H,
+            None,
         )
         .expect("render_headless pass 1 (atlas full path) should not panic");
     }
@@ -177,6 +179,7 @@ fn atlas_clear_then_renders_visible_pixels() {
         &row_texts,
         LOGICAL_W,
         LOGICAL_H,
+        None,
     )
     .expect("render_headless pass 2 after atlas full should not panic");
 

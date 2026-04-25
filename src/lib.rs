@@ -2,6 +2,7 @@
 #![deny(unsafe_code)]
 
 pub mod frame_stats;
+pub mod ime;
 pub mod pty;
 pub mod term;
 pub mod text;

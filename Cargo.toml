@@ -24,6 +24,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # 指针,纯 Rust 后端产出的协议对象不是 ABI 兼容 libwayland。
 wayland-backend = { version = "0.3", features = ["client_system"] }
 wayland-client = "0.31"
+# T-0505: text-input-unstable-v3 (TIv3) 协议绑定。sctk 0.19.2 不封装 IME 协议
+# (sctk roadmap 在 0.21+), wayland-protocols = "0.32" 已含 wp/text_input/zv3,
+# unstable feature gate 启用 zwp_text_input_v3 + zwp_text_input_manager_v3。
+# 详见 docs/adr/0007-wayland-protocols-text-input-v3.md。
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 wgpu = "29"
 # T-0501: Wayland wl_keyboard 协议给 client 的是 evdev scan code, 必须经
 # libxkbcommon 翻译 keymap (compositor 推 fd) + modifier mask → keysym + UTF-8。

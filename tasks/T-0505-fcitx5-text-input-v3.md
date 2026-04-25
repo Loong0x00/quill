@@ -1,8 +1,8 @@
 # T-0505 fcitx5 text-input-v3 (中文输入法)
 
 **Phase**: 5 (Phase 5 最后一单)
-**Assigned**: (open)
-**Status**: open
+**Assigned**: writer-T0505
+**Status**: in-review
 **Budget**: tokenBudget=200k (跨 protocol bind + IME 状态机 + preedit 渲染 + cursor rect + 测试)
 **Dependencies**: T-0501 (wl_keyboard, IME bypass 时 fallback 路径) / T-0408 (headless screenshot) / T-0504 (CSD 并行, 都改 src/wl/window.rs 不同段)
 **Priority**: P1 (中文输入是 user daily-drive 必需, 但 ASCII 已可用不算 P0)

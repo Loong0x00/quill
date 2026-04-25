@@ -142,6 +142,7 @@ fn run_headless_screenshot(path: &std::path::Path) -> Result<()> {
         &row_texts,
         WIDTH,
         HEIGHT,
+        None, // T-0505: --headless-screenshot CLI 路径无 IME 上下文, 不画 preedit
     )
     .context("render_headless 失败")?;
 

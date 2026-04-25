@@ -299,9 +299,6 @@ pub const BUTTON_W_LOGICAL_PX: u32 = 24;
 pub const BUTTON_H_LOGICAL_PX: u32 = 24;
 
 /// **CSD titlebar 配色**.
-///
-/// 与 GNOME mutter Adwaita 默认深色 titlebar 接近 (#2c2c2c). 不接系统主题
-/// (Phase 6+ 接 GTK 主题接口); 派单 In #D 硬编码即可.
 const TITLEBAR_BG: crate::term::Color = crate::term::Color {
     r: 0x2c,
     g: 0x2c,
@@ -322,7 +319,7 @@ const BUTTON_BG_CLOSE_HOVER: crate::term::Color = crate::term::Color {
     b: 0x35,
 };
 
-/// 按钮 icon 色 (浅灰 #d3d3d3, 在深灰 / 红背景上对比清晰, 与 cell.fg 默认色同源).
+/// 按钮 icon 色 (浅灰 #d3d3d3, 在深灰 / 红背景上对比清晰).
 const BUTTON_ICON: crate::term::Color = crate::term::Color {
     r: 0xd3,
     g: 0xd3,
@@ -330,21 +327,19 @@ const BUTTON_ICON: crate::term::Color = crate::term::Color {
 };
 
 /// **CSD titlebar 在 cell vertex buffer 内额外占的"虚拟 cell 行"数** (T-0504).
-///
-/// titlebar 走 cell pipeline (色块, 与 [`crate::wl::pointer::handle_pointer_event`]
-/// 决策的 hover region 渲染同 vertex 格式 `pos[2 f32] + color[3 f32]`),
-/// 需在 `ensure_cell_buffer` 容量留出空间. 当前生成顶点估算:
-/// - 1 个 titlebar 背景大色块 (整 width × titlebar_h) = 1 quad
-/// - 3 个按钮背景色块 (Min / Max / Close) = 3 quads
-/// - Close icon: 12 段 × 2 对角 = 24 quads (stair-stepped 模拟 ×, 见
-///   [`append_titlebar_vertices`] 3.1)
-/// - Maximize icon (□): 4 边 = 4 quads
-/// - Minimize icon (-): 1 quad
-///
-/// 总 ~33 quads. 留余量 64 quads (2× 安全系数 + 未来 Phase 6 加按钮 / icon
-/// 细化空间). `cells × VERTS_PER_CELL × VERTEX_BYTES` = 64 × 6 × 20 = 7680 字节,
-/// 与 cells 主体 (~230 KiB) 相比可忽略.
 const TITLEBAR_RESERVED_QUAD_ROWS: usize = 64;
+
+/// **T-0505: preedit 下划线像素厚度** (logical px, render 内部 × HIDPI_SCALE).
+pub const PREEDIT_UNDERLINE_PX: u32 = 2;
+
+/// T-0505: preedit overlay 入参。draw_frame / render_headless 收到 Some(_)
+/// 时在 (cursor_col, cursor_line) cell 起点之后绘制 preedit 字 + 底部下划线。
+#[derive(Debug, Clone)]
+pub struct PreeditOverlay {
+    pub text: String,
+    pub cursor_col: usize,
+    pub cursor_line: usize,
+}
 
 /// **HiDPI 整数缩放常数** (T-0404 简化版, hardcode 2x)。
 ///
@@ -1271,6 +1266,7 @@ impl Renderer {
     /// 5. queue.write_buffer 上传 cell + glyph vertex 数据
     /// 6. 单 RenderPass: LoadOp::Clear + cells draw + glyphs draw
     /// 7. submit + present
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_frame(
         &mut self,
         text_system: &mut TextSystem,
@@ -1278,11 +1274,10 @@ impl Renderer {
         cols: usize,
         rows: usize,
         row_texts: &[String],
-        // T-0504: 当前鼠标 hover 区域. Renderer 据此在 titlebar 三按钮中高亮
-        // 对应一个 (按钮背景变深, Close 变红). [`crate::wl::pointer::HoverRegion`]
-        // 是 quill 自有 enum (INV-010 类型隔离), 由 Dispatch<WlPointer> 调用方
-        // 维护. Phase 5 之前调用方传 [`HoverRegion::None`] 等价无高亮.
+        // T-0504: 当前鼠标 hover 区域. Renderer 据此在 titlebar 三按钮中高亮.
         hover: super::pointer::HoverRegion,
+        // T-0505: preedit overlay (None = 无 IME 组词). 见 PreeditOverlay struct.
+        preedit: Option<&PreeditOverlay>,
     ) -> Result<()> {
         if cols == 0 || rows == 0 {
             return self.render();
@@ -1337,7 +1332,7 @@ impl Renderer {
             self.surface_is_srgb,
             hover,
         );
-        let cell_vertex_count = (cell_vertex_bytes.len() / VERTEX_BYTES) as u32;
+        // cell_vertex_count 在下面的 preedit underline append 后再算 (T-0505)。
 
         // Step 4: shape + raster + atlas allocate + build glyph vertex bytes。
         // 错位检查: row_texts 长度应等于 rows; 若上层传入截短的 row_texts (例
@@ -1426,6 +1421,47 @@ impl Renderer {
                 }
             }
         }
+
+        // T-0505: preedit overlay (派单 In #D). 在 cursor cell 起点之后绘制
+        // preedit 字 + 底部下划线。preedit 字走 glyph pass (alpha-blended),
+        // 下划线走 cell pass (REPLACE color rect, append 到 cell_vertex_bytes).
+        // 颜色: preedit 文字浅灰 (cell.fg 默认值 #d3d3d3, 跟主流 IME 一致); 下
+        // 划线略亮 #ffffff 让用户区分组词态 vs 已 commit 字。
+        if let Some(p) = preedit {
+            if !p.text.is_empty() {
+                self.append_preedit_glyphs(
+                    text_system,
+                    &mut glyph_vertex_bytes,
+                    &p.text,
+                    p.cursor_col,
+                    p.cursor_line,
+                    cell_w_px,
+                    cell_h_px,
+                    baseline_y_px,
+                    surface_w,
+                    surface_h,
+                    glyph_color,
+                );
+                let underline_color = self.color_for_vertex(crate::term::Color {
+                    r: 0xff,
+                    g: 0xff,
+                    b: 0xff,
+                });
+                append_preedit_underline_to_cell_bytes(
+                    &mut cell_vertex_bytes,
+                    p.cursor_col,
+                    p.cursor_line,
+                    p.text.chars().count(),
+                    cell_w_px,
+                    cell_h_px,
+                    surface_w,
+                    surface_h,
+                    underline_color,
+                );
+            }
+        }
+        // cell_vertex_count 重新算 (preedit underline 可能 append 了 cell 顶点)
+        let cell_vertex_count = (cell_vertex_bytes.len() / VERTEX_BYTES) as u32;
         let glyph_vertex_count = (glyph_vertex_bytes.len() / GLYPH_VERTEX_BYTES) as u32;
 
         // 调试锚点 (debug 级, 不污染默认 info)
@@ -1865,6 +1901,135 @@ impl Renderer {
         }
         Some(slot)
     }
+
+    /// T-0505: shape preedit text + raster + atlas allocate + append 到
+    /// glyph_vertex_bytes. 与 [`Self::draw_frame`] 主路径中的行 shape 同套路,
+    /// 但起绘位置从 (cursor_col × cell_w, cursor_line × cell_h) 而非 (0, row_idx
+    /// × cell_h)。
+    ///
+    /// **why 单独 fn 而非内联**: 派单 In #D 强调 "preedit 在 cursor 当前位置
+    /// 之后绘制"; 抽出来让 draw_frame / render_headless 两路共享同一逻辑
+    /// (虽然 render_headless 也是独立 inline glyph loop, 此 method 仅 draw_frame
+    /// 复用; render_headless 内联类似 loop 是 T-0408 的设计选择)。
+    #[allow(clippy::too_many_arguments)]
+    fn append_preedit_glyphs(
+        &mut self,
+        text_system: &mut TextSystem,
+        glyph_vertex_bytes: &mut Vec<u8>,
+        text: &str,
+        cursor_col: usize,
+        cursor_line: usize,
+        cell_w_px: f32,
+        cell_h_px: f32,
+        baseline_y_px: f32,
+        surface_w: f32,
+        surface_h: f32,
+        glyph_color: [f32; 3],
+    ) {
+        // shape preedit 行 (cosmic-text 走 CJK fallback, T-0405 实测)
+        let glyphs = text_system.shape_line(text);
+        // preedit 行起绘 x 偏移 (cursor cell 左上角的 surface px). y 同主路径
+        // 用 cursor_line × cell_h_px。
+        let base_x_px = cursor_col as f32 * cell_w_px;
+        let base_y_px = cursor_line as f32 * cell_h_px;
+        for glyph in &glyphs {
+            if !glyph.x_advance.is_finite() || !glyph.x_offset.is_finite() {
+                continue;
+            }
+            let slot = match self.allocate_glyph_slot(text_system, glyph) {
+                Some(s) => s,
+                None => continue,
+            };
+            if slot.width == 0 || slot.height == 0 {
+                continue;
+            }
+            // 起绘位置: cursor cell 左 + glyph.x_offset (line-relative 累积) +
+            // bearing_x. y: cursor_line × cell_h + baseline - bearing_y。
+            let x_left = base_x_px + glyph.x_offset + slot.bearing_x as f32;
+            let y_top = base_y_px + baseline_y_px - slot.bearing_y as f32;
+            let x_right = x_left + slot.width as f32;
+            let y_bot = y_top + slot.height as f32;
+            let ndc_left = x_left / surface_w * 2.0 - 1.0;
+            let ndc_right = x_right / surface_w * 2.0 - 1.0;
+            let ndc_top = 1.0 - y_top / surface_h * 2.0;
+            let ndc_bot = 1.0 - y_bot / surface_h * 2.0;
+            let uv_l = slot.uv_min[0];
+            let uv_r = slot.uv_max[0];
+            let uv_t = slot.uv_min[1];
+            let uv_b = slot.uv_max[1];
+            let verts: [([f32; 2], [f32; 2]); 6] = [
+                ([ndc_left, ndc_top], [uv_l, uv_t]),
+                ([ndc_left, ndc_bot], [uv_l, uv_b]),
+                ([ndc_right, ndc_bot], [uv_r, uv_b]),
+                ([ndc_left, ndc_top], [uv_l, uv_t]),
+                ([ndc_right, ndc_bot], [uv_r, uv_b]),
+                ([ndc_right, ndc_top], [uv_r, uv_t]),
+            ];
+            for (pos, uv) in verts {
+                glyph_vertex_bytes.extend_from_slice(&pos[0].to_ne_bytes());
+                glyph_vertex_bytes.extend_from_slice(&pos[1].to_ne_bytes());
+                glyph_vertex_bytes.extend_from_slice(&uv[0].to_ne_bytes());
+                glyph_vertex_bytes.extend_from_slice(&uv[1].to_ne_bytes());
+                glyph_vertex_bytes.extend_from_slice(&glyph_color[0].to_ne_bytes());
+                glyph_vertex_bytes.extend_from_slice(&glyph_color[1].to_ne_bytes());
+                glyph_vertex_bytes.extend_from_slice(&glyph_color[2].to_ne_bytes());
+            }
+        }
+    }
+}
+
+/// T-0505: 在 cell_vertex_bytes 上追加 preedit 下划线矩形 (cell pass REPLACE
+/// 路径). 横跨 (cursor_col, cursor_line) 起 N 个 cell 宽度, 高 PREEDIT_UNDERLINE_PX
+/// × HIDPI_SCALE 在 cell 底部。N = preedit char 数; ASCII 1 字符 = 1 cell, CJK
+/// 1 字符 = 2 cell (但 char_count 取 chars().count() 偏小, Phase 6 接 east-asian
+/// width 表精确算 cell 数, 当前 KISS 用 char count, 视觉上差不多)。
+///
+/// **why free fn 不是 method on Renderer**: 不需要 self.device / self.atlas,
+/// 纯 vertex generation 数学; render_headless 也能复用 (但 headless 内联了类
+/// 似 loop, 此 fn 仅 draw_frame 路径用 — render_headless preedit 走自己的
+/// inline 实现, 与 T-0408 设计一致)。
+#[allow(clippy::too_many_arguments)]
+fn append_preedit_underline_to_cell_bytes(
+    cell_vertex_bytes: &mut Vec<u8>,
+    cursor_col: usize,
+    cursor_line: usize,
+    char_count: usize,
+    cell_w_px: f32,
+    cell_h_px: f32,
+    surface_w: f32,
+    surface_h: f32,
+    underline_color: [f32; 3],
+) {
+    if char_count == 0 {
+        return;
+    }
+    let underline_thickness_px = PREEDIT_UNDERLINE_PX as f32 * HIDPI_SCALE as f32;
+    let x0_px = cursor_col as f32 * cell_w_px;
+    let x1_px = x0_px + (char_count as f32) * cell_w_px;
+    // y 在 cell 底部往上 underline_thickness_px
+    let y1_px = (cursor_line + 1) as f32 * cell_h_px;
+    let y0_px = y1_px - underline_thickness_px;
+
+    let left = x0_px / surface_w * 2.0 - 1.0;
+    let right = x1_px / surface_w * 2.0 - 1.0;
+    let top = 1.0 - y0_px / surface_h * 2.0;
+    let bottom = 1.0 - y1_px / surface_h * 2.0;
+
+    let verts: [[f32; 2]; 6] = [
+        [left, top],
+        [left, bottom],
+        [right, bottom],
+        [left, top],
+        [right, bottom],
+        [right, top],
+    ];
+    for v in verts {
+        cell_vertex_bytes.extend_from_slice(&v[0].to_ne_bytes());
+        cell_vertex_bytes.extend_from_slice(&v[1].to_ne_bytes());
+        cell_vertex_bytes.extend_from_slice(&underline_color[0].to_ne_bytes());
+        cell_vertex_bytes.extend_from_slice(&underline_color[1].to_ne_bytes());
+        cell_vertex_bytes.extend_from_slice(&underline_color[2].to_ne_bytes());
+    }
 }
 
 /// **T-0408 加** — 离屏渲染入口。**不接 Wayland surface**, 直接 wgpu 渲染到内存
@@ -1929,6 +2094,11 @@ impl Renderer {
 ///
 /// **集成测试**: `tests/headless_screenshot.rs` 3 测试覆盖 PNG 文件存在 / 尺寸
 /// / 字像素 / 无 emoji artifact (派单 In #D)。
+///
+/// T-0505: 8 args 因 preedit overlay 加进来了。函数签名是 quill 离屏渲染入口
+/// (T-0408 单点), 入参语义都正交 (text_system / cells / dimensions / preedit),
+/// 抽 builder struct 收益小代价大 — 派单 KISS 接受 8 args + clippy allow。
+#[allow(clippy::too_many_arguments)]
 pub fn render_headless(
     text_system: &mut TextSystem,
     cells: &[CellRef],
@@ -1937,6 +2107,7 @@ pub fn render_headless(
     row_texts: &[String],
     width: u32,
     height: u32,
+    preedit: Option<&PreeditOverlay>,
 ) -> Result<(Vec<u8>, u32, u32)> {
     if width == 0 || height == 0 {
         return Err(anyhow!(
@@ -2126,9 +2297,7 @@ pub fn render_headless(
         }
     }
     // T-0504: 追加 titlebar + 3 按钮 + icon 顶点. headless 路径无真鼠标 hover,
-    // 走 HoverRegion::None (按钮全无高亮 — 视觉等价"窗口刚打开未鼠标接触" 状态,
-    // 三按钮可见但都是默认 titlebar 灰色). 派单 In #G "render_headless 写 PNG,
-    // 验 titlebar 区域有非清屏像素 + 3 按钮位置有非 titlebar bg 像素".
+    // 走 HoverRegion::None (按钮全无高亮).
     append_titlebar_vertices(
         &mut cell_vertex_bytes,
         surface_w,
@@ -2136,7 +2305,7 @@ pub fn render_headless(
         is_srgb,
         super::pointer::HoverRegion::None,
     );
-    let cell_vertex_count = (cell_vertex_bytes.len() / VERTEX_BYTES) as u32;
+    // cell_vertex_count 在 preedit underline append 后再算 (T-0505)。
 
     let effective_rows = row_texts.len().min(rows);
     // 默认 fg #d3d3d3 light gray (与 Renderer::draw_frame 同源, term::Color
@@ -2279,6 +2448,151 @@ pub fn render_headless(
             }
         }
     }
+
+    // T-0505: preedit overlay (派单 In #D + #H 测试覆盖). 在 cursor cell 起点
+    // 之后绘制 preedit 字 + 底部下划线。逻辑与 Renderer::draw_frame 同语义,
+    // 但 inline 实装 (T-0408 设计选择: render_headless 不复用 Renderer 内部
+    // 方法, 防 GPU 资源耦合)。
+    if let Some(p) = preedit {
+        if !p.text.is_empty() {
+            let base_x_px = p.cursor_col as f32 * cell_w_px;
+            let base_y_px = p.cursor_line as f32 * cell_h_px;
+            let preedit_glyphs = text_system.shape_line(&p.text);
+            for glyph in &preedit_glyphs {
+                if !glyph.x_advance.is_finite() || !glyph.x_offset.is_finite() {
+                    continue;
+                }
+                let key = glyph.atlas_key();
+                let slot_opt = if let Some(slot) = allocations.get(&key).copied() {
+                    Some(slot)
+                } else if let Some(raster) = text_system.rasterize(glyph) {
+                    if raster.width == 0 || raster.height == 0 {
+                        let slot = AtlasSlot {
+                            uv_min: [0.0, 0.0],
+                            uv_max: [0.0, 0.0],
+                            width: 0,
+                            height: 0,
+                            bearing_x: raster.bearing_x,
+                            bearing_y: raster.bearing_y,
+                        };
+                        allocations.insert(key, slot);
+                        Some(slot)
+                    } else {
+                        if atlas_cursor_x + raster.width > ATLAS_W {
+                            atlas_cursor_y += atlas_row_height;
+                            atlas_cursor_x = 0;
+                            atlas_row_height = 0;
+                        }
+                        if atlas_cursor_y + raster.height > ATLAS_H {
+                            tracing::warn!("headless preedit atlas full, clearing for re-raster");
+                            allocations.clear();
+                            atlas_cursor_x = 0;
+                            atlas_cursor_y = 0;
+                            atlas_row_height = 0;
+                        }
+                        let x = atlas_cursor_x;
+                        let y = atlas_cursor_y;
+                        queue.write_texture(
+                            wgpu::TexelCopyTextureInfo {
+                                texture: &glyph_texture,
+                                mip_level: 0,
+                                origin: wgpu::Origin3d { x, y, z: 0 },
+                                aspect: wgpu::TextureAspect::All,
+                            },
+                            &raster.bitmap,
+                            wgpu::TexelCopyBufferLayout {
+                                offset: 0,
+                                bytes_per_row: Some(raster.width),
+                                rows_per_image: Some(raster.height),
+                            },
+                            wgpu::Extent3d {
+                                width: raster.width,
+                                height: raster.height,
+                                depth_or_array_layers: 1,
+                            },
+                        );
+                        let slot = AtlasSlot {
+                            uv_min: [x as f32 / ATLAS_W as f32, y as f32 / ATLAS_H as f32],
+                            uv_max: [
+                                (x + raster.width) as f32 / ATLAS_W as f32,
+                                (y + raster.height) as f32 / ATLAS_H as f32,
+                            ],
+                            width: raster.width,
+                            height: raster.height,
+                            bearing_x: raster.bearing_x,
+                            bearing_y: raster.bearing_y,
+                        };
+                        allocations.insert(key, slot);
+                        atlas_cursor_x += raster.width;
+                        if raster.height > atlas_row_height {
+                            atlas_row_height = raster.height;
+                        }
+                        Some(slot)
+                    }
+                } else {
+                    None
+                };
+                let Some(slot) = slot_opt else { continue };
+                if slot.width == 0 || slot.height == 0 {
+                    continue;
+                }
+                let x_left = base_x_px + glyph.x_offset + slot.bearing_x as f32;
+                let y_top = base_y_px + baseline_y_px - slot.bearing_y as f32;
+                let x_right = x_left + slot.width as f32;
+                let y_bot = y_top + slot.height as f32;
+                let ndc_left = x_left / surface_w * 2.0 - 1.0;
+                let ndc_right = x_right / surface_w * 2.0 - 1.0;
+                let ndc_top = 1.0 - y_top / surface_h * 2.0;
+                let ndc_bot = 1.0 - y_bot / surface_h * 2.0;
+                let uv_l = slot.uv_min[0];
+                let uv_r = slot.uv_max[0];
+                let uv_t = slot.uv_min[1];
+                let uv_b = slot.uv_max[1];
+                let verts: [([f32; 2], [f32; 2]); 6] = [
+                    ([ndc_left, ndc_top], [uv_l, uv_t]),
+                    ([ndc_left, ndc_bot], [uv_l, uv_b]),
+                    ([ndc_right, ndc_bot], [uv_r, uv_b]),
+                    ([ndc_left, ndc_top], [uv_l, uv_t]),
+                    ([ndc_right, ndc_bot], [uv_r, uv_b]),
+                    ([ndc_right, ndc_top], [uv_r, uv_t]),
+                ];
+                for (pos, uv) in verts {
+                    glyph_vertex_bytes.extend_from_slice(&pos[0].to_ne_bytes());
+                    glyph_vertex_bytes.extend_from_slice(&pos[1].to_ne_bytes());
+                    glyph_vertex_bytes.extend_from_slice(&uv[0].to_ne_bytes());
+                    glyph_vertex_bytes.extend_from_slice(&uv[1].to_ne_bytes());
+                    glyph_vertex_bytes.extend_from_slice(&glyph_color[0].to_ne_bytes());
+                    glyph_vertex_bytes.extend_from_slice(&glyph_color[1].to_ne_bytes());
+                    glyph_vertex_bytes.extend_from_slice(&glyph_color[2].to_ne_bytes());
+                }
+            }
+
+            // 下划线: append 到 cell_vertex_bytes (cell pass REPLACE, 颜色 #ffffff
+            // 让用户区分组词态)
+            let underline_color = color_for_vertex_with_srgb(
+                crate::term::Color {
+                    r: 0xff,
+                    g: 0xff,
+                    b: 0xff,
+                },
+                is_srgb,
+            );
+            append_preedit_underline_to_cell_bytes(
+                &mut cell_vertex_bytes,
+                p.cursor_col,
+                p.cursor_line,
+                p.text.chars().count(),
+                cell_w_px,
+                cell_h_px,
+                surface_w,
+                surface_h,
+                underline_color,
+            );
+        }
+    }
+
+    // 重新算 vertex count (preedit 已可能 append cell underline + glyph)
+    let cell_vertex_count = (cell_vertex_bytes.len() / VERTEX_BYTES) as u32;
     let glyph_vertex_count = (glyph_vertex_bytes.len() / GLYPH_VERTEX_BYTES) as u32;
 
     let cell_vbuf = if cell_vertex_count > 0 {

@@ -64,7 +64,12 @@ use wayland_client::{
 use super::keyboard::{handle_key_event, KeyboardAction, KeyboardState};
 use super::pointer::{handle_pointer_event, PointerAction, PointerState, WindowButton};
 use super::render::Renderer;
+use crate::ime::{handle_text_input_event, CursorRectangle, ImeAction, ImeState};
 use wayland_client::protocol::wl_pointer;
+use wayland_protocols::wp::text_input::zv3::client::{
+    zwp_text_input_manager_v3::{self, ZwpTextInputManagerV3},
+    zwp_text_input_v3::{self, ZwpTextInputV3},
+};
 
 const INITIAL_WIDTH: u32 = 800;
 const INITIAL_HEIGHT: u32 = 600;
@@ -705,10 +710,31 @@ pub fn run_window() -> Result<()> {
     // pending state 推给 compositor (协议: scale 是 double-buffered, commit 生效)。
     window.commit();
 
+    // T-0505: 尝试 bind zwp_text_input_manager_v3 (TIv3) — fcitx5 / ibus 未启
+    // 时 compositor 不导出此 global, bind 失败 → None, IME 路径直接退化 (
+    // 用户敲键盘走 wl_keyboard ASCII 路径仍可用)。version 1 (协议唯一版本).
+    // ADR 0007 详释。
+    let text_input_manager: Option<ZwpTextInputManagerV3> = match globals.bind(&qh, 1..=1, ()) {
+        Ok(m) => {
+            tracing::info!("zwp_text_input_manager_v3 bound (compositor 支持 IME)");
+            Some(m)
+        }
+        Err(err) => {
+            tracing::info!(
+                ?err,
+                "zwp_text_input_manager_v3 不可用 — IME 退化到无 (fcitx5/ibus 未启 \
+                 或 compositor 不导出); 键盘 ASCII 路径仍正常"
+            );
+            None
+        }
+    };
+
     // State 字段顺序固化 INV-001(renderer→window→conn)+ pty 放最后(T-0202 Lead + 审码)。
     // T-0501 加: seat_state / keyboard_state / keyboard 三字段位于 core 与 pty 之间,
     // 不破坏 INV-001 链条 (它们都不持 wgpu/wayland 裸指针, 仅 SCTK/wayland-client
     // safe wrapper, drop 顺序无 UB 风险)。
+    // T-0505 加: text_input_manager / text_input / ime_state 三字段, 同性质
+    // (wayland-protocols 协议 handle + quill 自有 struct), drop 顺序无 UB。
     let mut state = State {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
@@ -728,6 +754,9 @@ pub fn run_window() -> Result<()> {
         pointer_seat: None,
         is_maximized: false,
         presentation_dirty: false,
+        text_input_manager,
+        text_input: None,
+        ime_state: ImeState::new(),
         pty: None,
     };
 
@@ -919,13 +948,36 @@ pub fn run_window() -> Result<()> {
 
             // T-0403: 走 draw_frame (含字形); 若 text_system 未建好降级到
             // draw_cells (Phase 3 色块路径)。
+            // T-0505: 当 IME 有 preedit 时构造 PreeditOverlay 传入 — 渲染层
+            // 在 cursor 当前位置追加 preedit 字 + 下划线。
+            let preedit_overlay: Option<crate::wl::render::PreeditOverlay> = {
+                let preedit_text = state.ime_state.current_preedit();
+                if preedit_text.is_empty() {
+                    None
+                } else {
+                    let pos = t.cursor_pos();
+                    Some(crate::wl::render::PreeditOverlay {
+                        text: preedit_text.to_owned(),
+                        cursor_col: pos.col,
+                        cursor_line: pos.line,
+                    })
+                }
+            };
             let draw_result = match text_system.as_mut() {
                 Some(ts) => {
                     // 收集每行的文本快照, 喂给 draw_frame shape。t.line_text(row)
                     // 给完整一行的 String (含末尾空白)。`rows` 行 × ~80 字符每行
                     // = ~7 KiB Vec, 与 cells Vec 同数量级。
                     let row_texts: Vec<String> = (0..rows).map(|row| t.line_text(row)).collect();
-                    r.draw_frame(ts, &cells, cols, rows, &row_texts, hover)
+                    r.draw_frame(
+                        ts,
+                        &cells,
+                        cols,
+                        rows,
+                        &row_texts,
+                        hover,
+                        preedit_overlay.as_ref(),
+                    )
                 }
                 None => r.draw_cells(&cells, cols, rows),
             };
@@ -942,6 +994,23 @@ pub fn run_window() -> Result<()> {
             frame_stats.record_and_log(std::time::Instant::now());
             t.clear_dirty();
             state.presentation_dirty = false;
+
+            // T-0505: cursor_rectangle 上报 (派单 In #E).
+            if state.ime_state.is_enabled() {
+                if let Some(ti) = state.text_input.as_ref() {
+                    let pos = t.cursor_pos();
+                    let rect = cursor_rectangle_for_cell(pos.col, pos.line);
+                    if let Some(new) = state.ime_state.update_cursor_rectangle(rect) {
+                        ti.set_cursor_rectangle(new.x, new.y, new.width, new.height);
+                        ti.commit();
+                        tracing::trace!(
+                            target: "quill::ime",
+                            x = new.x, y = new.y, w = new.width, h = new.height,
+                            "cursor_rectangle updated"
+                        );
+                    }
+                }
+            }
         })
         .context("calloop EventLoop::run 失败")?;
 
@@ -997,6 +1066,10 @@ struct State {
     /// idle callback 检查 `term.is_dirty() || state.presentation_dirty` 决定
     /// 是否重画; 重画后置 false. 与 INV-006 resize_dirty 同布尔脏标记套路.
     presentation_dirty: bool,
+    // T-0505: zwp_text_input_v3 (TIv3) IME 协议绑定 (fcitx5 / ibus 中文输入).
+    text_input_manager: Option<ZwpTextInputManagerV3>,
+    text_input: Option<ZwpTextInputV3>,
+    ime_state: ImeState,
     // `pty` **位于 State 最后一位**(Lead + 审码 2026-04-25 拍板,见 T-0202 ticket):
     // - PTY 持 Linux fd + 子进程句柄,与 wl / wgpu 资源生命周期正交,放最后避免
     //   跟 INV-001 的 renderer→window→conn 链条耦合,不需要新建 INV。
@@ -1313,6 +1386,18 @@ impl SeatHandler for State {
             let kb = seat.get_keyboard(qh, ());
             tracing::info!("wl_seat capability Keyboard 出现, wl_keyboard 已绑定");
             self.keyboard = Some(kb);
+
+            // T-0505: text-input-v3 跟 keyboard 同生命周期 (协议: TIv3 focus
+            // 跟 wl_keyboard focus). 仅当 manager 已 bind (compositor 支持 +
+            // fcitx5/ibus 启) 才 get text_input. 已有 text_input 时不重建
+            // (防 capability 重 fire), 与 wl_keyboard 同套路。
+            if self.text_input.is_none() {
+                if let Some(manager) = self.text_input_manager.as_ref() {
+                    let ti = manager.get_text_input(&seat, qh, ());
+                    tracing::info!("zwp_text_input_v3 bound on seat (IME 启用)");
+                    self.text_input = Some(ti);
+                }
+            }
         }
         // T-0504: Pointer 同 Keyboard 路径 — wl_seat::get_pointer 返 raw
         // WlPointer, 走自己的 Dispatch<WlPointer, ()> impl (INV-010, PointerState
@@ -1341,6 +1426,13 @@ impl SeatHandler for State {
                 kb.release();
                 tracing::info!("wl_seat capability Keyboard 移除, wl_keyboard 释放");
             }
+            // T-0505: text-input-v3 跟 keyboard 同生命周期; 协议 destroy
+            // 自动通过 ZwpTextInputV3 的 Drop 触发 (wayland-protocols 生成
+            // 的 Drop 实现内部调 destructor request)。take 让 Option 变 None,
+            // 后续 keyboard 重 bind 时也重 get text_input。
+            if self.text_input.take().is_some() {
+                tracing::info!("zwp_text_input_v3 释放 (随 keyboard capability 移除)");
+            }
         }
         if capability == Capability::Pointer {
             if let Some(ptr) = self.pointer.take() {
@@ -1353,7 +1445,7 @@ impl SeatHandler for State {
     }
 
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {
-        // seat 整个移除 — 当前 wl_keyboard / wl_pointer 一并失效, 走 take 释放。
+        // seat 整个移除 — wl_keyboard / wl_pointer / text_input 一并失效。
         if let Some(kb) = self.keyboard.take() {
             kb.release();
         }
@@ -1361,6 +1453,234 @@ impl SeatHandler for State {
             ptr.release();
         }
         self.pointer_seat = None;
+        // T-0505: text-input 跟 keyboard 同生命周期。
+        let _ = self.text_input.take();
+    }
+}
+
+/// T-0505: 把 cell cursor 位置 (col, line) 与 cell pixel size 翻译成 TIv3
+/// `set_cursor_rectangle` 的 logical px surface 坐标。
+///
+/// **why logical px** (TIv3 协议要求): 协议明示
+/// `set_cursor_rectangle(x, y, w, h)` 是 surface 局部 logical 坐标,
+/// compositor 自己加 HiDPI scale 转 physical 给 fcitx5 弹窗定位。`HIDPI_SCALE`
+/// 常数仅影响 `wgpu::Surface::configure` 的 backing buffer (T-0404), 与协议
+/// logical px 无关。
+///
+/// **抽纯 fn** (conventions §3): 跟 `cells_from_surface_px` 同套路, headless
+/// 单测覆盖几个边界 (col=0/79, line=0/23) → CursorRectangle 决策, 不依赖
+/// LoopData / 真 wayland 连接。
+pub(crate) fn cursor_rectangle_for_cell(col: usize, line: usize) -> CursorRectangle {
+    // logical px (跟 wayland 协议层单位一致). Phase 5 cell px 仍 hardcode
+    // (CELL_W_PX/CELL_H_PX), Phase 4 字体 metrics 测量后会改 — 届时本 fn
+    // 跟 `cells_from_surface_px` 同步换字体真实 advance 宽度。
+    let x = (col as f32 * crate::wl::render::CELL_W_PX) as i32;
+    let y = (line as f32 * crate::wl::render::CELL_H_PX) as i32;
+    let width = crate::wl::render::CELL_W_PX as i32;
+    let height = crate::wl::render::CELL_H_PX as i32;
+    CursorRectangle {
+        x,
+        y,
+        width,
+        height,
+    }
+}
+
+/// **`Dispatch<ZwpTextInputManagerV3>`**: manager 是工厂对象, 自身无事件
+/// (协议: zwp_text_input_manager_v3 只有 destroy / get_text_input 两个
+/// request, 零 event)。Dispatch::event 不应被调用; 防御性写法 — 收到协议
+/// 错误事件 trace warn 不 panic。
+impl Dispatch<ZwpTextInputManagerV3, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwpTextInputManagerV3,
+        _event: zwp_text_input_manager_v3::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // zwp_text_input_manager_v3 协议 0 event, 此 impl 仅满足 Dispatch
+        // trait bound (ZwpTextInputManagerV3 是 Proxy trait, 必须有 Dispatch).
+        // wayland-protocols Event enum 也是空 (`Event {}`), match 任何分支
+        // 都触发, 此处无操作。
+    }
+}
+
+/// **`Dispatch<ZwpTextInputV3>`** (T-0505 主路径): TIv3 atomic 协议事件 →
+/// [`handle_text_input_event`] → [`ImeAction`] → 副作用分派 (PTY write /
+/// preedit dirty / enable+commit / cursor_rect)。
+///
+/// 类型隔离 (INV-010): `event: zwp_text_input_v3::Event` 入参是
+/// wayland-protocols 协议类型 (已在 quill 公共 API 边界 — Dispatch trait
+/// 强制); 出参 [`ImeAction`] 是 quill 自有 enum, 不漏 wayland-protocols 类型。
+/// 与 `Dispatch<wl_keyboard::WlKeyboard>` 同套路 (T-0501)。
+///
+/// **PTY write 路径**: `ImeAction::Commit(bytes)` → `state.pty.write(&bytes)`,
+/// 与 wl_keyboard 同 PTY 路径 (INV-009 master fd O_NONBLOCK, INV-005 不重试,
+/// 派单 In #D 背压丢字节)。
+///
+/// **enable+commit 协议要求**: TIv3 协议明示 client 必须在 enter 后调
+/// `enable() + commit()` 才能接收 preedit/commit event。LeaveFocus 时调
+/// `disable() + commit()` 释放 fcitx5 grab 让其它 client 用。
+///
+/// **preedit dirty**: `ImeAction::UpdatePreedit` 不立即重绘 (避免在 wayland
+/// dispatch 路径里调 wgpu, 与 INV-007 WindowCore 纯逻辑同思路) — 仅置
+/// `core.resize_dirty` 触发 idle callback 重绘。复用 `resize_dirty` 标志
+/// 而非新加 `preedit_dirty` (idle callback 已用 `term.is_dirty()` 决定重绘,
+/// 这里同步置 `term.set_dirty()` 也是合法路径 — 但 alacritty Term 没有
+/// `set_dirty` public API, 走 resize_dirty 间接强制下一帧 propagate +
+/// idle 看 dirty=true)。**真简化**: ImeState 本身已存 current_preedit,
+/// idle callback 每次 draw 都读它 — preedit 变化自然在下一帧反映, 不需要
+/// 额外 dirty 标志 (idle 频率与 wayland event 同节奏, 协议 done 后下一次
+/// idle 必走)。
+impl Dispatch<ZwpTextInputV3, ()> for State {
+    fn event(
+        state: &mut Self,
+        text_input: &ZwpTextInputV3,
+        event: zwp_text_input_v3::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        let action = handle_text_input_event(event, &mut state.ime_state);
+        apply_ime_action(action, text_input, state);
+    }
+}
+
+/// 把 [`ImeAction`] 翻译成真副作用 (PTY write / 协议 request)。
+///
+/// 抽出来理由 (conventions §3): Composite variant 内部递归调用方便; Dispatch
+/// callback 内 split-borrow 复杂 — 单独 fn 让 borrow 路径更清晰。
+fn apply_ime_action(action: ImeAction, text_input: &ZwpTextInputV3, state: &mut State) {
+    match action {
+        ImeAction::Nothing => {}
+        ImeAction::Commit(bytes) => {
+            // 与 Dispatch<WlKeyboard> 同 PTY 路径; INV-009 master fd O_NONBLOCK,
+            // INV-005 calloop 不重试 WouldBlock 直接丢 (派单 In 中文输入背压
+            // 罕见, 一帧 done 字节 ≤ 12 (4 中文字符), kernel buffer 必能装下)。
+            let Some(pty) = state.pty.as_ref() else {
+                tracing::warn!(
+                    target: "quill::ime",
+                    n = bytes.len(),
+                    "ImeAction::Commit 时 pty=None, 丢字节"
+                );
+                return;
+            };
+            match pty.write(&bytes) {
+                Ok(n) if n == bytes.len() => {
+                    tracing::debug!(
+                        target: "quill::ime",
+                        n,
+                        "wrote IME commit bytes to pty"
+                    );
+                }
+                Ok(n) => {
+                    tracing::warn!(
+                        target: "quill::ime",
+                        wrote = n,
+                        total = bytes.len(),
+                        "pty.write IME commit 部分写入, 剩余字节丢弃 (背压)"
+                    );
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    tracing::warn!(
+                        target: "quill::ime",
+                        n = bytes.len(),
+                        "pty.write IME commit WouldBlock, 字节丢弃 (INV-005 不重试)"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "quill::ime",
+                        error = %e,
+                        n = bytes.len(),
+                        "pty.write IME commit 失败 (非 WouldBlock)"
+                    );
+                }
+            }
+        }
+        ImeAction::UpdatePreedit {
+            text,
+            cursor_begin,
+            cursor_end,
+        } => {
+            // current_preedit 已在 handle_text_input_event 内 apply 完成 (
+            // ImeState 内部 mutation), 这里仅 trace。渲染层下次 idle callback
+            // 走 draw_frame 时读 state.ime_state.current_preedit() 决定 preedit
+            // 渲染。
+            //
+            // **why 不主动 trigger redraw**: idle callback 在每次 wayland
+            // dispatch 后跑 (calloop EventLoop::run 第三 arg), preedit
+            // 变化自然在下一 idle 反映 — fcitx5 done event 与 idle 间隔
+            // < 1 frame, 用户感知 = 实时。Phase 6 若发现 preedit 卡顿可
+            // 加显式 `core.preedit_dirty` 标志 + idle 优先级提升, 当前 KISS。
+            tracing::debug!(
+                target: "quill::ime",
+                text = %text,
+                cursor_begin,
+                cursor_end,
+                "preedit 更新 (下次 idle 渲染)"
+            );
+        }
+        ImeAction::DeleteSurroundingText { before, after } => {
+            // **派单 Out**: terminal 没有 client 侧文本 buffer (alacritty Term
+            // 是 server 侧 grid, bash readline 才有 buffer 但跟 IME 不通).
+            // 我们仅 trace, 不翻译成 PTY backspace 序列 — fcitx5 实测在
+            // terminal 罕见触发 (拼音输入只 commit, delete_surrounding 主要
+            // 给 GTK4 文本框删字 / 候选回退场景用). Phase 6 决定是否实装。
+            tracing::debug!(
+                target: "quill::ime",
+                before,
+                after,
+                "DeleteSurroundingText 收到 — terminal 无 surrounding buffer, 派单 Out 跳过"
+            );
+        }
+        ImeAction::EnterFocus => {
+            // 协议要求: enter 后必须调 enable() + commit() 才能接收
+            // preedit/commit event。set_content_type 给 fcitx5 提示 "这是
+            // 终端" 让候选样式合适 (fcitx5 可能跳过自动大写之类干扰). content
+            // hint 用 NONE (无特殊行为)。purpose 用 TERMINAL (协议 enum
+            // value 13)。
+            text_input.enable();
+            text_input.set_content_type(
+                zwp_text_input_v3::ContentHint::None,
+                zwp_text_input_v3::ContentPurpose::Terminal,
+            );
+            // 立即上报 cursor_rectangle (focus 进入时 fcitx5 候选框需立即
+            // 知道位置). 用 ime_state 缓存避免重复上报。
+            //
+            // 入参用 (0, 0) 占位 — 真 cursor 位置由 PTY 输出 / 用户交互推动
+            // 时通过 `update_ime_cursor_rect_from_term` (idle callback 调用)
+            // 持续更新, 此处仅给 fcitx5 一个非 default 的初值。
+            // text_input.commit() 在路径末端 (协议要求每次 state 变化后 commit
+            // 一次, 把 enable + content_type + cursor_rect 一并 atomic 推过去).
+            let r = CursorRectangle {
+                x: 0,
+                y: 0,
+                width: crate::wl::render::CELL_W_PX as i32,
+                height: crate::wl::render::CELL_H_PX as i32,
+            };
+            if let Some(new) = state.ime_state.update_cursor_rectangle(r) {
+                text_input.set_cursor_rectangle(new.x, new.y, new.width, new.height);
+            }
+            text_input.commit();
+            tracing::info!(target: "quill::ime", "EnterFocus → enable + content_type + commit");
+        }
+        ImeAction::LeaveFocus => {
+            // 协议: disable + commit 释放 fcitx5 grab. 不重置 ime_state (已
+            // 在 handle_text_input_event::Leave 里清空 preedit + pending)。
+            text_input.disable();
+            text_input.commit();
+            tracing::info!(target: "quill::ime", "LeaveFocus → disable + commit");
+        }
+        ImeAction::Composite(actions) => {
+            // 按数组顺序逐个 apply — 协议规定 delete → commit → preedit。
+            // 不会无限递归 (Composite 内不再含 Composite, handle_text_input_event
+            // 内 apply_pending 仅生成 单一 variants 列表)。
+            for a in actions {
+                apply_ime_action(a, text_input, state);
+            }
+        }
     }
 }
 
