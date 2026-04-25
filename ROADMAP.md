@@ -97,13 +97,14 @@ Lead 决定:**T-0104 + Phase 2 PTY 并行推进**。理由:
 
 ---
 
-## Phase 4 — cosmic-text + CJK 5/8 (T-0408 待审, T-0405 简化 + T-0406 待派)
+## Phase 4 — cosmic-text + CJK 6/8 (T-0405 + T-0406 待派)
 
 - [x] `T-0401` cosmic-text 字体子系统初始化 (TextSystem + ShapedGlyph + INV-010 第 7 次应用) ✅ merged
 - [x] `T-0402` shaping pipeline (shape_line + ShapedGlyph x_offset/y_offset, INV-010 第 8 次) ✅ merged
 - [x] `T-0403` glyph 光栅化 + wgpu atlas (RasterizedGlyph + GlyphAtlas + draw_frame, INV-010 第 9 次, INV-002 字段 10→14) ✅ merged (字形渲染框架, 但有 cell+glyph 同色 bug)
 - [x] `T-0407` 字形 bug fix (face lock + emoji 黑名单 + GlyphKey + cell.bg cellColorSource) ✅ merged 🎉 **Phase 4 视觉里程碑真达成**: user 实测 5090 + Wayland cargo run 真显示 `[user@userPC ~]$` 完整 ASCII prompt (浅灰字 + 深蓝 + 黑 cursor, 截图 18-47-00)
 - [x] `T-0404` HiDPI 2x scale hardcode (HIDPI_SCALE=2 const + font 17→34 + Renderer surface ×2, 用户 224 ppi 单显示器固定) ✅ merged
+- [x] `T-0408` headless screenshot (offscreen render → PNG, agent 自验视觉, ADR 0005 image crate, INV-010 第 11 次) ✅ merged 🎯 **agent 自验视觉模式启动**: cargo run -- --headless-screenshot=PATH 写 1600×1200 PNG, agent Read PNG 直接 verify 不依赖 GNOME / Wayland / portal
 - [ ] `T-0404` 2x HiDPI 整数缩放 (`wl_output.scale` 接入)
 - [ ] `T-0405` CJK fallback 正确 (ASCII 用 mono, 中文 fallback CJK)
 - [ ] `T-0406` glyph cache + LRU 驱逐
@@ -196,4 +197,6 @@ Lead 决定:**T-0104 + Phase 2 PTY 并行推进**。理由:
 - 2026-04-25 派 T-0408 headless screenshot test (基建): quill 内置 offscreen render → PNG, agent 直接读 PNG 像素 verify 不依赖 GNOME / Wayland / portal — 治 T-0403 一周 3 次诊断错位的根因 (agent 没法看屏幕). 引 image crate (写 ADR 0005), 跨 main.rs CLI flag --headless-screenshot. T-0408 跟 T-0407 改动文件不重叠并行实装
 - 2026-04-25 **T-0404 merged**: HiDPI 2x scale hardcode 简化版 (用户 224 ppi 单显示器偏好). HIDPI_SCALE=2 const 一处定义全 codebase 引用 35+ 次. Renderer::new/resize × HIDPI_SCALE + shape_line Metrics 17→34 / 25→50. writer 主动告知 Renderer::new 必需补 (派单未列, T-0306 P0-2 模式). T-0407 fix 后 rebase 干净 1 处冲突 (atlas_key 测试期望 hardcode 17 → HIDPI_SCALE 单一来源). 112 tests (+2). INV-010 守 (HIDPI_SCALE 是 u32 const 不暴露上游类型). Phase 4 进度 5/8
 - 2026-04-25 **T-0408 完工实测 agent 自验视觉成功** (待 reviewer-T0408 完成审码合并). writer-T0408 跑 `cargo run --release -- --headless-screenshot=/tmp/quill_t0408.png`, Lead 直接 Read PNG 看到完整 quill 渲染 (深蓝清屏 + `[user@userPC ~]$` 浅灰字 + ~ 反色 cursor), **agent 第一次不依赖 user 自己 verify quill 视觉输出**. T-0408 治 T-0403 字形 bug 一周 3 次诊断错位的根因. rebase 干净零冲突 (writer 设计预防性避开 Renderer::ensure_*). 7 文件 +965 含 ADR 0005 + image crate dep. 118 tests (+5)
+- 2026-04-25 **T-0408 R2 merged (HIDPI 适配 + tuple API)**: T-0404 提前合让 T-0408 fork-point 落后, writer-T0408 二次 rebase + 适配 HIDPI_SCALE × 2 (physical_w/h / cell px / baseline 全 ×2 + bytes_per_row 256 对齐基于 physical). API 签名 Result<Vec<u8>> → Result<(Vec<u8>, u32, u32)> caller decoupling. PNG /tmp/quill_t0408_v2.png 1600×1200 / 47KB, Lead + reviewer 双源 Read PNG verify 视觉 (字号 ×2 真放大). 8 文件 +1375 (+57 vs R1). 120 tests (+2 from T-0404). INV-010 第 11 次. **教训** (Lead orchestration): 视觉验证基建 (T-0408 类) 应比依赖它的功能 ticket 优先合, 否则后到 ticket 必 rebase
+- 2026-04-25 Phase 4 进度 6/8: T-0405 CJK fallback simplify (T-0407 face lock 已部分覆盖, 缩简为 verify 中文 fallback 1 单) + T-0406 LRU cache 待派
 - (后续每个阶段起止在这追加)
