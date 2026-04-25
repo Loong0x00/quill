@@ -97,10 +97,10 @@ Lead 决定:**T-0104 + Phase 2 PTY 并行推进**。理由:
 
 ---
 
-## Phase 4 — cosmic-text + CJK 1/6 (2026-04-25)
+## Phase 4 — cosmic-text + CJK 2/6 (2026-04-25)
 
 - [x] `T-0401` cosmic-text 字体子系统初始化 (TextSystem + ShapedGlyph + INV-010 第 7 次应用) ✅ merged
-- [ ] `T-0402` shaping pipeline: grid cell → glyph run
+- [x] `T-0402` shaping pipeline (shape_line + ShapedGlyph x_offset/y_offset, INV-010 第 8 次) ✅ merged
 - [ ] `T-0403` glyph 光栅化 → wgpu texture atlas
 - [ ] `T-0404` 2x HiDPI 整数缩放 (`wl_output.scale` 接入)
 - [ ] `T-0405` CJK fallback 正确 (ASCII 用 mono, 中文 fallback CJK)
@@ -188,4 +188,5 @@ Lead 决定:**T-0104 + Phase 2 PTY 并行推进**。理由:
 - 2026-04-25 auditor-mainline 完工 A- (P0=0 / P1=1 / P2=7 / P3=9), 找到跨 ticket 累积 bug per-ticket reviewer 看不到 (FrameStats T-0106→T-0305 漏接 / event_loop::Core T-0105→T-0108 漂移 / SAFETY 注释 T-0202→T-0108 未同步 / INV-006 doc 引用过时 / INV-010 类型隔离原则未登记 / thiserror 死 dep / propagate_resize_if_dirty 漏单测 / TD 漏标). 印证 Phase-end 全局 audit 必要性 (per-ticket reviewer 不看跨段)
 - 2026-04-25 **T-0399 merged**: 91 tests (+2 net), 10 commits 一单清 8 项 P1+P2. writer-T0399 自报未 verify P2-2 calloop EBADF 论点, reviewer 独立 grep calloop-0.14.4 + polling-3.11.0 源码 verify writer 论点准确 (Generic::Drop 调 poller.delete().ok() silent ignore + polling::delete 透传 EBADF). INV-010 类型隔离原则正式登记 (Phase 4 cosmic-text 接入前覆盖). Lead 跟进 INV-006 行号引用改 symbol name (P3 reviewer 教训: 行号易偏移). conventions §6 加陷阱 4 "伪派活信号" (writer-T0306/T0307/T0399 多次 sanity check 物理化)
 - 2026-04-25 **Phase 4 起手 T-0401 merged**: cosmic-text 0.12.1 引入, 95 tests (+4), src/text/ 新模块 274 行 (TextSystem + ShapedGlyph), INV-010 第 7 次应用 (writer 自审删 pub(crate).*cosmic_text 视为暴露). reviewer 独立 grep cosmic-text 0.12.1 源 (layout.rs:30 + shape.rs:1459-1474) verify x_advance ← g.w 字段映射准确. Lead 跟进 cargo audit 0 vulnerabilities + shape_chinese 注释 P3-2 微改更精确 (覆盖正常 vs CI 退化两路径). Phase 4 进度 1/6
+- 2026-04-25 **T-0402 merged**: shape_line API + ShapedGlyph 加 x_offset/y_offset, 99 tests (+4), src/text/mod.rs +201 单文件. INV-010 第 8 次零违规 (cosmic-text Attrs/Buffer/Family/Metrics/Shaping/LayoutGlyph 6 类型全锁 fn body 内). writer 主动告知 ShapedGlyph x_offset/y_offset 与 cosmic-text LayoutGlyph::x_offset 命名歧义 + Metrics 17/25 vs shape_one_char 14/20 不一致, reviewer 独立 grep cosmic-text 0.12.1 源 verify physical() 计算公式 (self.x + font_size * self.x_offset) 表明两组字段语义不同, 接受 spec 选择 + P2 登记 "Phase 5+ sub-pixel rendering 时 rename". Phase 4 进度 2/6
 - (后续每个阶段起止在这追加)
