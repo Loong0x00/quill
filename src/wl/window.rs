@@ -48,7 +48,7 @@ use smithay_client_toolkit::{
     seat::{Capability, SeatHandler, SeatState},
     shell::{
         xdg::{
-            window::{Window, WindowConfigure, WindowDecorations, WindowHandler},
+            window::{DecorationMode, Window, WindowConfigure, WindowDecorations, WindowHandler},
             XdgShell,
         },
         WaylandSurface,
@@ -84,6 +84,11 @@ pub struct WindowCore {
     /// swapchain 重建路径)读取后自行清零。布尔而非队列,天然把连续 resize
     /// 合并到单次脏标记。
     pub resize_dirty: bool,
+    /// T-0503 装饰协商一次性 log 标记。`WindowHandler::configure` 在每次 compositor
+    /// 发 configure (focus / resize / state 变化) 都会跑, 但装饰协商结果在窗口
+    /// 生命周期内一般不变 — 只在首次 configure 后 log 一次, 避免 trace 噪音。
+    /// `false` = 还没 log 过, log 后置 `true`。
+    pub decoration_logged: bool,
 }
 
 impl WindowCore {
@@ -94,6 +99,7 @@ impl WindowCore {
             first_configure: true,
             exit: false,
             resize_dirty: false,
+            decoration_logged: false,
         }
     }
 }
@@ -407,6 +413,49 @@ fn pty_read_tick(
 
 // T-0108 删除 drain_pipe —— self-pipe signal 机制废弃,calloop::signals::Signals
 // 走 signalfd 由 calloop 内部 source 直接读。
+
+/// T-0503 装饰协商决策。
+///
+/// `WindowConfigure::decoration_mode` 是 compositor 对我们 `RequestServer` 的应答。
+/// 协商规则 (xdg-decoration-unstable-v1 + sctk 0.19 双重保证):
+/// - sctk `XdgShell::bind` 自动尝试 bind `zxdg_decoration_manager_v1`; 不存在则
+///   `GlobalProxy::Err`, sctk 在 `create_window` 时跳过 `set_mode` 调用, 任何后续
+///   `WindowConfigure::decoration_mode` 字段固定 `Client` (sctk 文档明示)
+/// - manager 存在但 compositor 拒绝 SSD: 也回 `Client`
+/// - manager 存在且 compositor 同意 SSD: 回 `Server`
+///
+/// **GNOME mutter 50.1 实测不导出 `zxdg_decoration_manager_v1` global**
+/// (政策性 CSD-only, GNOME 设计哲学不让 SSD 进, 多年争议无解)。
+/// 故 GNOME 桌面下本字段恒 `Client`, quill 当前阶段不自画 CSD (派单 Out C),
+/// 结果是窗口无 titlebar — **派单"cargo run 看到 titlebar"在 GNOME 不成立**,
+/// 需 KDE / wlroots / Hyprland 等支持 SSD 的 compositor 验证。
+///
+/// 抽 enum 而非 bool 让未来扩展 (CSD fallback / hybrid 装饰) 不破 ABI;
+/// 抽纯 fn 走 conventions §3 套路, 单测覆盖三种输入 → 三种 log 决策。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DecorationLogDecision {
+    /// `decoration_mode == Server`: SSD 协商成功, 窗口由 compositor 画装饰。
+    /// log 路径: tracing::info! "got server-side decoration"。
+    ServerSideAccepted,
+    /// `decoration_mode == Client`: 协商被拒 / manager 不存在 (GNOME 路径)。
+    /// log 路径: tracing::warn! "fell back to client-side; quill 暂不自画" — 提示
+    /// 用户当前 compositor 不支持 SSD, quill 显示无装饰是符合预期的。
+    ClientSideFallback,
+}
+
+/// 把 sctk `DecorationMode` 转成本模块的决策 enum。INV-010 类型隔离: `DecorationMode`
+/// 是 sctk re-export 的 enum, 不流出本 module 边界 (本 fn pub(crate), 上游唯一调
+/// 用方 `WindowHandler::configure`); `DecorationLogDecision` 是 quill 自有 enum,
+/// 不实现 `From<DecorationMode>` trait (避免下游 `mode.into()` 偷渡公开类型路径)。
+///
+/// **exhaustive match 无 `_ =>`**: sctk 升级加新 `DecorationMode` variant 时编译
+/// 期 catch (例如未来 hybrid / off 模式)。conventions §5 + INV-010 双重要求。
+pub(crate) fn decoration_log_decision(mode: DecorationMode) -> DecorationLogDecision {
+    match mode {
+        DecorationMode::Server => DecorationLogDecision::ServerSideAccepted,
+        DecorationMode::Client => DecorationLogDecision::ClientSideFallback,
+    }
+}
 
 /// surface 像素 → grid cell 计数。Wayland configure 给的是 surface 像素尺寸,
 /// 终端 grid 用 cell 计数;两者通过 cell 像素常数 [`crate::wl::render::CELL_W_PX`]
@@ -1117,6 +1166,32 @@ impl WindowHandler for State {
             "configure"
         );
 
+        // T-0503: 装饰协商结果一次性 log。configure 每帧 fire (focus/resize/state),
+        // 装饰模式生命周期内不变, 只 log 第一次。GNOME mutter 不导出
+        // zxdg_decoration_manager_v1, 永远 ClientSideFallback (warn);
+        // KDE/wlroots/Hyprland 通常 ServerSideAccepted (info, 用户能看 titlebar)。
+        if !self.core.decoration_logged {
+            match decoration_log_decision(configure.decoration_mode) {
+                DecorationLogDecision::ServerSideAccepted => {
+                    tracing::info!(
+                        target: "quill::wl::decoration",
+                        "xdg-decoration negotiated: ServerSide \
+                         (compositor 画 titlebar + 最小化/最大化/关闭按钮)"
+                    );
+                }
+                DecorationLogDecision::ClientSideFallback => {
+                    tracing::warn!(
+                        target: "quill::wl::decoration",
+                        "xdg-decoration fell back to ClientSide \
+                         (compositor 不支持 SSD 或未导出 zxdg_decoration_manager_v1, \
+                         e.g. GNOME mutter); quill 当前不自画 CSD, 窗口将无 titlebar — \
+                         此时请用键盘 / WM 快捷键关闭, 或换支持 SSD 的 compositor"
+                    );
+                }
+            }
+            self.core.decoration_logged = true;
+        }
+
         let was_first = self.core.first_configure;
         let action = handle_event(
             &mut self.core,
@@ -1527,6 +1602,43 @@ mod tests {
             verdict_for_scale(our_scale, our_scale),
             OutputScaleVerdict::Match,
             "compositor 上报 scale 与 HIDPI_SCALE 一致时必走 debug"
+        );
+    }
+
+    // ---------- T-0503 decoration_log_decision 纯逻辑单测 ----------
+    // 抽 enum 转换 + 纯 fn 测 (conventions §3 + INV-010 类型隔离实践)。
+    // sctk DecorationMode 升级加 variant 时, exhaustive match 在 callsite 编译
+    // 期 catches; 本组单测固化"两种已知 variant → 两种 log 决策"的映射不漂移。
+
+    #[test]
+    fn decoration_log_decision_server_is_accepted() {
+        // KDE / wlroots / Hyprland 等支持 SSD 的 compositor, 协商成功 → info log
+        // "got titlebar"。锁住"Server → ServerSideAccepted"映射。
+        assert_eq!(
+            decoration_log_decision(DecorationMode::Server),
+            DecorationLogDecision::ServerSideAccepted,
+        );
+    }
+
+    #[test]
+    fn decoration_log_decision_client_is_fallback() {
+        // GNOME mutter (无 zxdg_decoration_manager_v1) 或拒绝 SSD 的 compositor,
+        // 协商失败 → warn log "no titlebar, quill 不自画 CSD"。
+        // sctk 文档明示: manager 不存在时 decoration_mode 字段恒 Client。
+        assert_eq!(
+            decoration_log_decision(DecorationMode::Client),
+            DecorationLogDecision::ClientSideFallback,
+        );
+    }
+
+    #[test]
+    fn window_core_decoration_logged_starts_false() {
+        // WindowCore::new 初始 decoration_logged=false; configure 首次 fire 后
+        // 置 true, 后续 configure 不重复 log。锁住"一次性 log"语义不漂移。
+        let core = WindowCore::new(800, 600);
+        assert!(
+            !core.decoration_logged,
+            "新建 WindowCore 应未 log 过装饰协商"
         );
     }
 
