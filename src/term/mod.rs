@@ -14,8 +14,11 @@
 //!   `#[cfg(test)]` 的 `term::test` 模块里,下游只能自己实现)
 //! - `advance(bytes)` 是入口,单个方法名一致于上游 `Processor::advance`
 //!   语义,调用方不用学两套术语
-//! - `cursor_point()` 给 trace / 未来渲染用,返回 `(column, line)`
-//!   —— 注意 line 可以是负数(scrollback 历史)但 Phase 3 暂不触发
+//! - `cursor_pos()` 返回 [`CellPos`](T-0303 替代原 `cursor_point() -> (usize, i32)`,
+//!   消 `i32` 类型污染);[`cursor_visible`] / [`cursor_shape`] 见各自 doc
+//!
+//! [`cursor_visible`]: TermState::cursor_visible
+//! [`cursor_shape`]: TermState::cursor_shape
 
 use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::grid::Dimensions;
@@ -60,6 +63,57 @@ impl CellPos {
         Self {
             col: p.column.0,
             line: p.line.0.max(0) as usize,
+        }
+    }
+}
+
+/// quill 自己的光标形状枚举,**不**re-export `alacritty_terminal::vte::ansi::CursorShape`。
+///
+/// 与 alacritty 0.26 的 5 个 variants 一一对应:
+/// - `Block` — 实心方块 `▒`(alacritty 默认)
+/// - `Underline` — 下划线 `_`
+/// - `Beam` — 竖线 `⎸`
+/// - `HollowBlock` — 空心框 `☐`(blur 时常见)
+/// - `Hidden` — 不画(独立于 SHOW_CURSOR mode 位)
+///
+/// **设计理由**(沿袭 `CellPos` 同款类型隔离):
+/// - 不 re-export 上游 enum,防止下游 `use alacritty::CursorShape` 后
+///   `match` 时漏 / 多 variant
+/// - 私有 `from_alacritty` inherent fn(非 `From` trait),让 alacritty 类型
+///   彻底锁在 `src/term/mod.rs` 内
+/// - 未来换 VT 库时,quill 渲染层只需要重写 `from_alacritty` 转换逻辑,
+///   不动渲染调用点
+///
+/// `Hidden` 与 `cursor_visible() == false` 的关系:**正交,两个都得查**。
+/// alacritty 内部 `CursorRenderingData` 在 `SHOW_CURSOR` 关时返 Hidden;
+/// 我们刻意把"模式位"(SHOW_CURSOR)和"形状配置"(CursorShape::Hidden)
+/// 拆开 —— 渲染层 `if visible { draw(shape) }`,语义清晰。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CursorShape {
+    Block,
+    Underline,
+    Beam,
+    HollowBlock,
+    Hidden,
+}
+
+impl CursorShape {
+    /// 从 alacritty 的 `CursorShape` 转过来。**模块私有 inherent fn**,不开
+    /// `impl From<...>` trait —— 同 `CellPos::from_alacritty` 的隔离套路:
+    /// 下游即使 `use alacritty::CursorShape` 也无法构造 quill 的
+    /// `CursorShape`,只能拿 `cursor_shape()` 返回的实例。
+    ///
+    /// 5 个 variant 全 1:1 映射,无折叠 —— alacritty 0.26 的 enum 与本枚举
+    /// 一一对应,未来若 alacritty 加新 variant(例 `Bar`),编译期会报
+    /// 非穷尽 match 错,届时显式补一行 + 决策映射(可能合并到 `Beam`)。
+    fn from_alacritty(s: alacritty_terminal::vte::ansi::CursorShape) -> Self {
+        use alacritty_terminal::vte::ansi::CursorShape as Up;
+        match s {
+            Up::Block => CursorShape::Block,
+            Up::Underline => CursorShape::Underline,
+            Up::Beam => CursorShape::Beam,
+            Up::HollowBlock => CursorShape::HollowBlock,
+            Up::Hidden => CursorShape::Hidden,
         }
     }
 }
@@ -147,18 +201,23 @@ impl TermState {
         self.dirty = true;
     }
 
-    /// 返回当前光标位置 `(column, line_offset_from_top_of_screen)`。
+    /// 返回当前光标位置(viewport 坐标 [`CellPos`])。
     ///
-    /// - `column` 是 0-based 列号(left = 0)
-    /// - `line` 是 0-based 行号,相对当前 viewport(不含 scrollback offset);
-    ///   typical bash prompt 刚出来时是 `(prompt_len, 0)`
+    /// T-0303 把原 `cursor_point() -> (usize, i32)` 改成本签名 —— 消除 `i32`
+    /// line 的类型污染,与 [`cells_iter`] 产出的 `CellRef.pos: CellPos`
+    /// 类型一致,渲染层 / 调用方一套类型贯通。
     ///
-    /// 返回 `i32` 而不是 `usize`:alacritty 的 `Line` 内部是 i32,-n 表示
-    /// scrollback 历史。当前 Phase 3 暂不触发负数;保留原始类型少一次 lossy
-    /// cast。
-    pub fn cursor_point(&self) -> (usize, i32) {
-        let point = self.term.grid().cursor.point;
-        (point.column.0, point.line.0)
+    /// - `pos.col` 0-based 列号(left = 0)
+    /// - `pos.line` 0-based screen-line(不含 scrollback offset);bash prompt
+    ///   刚出来时通常是 `(prompt_len, 0)`
+    ///
+    /// 走 `CellPos::from_alacritty`(模块私有 saturating cast),scrollback
+    /// 历史的负 line 在本 API 路径下不会触发(grid().cursor.point 永远在
+    /// viewport),但即使触发也 clamp 到 0,不 panic。
+    ///
+    /// [`cells_iter`]: Self::cells_iter
+    pub fn cursor_pos(&self) -> CellPos {
+        CellPos::from_alacritty(self.term.grid().cursor.point)
     }
 
     /// 读取指定行(screen-line `0..screen_lines`)的字符,作为 `String` 返回。
@@ -239,6 +298,26 @@ impl TermState {
         self.term.mode().contains(TermMode::SHOW_CURSOR)
     }
 
+    /// 光标形状,见 [`CursorShape`]。**与 [`cursor_visible`] 正交,两个都得查**:
+    /// 渲染层伪代码 `if t.cursor_visible() { draw_cursor(t.cursor_shape()) }`。
+    ///
+    /// 改光标形状的 ANSI 序列是 `DECSCUSR` (`CSI Ps SP q`):
+    /// - `0` / `1` = blinking block(默认)→ Block
+    /// - `2` = steady block → Block
+    /// - `3` = blinking underline → Underline
+    /// - `4` = steady underline → Underline
+    /// - `5` = blinking beam → Beam
+    /// - `6` = steady beam → Beam
+    ///
+    /// **不暴露 blinking 信息**:`alacritty::CursorStyle.blinking` 字段我们
+    /// 暂不读。Phase 3 渲染先不实现 blink 动画,T-0303 scope 也不含;若未来
+    /// 加 blink 渲染,新增 `cursor_blinking() -> bool` 方法,不破坏本 API。
+    ///
+    /// [`cursor_visible`]: Self::cursor_visible
+    pub fn cursor_shape(&self) -> CursorShape {
+        CursorShape::from_alacritty(self.term.cursor_style().shape)
+    }
+
     /// viewport 尺寸,返 `(cols, rows)`。渲染层算 cell 像素位置用:
     /// - 窗口宽 = cols × cell_width
     /// - 窗口高 = rows × cell_height
@@ -286,26 +365,29 @@ pub struct CellRef {
 mod tests {
     use super::*;
 
-    /// T-0301 冒烟:构造一个 80×24 的 Term,喂 `"hi\n"`,光标应从 (0,0) 前进到
-    /// 下一行列首(`\n` 在 Term 里走 Index + CarriageReturn 语义 —— 实际就是
-    /// 新行列 0)。这一条最小验证 `advance` 通路接通,不依赖 PTY / wayland。
+    /// T-0301 冒烟:构造一个 80×24 的 Term,喂 `"hi\r\n"`,光标移动符合
+    /// VT100 / xterm 语义。T-0303 起断言走 `cursor_pos() -> CellPos`。
     #[test]
     fn advance_hi_newline_moves_cursor() {
         let mut t = TermState::new(80, 24);
-        assert_eq!(t.cursor_point(), (0, 0), "初始光标应在 (0, 0)");
+        assert_eq!(
+            t.cursor_pos(),
+            CellPos { col: 0, line: 0 },
+            "初始光标应在 (0, 0)"
+        );
 
         t.advance(b"hi");
-        let (col, line) = t.cursor_point();
-        assert_eq!(line, 0, "'hi' 没换行, 光标应仍在第 0 行");
-        assert_eq!(col, 2, "'hi' 写两个字,列号到 2");
+        let cp = t.cursor_pos();
+        assert_eq!(cp.line, 0, "'hi' 没换行, 光标应仍在第 0 行");
+        assert_eq!(cp.col, 2, "'hi' 写两个字,列号到 2");
 
         // \r\n: CR 回列首, LF index 到下一行。alacritty 对 LF 默认 linefeed
         // 不附带 CR, 实际终端 onlcr 由 tty 层翻译;本测试走 \r\n 模拟 PTY
         // 真正吐给我们的字节。
         t.advance(b"\r\n");
-        let (col, line) = t.cursor_point();
-        assert_eq!(col, 0, "CRLF 后列应回 0");
-        assert_eq!(line, 1, "CRLF 后行应 +1");
+        let cp = t.cursor_pos();
+        assert_eq!(cp.col, 0, "CRLF 后列应回 0");
+        assert_eq!(cp.line, 1, "CRLF 后行应 +1");
     }
 
     /// 防回归:构造后立即 advance 空切片不 panic,不改动光标。
@@ -313,7 +395,7 @@ mod tests {
     fn advance_empty_is_noop() {
         let mut t = TermState::new(80, 24);
         t.advance(b"");
-        assert_eq!(t.cursor_point(), (0, 0));
+        assert_eq!(t.cursor_pos(), CellPos { col: 0, line: 0 });
     }
 
     /// 尺寸参数如实落到 Term。80x24 是项目基准,改了要明白影响面。
@@ -331,10 +413,18 @@ mod tests {
     fn ansi_home_and_clear_resets_cursor() {
         let mut t = TermState::new(80, 24);
         t.advance(b"xyz");
-        assert_ne!(t.cursor_point(), (0, 0), "pre: 'xyz' 后不应仍在 0,0");
+        assert_ne!(
+            t.cursor_pos(),
+            CellPos { col: 0, line: 0 },
+            "pre: 'xyz' 后不应仍在 0,0"
+        );
 
         t.advance(b"\x1b[H\x1b[2J"); // ESC[H 回家 + ESC[2J 清屏
-        assert_eq!(t.cursor_point(), (0, 0), "ESC[H 应把光标回 (0, 0)");
+        assert_eq!(
+            t.cursor_pos(),
+            CellPos { col: 0, line: 0 },
+            "ESC[H 应把光标回 (0, 0)"
+        );
     }
 
     // ---------- T-0302 渲染 API 单测 ----------
@@ -441,5 +531,68 @@ mod tests {
         let cp_neg = CellPos::from_alacritty(p_neg);
         assert_eq!(cp_neg.col, 7);
         assert_eq!(cp_neg.line, 0, "负 line 应 clamp 到 0");
+    }
+
+    // ---------- T-0303 cursor 追踪 API 单测 ----------
+
+    /// `cursor_pos()` 替代旧 `cursor_point() -> (usize, i32)`,返回 [`CellPos`]
+    /// 与 `cells_iter` 产出的 `CellRef.pos` 类型一致。本测试锁住:
+    /// 1. 初始 (0, 0)
+    /// 2. 写字节后 col 前进
+    /// 3. 类型显式是 `CellPos`(非 tuple)—— 编译期保障
+    #[test]
+    fn cursor_pos_returns_cellpos() {
+        let mut t = TermState::new(80, 24);
+        let cp: CellPos = t.cursor_pos();
+        assert_eq!(cp, CellPos { col: 0, line: 0 });
+
+        t.advance(b"abc");
+        assert_eq!(t.cursor_pos(), CellPos { col: 3, line: 0 });
+    }
+
+    /// `cursor_shape` 默认 `Block`(alacritty 0.26 `CursorStyle::default().shape`
+    /// 即 `Block`)。新构造的 TermState 不应已经被 DECSCUSR 改过状态。
+    #[test]
+    fn cursor_shape_default_is_block() {
+        let t = TermState::new(80, 24);
+        assert_eq!(t.cursor_shape(), CursorShape::Block);
+    }
+
+    /// `DECSCUSR` (`CSI Ps SP q`) 切光标形状:奇数闪烁,偶数 steady,**形状**
+    /// 在我们的 enum 里 fold 掉闪烁信息(不暴露 blinking)。
+    /// - `1`/`2` block, `3`/`4` underline, `5`/`6` beam
+    /// - `0` 是 "reset to default"(回 block)
+    #[test]
+    fn cursor_shape_reacts_to_decscusr() {
+        let mut t = TermState::new(80, 24);
+        // 初始 Block(本测试不依赖 default test 的覆盖,自测一次)
+        assert_eq!(t.cursor_shape(), CursorShape::Block);
+
+        t.advance(b"\x1b[3 q"); // blinking underline
+        assert_eq!(t.cursor_shape(), CursorShape::Underline);
+
+        t.advance(b"\x1b[6 q"); // steady beam
+        assert_eq!(t.cursor_shape(), CursorShape::Beam);
+
+        t.advance(b"\x1b[2 q"); // steady block
+        assert_eq!(t.cursor_shape(), CursorShape::Block);
+    }
+
+    /// `CursorShape::from_alacritty` 5 个 variants 全 1:1 映射,无折叠 / 无丢失。
+    /// 同文件 tests mod 可访问私有 inherent fn。
+    #[test]
+    fn cursor_shape_from_alacritty_all_variants() {
+        use alacritty_terminal::vte::ansi::CursorShape as Up;
+        assert_eq!(CursorShape::from_alacritty(Up::Block), CursorShape::Block);
+        assert_eq!(
+            CursorShape::from_alacritty(Up::Underline),
+            CursorShape::Underline
+        );
+        assert_eq!(CursorShape::from_alacritty(Up::Beam), CursorShape::Beam);
+        assert_eq!(
+            CursorShape::from_alacritty(Up::HollowBlock),
+            CursorShape::HollowBlock
+        );
+        assert_eq!(CursorShape::from_alacritty(Up::Hidden), CursorShape::Hidden);
     }
 }

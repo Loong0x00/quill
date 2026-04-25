@@ -2,7 +2,7 @@
 
 **Phase**: 3
 **Assigned**: 写码-close
-**Status**: claimed
+**Status**: in-review
 **Budget**: tokenBudget=40k(lead 派单)
 **Dependencies**: T-0302(CellPos / cursor_visible 已就绪)
 

@@ -56,7 +56,13 @@ fn echo_hello_reaches_term_grid_first_line() {
     );
     // 额外:光标应已前进过(不在 0,0),精确位置取决于 PTY 的 onlcr + echo 换行
     // 行为,不强断言具体坐标,只断"不是起点"即可证 advance 起作用。
-    assert_ne!(term.cursor_point(), (0, 0), "喂过字节后光标不应还在 (0,0)");
+    // T-0303:`cursor_point()` → `cursor_pos() -> CellPos`,API 类型一统。
+    use quill::term::CellPos;
+    assert_ne!(
+        term.cursor_pos(),
+        CellPos { col: 0, line: 0 },
+        "喂过字节后光标不应还在 (0,0)"
+    );
 }
 
 /// 防回归:PTY 喂空切片 /  写的 ANSI 序列不该让 term panic 或卡死。

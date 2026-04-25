@@ -315,12 +315,15 @@ fn pty_read_tick(
                     // None 跳过(未来可能 T-0305+ 在 resize 时临时 take/put)。
                     if let Some(t) = term.as_mut() {
                         t.advance(&buf[..n]);
-                        let (col, line) = t.cursor_point();
+                        // T-0303:`cursor_point` → `cursor_pos`,返 CellPos 而非
+                        // `(usize, i32)`。trace 字段保持 col / line 命名兼容
+                        // 旧日志工具,但读自 `pos.col / pos.line` 都是 usize。
+                        let pos = t.cursor_pos();
                         tracing::trace!(
                             target: "quill::term",
                             n,
-                            col,
-                            line,
+                            col = pos.col,
+                            line = pos.line,
                             "term advanced"
                         );
                     }
