@@ -15,7 +15,7 @@
 //! 沿袭 T-0306 `tests/resize_chain.rs` 同款 trade-off: 集成测试只跑能 headless
 //! 部分, GPU 真路径走手测 + Phase 6 soak。
 
-use quill::text::TextSystem;
+use quill::text::{GlyphKey, TextSystem};
 
 #[test]
 fn atlas_caches_glyph_after_first_render() {
@@ -61,8 +61,8 @@ fn atlas_caches_glyph_after_first_render() {
 
 #[test]
 fn atlas_handles_multiple_glyphs_no_collision() {
-    // 10+ 不同字符的 atlas_key 互不相同 (Phase 4 单 monospace 面假设下, 不同
-    // gid 必给不同 (gid, font_size_bits) tuple)。
+    // 10+ 不同字符的 atlas_key 互不相同 (单 monospace 面 + T-0407 三维 GlyphKey
+    // 假设下, 不同 gid 必给不同 (face_id, gid, font_size_quantized) GlyphKey)。
     let mut ts = TextSystem::new().expect("TextSystem::new on user machine");
     // 选 ASCII printable, 必有不同 gid。空格 gid 也独一档 (face 内 space 单独 gid)。
     let text = "abcdefghij0123";
@@ -72,8 +72,7 @@ fn atlas_handles_multiple_glyphs_no_collision() {
         text.chars().count(),
         "ASCII printable shape must 1:1 to chars"
     );
-    let keys: std::collections::HashSet<(u16, u32)> =
-        glyphs.iter().map(|g| g.atlas_key()).collect();
+    let keys: std::collections::HashSet<GlyphKey> = glyphs.iter().map(|g| g.atlas_key()).collect();
     assert_eq!(
         keys.len(),
         glyphs.len(),
