@@ -62,7 +62,9 @@ use wayland_client::{
 };
 
 use super::keyboard::{handle_key_event, KeyboardAction, KeyboardState};
+use super::pointer::{handle_pointer_event, PointerAction, PointerState, WindowButton};
 use super::render::Renderer;
+use wayland_client::protocol::wl_pointer;
 
 const INITIAL_WIDTH: u32 = 800;
 const INITIAL_HEIGHT: u32 = 600;
@@ -467,14 +469,21 @@ pub(crate) fn decoration_log_decision(mode: DecorationMode) -> DecorationLogDeci
 /// `TIOCSWINSZ` 给 winsize.col=0 也 EINVAL),clamp 到 1 是不可见但合法的最小
 /// grid。
 ///
+/// **T-0504**: 可用高度从 `height` 减 [`crate::wl::render::TITLEBAR_H_LOGICAL_PX`]
+/// (titlebar 占用顶部 28 logical px), 让 cell rows 数对应 cell 区可用高度. 高度
+/// 不足以放完整 titlebar (height < TITLEBAR_H) 时, saturating_sub 防 underflow,
+/// cell rows 落到 max(1) 兜底; 视觉上极小窗口仅显示 titlebar 头部 + 1 行 cell,
+/// 仍可工作.
+///
 /// 抽成纯 fn(无副作用、不碰 LoopData)是 conventions §3 "复杂决策抽纯函数 +
 /// 单测" 套路的复用 —— resize 数学决策能 headless 单测覆盖,与
 /// `propagate_resize_if_dirty` 的真副作用解耦。
 ///
 /// 测试覆盖见 `tests::cells_from_surface_px_*`。
 pub(crate) fn cells_from_surface_px(width: u32, height: u32) -> (usize, usize) {
+    let usable_h = height.saturating_sub(crate::wl::render::TITLEBAR_H_LOGICAL_PX);
     let cols = ((width as f32) / crate::wl::render::CELL_W_PX) as usize;
-    let rows = ((height as f32) / crate::wl::render::CELL_H_PX) as usize;
+    let rows = ((usable_h as f32) / crate::wl::render::CELL_H_PX) as usize;
     (cols.max(1), rows.max(1))
 }
 
@@ -548,13 +557,17 @@ fn propagate_resize_if_dirty(data: &mut LoopData) {
         }
     }
 
+    // T-0504: 同步 PointerState 的 surface 尺寸 (logical px), 让 hit_test 用
+    // 最新尺寸算按钮位置 (按钮在右上角, 拖窗口时按钮跟着移).
+    state.pointer_state.set_surface_size(width, height);
+
     state.core.resize_dirty = false;
     tracing::debug!(
         width,
         height,
         cols,
         rows,
-        "propagated resize → renderer + term + pty"
+        "propagated resize → renderer + term + pty + pointer"
     );
 }
 
@@ -707,6 +720,14 @@ pub fn run_window() -> Result<()> {
         keyboard_state: KeyboardState::new()
             .context("KeyboardState::new 失败 (xkbcommon Context 初始化)")?,
         keyboard: None,
+        // T-0504: PointerState 起步用 INITIAL_WIDTH/HEIGHT (与 WindowCore 同步),
+        // configure 收到首次尺寸后 propagate_resize_if_dirty 调 set_surface_size
+        // 同步.
+        pointer_state: PointerState::new(INITIAL_WIDTH, INITIAL_HEIGHT),
+        pointer: None,
+        pointer_seat: None,
+        is_maximized: false,
+        presentation_dirty: false,
         pty: None,
     };
 
@@ -875,7 +896,10 @@ pub fn run_window() -> Result<()> {
             let Some(t) = term.as_mut() else {
                 return;
             };
-            if !t.is_dirty() {
+            // T-0504: 检查 term cell 内容 dirty || presentation (CSD hover) dirty.
+            // 任一为真即重画. presentation_dirty 由 Dispatch<WlPointer> 在
+            // HoverChange 时置位, 重画后清.
+            if !t.is_dirty() && !state.presentation_dirty {
                 return;
             }
             let Some(r) = state.renderer.as_mut() else {
@@ -890,6 +914,9 @@ pub fn run_window() -> Result<()> {
             let cells: Vec<crate::term::CellRef> = t.cells_iter().collect();
             let (cols, rows) = t.dimensions();
 
+            // T-0504: hover 区域 (CSD titlebar 按钮高亮) 由 PointerState 维护.
+            let hover = state.pointer_state.hover();
+
             // T-0403: 走 draw_frame (含字形); 若 text_system 未建好降级到
             // draw_cells (Phase 3 色块路径)。
             let draw_result = match text_system.as_mut() {
@@ -898,7 +925,7 @@ pub fn run_window() -> Result<()> {
                     // 给完整一行的 String (含末尾空白)。`rows` 行 × ~80 字符每行
                     // = ~7 KiB Vec, 与 cells Vec 同数量级。
                     let row_texts: Vec<String> = (0..rows).map(|row| t.line_text(row)).collect();
-                    r.draw_frame(ts, &cells, cols, rows, &row_texts)
+                    r.draw_frame(ts, &cells, cols, rows, &row_texts, hover)
                 }
                 None => r.draw_cells(&cells, cols, rows),
             };
@@ -914,6 +941,7 @@ pub fn run_window() -> Result<()> {
             // present (与 dirty 清零节奏对齐, 一次 idle 一次 record)。
             frame_stats.record_and_log(std::time::Instant::now());
             t.clear_dirty();
+            state.presentation_dirty = false;
         })
         .context("calloop EventLoop::run 失败")?;
 
@@ -946,6 +974,29 @@ struct State {
     /// drop 顺序: WlKeyboard 是 wayland Proxy (handle), drop 时发 release
     /// request 给 compositor, 不依赖 wgpu, 放尾部安全。
     keyboard: Option<wl_keyboard::WlKeyboard>,
+    /// T-0504: 鼠标状态封装 (PointerState 自有 struct, INV-010 类型隔离, 字段
+    /// 全私有). 与 keyboard_state 同性质 — wayland safe wrapper, drop 顺序
+    /// 无 UB 风险, 放此处不破坏 INV-001 链条.
+    pointer_state: PointerState,
+    /// 当前绑定的 wl_pointer (capabilities 含 Pointer 时由 SeatHandler::
+    /// new_capability 创建). 与 keyboard 同性质.
+    pointer: Option<wl_pointer::WlPointer>,
+    /// T-0504: 当前绑定 wl_pointer 时关联的 wl_seat (最后一次新 Pointer
+    /// capability 出现时记). xdg_toplevel.move 协议要求传 wl_seat + serial,
+    /// PointerAction::StartMove 路径需读此字段. drop 顺序: WlSeat 也是
+    /// wayland Proxy, 与 keyboard / pointer 同等放尾部安全.
+    pointer_seat: Option<wl_seat::WlSeat>,
+    /// T-0504: 当前是否最大化 (toggle 状态). ButtonClick(Maximize) 时反转 →
+    /// 调 set_maximized / unset_maximized. WindowConfigure event (configure
+    /// 携带 state 数组含 Maximized) 也可同步, 但 sctk 0.19 WindowConfigure
+    /// 暴露的是 Vec<State>, 接入复杂; 简化: 客户端自跟踪, 与 Adwaita /
+    /// alacritty 等 CSD 客户端实践一致.
+    is_maximized: bool,
+    /// T-0504: presentation-only dirty (CSD titlebar 按钮 hover 高亮变化).
+    /// cell 内容未变, term.is_dirty 不会置位, 但 hover 切换需要重画 titlebar.
+    /// idle callback 检查 `term.is_dirty() || state.presentation_dirty` 决定
+    /// 是否重画; 重画后置 false. 与 INV-006 resize_dirty 同布尔脏标记套路.
+    presentation_dirty: bool,
     // `pty` **位于 State 最后一位**(Lead + 审码 2026-04-25 拍板,见 T-0202 ticket):
     // - PTY 持 Linux fd + 子进程句柄,与 wl / wgpu 资源生命周期正交,放最后避免
     //   跟 INV-001 的 renderer→window→conn 链条耦合,不需要新建 INV。
@@ -1180,12 +1231,13 @@ impl WindowHandler for State {
                     );
                 }
                 DecorationLogDecision::ClientSideFallback => {
-                    tracing::warn!(
+                    // T-0504: quill 已自画 CSD (titlebar + 最小化/最大化/关闭),
+                    // ClientSide 路径不再无装饰. 改 warn → info, 描述自画行为.
+                    tracing::info!(
                         target: "quill::wl::decoration",
-                        "xdg-decoration fell back to ClientSide \
-                         (compositor 不支持 SSD 或未导出 zxdg_decoration_manager_v1, \
-                         e.g. GNOME mutter); quill 当前不自画 CSD, 窗口将无 titlebar — \
-                         此时请用键盘 / WM 快捷键关闭, 或换支持 SSD 的 compositor"
+                        "xdg-decoration: ClientSide (compositor 不支持 SSD 或未导出 \
+                         zxdg_decoration_manager_v1, e.g. GNOME mutter); \
+                         quill 自画 CSD (titlebar + 最小化/最大化/关闭按钮)"
                     );
                 }
             }
@@ -1262,6 +1314,16 @@ impl SeatHandler for State {
             tracing::info!("wl_seat capability Keyboard 出现, wl_keyboard 已绑定");
             self.keyboard = Some(kb);
         }
+        // T-0504: Pointer 同 Keyboard 路径 — wl_seat::get_pointer 返 raw
+        // WlPointer, 走自己的 Dispatch<WlPointer, ()> impl (INV-010, PointerState
+        // 是 quill 自有, 不偷渡 SCTK pointer 类型). 记 seat 给 xdg_toplevel.move
+        // 用 (StartMove 路径需 seat + serial).
+        if capability == Capability::Pointer && self.pointer.is_none() {
+            let ptr = seat.get_pointer(qh, ());
+            tracing::info!("wl_seat capability Pointer 出现, wl_pointer 已绑定");
+            self.pointer = Some(ptr);
+            self.pointer_seat = Some(seat);
+        }
     }
 
     fn remove_capability(
@@ -1280,13 +1342,25 @@ impl SeatHandler for State {
                 tracing::info!("wl_seat capability Keyboard 移除, wl_keyboard 释放");
             }
         }
+        if capability == Capability::Pointer {
+            if let Some(ptr) = self.pointer.take() {
+                ptr.release();
+                tracing::info!("wl_seat capability Pointer 移除, wl_pointer 释放");
+            }
+            // pointer_seat 暂留 — 极端 race 下 seat 可能仍持续 (compositor 只
+            // 移 capability 而 seat 本身仍存); remove_seat 路径再清.
+        }
     }
 
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {
-        // seat 整个移除 — 当前 wl_keyboard 一并失效, 走 take 释放。
+        // seat 整个移除 — 当前 wl_keyboard / wl_pointer 一并失效, 走 take 释放。
         if let Some(kb) = self.keyboard.take() {
             kb.release();
         }
+        if let Some(ptr) = self.pointer.take() {
+            ptr.release();
+        }
+        self.pointer_seat = None;
     }
 }
 
@@ -1364,6 +1438,92 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                     }
                 }
             }
+        }
+    }
+}
+
+/// T-0504: wl_pointer 协议事件 → 转 [`handle_pointer_event`] → [`PointerAction`]
+/// 分派 → xdg_toplevel.move / set_minimized / set_maximized / close.
+///
+/// **why 自己实现 Dispatch 而非 SCTK PointerHandler** (INV-010 + 派单 In #C 同
+/// keyboard 同决策): SCTK 0.19 pointer 模块的 `PointerEvent` struct 把内部坐标
+/// / 滚轮帧 / cursor shape 等揉在一起, 暴露需要 `import` SCTK 类型走 trait 边界.
+/// 本项目走 raw `Dispatch<WlPointer>` + 自己持 [`PointerState`] (内部封 hover /
+/// pos / serial), quill 公共 API (`handle_pointer_event` 入参 `wl_pointer::Event`,
+/// 出参 `PointerAction`) 全 quill 自有 / wayland-client 协议类型, 不漏 SCTK.
+///
+/// **redraw 路径**: PointerAction::HoverChange 触发 redraw — 走 `term.set_dirty()`
+/// 让下一次 idle callback 重画. cell 内容未变, 但 titlebar 三按钮 hover 状态
+/// 在 `Renderer::draw_frame` 入参 hover 中读, 重画时按钮颜色更新.
+impl Dispatch<wl_pointer::WlPointer, ()> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &wl_pointer::WlPointer,
+        event: wl_pointer::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        let action = handle_pointer_event(event, &mut state.pointer_state);
+        match action {
+            PointerAction::Nothing => {}
+            PointerAction::HoverChange(_new_hover) => {
+                // hover 变化 → 触发下一次 idle callback 重画 (按钮高亮更新).
+                // term 内容未变, 走 state.presentation_dirty (新增, 与 term
+                // .dirty 解耦避免污染 cell 渲染节奏). idle callback 检查
+                // `term.is_dirty() || state.presentation_dirty` 决定是否重画.
+                state.presentation_dirty = true;
+                tracing::trace!(
+                    target: "quill::pointer",
+                    ?_new_hover,
+                    "hover changed, presentation_dirty=true"
+                );
+            }
+            PointerAction::StartMove { serial } => {
+                // xdg_toplevel.move(seat, serial). compositor 接管拖动直到鼠标
+                // release; quill 期间不收 motion event (compositor grab pointer).
+                let Some(seat) = state.pointer_seat.as_ref() else {
+                    tracing::warn!(
+                        target: "quill::pointer",
+                        "StartMove 时 pointer_seat=None, 跳过 (race 下罕见)"
+                    );
+                    return;
+                };
+                tracing::debug!(
+                    target: "quill::pointer",
+                    serial,
+                    "xdg_toplevel.move (titlebar drag)"
+                );
+                state.window.move_(seat, serial);
+            }
+            PointerAction::ButtonClick(button) => match button {
+                WindowButton::Minimize => {
+                    tracing::info!(target: "quill::pointer", "click Minimize → set_minimized");
+                    state.window.set_minimized();
+                }
+                WindowButton::Maximize => {
+                    // toggle: 当前 maximized → unset; 否则 set.
+                    if state.is_maximized {
+                        tracing::info!(
+                            target: "quill::pointer",
+                            "click Maximize (toggle) → unset_maximized"
+                        );
+                        state.window.unset_maximized();
+                        state.is_maximized = false;
+                    } else {
+                        tracing::info!(
+                            target: "quill::pointer",
+                            "click Maximize (toggle) → set_maximized"
+                        );
+                        state.window.set_maximized();
+                        state.is_maximized = true;
+                    }
+                }
+                WindowButton::Close => {
+                    tracing::info!(target: "quill::pointer", "click Close → exit");
+                    let _ = handle_event(&mut state.core, WindowEvent::Close);
+                }
+            },
         }
     }
 }
@@ -1485,28 +1645,32 @@ mod tests {
     // max(1) clamp 两条分支, 不需要构造 LoopData / 真 wayland 连接。
 
     #[test]
-    fn cells_from_surface_px_default_800x600_matches_80x24() {
-        // 初始尺寸 800×600 + cell 10×25 → 80×24 (与 spawn_shell(80, 24) 对齐)。
-        // 锁住"Phase 3 默认行为不变"——T-0306 接通 resize 后默认窗口仍 80×24。
+    fn cells_from_surface_px_default_800x600_matches_80x22() {
+        // 初始尺寸 800×600 + cell 10×25 + T-0504 titlebar 28 → usable 572 → 22 行.
+        // 之前 (T-0306 时无 titlebar): 80×24. T-0504 起 cell rows 减为 22 给 titlebar
+        // 让出顶部 28 px logical 空间.
         assert_eq!(
             cells_from_surface_px(super::INITIAL_WIDTH, super::INITIAL_HEIGHT),
-            (80, 24),
-            "默认 800×600 + cell 10×25 应给 80×24"
+            (80, 22),
+            "800×600 - titlebar 28 → cell 80×22"
         );
     }
 
     #[test]
     fn cells_from_surface_px_grows_with_surface() {
         // 拖大窗口能多显示 cells (T-0306 acceptance 核心)
+        // T-0504: usable_h = h - 28, rows = usable_h / 25.
+        // 1200 - 28 = 1172, 1172 / 25 = 46.
         assert_eq!(
             cells_from_surface_px(1600, 1200),
-            (160, 48),
-            "1600×1200 应给 160×48 (双倍)"
+            (160, 46),
+            "1600×1200 - titlebar 28 → 160×46"
         );
+        // 1080 - 28 = 1052, 1052 / 25 = 42.
         assert_eq!(
             cells_from_surface_px(1920, 1080),
-            (192, 43),
-            "1920×1080 typical → 192×43 (Phase 3 cell 常数)"
+            (192, 42),
+            "1920×1080 - titlebar 28 → 192×42"
         );
     }
 
@@ -1519,10 +1683,17 @@ mod tests {
             (1, 1),
             "5px (< CELL_W_PX=10) 应 clamp col=1"
         );
+        // T-0504: 极小 height 触发 saturating_sub → usable_h = 0, rows clamp 到 1.
         assert_eq!(
             cells_from_surface_px(20, 5),
             (2, 1),
-            "5px (< CELL_H_PX=25) 应 clamp row=1"
+            "5px (< titlebar 28) 应 clamp row=1"
+        );
+        // T-0504: height 正好 = titlebar (28) → usable_h = 0, rows clamp 到 1.
+        assert_eq!(
+            cells_from_surface_px(20, 28),
+            (2, 1),
+            "height = titlebar 应 clamp row=1"
         );
     }
 
@@ -1530,10 +1701,11 @@ mod tests {
     fn cells_from_surface_px_truncates_partial_cells() {
         // 整数除截断, 余下边距 Phase 4 再细化 (派单允许)。
         // 805px / 10 = 80 cells (剩 5px 边距), 不向上取 81。
+        // T-0504: usable_h = 612 - 28 = 584, 584 / 25 = 23 行.
         assert_eq!(
             cells_from_surface_px(805, 612),
-            (80, 24),
-            "余数 5px / 12px 应被截断, 不上取"
+            (80, 23),
+            "余数应被截断 + titlebar 28 减让"
         );
     }
 

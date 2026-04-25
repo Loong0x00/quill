@@ -3,6 +3,7 @@
 //! wgpu 的全部原始类型。后续 ticket 接 calloop / resize。
 
 mod keyboard;
+mod pointer;
 mod render;
 mod window;
 

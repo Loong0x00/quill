@@ -280,6 +280,72 @@ pub const CELL_W_PX: f32 = 10.0;
 /// **cell 像素高度** —— Phase 3 临时常数。配套见 [`CELL_W_PX`]。
 pub const CELL_H_PX: f32 = 25.0;
 
+/// **CSD titlebar 高度** (logical px, T-0504). 派单 In #D 硬编码 28.
+///
+/// 顶部 28 logical px (= 56 physical 在 HIDPI×2) 是 client-side decoration
+/// titlebar — 灰色矩形 + 三按钮位于右上角. text area (cell grid) 起始 y 从
+/// 此常数往下偏移. 视觉上接近 GNOME mutter / Adwaita 默认 titlebar 高度.
+///
+/// **单一来源**: [`crate::wl::pointer::hit_test`] 直接 import 用, 改一处即视觉
+/// 与 hit-test 同步, 无漂移风险 (派单 In #F SOP).
+pub const TITLEBAR_H_LOGICAL_PX: u32 = 28;
+
+/// **CSD 按钮宽度** (logical px, T-0504). 24 logical px 是 GNOME / KDE 默认
+/// titlebar 按钮尺寸; 三按钮总宽 72 logical, 800 logical 窗口右上角放得下.
+pub const BUTTON_W_LOGICAL_PX: u32 = 24;
+
+/// **CSD 按钮高度** (logical px, T-0504). 24 logical, ≤ TITLEBAR_H (28),
+/// 顶贴 titlebar 顶部 (y ∈ [0, 24)), 底部留 4 px 边距使按钮视觉与 titlebar 分离.
+pub const BUTTON_H_LOGICAL_PX: u32 = 24;
+
+/// **CSD titlebar 配色**.
+///
+/// 与 GNOME mutter Adwaita 默认深色 titlebar 接近 (#2c2c2c). 不接系统主题
+/// (Phase 6+ 接 GTK 主题接口); 派单 In #D 硬编码即可.
+const TITLEBAR_BG: crate::term::Color = crate::term::Color {
+    r: 0x2c,
+    g: 0x2c,
+    b: 0x2c,
+};
+
+/// 按钮 hover 时背景色 (深灰).
+const BUTTON_BG_HOVER: crate::term::Color = crate::term::Color {
+    r: 0x4a,
+    g: 0x4a,
+    b: 0x4a,
+};
+
+/// Close 按钮 hover 时背景色 (红, 与 GNOME / KDE 关闭按钮 hover 视觉一致).
+const BUTTON_BG_CLOSE_HOVER: crate::term::Color = crate::term::Color {
+    r: 0xe5,
+    g: 0x39,
+    b: 0x35,
+};
+
+/// 按钮 icon 色 (浅灰 #d3d3d3, 在深灰 / 红背景上对比清晰, 与 cell.fg 默认色同源).
+const BUTTON_ICON: crate::term::Color = crate::term::Color {
+    r: 0xd3,
+    g: 0xd3,
+    b: 0xd3,
+};
+
+/// **CSD titlebar 在 cell vertex buffer 内额外占的"虚拟 cell 行"数** (T-0504).
+///
+/// titlebar 走 cell pipeline (色块, 与 [`crate::wl::pointer::handle_pointer_event`]
+/// 决策的 hover region 渲染同 vertex 格式 `pos[2 f32] + color[3 f32]`),
+/// 需在 `ensure_cell_buffer` 容量留出空间. 当前生成顶点估算:
+/// - 1 个 titlebar 背景大色块 (整 width × titlebar_h) = 1 quad
+/// - 3 个按钮背景色块 (Min / Max / Close) = 3 quads
+/// - Close icon: 12 段 × 2 对角 = 24 quads (stair-stepped 模拟 ×, 见
+///   [`append_titlebar_vertices`] 3.1)
+/// - Maximize icon (□): 4 边 = 4 quads
+/// - Minimize icon (-): 1 quad
+///
+/// 总 ~33 quads. 留余量 64 quads (2× 安全系数 + 未来 Phase 6 加按钮 / icon
+/// 细化空间). `cells × VERTS_PER_CELL × VERTEX_BYTES` = 64 × 6 × 20 = 7680 字节,
+/// 与 cells 主体 (~230 KiB) 相比可忽略.
+const TITLEBAR_RESERVED_QUAD_ROWS: usize = 64;
+
 /// **HiDPI 整数缩放常数** (T-0404 简化版, hardcode 2x)。
 ///
 /// **why hardcode 而非 wl_output.scale event**: 用户硬偏好 (派单 Out 段),
@@ -342,6 +408,264 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(in.color, 1.0);
 }
 "#;
+
+/// 把一个像素矩形 (x0, y0, x1, y1) 加 6 顶点到 vertex buffer (CCW 三角化).
+/// `color` 已是 linear f32x3 (调用方按 sRGB-aware [`color_for_vertex_with_srgb`]
+/// 或 [`Renderer::color_for_vertex`] 预处理过).
+///
+/// `clippy::too_many_arguments` allow: 函数职责单一 (NDC 换算 + 6 顶点输出),
+/// 8 个参数都直接对应 NDC 公式输入 (rect coords / surface dims / color). 抽
+/// struct 反而引入间接 + 调用方需先建临时 struct, 净复杂度增加.
+#[allow(clippy::too_many_arguments)]
+fn append_quad_px(
+    out: &mut Vec<u8>,
+    x0_px: f32,
+    y0_px: f32,
+    x1_px: f32,
+    y1_px: f32,
+    surface_w: f32,
+    surface_h: f32,
+    color: [f32; 3],
+) {
+    let left = x0_px / surface_w * 2.0 - 1.0;
+    let right = x1_px / surface_w * 2.0 - 1.0;
+    let top = 1.0 - y0_px / surface_h * 2.0;
+    let bottom = 1.0 - y1_px / surface_h * 2.0;
+    let verts: [[f32; 2]; 6] = [
+        [left, top],
+        [left, bottom],
+        [right, bottom],
+        [left, top],
+        [right, bottom],
+        [right, top],
+    ];
+    for v in verts {
+        out.extend_from_slice(&v[0].to_ne_bytes());
+        out.extend_from_slice(&v[1].to_ne_bytes());
+        out.extend_from_slice(&color[0].to_ne_bytes());
+        out.extend_from_slice(&color[1].to_ne_bytes());
+        out.extend_from_slice(&color[2].to_ne_bytes());
+    }
+}
+
+/// **T-0504 CSD titlebar 顶点生成** — 走 cell pipeline (色块, 同 vertex 格式
+/// `pos[2 f32] + color[3 f32]`). 调用方追加到 cell_vertex_bytes 末尾, cell pass
+/// 一次 draw 同时画 cell 与 titlebar.
+///
+/// 视觉布局 (logical px, 与 [`crate::wl::pointer::hit_test`] 同源):
+/// - 顶部 [`TITLEBAR_H_LOGICAL_PX`] (28 logical) 整 width 灰色矩形 (#2c2c2c).
+/// - 三按钮位于 titlebar 右端: Close (右) → Maximize (中) → Minimize (左),
+///   各 [`BUTTON_W_LOGICAL_PX`] × [`BUTTON_H_LOGICAL_PX`] (24×24 logical).
+/// - 按钮 hover 时背景变深 (#4a4a4a); Close hover 变红 (#e53935).
+/// - 按钮 icon (浅灰 #d3d3d3): Close = 两条对角线; Maximize = 矩形框 (4 边);
+///   Minimize = 中间一横线.
+///
+/// 单位: 入参 `surface_w` / `surface_h` 是 **physical px** (NDC 换算分母),
+/// 内部 logical px × HIDPI_SCALE 算 physical 与 surface 单位一致 — 与
+/// [`Renderer::draw_frame`] 内 cell px × HIDPI_SCALE 同套路.
+///
+/// `is_srgb`: surface 是否 sRGB 格式. 同 [`color_for_vertex_with_srgb`].
+fn append_titlebar_vertices(
+    out: &mut Vec<u8>,
+    surface_w: f32,
+    surface_h: f32,
+    is_srgb: bool,
+    hover: super::pointer::HoverRegion,
+) {
+    use super::pointer::{HoverRegion, WindowButton};
+
+    let hidpi = HIDPI_SCALE as f32;
+    let titlebar_h = TITLEBAR_H_LOGICAL_PX as f32 * hidpi;
+    let btn_w = BUTTON_W_LOGICAL_PX as f32 * hidpi;
+    let btn_h = BUTTON_H_LOGICAL_PX as f32 * hidpi;
+
+    let titlebar_bg = color_for_vertex_with_srgb(TITLEBAR_BG, is_srgb);
+    let icon_color = color_for_vertex_with_srgb(BUTTON_ICON, is_srgb);
+
+    // 1. titlebar 整 width 背景
+    append_quad_px(
+        out,
+        0.0,
+        0.0,
+        surface_w,
+        titlebar_h,
+        surface_w,
+        surface_h,
+        titlebar_bg,
+    );
+
+    // 2. 三按钮 (右上角, 右→左 Close / Maximize / Minimize). 视觉与
+    //    [`crate::wl::pointer::hit_test`] 严格一致 (单一来源 const, 同源 BTN_W).
+    let close_x_min = surface_w - btn_w;
+    let close_x_max = surface_w;
+    let max_x_min = surface_w - 2.0 * btn_w;
+    let max_x_max = close_x_min;
+    let min_x_min = surface_w - 3.0 * btn_w;
+    let min_x_max = max_x_min;
+
+    // 按钮背景 (hover 时变深, Close hover 变红)
+    let close_bg = match hover {
+        HoverRegion::Button(WindowButton::Close) => {
+            color_for_vertex_with_srgb(BUTTON_BG_CLOSE_HOVER, is_srgb)
+        }
+        _ => titlebar_bg,
+    };
+    let max_bg = match hover {
+        HoverRegion::Button(WindowButton::Maximize) => {
+            color_for_vertex_with_srgb(BUTTON_BG_HOVER, is_srgb)
+        }
+        _ => titlebar_bg,
+    };
+    let min_bg = match hover {
+        HoverRegion::Button(WindowButton::Minimize) => {
+            color_for_vertex_with_srgb(BUTTON_BG_HOVER, is_srgb)
+        }
+        _ => titlebar_bg,
+    };
+
+    // 按钮背景区 (即使非 hover 也画一层 — 让 hover↔无 hover 切换时按钮位置
+    // 视觉无空洞; titlebar_bg 与按钮 bg 同色, 视觉等价 titlebar 整片色).
+    append_quad_px(
+        out,
+        close_x_min,
+        0.0,
+        close_x_max,
+        btn_h,
+        surface_w,
+        surface_h,
+        close_bg,
+    );
+    append_quad_px(
+        out, max_x_min, 0.0, max_x_max, btn_h, surface_w, surface_h, max_bg,
+    );
+    if min_x_min >= 0.0 {
+        append_quad_px(
+            out, min_x_min, 0.0, min_x_max, btn_h, surface_w, surface_h, min_bg,
+        );
+    }
+
+    // 3. 按钮 icons. 走"细线 quad"画法 — 单 line stroke 用一个 thin quad,
+    //    宽度 stroke_w = 2 × HIDPI_SCALE physical px (HiDPI 视觉清晰).
+    let stroke_w = 2.0 * hidpi;
+    let icon_pad = 6.0 * hidpi; // 按钮内边距, icon 不贴边
+
+    // 3.1 Close: 两条对角线 (×) 走 stair-stepped 小矩形模拟 (cell pipeline
+    // 无 rotation transform, 真斜线只能用 small quad 阶梯近似). 派单 #D
+    // 原文 "Close = 两条对角线", 阶梯近似仍读为 × 视觉.
+    {
+        let cx_min = close_x_min + icon_pad;
+        let cx_max = close_x_max - icon_pad;
+        let cy_min = icon_pad;
+        let cy_max = btn_h - icon_pad;
+        let span_x = cx_max - cx_min;
+        let span_y = cy_max - cy_min;
+        // 12 段阶梯 (HiDPI×2 下 24 logical 内 ~12 物理 step), 每段 step_w
+        // 物理像素宽 stroke_w 高 stroke_w. 对角 √2 倍 stroke 视觉略粗
+        // 但读得出 ×.
+        let segments: usize = 12;
+        let dx = span_x / segments as f32;
+        let dy = span_y / segments as f32;
+        for i in 0..segments {
+            let t = i as f32 + 0.5;
+            // 主对角 (左上 → 右下)
+            let x = cx_min + dx * t;
+            let y = cy_min + dy * t;
+            append_quad_px(
+                out,
+                x - stroke_w / 2.0,
+                y - stroke_w / 2.0,
+                x + stroke_w / 2.0,
+                y + stroke_w / 2.0,
+                surface_w,
+                surface_h,
+                icon_color,
+            );
+            // 副对角 (右上 → 左下)
+            let x2 = cx_max - dx * t;
+            let y2 = cy_min + dy * t;
+            append_quad_px(
+                out,
+                x2 - stroke_w / 2.0,
+                y2 - stroke_w / 2.0,
+                x2 + stroke_w / 2.0,
+                y2 + stroke_w / 2.0,
+                surface_w,
+                surface_h,
+                icon_color,
+            );
+        }
+    }
+
+    // 3.2 Maximize: 矩形框 (4 边)
+    {
+        let mx_min = max_x_min + icon_pad;
+        let mx_max = max_x_max - icon_pad;
+        let my_min = icon_pad;
+        let my_max = btn_h - icon_pad;
+        // 上边
+        append_quad_px(
+            out,
+            mx_min,
+            my_min,
+            mx_max,
+            my_min + stroke_w,
+            surface_w,
+            surface_h,
+            icon_color,
+        );
+        // 下边
+        append_quad_px(
+            out,
+            mx_min,
+            my_max - stroke_w,
+            mx_max,
+            my_max,
+            surface_w,
+            surface_h,
+            icon_color,
+        );
+        // 左边
+        append_quad_px(
+            out,
+            mx_min,
+            my_min,
+            mx_min + stroke_w,
+            my_max,
+            surface_w,
+            surface_h,
+            icon_color,
+        );
+        // 右边
+        append_quad_px(
+            out,
+            mx_max - stroke_w,
+            my_min,
+            mx_max,
+            my_max,
+            surface_w,
+            surface_h,
+            icon_color,
+        );
+    }
+
+    // 3.3 Minimize: 中间一横线 (位于按钮垂直中点偏下位置, 视觉上像 _)
+    if min_x_min >= 0.0 {
+        let nx_min = min_x_min + icon_pad;
+        let nx_max = min_x_max - icon_pad;
+        // 横线 y 位置 = 按钮垂直中点 (icon_pad 内画一横, 不贴底)
+        let ny = btn_h / 2.0;
+        append_quad_px(
+            out,
+            nx_min,
+            ny - stroke_w / 2.0,
+            nx_max,
+            ny + stroke_w / 2.0,
+            surface_w,
+            surface_h,
+            icon_color,
+        );
+    }
+}
 
 impl Renderer {
     /// 从 Wayland 裸指针构造 Renderer,配置初始尺寸并返回。
@@ -632,6 +956,9 @@ impl Renderer {
             // Phase 3 fallback 路径 (text_system 未建好时降级): cell 染 fg 色作
             // 视觉锚点 (T-0305 acceptance "看见 prompt 字符位置以色块画出")。
             CellColorSource::Fg,
+            // T-0504: draw_cells fallback 不画 titlebar (无 hover 信息), cells
+            // 走 y_offset=0 维持 Phase 3 视觉契约.
+            0.0,
         );
         let vertex_count = (vertex_bytes.len() / VERTEX_BYTES) as u32;
         // 给手测 / 日志排障一个固定锚点:每次 draw_cells 报本帧 cell 矩形数。
@@ -833,6 +1160,10 @@ impl Renderer {
     ///
     /// NDC 坐标系: x ∈ [-1, 1] 左→右,y ∈ [-1, 1] 下→上(像素 y=0 在顶,
     /// NDC y 翻转一次)。
+    /// `clippy::too_many_arguments` allow: T-0504 加 `y_offset_px` 让 cells
+    /// 区域偏移到 titlebar 之下 (派单 #E + #D), 抽 struct 反而把 NDC 换算
+    /// 主线变间接. 与 [`append_quad_px`] 同决策.
+    #[allow(clippy::too_many_arguments)]
     fn build_vertex_bytes(
         &self,
         cells: &[CellRef],
@@ -841,6 +1172,7 @@ impl Renderer {
         surface_w: f32,
         surface_h: f32,
         color_source: CellColorSource,
+        y_offset_px: f32,
     ) -> Vec<u8> {
         let mut out: Vec<u8> = Vec::with_capacity(cells.len() * VERTS_PER_CELL * VERTEX_BYTES);
         for cell in cells {
@@ -849,7 +1181,10 @@ impl Renderer {
                 continue;
             }
             let x0_px = cell.pos.col as f32 * cell_w_px;
-            let y0_px = cell.pos.line as f32 * cell_h_px;
+            // T-0504: cells 区域起始 y 从 y_offset_px (titlebar 高度 physical px)
+            // 往下偏移. 调用方 draw_frame / draw_cells 传 TITLEBAR_H_LOGICAL_PX ×
+            // HIDPI_SCALE; draw_cells 走 0 (Phase 3 fallback 路径无 titlebar).
+            let y0_px = cell.pos.line as f32 * cell_h_px + y_offset_px;
             let x1_px = x0_px + cell_w_px;
             let y1_px = y0_px + cell_h_px;
 
@@ -943,6 +1278,11 @@ impl Renderer {
         cols: usize,
         rows: usize,
         row_texts: &[String],
+        // T-0504: 当前鼠标 hover 区域. Renderer 据此在 titlebar 三按钮中高亮
+        // 对应一个 (按钮背景变深, Close 变红). [`crate::wl::pointer::HoverRegion`]
+        // 是 quill 自有 enum (INV-010 类型隔离), 由 Dispatch<WlPointer> 调用方
+        // 维护. Phase 5 之前调用方传 [`HoverRegion::None`] 等价无高亮.
+        hover: super::pointer::HoverRegion,
     ) -> Result<()> {
         if cols == 0 || rows == 0 {
             return self.render();
@@ -950,7 +1290,12 @@ impl Renderer {
 
         // Step 1: lazy init 全部 GPU 资源。
         self.ensure_cell_pipeline();
-        self.ensure_cell_buffer(cols, rows);
+        // T-0504: cell buffer 容量需为 cells + titlebar (1 bg quad + 3 button
+        // bg quads + 3 button icons ~9 quads = 13 quads max) 留余量, 简化
+        // 直接在 ensure_cell_buffer 入参加 13 个虚拟 cell 防 buffer 太小
+        // 撞 wgpu validation. 13 × 6 顶点 × 20 字节 = 1560 字节, 与 cells
+        // 主体相比可忽略.
+        self.ensure_cell_buffer(cols, rows + TITLEBAR_RESERVED_QUAD_ROWS);
         self.ensure_glyph_atlas();
         self.ensure_glyph_pipeline();
 
@@ -962,17 +1307,35 @@ impl Renderer {
         let cell_w_px = CELL_W_PX * HIDPI_SCALE as f32;
         let cell_h_px = CELL_H_PX * HIDPI_SCALE as f32;
         let baseline_y_px = BASELINE_Y_PX * HIDPI_SCALE as f32;
+        // T-0504: titlebar 高度 (physical px = logical × HIDPI_SCALE).
+        let titlebar_y_offset_px = TITLEBAR_H_LOGICAL_PX as f32 * HIDPI_SCALE as f32;
 
         // Step 3: cell vertex bytes (T-0407 D fix: 走 bg 色, 让 glyph fg 字形
         // 在 cell bg 块上可见; T-0403 用 fg 致字形被 cell fg 块"涂同色"不可见,
         // 用户实测看到一片连续 fg 色矩形不见字)。
-        let cell_vertex_bytes = self.build_vertex_bytes(
+        let mut cell_vertex_bytes = self.build_vertex_bytes(
             cells,
             cell_w_px,
             cell_h_px,
             surface_w,
             surface_h,
             CellColorSource::Bg,
+            // T-0504: cells 区域往下偏移 titlebar 高度 (physical px), 让 titlebar
+            // 在顶部 28 logical px 内独占空间, cell grid 起 y = TITLEBAR_H_LOGICAL_PX
+            // × HIDPI_SCALE (= 56 physical 在 HIDPI×2). cells_from_surface_px
+            // 同步减 titlebar 高让 cell rows 数对应 cell 区可用高度, 总高 = surface
+            // (logical) - titlebar (logical), 视觉无超出.
+            titlebar_y_offset_px,
+        );
+        // T-0504: 追加 titlebar + 3 按钮 + icon 顶点到 cell pipeline 同 buffer.
+        // titlebar 与 cell 共用 cell pipeline (同 vertex 格式 pos+color), 一次
+        // draw 同时画完, 视觉无延迟. hover 来自调用方维护的 PointerState.hover().
+        append_titlebar_vertices(
+            &mut cell_vertex_bytes,
+            surface_w,
+            surface_h,
+            self.surface_is_srgb,
+            hover,
         );
         let cell_vertex_count = (cell_vertex_bytes.len() / VERTEX_BYTES) as u32;
 
@@ -1023,8 +1386,11 @@ impl Renderer {
                 // slot.height 都已经是 physical px (shape_line 用 17 × HIDPI_SCALE
                 // metrics, rasterize 出的 bitmap 也是 physical 尺寸), 与 cell_h_px /
                 // baseline_y_px (× HIDPI_SCALE) 单位一致, 直接相加无需再乘。
+                // T-0504: y 加 titlebar_y_offset_px 让字形落在 cell 区 (cell 已
+                // 偏移), 与 cell 视觉对齐.
                 let x_left = glyph.x_offset + slot.bearing_x as f32;
-                let y_top = (row_idx as f32) * cell_h_px + baseline_y_px - slot.bearing_y as f32;
+                let y_top = (row_idx as f32) * cell_h_px + baseline_y_px + titlebar_y_offset_px
+                    - slot.bearing_y as f32;
                 let x_right = x_left + slot.width as f32;
                 let y_bot = y_top + slot.height as f32;
 
@@ -1720,6 +2086,8 @@ pub fn render_headless(
     let cell_w_px = CELL_W_PX * HIDPI_SCALE as f32;
     let cell_h_px = CELL_H_PX * HIDPI_SCALE as f32;
     let baseline_y_px = BASELINE_Y_PX * HIDPI_SCALE as f32;
+    // T-0504: titlebar 高度 (physical px), cells 偏移到 titlebar 之下.
+    let titlebar_y_offset_px = TITLEBAR_H_LOGICAL_PX as f32 * HIDPI_SCALE as f32;
 
     let mut cell_vertex_bytes: Vec<u8> =
         Vec::with_capacity(cells.len() * VERTS_PER_CELL * VERTEX_BYTES);
@@ -1728,7 +2096,9 @@ pub fn render_headless(
             continue;
         }
         let x0_px = cell.pos.col as f32 * cell_w_px;
-        let y0_px = cell.pos.line as f32 * cell_h_px;
+        // T-0504: cells 区域起始 y 偏移 titlebar 高度 (与 Renderer::draw_frame
+        // build_vertex_bytes 同语义).
+        let y0_px = cell.pos.line as f32 * cell_h_px + titlebar_y_offset_px;
         let x1_px = x0_px + cell_w_px;
         let y1_px = y0_px + cell_h_px;
         let left = x0_px / surface_w * 2.0 - 1.0;
@@ -1755,6 +2125,17 @@ pub fn render_headless(
             cell_vertex_bytes.extend_from_slice(&color[2].to_ne_bytes());
         }
     }
+    // T-0504: 追加 titlebar + 3 按钮 + icon 顶点. headless 路径无真鼠标 hover,
+    // 走 HoverRegion::None (按钮全无高亮 — 视觉等价"窗口刚打开未鼠标接触" 状态,
+    // 三按钮可见但都是默认 titlebar 灰色). 派单 In #G "render_headless 写 PNG,
+    // 验 titlebar 区域有非清屏像素 + 3 按钮位置有非 titlebar bg 像素".
+    append_titlebar_vertices(
+        &mut cell_vertex_bytes,
+        surface_w,
+        surface_h,
+        is_srgb,
+        super::pointer::HoverRegion::None,
+    );
     let cell_vertex_count = (cell_vertex_bytes.len() / VERTEX_BYTES) as u32;
 
     let effective_rows = row_texts.len().min(rows);
@@ -1866,7 +2247,9 @@ pub fn render_headless(
             // T-0404: baseline_y_px 已 × HIDPI_SCALE (与 cell_h_px 同单位 physical),
             // glyph.x_offset / bearing_x / bearing_y / slot.width / slot.height
             // 都 physical (shape_line Metrics × HIDPI_SCALE), 单位一致直接相加
-            let y_top = (row_idx as f32) * cell_h_px + baseline_y_px - slot.bearing_y as f32;
+            // T-0504: y 加 titlebar_y_offset_px 让字形落 cell 区 (与 cell 偏移一致).
+            let y_top = (row_idx as f32) * cell_h_px + baseline_y_px + titlebar_y_offset_px
+                - slot.bearing_y as f32;
             let x_right = x_left + slot.width as f32;
             let y_bot = y_top + slot.height as f32;
             let ndc_left = x_left / surface_w * 2.0 - 1.0;
