@@ -1,8 +1,8 @@
 # T-0306 Wayland resize → Term + PTY 同步
 
 **Phase**: 3
-**Assigned**: (open)
-**Status**: open
+**Assigned**: writer-T0306
+**Status**: claimed
 **Budget**: tokenBudget=60k (lead 派单)
 **Dependencies**: T-0204 (PtyHandle::resize 已就绪) / T-0302 (TermState::dimensions) / T-0305 (draw_cells 用 cols/rows 参数)
 
