@@ -2,7 +2,7 @@
 
 **Phase**: 4
 **Assigned**: writer-T0407
-**Status**: in-review
+**Status**: merged
 **Budget**: tokenBudget=80k (中型 fix)
 **Dependencies**: T-0403 (glyph atlas + draw_frame 已合并但有 bug)
 **Priority**: P0 (Phase 4 字形渲染当前 broken, T-0404 暂停等本单)
