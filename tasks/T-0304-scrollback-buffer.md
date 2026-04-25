@@ -2,7 +2,7 @@
 
 **Phase**: 3
 **Assigned**: 写码-T0304
-**Status**: claimed
+**Status**: in-review
 **Budget**: tokenBudget=50k (lead 派单)
 **Dependencies**: T-0302 (CellPos 已就绪) / T-0303 (cursor API 完整)
 
