@@ -49,7 +49,11 @@
 
 ---
 
-## TD-002: T-0202 pump_once BorrowedFd SAFETY 注释详略差异
+## TD-002: T-0202 pump_once BorrowedFd SAFETY 注释详略差异 ⛔ OBSOLETE 2026-04-25
+
+**状态**: ⛔ **OBSOLETE** (T-0399 housekeeping, mainline-audit P2-7 跟进) — `pump_once` 整段在 T-0108 refactor 时已被删除 (`src/wl/window.rs:186-194` 注释明示), 引用的 `src/wl/window.rs:272-275` 不再存在。本 TD 指向不存在代码, 标 OBSOLETE 而非"待办"。后续 SAFETY 注释精度问题已转登 TD-017 (drop 序错位)。
+
+---
 
 **识别日期**: 2026-04-25
 **识别者**: 审码-opus (T-0202 audit 报告 P3-2)
@@ -69,7 +73,11 @@
 
 ---
 
-## TD-003: T-0202 run_window BorrowedFd<'static> 未明写 Rust 反向 drop 保证
+## TD-003: T-0202 run_window BorrowedFd<'static> 未明写 Rust 反向 drop 保证 ⛔ OBSOLETE 2026-04-25
+
+**状态**: ⛔ **OBSOLETE** (T-0399 housekeeping, mainline-audit P2-7 跟进) — 现行代码 (window.rs:613-619, 645-650) 已加 SAFETY 注释明写 drop 序, 原 "未明写" 论点已 RESOLVED。但 mainline-audit P2-2 指出该 SAFETY 文字描述方向**反了** (T-0108 重构后 loop_data 先 drop / event_loop 后 drop, 与原文字相反), 后续治理迁至新 TD-017 (SAFETY 注释 drop 序错位); T-0399 已修文字。
+
+---
 
 **识别日期**: 2026-04-25
 **识别者**: 审码-opus (T-0202 audit 报告 P3-3)
@@ -238,7 +246,11 @@
 
 ---
 
-## TD-012: pty master EOF 导致 pump_once busy-warn (Level-triggered + 未 Remove source)
+## TD-012: pty master EOF 导致 pump_once busy-warn (Level-triggered + 未 Remove source) ✅ RESOLVED 2026-04-25
+
+**状态**: ✅ **已解决** (T-0205 + T-0108 双重消除, T-0399 housekeeping 落标, mainline-audit P2-7 跟进) — T-0205 实装 `pty_readable_action::RequestExit → loop_signal.stop()` 闭环修了 busy-warn (commit `5de918c`); T-0108 又把 `pump_once` 整段删除 (commit `0ffabea`), `pty_read_callback` 路径上的 master EOF 现在直接走 `loop_signal.stop()` 退出主循环, 不再有 Level-triggered 死循环。`grep 'pump_once' src/` 零命中 (仅历史注释)。audit: `docs/audit/2026-04-25-T-0205-review.md` + `docs/audit/2026-04-25-T-0108-T-0301-review.md`。
+
+---
 
 **识别日期**: 2026-04-25
 **识别者**: 审码-opus (T-0203 audit P3-2)
@@ -305,4 +317,123 @@ Callback 内 `debug_assert_nonblock(pty);` 一行
 - 或用户反馈半夜 Desktop 启动 quill 出来 cwd 奇怪
 
 **解决路径**: Phase 6 配置系统引入 `[shell]` section, 支持 `cwd = "$HOME"` / `cwd = "$PWD"` / `cwd = "/abs/path"`, 默认 `$HOME` 符合大多数终端习惯
+
+---
+
+## TD-014: thiserror 死依赖 ✅ RESOLVED 2026-04-25
+
+**状态**: ✅ **已解决** (T-0399 housekeeping, mainline-audit P2-5 跟进) — `Cargo.toml` 第 16 行 `thiserror = "2"` 删除 (commit `74bdec1`), `grep -rn 'thiserror' src/ tests/ Cargo.toml` 零命中。Cargo.lock 由 cargo 后续 build 自然清理。
+
+---
+
+**识别日期**: 2026-04-25
+**识别者**: auditor-mainline (mainline-audit Phase 3 end P2-5)
+
+**代码位置**: `Cargo.toml:16` 列出 `thiserror = "2"`, 但 `grep -rn "thiserror|use thiserror" src/ tests/` 零命中
+
+**当前状态**: 死依赖
+- 增加构建时间 + 依赖图复杂度 + cargo audit 噪音
+- 当前 application errors 用 `anyhow`, IO 用 `std::io::Error`, 不需要 derive `Error` trait
+
+**触发修理的条件**: T-0399 housekeeping 已修
+
+**解决路径**: 删 `Cargo.toml` 一行, `cargo build` 验
+
+---
+
+## TD-015: FrameStats 模块未接入 draw 路径 ✅ RESOLVED 2026-04-25
+
+**状态**: ✅ **已解决** (T-0399 housekeeping, mainline-audit P1-1 跟进) — `LoopData` 加 `frame_stats: FrameStats` 字段, `event_loop.run` idle callback 在 `t.clear_dirty()` 之前调 `frame_stats.record_and_log(Instant::now())`, `tests/frame_stats_integration.rs` 验 60 帧后 `quill::frame` target 出一行 trace。Phase 6 soak 信号采集点闭环。
+
+---
+
+**识别日期**: 2026-04-25
+**识别者**: auditor-mainline (mainline-audit Phase 3 end P1-1)
+
+**代码位置**: `src/frame_stats.rs::FrameStats::record_and_log` 在 `src/wl/window.rs` idle / draw_cells 路径上零调用
+
+**当前状态**: 跨 ticket 漂移
+- T-0106 完工 frame_stats 模块, 计划接入点是 T-0103 (推迟到 Phase 3+)
+- T-0305 引入 `draw_cells` 时**没有顺手**加 record_and_log, per-ticket reviewer 也不背"验上一 ticket 产出还活着"责任
+- ROADMAP Phase 6 T-0601 soak 监控 RSS 信号当前**永远不产出**
+
+**触发修理的条件**: T-0399 housekeeping 已修 (Phase 5 fcitx5 起步前必须修)
+
+**解决路径**: LoopData 加字段 + idle callback 调 record_and_log + integration test 截 tracing 日志验证
+
+---
+
+## TD-016: event_loop::Core 死代码 ✅ RESOLVED 2026-04-25
+
+**状态**: ✅ **已解决** (T-0399 housekeeping, mainline-audit P2-1 跟进, 选项 A) — 删 `src/event_loop.rs` 整模块 + `tests/event_loop_smoke.rs` + `src/lib.rs::pub mod event_loop;` 一行 (commit `ba00d5f`)。run_window 直接走 calloop, 无 Core wrapper。测试数 89 → 87 (-2 孤儿)。
+
+---
+
+**识别日期**: 2026-04-25
+**识别者**: auditor-mainline (mainline-audit Phase 3 end P2-1)
+
+**代码位置**: `src/event_loop.rs::Core<'l, State>` + `tests/event_loop_smoke.rs` (2 tests)
+
+**当前状态**: T-0105 设计 Core wrapper, T-0108 calloop 三源统一时直接 `EventLoop::try_new()` 绕过, Core 仅在孤儿测试存活
+
+**触发修理的条件**: T-0399 housekeeping 已修
+
+**解决路径**: 选项 A 删整模块 (Phase 4-5 不再做事件循环结构性变化, Core wrapper 无功能价值)
+
+---
+
+## TD-017: SAFETY 注释 drop 序错位 ✅ RESOLVED 2026-04-25
+
+**状态**: ✅ **已解决** (T-0399 housekeeping, mainline-audit P2-2 跟进) — `src/wl/window.rs:610-614` + `:644-648` 两处 `unsafe { BorrowedFd::borrow_raw }` 的 SAFETY 注释文字校正, 反映 T-0108 重构后真实 drop 序 (loop_data 先 drop / event_loop 后 drop, Generic source 的 epoll_ctl(EPOLL_CTL_DEL) 对已关 fd 返 EBADF 非 UB)。代码行为不动 (NLL 借用结束时机本来就对), 只修文字。原 TD-003 同步标 OBSOLETE。
+
+---
+
+**识别日期**: 2026-04-25
+**识别者**: auditor-mainline (mainline-audit Phase 3 end P2-2)
+
+**代码位置**: `src/wl/window.rs:613-614` (wayland_fd) + `:645-650` (pty_borrowed)
+
+**当前状态**: SAFETY 文字描述 "event_loop 先于 state 被 drop", 但实际 T-0108 后 `loop_data` (持 state) 先 drop / `event_loop` 后 drop。`epoll_ctl` 对已关 fd 返 EBADF 不 UB, 严格安全, 但文字误导后续维护者推理。
+
+**触发修理的条件**: T-0399 housekeeping 已修
+
+**解决路径**: 文字改为 "loop_data 先 drop (state.conn 关 fd) → event_loop 后 drop (Generic source 的 epoll_ctl(EPOLL_CTL_DEL) 对已关 fd 返 EBADF 非 UB)"
+
+---
+
+## TD-018: INV-006 doc 引用过时 caller ✅ RESOLVED 2026-04-25
+
+**状态**: ✅ **已解决** (T-0399 housekeeping, mainline-audit P2-3 跟进) — `docs/invariants.md` INV-006 文字改引 `propagate_resize_if_dirty` (drive_wayland 在 dispatch_pending 之后调一次, `src/wl/window.rs:437`), 不再引未实装的 T-0103。
+
+---
+
+**识别日期**: 2026-04-25
+**识别者**: auditor-mainline (mainline-audit Phase 3 end P2-3)
+
+**代码位置**: `docs/invariants.md` INV-006 文字 "上层(T-0103 wgpu swapchain 重建者)"
+
+**当前状态**: T-0103 推迟到 Phase 3+, 真消费者是 T-0306 实装的 `propagate_resize_if_dirty`。T-0306 audit 已指出消费者单一性, 但 invariants.md 文字未同步。
+
+**触发修理的条件**: T-0399 housekeeping 已修
+
+**解决路径**: 1 行改 — 引 `propagate_resize_if_dirty` 而非 T-0103
+
+---
+
+## TD-019: propagate_resize_if_dirty 无单测 ✅ RESOLVED 2026-04-25
+
+**状态**: ✅ **已解决** (T-0399 housekeeping, mainline-audit P2-6 跟进) — 抽纯 fn `should_propagate_resize(resize_dirty: bool) -> bool` (window.rs), 单测覆盖 dirty=true → 应消费 / dirty=false → 早返。完整 propagate_resize_if_dirty 的副作用链 (renderer/term/pty 三方 resize) 由 `tests/resize_chain.rs` 集成测试 (T-0306) + 4 个 cells_from_surface_px 单测覆盖, 无回归风险。
+
+---
+
+**识别日期**: 2026-04-25
+**识别者**: auditor-mainline (mainline-audit Phase 3 end P2-6)
+
+**代码位置**: `src/wl/window.rs::propagate_resize_if_dirty` (T-0306 实装, INV-006 唯一消费路径)
+
+**当前状态**: 无自动化测试 — 改函数 (例: 调换三方顺序 / 误删清 dirty 那行) 不会被 cargo test 拦截, 只在手测时显形
+
+**触发修理的条件**: T-0399 housekeeping 已修
+
+**解决路径**: 抽决策点纯 fn `should_propagate_resize` 测 dirty 分支, 副作用链由集成测试 + 既有单测 cover, conventions §3 抽状态机模式
 
