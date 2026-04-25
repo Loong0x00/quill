@@ -1,8 +1,8 @@
 # T-0307 端到端测试: ls -la → Term grid 内容
 
 **Phase**: 3 (Phase 3 收尾)
-**Assigned**: (open)
-**Status**: open
+**Assigned**: writer-T0307
+**Status**: claimed
 **Budget**: tokenBudget=40k (lead 派单)
 **Dependencies**: T-0201 (PtyHandle::spawn_program) / T-0301 (TermState::advance) / T-0302 (cells_iter / line_text) / T-0306 (term.resize)
 
