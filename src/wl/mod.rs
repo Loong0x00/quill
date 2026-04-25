@@ -30,3 +30,11 @@ pub use render::render_headless;
 // 自有 struct (INV-010, 不漏 wayland-protocols 类型). PREEDIT_UNDERLINE_PX
 // 常数同步 re-export 给测试 / Phase 6 计算用。
 pub use render::{PreeditOverlay, PREEDIT_UNDERLINE_PX};
+
+// T-0603: 集成测试 tests/keyboard_repeat_e2e.rs 需要构造 KeyboardState +
+// 喂 wl_keyboard::Event + 拿 KeyboardAction. 这三个都是 quill 自有类型
+// (INV-010: KeyboardState 字段全私有, KeyboardAction 是 std 类型 enum, 不
+// 漏 xkbcommon / wayland-client 内部类型). 入参 wl_keyboard::Event 是
+// wayland-client 协议类型 (已在 Dispatch trait 边界, 集成测试用同一类型
+// 构造 event 是协议层防御测试惯例, 与 Dispatch<WlKeyboard> 同等暴露).
+pub use keyboard::{handle_key_event, KeyboardAction, KeyboardState};

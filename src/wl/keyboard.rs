@@ -29,9 +29,19 @@
 //!         └→ Event::RepeatInfo(rate, delay)         → 仅记录, 不真 repeat
 //! ```
 //!
-//! 真按键 repeat (按住不放连续吐字节) **不在本 ticket scope** — 派单 In #B
-//! "不实现真 repeat (Phase 6 timerfd 接 calloop), 单按只发一次"。本模块仅
-//! 暂存 RepeatInfo 给 Phase 6 timerfd 路径用。
+//! ## 键盘 repeat (T-0603)
+//!
+//! T-0501 阶段仅记录 `RepeatInfo` (rate / delay), Phase 6 留 timerfd 接入口。
+//! T-0603 真接 calloop `Timer` source: Pressed 时 [`handle_key_event`] 返
+//! [`KeyboardAction::StartRepeat`], 调用方 (`wl/window.rs`) schedule 一个
+//! `Timer::from_duration(delay_ms)`; timer fire 时调 [`tick_repeat`] 拿当前
+//! repeat key 的字节副本写 PTY, 返回 `TimeoutAction::ToDuration(rate_ms)`
+//! 自动 reschedule. Released 同 keycode 或任意 modifier 变化时返
+//! [`KeyboardAction::StopRepeat`], 调用方 remove timer (或下次 tick 检查
+//! `current_repeat == None` 自动 Drop).
+//!
+//! 派单 In #C: modifier 任意变化 cancel 当前 repeat (alacritty/foot 行为) —
+//! 简化路径, 不区分 Shift / Ctrl / Alt.
 //!
 //! ## 安全边界
 //!
@@ -60,7 +70,9 @@ use xkbcommon::xkb;
 /// - rate (i32, keys/sec, 0 表示禁用 repeat)
 /// - delay (i32, 首次按下到第一次 repeat 的延迟 ms)
 ///
-/// 本 ticket **仅记录**, 不真启 timerfd — 派单 In #B "Phase 6 接 calloop"。
+/// T-0603 真接入 calloop Timer: Pressed → [`KeyboardAction::StartRepeat`],
+/// Released / Modifier 变化 → [`KeyboardAction::StopRepeat`], timer fire 时
+/// 调 [`tick_repeat`] 取字节副本.
 pub struct KeyboardState {
     /// xkbcommon 库上下文。生命周期与 KeyboardState 同, 进程内单例 (一个 quill
     /// 一个 KeyboardState, 一份 Context)。无 unsafe, 纯 Rust safe wrapper。
@@ -73,11 +85,33 @@ pub struct KeyboardState {
     /// 当前键盘状态 (含 modifier / layout / level), 由 keymap 派生。
     xkb_state: Option<xkb::State>,
     /// wl_keyboard `RepeatInfo` 给的 rate (keys/sec)。0 = compositor 禁用
-    /// repeat, 非 0 = 期望连发频率。本 ticket 仅记录。
+    /// repeat, 非 0 = 期望连发频率。T-0603 timer reschedule 用此值算 interval.
     repeat_rate: i32,
     /// wl_keyboard `RepeatInfo` 给的 delay (ms, 首次按下 → 第一次 repeat 间隔)。
-    /// 本 ticket 仅记录。
+    /// T-0603 timer 首次 fire 用此值。
     repeat_delay: i32,
+    /// T-0603: 当前正在 repeat 的键 (Pressed 但还没 Released, 且 modifier 未
+    /// 变). `None` 表示无 repeat 进行 — [`tick_repeat`] 此时返 `None` 让
+    /// timer callback 走 `TimeoutAction::Drop` 自然终止. 非 modifier-only /
+    /// utf8 非空的 Pressed 键才会进入 repeat (modifier 单按 / utf8 空键忽略).
+    current_repeat: Option<RepeatKey>,
+    /// T-0603: 上次记录的 modifier mask (mods_depressed). 用于检测 modifier
+    /// 变化 — `update_modifiers` 收到新 mask 与此值不同时 → cancel 当前
+    /// repeat (派单 In #C alacritty 行为). 起步 0 (无 modifier 按下).
+    last_modifier_mask: u32,
+}
+
+/// T-0603: 当前 repeat 中的键的状态. 字段全私有 (INV-010), 仅本模块构造 / 读取.
+#[derive(Debug, Clone)]
+struct RepeatKey {
+    /// evdev keycode (Pressed 时记录), 用于 `Released` 时判断"是否同一键"
+    /// → 不同键不取消 (按住 a 又按 b 时 a release 才 stop, b release 不影响).
+    keycode: u32,
+    /// 对应字节 (xkbcommon 算出的 utf8 / terminal_keysym_override) 副本.
+    /// timer fire 时直接 clone 给调用方 — 不重新走 xkbcommon (modifier
+    /// 状态可能已变, 但派单 In #C 已规定 modifier 变化即 cancel, 字节
+    /// 在 StartRepeat 一次性算定不变).
+    bytes: Vec<u8>,
 }
 
 impl KeyboardState {
@@ -94,14 +128,23 @@ impl KeyboardState {
             xkb_state: None,
             repeat_rate: 0,
             repeat_delay: 0,
+            current_repeat: None,
+            last_modifier_mask: 0,
         })
     }
 
     /// 测试入口: 用内置 us layout 字符串建 keymap, 跳过 wl_keyboard `Keymap`
-    /// event 路径。仅 `#[cfg(test)]`, 真路径 (`handle_key_event` 收 Keymap event)
-    /// 不走此函数。
-    #[cfg(test)]
-    pub(crate) fn load_default_us_keymap(&mut self) -> Result<()> {
+    /// event 路径。**仅 lib unit test + integration test (T-0603) 用**, 真
+    /// 路径 (`handle_key_event` 收 Keymap event) 不走此函数。
+    ///
+    /// `#[doc(hidden)] pub`: 集成测试 `tests/keyboard_repeat_e2e.rs` (T-0603)
+    /// 在 quill crate 外, 拿不到 `pub(crate)` 项; 改为 `pub` + `doc(hidden)`
+    /// 让集成测试可调但不出现在 docs.rs (与 INV-010 类型隔离精神一致 — 不算
+    /// 公共 API). T-0501 的 `#[cfg(test)]` 限定保留也行, 但 cfg(test) 在集成
+    /// 测试 crate 编译时**不生效** (集成测试是独立 crate, dep on quill 是
+    /// release / debug profile, 非 test profile), 必须 `pub` 才能跨 crate.
+    #[doc(hidden)]
+    pub fn load_default_us_keymap(&mut self) -> Result<()> {
         // xkbcommon `Keymap::new_from_names` 用 RMLVO (rules / model / layout /
         // variant / options) 系统默认值生成 keymap — 系统装了 X.Org keyboard
         // dataset (xkeyboard-config 包) 即可, Wayland session 必装。
@@ -121,34 +164,86 @@ impl KeyboardState {
         Ok(())
     }
 
-    /// 当前 RepeatInfo (rate, delay), 给 Phase 6 timerfd repeat 路径预留访问。
-    /// 本 ticket 单测 wl_keyboard `RepeatInfo` event 真到达时此值更新。
+    /// 当前 RepeatInfo (rate, delay). T-0603 calloop Timer 调用方读此值算
+    /// 首次 delay (`Duration::from_millis(delay as u64)`) + 后续 interval
+    /// (`Duration::from_millis(1000 / rate)`).
     ///
-    /// `#[allow(dead_code)]`: T-0501 阶段 main 路径不消费 (派单 In #B "不实
-    /// 现真 repeat, Phase 6 timerfd 接 calloop"); 仅 lib 单测
-    /// `repeat_info_updates_state` 验更新路径。Phase 6 timerfd ticket 接入
-    /// 时移除 attribute。
-    #[allow(dead_code)]
+    /// rate=0 (compositor 禁 repeat) 时调用方应**完全不 schedule timer** —
+    /// 派单 In #B "wl_keyboard.repeat_info 给的值即可"。
     pub fn repeat_info(&self) -> (i32, i32) {
         (self.repeat_rate, self.repeat_delay)
+    }
+
+    /// T-0603 timer fire 入口: 检查当前是否仍有 repeat 进行, 是则返字节副本.
+    /// 调用方 (`wl/window.rs` 的 timer callback) 据此 `pty.write(&bytes)`,
+    /// 然后返 `TimeoutAction::ToDuration(rate_interval)` 让 calloop 自动
+    /// reschedule. None 时调用方返 `TimeoutAction::Drop` 终止 timer.
+    ///
+    /// **why 不在此判时间到没到**: calloop `Timer::from_duration` 已经把
+    /// "delay / interval" 调度交给 calloop 内核 (`TimeoutAction::ToDuration`
+    /// 自动 reschedule), 此处仅校验"键是否仍按住", 不算时间窗口.
+    ///
+    /// **派单 In #A 描述**: `tick_repeat(state, now) -> Option<Vec<u8>>` —
+    /// `now: Instant` 入参在最终设计里**用不到** (calloop 调度精度由
+    /// `TimeoutAction::ToDuration` 提供, callback 不需自算 deadline). 偏离
+    /// 项: 去掉 now 参数, 简化 API. 不引 `std::time::Instant` 依赖.
+    pub fn tick_repeat(&self) -> Option<Vec<u8>> {
+        self.current_repeat.as_ref().map(|r| r.bytes.clone())
+    }
+
+    /// T-0603: 当前是否有 repeat 正在进行. 仅给单测 / 调用方查询用 (调用方
+    /// 通过 `KeyboardAction::StartRepeat` / `StopRepeat` 同步管理 timer 句柄,
+    /// 不需要轮询此字段).
+    #[cfg(test)]
+    pub(crate) fn has_repeat(&self) -> bool {
+        self.current_repeat.is_some()
     }
 }
 
 /// `handle_key_event` 的副作用描述: 翻译完一次 wl_keyboard event 后告诉调用方
-/// 要不要往 PTY 写字节。
+/// 要不要往 PTY 写字节 / 调度 timer.
 ///
 /// 抽 enum 而非直接 `Option<Vec<u8>>` 是 conventions §3 套路 (类比
 /// `WindowAction`), 给将来扩展空间 — 例如 Phase 6 加 "焦点切走 → 清 IME
 /// preedit" 时可 + variant, 不破坏 `handle_key_event` 签名。
+///
+/// T-0603 加 `StartRepeat` / `StopRepeat` (派单 In #A): 由调用方
+/// (`wl/window.rs::Dispatch<WlKeyboard>`) 据此调度 / 取消 calloop
+/// `Timer` source. `WriteToPty` 仍代表"立即写一次"语义 (Pressed 即时回显),
+/// `StartRepeat` 携带相同 `bytes` (副本), 让 timer fire 时一致回放.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum KeyboardAction {
     /// 没事可做 — 例如 Modifiers/Enter/Leave/RepeatInfo/Keymap event, 或者
-    /// Key event 但 keymap 未到, 或释放键 (release event), 或 utf8 为空字符串。
+    /// Key event 但 keymap 未到, 或释放键 (release event 不匹配 current_repeat),
+    /// 或 utf8 为空字符串。
     #[default]
     Nothing,
     /// 往 PTY master 写这串字节 (UTF-8)。空 vec 已被 `Nothing` 路径吃掉,
-    /// 这里 vec 至少 1 字节。
+    /// 这里 vec 至少 1 字节。**单按一次**, 不含 repeat 语义 — repeat 由
+    /// `StartRepeat` 走 timer 路径 (派单 In #A 分离即时写与 repeat 调度).
+    ///
+    /// **当前未构造路径** (T-0603): `key_press_action` 全部 utf8 非空 Pressed
+    /// 走 `StartRepeat` (含立即写一次的 bytes). `WriteToPty` 留给将来 "写一次
+    /// 但**不**进 repeat" 的键 (例如未来 F1-F12 escape sequence 决定不连发,
+    /// 或 IME compose 中间态需要回显但不 repeat). `#[allow(dead_code)]` 显式
+    /// 放行, 不删 variant 以保持 Dispatch<WlKeyboard> 路径 match 无 `_ =>`
+    /// 兜底 (INV-010 enum 防御 — 加新 variant 时编译期 catch).
+    #[allow(dead_code)]
     WriteToPty(Vec<u8>),
+    /// T-0603: Pressed 且字节非空 (非 modifier-only) → 立即写一次 + schedule
+    /// repeat timer (delay_ms 后首次 fire, 之后 1000/rate ms 周期). 调用方应:
+    /// 1. `pty.write(&bytes)` (与 `WriteToPty` 同写一次)
+    /// 2. cancel 已有 repeat timer (若任意, 防多键重叠)
+    /// 3. 用 `KeyboardState::repeat_info()` 拿 (rate, delay), rate>0 时
+    ///    `Timer::from_duration(Duration::from_millis(delay as u64))` 注册
+    ///    新 source. rate=0 不 schedule (compositor 禁 repeat).
+    StartRepeat { bytes: Vec<u8> },
+    /// T-0603: Released 匹配 `current_repeat.keycode` / 或 modifier 任意变化.
+    /// 调用方应 cancel 已注册 repeat timer (remove RegistrationToken).
+    /// timer 即使下次仍 fire (race: stop 与 timer fire 在 calloop 同 tick),
+    /// `tick_repeat()` 此时 `current_repeat=None` 返 `None`, callback 走
+    /// `TimeoutAction::Drop` 自然终止 — 双保险.
+    StopRepeat,
 }
 
 /// 接 wl_keyboard 协议事件 → 算 [`KeyboardAction`]。
@@ -206,7 +301,22 @@ pub fn handle_key_event(event: wl_keyboard::Event, state: &mut KeyboardState) ->
             group,
             ..
         } => {
+            // T-0603 派单 In #C: 任何 modifier 变化 cancel 当前 repeat
+            // (alacritty/foot 行为). 比较新旧 mods_depressed mask, 不一致即
+            // cancel — 简化路径不区分 Shift/Ctrl/Alt 哪个变了.
+            let prev_mask = state.last_modifier_mask;
             update_modifiers(state, mods_depressed, mods_latched, mods_locked, group);
+            state.last_modifier_mask = mods_depressed;
+            if prev_mask != mods_depressed && state.current_repeat.is_some() {
+                state.current_repeat = None;
+                tracing::debug!(
+                    target: "quill::keyboard",
+                    prev_mask,
+                    new_mask = mods_depressed,
+                    "modifier 变化, cancel current repeat"
+                );
+                return KeyboardAction::StopRepeat;
+            }
             KeyboardAction::Nothing
         }
         wl_keyboard::Event::RepeatInfo { rate, delay } => {
@@ -276,18 +386,44 @@ fn handle_keymap_event(
     tracing::info!(target: "quill::keyboard", "wl_keyboard keymap 加载成功");
 }
 
-/// 处理一次 Key (press/release) → bytes。
+/// 处理一次 Key (press/release) → bytes / repeat 调度.
 ///
-/// release 不发 (派单 In #B 单按一次)。press 走 xkbcommon `key_get_utf8`,
-/// 它内部已含 modifier composition (Ctrl+c → "\x03", Shift+a → "A", AltGr+e
-/// → "é", dead key + base → composed)。
+/// **Released 路径**:
+/// - 匹配 `current_repeat.keycode` → 清 `current_repeat` + 返 `StopRepeat`
+///   (调用方 cancel timer)
+/// - 不匹配 (按住 a 又按 b 时 b 的 release) → `Nothing` (a 仍 repeat)
+/// - 无 `current_repeat` → `Nothing` (单按 release / 早于 keymap 的 release)
+///
+/// **Pressed 路径**:
+/// - 走 xkbcommon `key_get_utf8` (modifier composition 由 xkbcommon 内部
+///   做: Ctrl+c → "\x03", Shift+a → "A", AltGr+e → "é", dead key + base
+///   → composed)
+/// - terminal_keysym_override 命中 (BackSpace/Delete) → 用 override bytes
+/// - utf8 空 (modifier-only single press) → `Nothing` (不进 repeat)
+/// - utf8 非空 → 记 `current_repeat = Some(RepeatKey { keycode, bytes })`
+///   + 返 `StartRepeat { bytes }` (调用方写 PTY 一次 + schedule timer)
 fn key_press_action(
     state: &mut KeyboardState,
     evdev_keycode: u32,
     key_state: WEnum<KeyState>,
 ) -> KeyboardAction {
-    let pressed = matches!(key_state, WEnum::Value(KeyState::Pressed));
-    if !pressed {
+    // Released 分支
+    if matches!(key_state, WEnum::Value(KeyState::Released)) {
+        if let Some(active) = state.current_repeat.as_ref() {
+            if active.keycode == evdev_keycode {
+                state.current_repeat = None;
+                tracing::debug!(
+                    target: "quill::keyboard",
+                    evdev_keycode,
+                    "released active repeat key"
+                );
+                return KeyboardAction::StopRepeat;
+            }
+        }
+        return KeyboardAction::Nothing;
+    }
+    // 非 Pressed 也非 Released (例如 WEnum::Unknown / 未来 variant) → 沉默
+    if !matches!(key_state, WEnum::Value(KeyState::Pressed)) {
         return KeyboardAction::Nothing;
     }
     let xkb_state = match state.xkb_state.as_mut() {
@@ -313,17 +449,27 @@ fn key_press_action(
     // 串更稳。其它键全走 xkbcommon utf8 默认 (Ctrl+letter / Shift+letter /
     // dead key / compose 全交给 xkbcommon)。
     let keysym = xkb_state.key_get_one_sym(xkb_keycode);
-    if let Some(bytes) = terminal_keysym_override(keysym) {
-        return KeyboardAction::WriteToPty(bytes);
-    }
+    let bytes = if let Some(b) = terminal_keysym_override(keysym) {
+        b
+    } else {
+        let utf8 = xkb_state.key_get_utf8(xkb_keycode);
+        if utf8.is_empty() {
+            // modifier-only key (Shift / Ctrl / Alt 单按) → 无 UTF-8 输出,
+            // 沉默 + 不进 repeat (按住 Shift 不该连发).
+            return KeyboardAction::Nothing;
+        }
+        utf8.into_bytes()
+    };
 
-    let utf8 = xkb_state.key_get_utf8(xkb_keycode);
-    if utf8.is_empty() {
-        // modifier-only key (Shift / Ctrl / Alt 单按) → 无 UTF-8 输出, 沉默。
-        return KeyboardAction::Nothing;
-    }
-    let bytes = utf8.into_bytes();
-    KeyboardAction::WriteToPty(bytes)
+    // T-0603: 进入 repeat. 不论之前 current_repeat 是否为 Some — 直接覆盖
+    // (用户切按下另一键时, 旧 repeat 被新 repeat 替换, alacritty/foot 同).
+    // 调用方在 StartRepeat 路径 cancel 旧 timer + insert 新 timer, 不会留
+    // 重复 source.
+    state.current_repeat = Some(RepeatKey {
+        keycode: evdev_keycode,
+        bytes: bytes.clone(),
+    });
+    KeyboardAction::StartRepeat { bytes }
 }
 
 /// terminal-style keysym 重写表。命中返 `Some(bytes)`, 不命中返 `None` 让
@@ -465,9 +611,11 @@ mod tests {
         let _ = handle_key_event(event, state);
     }
 
-    /// 'a' key (evdev KEY_A = 30) 单按 → b"a"。最基本路径, 派单 acceptance 第一条。
+    /// 'a' key (evdev KEY_A = 30) 单按 → StartRepeat { b"a" }. T-0603 起改为
+    /// `StartRepeat` (Pressed 即时回显由调用方 `pty.write(&bytes)`, repeat
+    /// 由调用方 schedule timer). 派单 acceptance 第一条 (字节内容仍是 "a").
     #[test]
-    fn press_a_writes_lowercase_a() {
+    fn press_a_starts_repeat_with_lowercase_a() {
         let mut state = KeyboardState::new().expect("ctx new");
         state
             .load_default_us_keymap()
@@ -476,69 +624,94 @@ mod tests {
         let action = press(&mut state, 30);
         assert_eq!(
             action,
-            KeyboardAction::WriteToPty(b"a".to_vec()),
-            "us layout 'a' 单按应写 lowercase 'a'"
+            KeyboardAction::StartRepeat {
+                bytes: b"a".to_vec()
+            },
+            "us layout 'a' 单按应 StartRepeat 携带 lowercase 'a'"
         );
+        assert!(state.has_repeat(), "Pressed 后应进入 repeat 状态");
     }
 
-    /// Ctrl+c → 0x03 (ETX, shell SIGINT). xkbcommon 内部对 Ctrl+letter 做
-    /// modifier composition 直返控制字符, 我们不需要自己 mask。派单 acceptance
-    /// 第二条。
+    /// Ctrl+c → StartRepeat { 0x03 } (ETX, shell SIGINT). xkbcommon 内部对
+    /// Ctrl+letter 做 modifier composition 直返控制字符. 派单 acceptance 第二条.
     #[test]
-    fn ctrl_c_writes_etx_0x03() {
+    fn ctrl_c_starts_repeat_with_etx_0x03() {
         let mut state = KeyboardState::new().expect("ctx new");
         state.load_default_us_keymap().expect("keymap");
         // 设 Control mask. xkbcommon 默认 Control_L 在 mod_index Control (=2),
         // 即 mods_depressed bit 2 = 0b0100 = 4。
-        // 但派单允许我们用查询方式: 通过 mod_name_is_active 验证 Control 实际
-        // 起效。这里直接用 bit 2 (Control mod index) 喂 update_mask。
         set_modifiers(&mut state, 1 << 2);
         // KEY_C = 46
         let action = press(&mut state, 46);
         assert_eq!(
             action,
-            KeyboardAction::WriteToPty(vec![0x03]),
-            "Ctrl+C 应给 ETX 0x03 (SIGINT 字符)"
+            KeyboardAction::StartRepeat { bytes: vec![0x03] },
+            "Ctrl+C 应 StartRepeat 携带 ETX 0x03"
         );
     }
 
-    /// Enter (return) → b"\r" (CR). PTY raw mode 期望 \r, 由 termios icrnl
-    /// 转换为 \n (我们不在 client 侧做转换, 派单语义)。
+    /// Enter (return) → StartRepeat { b"\r" } (CR). PTY raw mode 期望 \r,
+    /// 由 termios icrnl 转换为 \n (我们不在 client 侧做转换).
     /// KEY_ENTER = 28
     #[test]
-    fn enter_writes_carriage_return() {
+    fn enter_starts_repeat_with_carriage_return() {
         let mut state = KeyboardState::new().expect("ctx new");
         state.load_default_us_keymap().expect("keymap");
         let action = press(&mut state, 28);
         assert_eq!(
             action,
-            KeyboardAction::WriteToPty(b"\r".to_vec()),
-            "Enter 应给 \\r (PTY termios 自己转 \\n)"
+            KeyboardAction::StartRepeat {
+                bytes: b"\r".to_vec()
+            },
+            "Enter 应 StartRepeat 携带 \\r (PTY termios 自己转 \\n)"
         );
     }
 
-    /// Backspace → 0x7f (DEL). 现代 unix terminal 约定 (xterm / gnome-terminal /
-    /// alacritty 都送 DEL, foot 同), 区别于 BS 0x08 (老 telnet 风格)。
+    /// Backspace → StartRepeat { 0x7f } (DEL). 现代 unix terminal 约定 (xterm /
+    /// gnome-terminal / alacritty 都送 DEL). T-0603 长按 backspace 必须连续删
+    /// — 用户实测反馈的核心场景.
     /// KEY_BACKSPACE = 14
     #[test]
-    fn backspace_writes_del_0x7f() {
+    fn backspace_starts_repeat_with_del_0x7f() {
         let mut state = KeyboardState::new().expect("ctx new");
         state.load_default_us_keymap().expect("keymap");
         let action = press(&mut state, 14);
         assert_eq!(
             action,
-            KeyboardAction::WriteToPty(vec![0x7f]),
-            "Backspace 应给 DEL 0x7f (xterm convention)"
+            KeyboardAction::StartRepeat { bytes: vec![0x7f] },
+            "Backspace 应 StartRepeat 携带 DEL 0x7f (xterm convention)"
         );
     }
 
-    /// release 事件不发字节 — 派单 "单按只发一次" 规则。
+    /// release 同 keycode 应触发 StopRepeat (派单 In #A: Released 时调用方应
+    /// cancel timer). T-0603 改: release 是 stop 信号而非 Nothing.
     #[test]
-    fn release_does_not_write() {
+    fn release_after_press_stops_repeat() {
         let mut state = KeyboardState::new().expect("ctx new");
         state.load_default_us_keymap().expect("keymap");
-        let action = release(&mut state, 30); // KEY_A
-        assert_eq!(action, KeyboardAction::Nothing, "release 不应发字节");
+        let _start = press(&mut state, 30); // KEY_A → StartRepeat
+        assert!(state.has_repeat());
+        let action = release(&mut state, 30);
+        assert_eq!(
+            action,
+            KeyboardAction::StopRepeat,
+            "release 同键应 StopRepeat"
+        );
+        assert!(!state.has_repeat(), "release 后 current_repeat 应清");
+    }
+
+    /// release 不在 current_repeat 时返 Nothing (无前置 press / 早于 keymap
+    /// 的 release / 已被 modifier 变化清掉的 repeat).
+    #[test]
+    fn release_without_repeat_is_nothing() {
+        let mut state = KeyboardState::new().expect("ctx new");
+        state.load_default_us_keymap().expect("keymap");
+        let action = release(&mut state, 30); // KEY_A 未先 press
+        assert_eq!(
+            action,
+            KeyboardAction::Nothing,
+            "无 current_repeat 时 release 应 Nothing"
+        );
     }
 
     /// keymap 未到时所有 Key event 沉默 (wl_keyboard 协议保证 Keymap 先于 Key,
@@ -555,23 +728,9 @@ mod tests {
         );
     }
 
-    /// modifier-only 单按 (Shift_L) 不应发字节 — UTF-8 为空。
-    /// KEY_LEFTSHIFT = 42
+    /// Shift+a → StartRepeat { 'A' } (capital). Modifier composition 走 xkbcommon.
     #[test]
-    fn shift_only_does_not_write() {
-        let mut state = KeyboardState::new().expect("ctx new");
-        state.load_default_us_keymap().expect("keymap");
-        let action = press(&mut state, 42);
-        assert_eq!(
-            action,
-            KeyboardAction::Nothing,
-            "Shift 单按 (无后续 letter) 应沉默"
-        );
-    }
-
-    /// Shift+a → 'A' (capital). Modifier composition 走 xkbcommon。
-    #[test]
-    fn shift_a_writes_capital_a() {
+    fn shift_a_starts_repeat_with_capital_a() {
         let mut state = KeyboardState::new().expect("ctx new");
         state.load_default_us_keymap().expect("keymap");
         // Shift mod index = 0 (Shift), bit 0 = 1
@@ -579,13 +738,136 @@ mod tests {
         let action = press(&mut state, 30); // KEY_A
         assert_eq!(
             action,
-            KeyboardAction::WriteToPty(b"A".to_vec()),
-            "Shift+a 应给 'A'"
+            KeyboardAction::StartRepeat {
+                bytes: b"A".to_vec()
+            },
+            "Shift+a 应 StartRepeat 携带 'A'"
         );
     }
 
-    /// RepeatInfo 事件应更新 repeat_rate / repeat_delay 不返字节, Phase 6
-    /// timerfd 路径将读这两个值。
+    /// Tab key → StartRepeat { b"\t" }. 常用编辑器 / shell completion 触发,
+    /// 派单 ASCII 范畴内. KEY_TAB = 15
+    #[test]
+    fn tab_starts_repeat_with_tab() {
+        let mut state = KeyboardState::new().expect("ctx new");
+        state.load_default_us_keymap().expect("keymap");
+        let action = press(&mut state, 15);
+        assert_eq!(
+            action,
+            KeyboardAction::StartRepeat {
+                bytes: b"\t".to_vec()
+            },
+            "Tab 应 StartRepeat 携带 \\t (HT)"
+        );
+    }
+
+    // === T-0603 新加测试 (派单 In #D) ===
+
+    /// modifier 任意变化 cancel 当前 repeat (派单 In #C alacritty 行为).
+    /// 按住 'a' 进入 repeat → 按 Shift (modifier mask 变化) → 应返 StopRepeat
+    /// 且 current_repeat 被清.
+    #[test]
+    fn modifier_change_cancels_repeat() {
+        let mut state = KeyboardState::new().expect("ctx new");
+        state.load_default_us_keymap().expect("keymap");
+        let _ = press(&mut state, 30); // KEY_A → StartRepeat
+        assert!(state.has_repeat());
+        // 按 Shift: modifier mask 从 0 变 1
+        let event = wl_keyboard::Event::Modifiers {
+            serial: 0,
+            mods_depressed: 1 << 0,
+            mods_latched: 0,
+            mods_locked: 0,
+            group: 0,
+        };
+        let action = handle_key_event(event, &mut state);
+        assert_eq!(
+            action,
+            KeyboardAction::StopRepeat,
+            "modifier 变化应 StopRepeat"
+        );
+        assert!(!state.has_repeat(), "modifier 变化后 current_repeat 应清");
+    }
+
+    /// modifier 不变时 (重复同 mask) 不应误 cancel repeat. 防御 compositor
+    /// 在 focus 切回 / 别的事件携带 Modifiers 但 mask 没动的场景.
+    #[test]
+    fn modifier_unchanged_keeps_repeat() {
+        let mut state = KeyboardState::new().expect("ctx new");
+        state.load_default_us_keymap().expect("keymap");
+        // 起步 set_modifiers(0) (与初始 last_modifier_mask 同), 不动 repeat
+        set_modifiers(&mut state, 0);
+        let _ = press(&mut state, 30); // KEY_A → StartRepeat
+        assert!(state.has_repeat());
+        // 再发一次 mods_depressed=0 (无变化)
+        set_modifiers(&mut state, 0);
+        assert!(state.has_repeat(), "mask 不变不应清 repeat");
+    }
+
+    /// 按住 'a' 又按 'b' (新 Pressed): 旧 repeat 被新 repeat 覆盖. 调用方
+    /// 在 StartRepeat 路径会 cancel 旧 timer + insert 新 timer, 因此新键
+    /// 接管 repeat. release 'b' 时 stop, release 'a' 时 (current_repeat 已
+    /// 是 b, keycode 不匹配 a) 返 Nothing.
+    #[test]
+    fn second_press_replaces_first_repeat() {
+        let mut state = KeyboardState::new().expect("ctx new");
+        state.load_default_us_keymap().expect("keymap");
+        let _ = press(&mut state, 30); // KEY_A
+        let action_b = press(&mut state, 48); // KEY_B = 48
+        assert_eq!(
+            action_b,
+            KeyboardAction::StartRepeat {
+                bytes: b"b".to_vec()
+            },
+            "第二个 Pressed 应覆盖前 repeat 给 StartRepeat"
+        );
+        // release 'a' (旧键, 已不在 current_repeat) → Nothing
+        let release_a = release(&mut state, 30);
+        assert_eq!(release_a, KeyboardAction::Nothing, "释放旧键应 Nothing");
+        assert!(state.has_repeat(), "旧键 release 不应清 b 的 repeat");
+        // release 'b' → StopRepeat
+        let release_b = release(&mut state, 48);
+        assert_eq!(release_b, KeyboardAction::StopRepeat);
+    }
+
+    /// modifier-only 单按 (Shift_L) 不应进 repeat — utf8 空, 无 StartRepeat.
+    /// 派单隐式: 按住 Shift 不该连发任何字节.
+    #[test]
+    fn shift_only_does_not_enter_repeat() {
+        let mut state = KeyboardState::new().expect("ctx new");
+        state.load_default_us_keymap().expect("keymap");
+        let action = press(&mut state, 42); // KEY_LEFTSHIFT
+        assert_eq!(
+            action,
+            KeyboardAction::Nothing,
+            "Shift 单按 (无后续 letter) 应沉默"
+        );
+        assert!(!state.has_repeat(), "modifier-only press 不进 repeat");
+    }
+
+    /// `tick_repeat` 在 current_repeat=Some 时返字节副本; None 时返 None.
+    /// timer callback 走此入口, None 触发 TimeoutAction::Drop.
+    #[test]
+    fn tick_repeat_returns_bytes_when_repeating() {
+        let mut state = KeyboardState::new().expect("ctx new");
+        state.load_default_us_keymap().expect("keymap");
+        assert_eq!(state.tick_repeat(), None, "无 repeat 时返 None");
+        let _ = press(&mut state, 30); // KEY_A
+        assert_eq!(
+            state.tick_repeat(),
+            Some(b"a".to_vec()),
+            "repeat 中应返字节副本"
+        );
+        // 多次 tick 拿同一字节 (不 mutate state)
+        assert_eq!(state.tick_repeat(), Some(b"a".to_vec()));
+        let _ = release(&mut state, 30);
+        assert_eq!(state.tick_repeat(), None, "release 后返 None");
+    }
+
+    /// RepeatInfo 事件应更新 repeat_rate / repeat_delay 不返字节.
+    /// T-0603 timer 调度调用方读 `repeat_info()` 的 (rate, delay) 算
+    /// `Timer::from_duration(Duration::from_millis(delay))` + reschedule
+    /// `1000/rate` ms.
     #[test]
     fn repeat_info_updates_state() {
         let mut state = KeyboardState::new().expect("ctx new");
@@ -596,19 +878,5 @@ mod tests {
         let action = handle_key_event(event, &mut state);
         assert_eq!(action, KeyboardAction::Nothing);
         assert_eq!(state.repeat_info(), (25, 600), "RepeatInfo 应被记录");
-    }
-
-    /// Tab key → b"\t". 常用编辑器 / shell completion 触发, 派单 ASCII 范畴内。
-    /// KEY_TAB = 15
-    #[test]
-    fn tab_writes_tab() {
-        let mut state = KeyboardState::new().expect("ctx new");
-        state.load_default_us_keymap().expect("keymap");
-        let action = press(&mut state, 15);
-        assert_eq!(
-            action,
-            KeyboardAction::WriteToPty(b"\t".to_vec()),
-            "Tab 应给 \\t (HT)"
-        );
     }
 }
