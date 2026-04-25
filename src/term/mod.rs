@@ -67,6 +67,61 @@ impl CellPos {
     }
 }
 
+/// 滚动 buffer (scrollback) 中某历史行的位置。**与 [`CellPos`] 完全分离**,
+/// 不扩 `CellPos` enum:viewport 内的 cell 用 `CellPos { col, line }`(line ∈
+/// `0..rows`),滚出去的历史行用 `ScrollbackPos { row }`(row ∈
+/// `0..scrollback_size()`)。两条独立通路,渲染层 / 调用方按场景选其一。
+///
+/// **row 语义**:
+/// - `row = 0` → **最旧**的历史行(scrollback 顶端)
+/// - `row = scrollback_size() - 1` → **最新**滚出 viewport 那一行(贴着 viewport 顶)
+///
+/// 这个方向选择是 quill 渲染层友好序:scroll-up UI 时"往上滚 N 行"对应
+/// `row` 减少,自然顺序与 alacritty 内部 `Line(-1)` 是最新、`Line(-history)`
+/// 是最旧的负值方向相反 —— 私有 [`to_alacritty`] 做反向映射,下游不感知。
+///
+/// **设计理由**(沿袭 T-0302 [`CellPos`] / T-0303 [`CursorShape`] 类型隔离 SOP):
+/// - 不 re-export `alacritty_terminal::index::Line`/`Point`(那是 `i32`,负值 =
+///   scrollback,语义对外不友好,且未来换 VT 库时要 cascade 改)
+/// - 私有 `to_alacritty` inherent fn(非 `From` trait),让 alacritty scrollback
+///   坐标彻底锁在 `src/term/mod.rs` 内,审码 T-0303 P3-2 推荐源头
+/// - viewport line 永正,scrollback row 永正 —— 类型层面隔开正/负,
+///   渲染调用点不再 mix `i32` / `usize`
+///
+/// 测试覆盖见 `tests::scrollback_*`。
+///
+/// [`to_alacritty`]: ScrollbackPos::to_alacritty
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ScrollbackPos {
+    pub row: usize,
+}
+
+impl ScrollbackPos {
+    /// 把 quill 的 `ScrollbackPos { row }`(row=0 最旧、row=history-1 最新)
+    /// 映射到 alacritty 内部 `Line(i32)`(`-history` 最旧、`-1` 最新)。
+    ///
+    /// **模块私有 inherent fn**,不开 `impl From` / `impl Into` —— 沿袭
+    /// `CellPos::from_alacritty` / `CursorShape::from_alacritty` 的隔离套路:
+    /// 下游既不能 `Line::from(pos)` 反向构造,也不能 `pos.into()` 偷渡 alacritty
+    /// 类型出去。
+    ///
+    /// **饱和 clamp**:理想情况下调用方先用 [`TermState::scrollback_size`] 校验
+    /// row 在范围内,但万一漏检(row >= history_size 或 history_size == 0),
+    /// 这里 clamp 到 `Line(-1)`(最新历史行)而非 panic / UB。下游看见已存在
+    /// 历史行的内容(过近 1 行),比 alacritty `grid[Line]` 的越界 panic 友好。
+    /// `history_size == 0` 时落到 `Line(0)` 即 viewport 第 0 行(无历史可索引,
+    /// 显式分支让意图清楚)。
+    fn to_alacritty(self, history_size: usize) -> alacritty_terminal::index::Line {
+        use alacritty_terminal::index::Line;
+        if history_size == 0 {
+            return Line(0);
+        }
+        let history = history_size as i32;
+        let row = (self.row as i32).min(history - 1);
+        Line(row - history)
+    }
+}
+
 /// quill 自己的光标形状枚举,**不**re-export `alacritty_terminal::vte::ansi::CursorShape`。
 ///
 /// 与 alacritty 0.26 的 5 个 variants 一一对应:
@@ -328,6 +383,79 @@ impl TermState {
     pub fn dimensions(&self) -> (usize, usize) {
         (self.term.columns(), self.term.screen_lines())
     }
+
+    // ---------- T-0304 scrollback API ----------
+    // alacritty `Grid` 已经实装 ring-buffer 形式的 scrollback storage(`Term::new`
+    // 时按 `Config::scrolling_history` 默认 10000 行预留 max_scroll_limit),viewport
+    // 满后多余的行往负 `Line(i32)` 索引扩张。本组方法是给 quill 公共 API 暴露
+    // **只读**入口:
+    // - `scrollback_size`:当前历史行数(动态 0..max_scroll_limit)
+    // - `scrollback_line_text`:某历史行文本(测试 / 调试 / 未来 search-up UI)
+    // - `scrollback_cells_iter`:某历史行 cell 迭代(给 T-0305 渲染层 scroll-up 用)
+    //
+    // 位置类型用独立 [`ScrollbackPos`](row=0 最旧),不混入 `CellPos`(它的 line
+    // 永远在 `0..rows` viewport 内)。
+    //
+    // 不在 scope 内:scroll-up UI / 选择文本 / 历史行写入 / 改 history_size,
+    // 这些是后续 ticket 的事。
+
+    /// 当前 scrollback 中的历史行数。`0` 表示还没行被滚出 viewport。
+    ///
+    /// 上限是 `Config::scrolling_history`(默认 10000),实际值随 PTY 输出动态
+    /// 增长 —— 每次 viewport 满后再来一行,最旧 viewport 行进 scrollback,
+    /// `scrollback_size()` 加 1,直到撞到上限后旧行被丢弃。
+    pub fn scrollback_size(&self) -> usize {
+        self.term.grid().history_size()
+    }
+
+    /// 读取某历史行的文本。row 语义见 [`ScrollbackPos`]:`row = 0` 最旧、
+    /// `row = scrollback_size() - 1` 最新滚出。
+    ///
+    /// 末尾空白不 trim(与 [`line_text`] 一致),调用方自己判断。主要给集成
+    /// 测试 / 调试用;渲染层走 [`scrollback_cells_iter`] 更高效(避免 String 分配)。
+    ///
+    /// 越界(row >= scrollback_size 或 scrollback_size == 0)走
+    /// [`ScrollbackPos::to_alacritty`] 的 clamp 路径,不 panic;返回的内容是
+    /// clamp 落点行(最新一行 / viewport 第 0 行),调用方应先用
+    /// [`scrollback_size`] 校验。
+    ///
+    /// [`line_text`]: Self::line_text
+    /// [`scrollback_cells_iter`]: Self::scrollback_cells_iter
+    /// [`scrollback_size`]: Self::scrollback_size
+    pub fn scrollback_line_text(&self, pos: ScrollbackPos) -> String {
+        use alacritty_terminal::index::Column;
+        let grid = self.term.grid();
+        let line = pos.to_alacritty(grid.history_size());
+        let row = &grid[line];
+        let cols = grid.columns();
+        (0..cols).map(|c| row[Column(c)].c).collect()
+    }
+
+    /// 历史行的 cell 迭代器,给 T-0305 渲染层 scroll-up 用。
+    ///
+    /// 产出 `cols` 个 [`CellRef`](80×24 默认 80 个),与 [`cells_iter`] 同类型
+    /// —— 渲染调用点能复用同一套绘制逻辑(`draw_cell_at_pos`)。
+    ///
+    /// **位置语义注意**:每个 `CellRef.pos.line` 字段固定填 `0`(占位),
+    /// **真实位置由调用方传入的 [`ScrollbackPos`] 单独承载**。理由:scrollback
+    /// 行没有 viewport line 概念,硬塞会让 `CellPos` 语义混乱(viewport line ∈
+    /// `0..rows`)。`pos.col` 字段仍然有效(0..cols)。
+    ///
+    /// 越界 row 走 clamp(见 [`ScrollbackPos::to_alacritty`])。
+    ///
+    /// [`cells_iter`]: Self::cells_iter
+    pub fn scrollback_cells_iter(&self, pos: ScrollbackPos) -> impl Iterator<Item = CellRef> + '_ {
+        use alacritty_terminal::index::Column;
+        let grid = self.term.grid();
+        let line = pos.to_alacritty(grid.history_size());
+        let cols = grid.columns();
+        (0..cols).map(move |c| CellRef {
+            // line=0 占位:scrollback 行没有 viewport line 概念,真实位置走
+            // 调用方传入的 ScrollbackPos。详见 fn docstring。
+            pos: CellPos { col: c, line: 0 },
+            c: grid[line][Column(c)].c,
+        })
+    }
 }
 
 /// [`TermState::cells_iter`] 的 iterator。把 alacritty 的
@@ -576,6 +704,137 @@ mod tests {
 
         t.advance(b"\x1b[2 q"); // steady block
         assert_eq!(t.cursor_shape(), CursorShape::Block);
+    }
+
+    // ---------- T-0304 scrollback API 单测 ----------
+
+    /// ctor 后 grid 还没溢出过 viewport,scrollback 应为 0。
+    #[test]
+    fn scrollback_size_zero_initially() {
+        let t = TermState::new(80, 24);
+        assert_eq!(
+            t.scrollback_size(),
+            0,
+            "新构造的 TermState 还没行被滚出 viewport, scrollback 应为 0"
+        );
+    }
+
+    /// 写超过 viewport 的行数,scrollback 应增长。24-行 viewport 推 50 行,
+    /// 期望 scrollback >= 25(50 - 24 = 26 行进 history,允许 1 行误差给最后一行
+    /// 的尾随换行边界)。
+    ///
+    /// 用 `\r\n` 而非 `\n`(详见 `advance_hi_newline_moves_cursor` 测试 PTY
+    /// 字节语义说明)。
+    #[test]
+    fn scrollback_size_grows_after_overflow() {
+        let mut t = TermState::new(80, 24);
+        // 50 行,够把 24-行 viewport 顶满 + 多 26 行进 scrollback
+        for i in 0..50 {
+            let line = format!("line_{:02}\r\n", i);
+            t.advance(line.as_bytes());
+        }
+        assert!(
+            t.scrollback_size() >= 25,
+            "推 50 行后 scrollback 应 >= 25, 实际 = {}",
+            t.scrollback_size()
+        );
+    }
+
+    /// `ScrollbackPos { row: 0 }` 应取最旧的历史行(scrollback 顶端)。
+    ///
+    /// 写 `line_00`...`line_49`,`row=0` 应返 `line_00...`(末尾空格不 trim,
+    /// 验证 `starts_with`)。锁住"row 方向":row=0 是最旧,row=history-1 是
+    /// 最新滚出 — 渲染层 / scroll-up UI 友好序。
+    #[test]
+    fn scrollback_line_text_returns_oldest_first() {
+        let mut t = TermState::new(80, 24);
+        for i in 0..50 {
+            let line = format!("line_{:02}\r\n", i);
+            t.advance(line.as_bytes());
+        }
+        let history = t.scrollback_size();
+        assert!(history >= 25, "前置: scrollback 应 >= 25");
+
+        let oldest = t.scrollback_line_text(ScrollbackPos { row: 0 });
+        assert!(
+            oldest.starts_with("line_00"),
+            "row=0 应是最旧行 'line_00...', 实际: {:?}",
+            oldest
+        );
+
+        // 反向锁: row=history-1 应是最新滚出去那一行
+        // 50 行推完,viewport 显示最末 24 行(line_26..line_49),
+        // 所以最新进 scrollback 的是 line_25 (推 line_26 时 line_25 顶出 viewport
+        // 进 scrollback,以此类推)。但 alacritty 语义略有边界差异,只锁前缀
+        // 是 line_xx 形式即可,不 hard-code 编号。
+        let newest_history = t.scrollback_line_text(ScrollbackPos { row: history - 1 });
+        assert!(
+            newest_history.starts_with("line_"),
+            "row=history-1 应也是某行 'line_NN...', 实际: {:?}",
+            newest_history
+        );
+    }
+
+    /// `scrollback_cells_iter` 产出的字符序列应与 `scrollback_line_text` 一致
+    /// (同行另一种访问方式)。也锁住每个 `CellRef.pos.line == 0` 占位、
+    /// `pos.col` 0..cols 顺序。
+    #[test]
+    fn scrollback_cells_iter_yields_chars() {
+        let mut t = TermState::new(80, 24);
+        for i in 0..50 {
+            let line = format!("ABC{:02}\r\n", i);
+            t.advance(line.as_bytes());
+        }
+        let history = t.scrollback_size();
+        assert!(history >= 25);
+
+        let pos = ScrollbackPos { row: 0 };
+        let cells: Vec<CellRef> = t.scrollback_cells_iter(pos).collect();
+        assert_eq!(cells.len(), 80, "每行应产 80 个 cell (cols)");
+
+        // pos.line 占位为 0, pos.col 0..80 严格递增
+        for (i, cr) in cells.iter().enumerate() {
+            assert_eq!(
+                cr.pos.line, 0,
+                "scrollback CellRef.pos.line 应固定为 0 占位"
+            );
+            assert_eq!(cr.pos.col, i, "pos.col 应严格 0..80 递增");
+        }
+
+        // 字符序列 = scrollback_line_text 一致
+        let chars_from_iter: String = cells.iter().map(|c| c.c).collect();
+        let chars_from_text = t.scrollback_line_text(pos);
+        assert_eq!(
+            chars_from_iter, chars_from_text,
+            "cells_iter 与 line_text 应给出同一行同一字符序列"
+        );
+        assert!(
+            chars_from_iter.starts_with("ABC00"),
+            "row=0 (oldest) 应是 'ABC00...', 实际: {:?}",
+            chars_from_iter
+        );
+    }
+
+    /// `ScrollbackPos::to_alacritty` 私有 inherent fn 的边界测试:
+    /// 1. 正常映射 (row=0 → Line(-history), row=history-1 → Line(-1))
+    /// 2. row 越界 → clamp 到 Line(-1) (不 panic)
+    /// 3. history_size == 0 → 落到 Line(0) (兜底分支)
+    ///
+    /// 与 T-0302 `cellpos_from_alacritty_viewport_and_negative_line` 同款思路:
+    /// 私有 fn 的覆盖也走同文件 tests mod。
+    #[test]
+    fn scrollbackpos_to_alacritty_boundaries() {
+        use alacritty_terminal::index::Line;
+
+        // 正常: history=10, row=0 → Line(-10) (最旧)
+        assert_eq!(ScrollbackPos { row: 0 }.to_alacritty(10), Line(-10));
+        // 正常: history=10, row=9 → Line(-1) (最新滚出)
+        assert_eq!(ScrollbackPos { row: 9 }.to_alacritty(10), Line(-1));
+        // 越界: history=10, row=999 → clamp Line(-1)
+        assert_eq!(ScrollbackPos { row: 999 }.to_alacritty(10), Line(-1));
+        // 边界 history=0: 兜底落 Line(0) (无历史可索引)
+        assert_eq!(ScrollbackPos { row: 0 }.to_alacritty(0), Line(0));
+        assert_eq!(ScrollbackPos { row: 5 }.to_alacritty(0), Line(0));
     }
 
     /// `CursorShape::from_alacritty` 5 个 variants 全 1:1 映射,无折叠 / 无丢失。
