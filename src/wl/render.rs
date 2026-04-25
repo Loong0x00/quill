@@ -341,6 +341,58 @@ pub struct PreeditOverlay {
     pub cursor_line: usize,
 }
 
+/// **T-0601: 光标渲染厚度** (logical px, render 内部 × HIDPI_SCALE).
+/// Underline 模式底部横线 / Beam 模式左侧竖线 / HollowBlock 边框 厚度共用。
+/// 2 logical = 4 physical (HIDPI_SCALE=2), 视觉清晰且不喧宾夺主。
+pub const CURSOR_THICKNESS_PX: u32 = 2;
+
+/// T-0601: 光标渲染入参。draw_frame / render_headless 在 (col, line) cell 位
+/// 置按 [`CursorStyle`] 绘制 quad (Block 整 cell 反色, Underline 底部横线,
+/// Beam 左侧竖线, HollowBlock 4 边框, Hidden 跳过)。
+///
+/// **why quill 自有 enum 而非 re-export `term::CursorShape`**: INV-010 类型
+/// 隔离 — render 层入参语义只关心"渲染怎么画", 与 term 状态机的 ANSI shape
+/// 语义解耦。term 的 `CursorShape` 已经是 quill 自有 enum (而非 alacritty
+/// 上游), render 这边再加一层 `CursorStyle` 仅 4 variant (Block / Underline /
+/// Beam / HollowBlock, Hidden 折叠到 visible=false), 调用方 (window.rs idle
+/// callback) 显式 match `term::CursorShape -> render::CursorStyle` — 上游加
+/// shape variant 时 compile error 在 window.rs 一处捕获, 不传染到 render。
+///
+/// `visible` 字段独立 (与 [`crate::term::TermState::cursor_visible`] 同语义,
+/// SHOW_CURSOR 模式位): IME preedit 显示时调用方传 `visible=false` 隐光标
+/// (光标位置与 preedit 起点视觉冲突, 主流 IME 都隐光标显 preedit)。
+#[derive(Debug, Clone, Copy)]
+pub struct CursorInfo {
+    pub col: usize,
+    pub line: usize,
+    pub visible: bool,
+    pub style: CursorStyle,
+    /// 光标块 / 线 / 框的颜色。常态走 cell.fg (浅灰 #d3d3d3, 与字形同色 → cell
+    /// 上字形被块覆盖呈"实心方块"视觉, alacritty 的 unfocused 等价路径). 调用
+    /// 方据需自定 — 例: 未来 focus-aware 可在失焦时改 #888888 暗灰。
+    pub color: crate::term::Color,
+}
+
+/// T-0601: 光标渲染形状. 与 [`crate::term::CursorShape`] 5 variant 语义同源,
+/// 但 render 层折掉 `Hidden` (走 [`CursorInfo::visible`] = false). 4 variant 全
+/// 走 cell pass (REPLACE color rect, append 到 cell_vertex_bytes), 不需 glyph
+/// 路径.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorStyle {
+    /// 整 cell 实心填充 (默认). 字形被覆盖呈实心方块, daily-drive 体感与
+    /// alacritty / foot 一致.
+    Block,
+    /// 底部横线 (`CURSOR_THICKNESS_PX × HIDPI_SCALE` 物理 px), 与 preedit
+    /// underline 共用厚度但不与之重叠 (preedit 隐光标, 见 [`CursorInfo`] doc).
+    Underline,
+    /// 左侧竖线 (`CURSOR_THICKNESS_PX × HIDPI_SCALE` 物理 px). VS Code 风格.
+    Beam,
+    /// 4 边框 (各 `CURSOR_THICKNESS_PX × HIDPI_SCALE` 物理 px). alacritty
+    /// 失焦时的视觉, focus-aware 入口 (Phase 6+ wl_keyboard enter/leave 接入
+    /// 时 window.rs 据此切换 Block ↔ HollowBlock).
+    HollowBlock,
+}
+
 /// **HiDPI 整数缩放常数** (T-0404 简化版, hardcode 2x)。
 ///
 /// **why hardcode 而非 wl_output.scale event**: 用户硬偏好 (派单 Out 段),
@@ -1278,6 +1330,10 @@ impl Renderer {
         hover: super::pointer::HoverRegion,
         // T-0505: preedit overlay (None = 无 IME 组词). 见 PreeditOverlay struct.
         preedit: Option<&PreeditOverlay>,
+        // T-0601: cursor info (None = 调用方明确不画光标 / 测试). 常态 Some(_),
+        // 调用方在 IME preedit 显示时把 visible=false (光标位置与 preedit 起点
+        // 视觉冲突). 见 [`CursorInfo`] doc.
+        cursor: Option<&CursorInfo>,
     ) -> Result<()> {
         if cols == 0 || rows == 0 {
             return self.render();
@@ -1460,7 +1516,33 @@ impl Renderer {
                 );
             }
         }
-        // cell_vertex_count 重新算 (preedit underline 可能 append 了 cell 顶点)
+
+        // T-0601: 光标 quad(s). 在 cell pass 内, REPLACE blend 直接覆盖 cell bg
+        // (Block 模式下也覆盖 glyph 因为顶点提交顺序: cells → cursor 都在同一
+        // pass 一次 draw, 但 GPU rasterize 顺序由 vertex 索引决定 → cursor 顶点
+        // 位于 cell 顶点之后, 同 z-depth REPLACE 即"后写者覆盖"). 派单 In #B
+        // 主线: Block 整 cell 实心填 cell.fg 色; 字形仍走 glyph pass (alpha
+        // blend in fg) 在 cursor 块上"涂同色等于不可见", 视觉上呈实心方块, 与
+        // alacritty unfocused / foot 一致 (派单 acceptance "光标位置可见").
+        //
+        // visible=false (DECRST 25 / IME preedit 显示) 时跳过, 见 append fn.
+        if let Some(c) = cursor {
+            let cursor_color = self.color_for_vertex(c.color);
+            append_cursor_quads_to_cell_bytes(
+                &mut cell_vertex_bytes,
+                c,
+                cols,
+                rows,
+                cell_w_px,
+                cell_h_px,
+                surface_w,
+                surface_h,
+                titlebar_y_offset_px,
+                cursor_color,
+            );
+        }
+
+        // cell_vertex_count 重新算 (preedit underline / cursor quad 可能已 append)
         let cell_vertex_count = (cell_vertex_bytes.len() / VERTEX_BYTES) as u32;
         let glyph_vertex_count = (glyph_vertex_bytes.len() / GLYPH_VERTEX_BYTES) as u32;
 
@@ -2032,6 +2114,98 @@ fn append_preedit_underline_to_cell_bytes(
     }
 }
 
+/// **T-0601: 在 cell_vertex_bytes 上追加光标 quad(s)** (cell pass REPLACE
+/// 路径). 按 `cursor.style` 派生 1 (Block / Underline / Beam) 或 4 (HollowBlock)
+/// 个矩形. `cursor.visible == false` / 越界 (col >= cols / line >= rows) 时
+/// no-op.
+///
+/// **why free fn 而非 method on Renderer**: 与 [`append_preedit_underline_to_cell_bytes`]
+/// 同决策 — 纯 vertex generation 数学, 无 GPU 资源依赖, render_headless 也能
+/// 复用. 入参显式传 cell_w_px / cell_h_px / surface_w / surface_h, 与上下文
+/// 解耦让两路径 (Renderer::draw_frame + render_headless) 共用一个 fn.
+///
+/// **why y_offset_px 入参**: T-0504 后 cell 区起绘 y 已偏移 titlebar 高度
+/// (`build_vertex_bytes` 同入参), 光标位置必须同步加 offset, 否则光标飘到
+/// titlebar 之上视觉错位. headless 路径同样需要 (T-0504 已在 render_headless
+/// inline cell quad 生成时加 offset).
+#[allow(clippy::too_many_arguments)]
+fn append_cursor_quads_to_cell_bytes(
+    cell_vertex_bytes: &mut Vec<u8>,
+    cursor: &CursorInfo,
+    cols: usize,
+    rows: usize,
+    cell_w_px: f32,
+    cell_h_px: f32,
+    surface_w: f32,
+    surface_h: f32,
+    y_offset_px: f32,
+    color: [f32; 3],
+) {
+    if !cursor.visible {
+        return;
+    }
+    // 越界保护: term::TermState::resize 后 alacritty 内部 clamp cursor 但
+    // 调用方可能传入旧快照 (race), KISS 直接静默 no-op.
+    if cursor.col >= cols || cursor.line >= rows {
+        return;
+    }
+    let thickness_px = CURSOR_THICKNESS_PX as f32 * HIDPI_SCALE as f32;
+    let cell_x0 = cursor.col as f32 * cell_w_px;
+    let cell_y0 = cursor.line as f32 * cell_h_px + y_offset_px;
+    let cell_x1 = cell_x0 + cell_w_px;
+    let cell_y1 = cell_y0 + cell_h_px;
+
+    // 闭包: 给定 px 矩形 push 6 顶点 (CCW: TL→BL→BR + TL→BR→TR), 与
+    // build_vertex_bytes / append_preedit_underline_to_cell_bytes 同顶点序.
+    let mut push_quad = |x0_px: f32, y0_px: f32, x1_px: f32, y1_px: f32| {
+        let left = x0_px / surface_w * 2.0 - 1.0;
+        let right = x1_px / surface_w * 2.0 - 1.0;
+        let top = 1.0 - y0_px / surface_h * 2.0;
+        let bottom = 1.0 - y1_px / surface_h * 2.0;
+        let verts: [[f32; 2]; 6] = [
+            [left, top],
+            [left, bottom],
+            [right, bottom],
+            [left, top],
+            [right, bottom],
+            [right, top],
+        ];
+        for v in verts {
+            cell_vertex_bytes.extend_from_slice(&v[0].to_ne_bytes());
+            cell_vertex_bytes.extend_from_slice(&v[1].to_ne_bytes());
+            cell_vertex_bytes.extend_from_slice(&color[0].to_ne_bytes());
+            cell_vertex_bytes.extend_from_slice(&color[1].to_ne_bytes());
+            cell_vertex_bytes.extend_from_slice(&color[2].to_ne_bytes());
+        }
+    };
+
+    match cursor.style {
+        CursorStyle::Block => {
+            push_quad(cell_x0, cell_y0, cell_x1, cell_y1);
+        }
+        CursorStyle::Underline => {
+            // 底部 thickness_px 横线
+            push_quad(cell_x0, cell_y1 - thickness_px, cell_x1, cell_y1);
+        }
+        CursorStyle::Beam => {
+            // 左侧 thickness_px 竖线
+            push_quad(cell_x0, cell_y0, cell_x0 + thickness_px, cell_y1);
+        }
+        CursorStyle::HollowBlock => {
+            // 4 边框 (top / bottom / left / right). 各 thickness_px, 角落像素
+            // 重叠允许 (REPLACE blend 同色无视觉差).
+            // top
+            push_quad(cell_x0, cell_y0, cell_x1, cell_y0 + thickness_px);
+            // bottom
+            push_quad(cell_x0, cell_y1 - thickness_px, cell_x1, cell_y1);
+            // left
+            push_quad(cell_x0, cell_y0, cell_x0 + thickness_px, cell_y1);
+            // right
+            push_quad(cell_x1 - thickness_px, cell_y0, cell_x1, cell_y1);
+        }
+    }
+}
+
 /// **T-0408 加** — 离屏渲染入口。**不接 Wayland surface**, 直接 wgpu 渲染到内存
 /// `Texture`, readback 像素返 RGBA8 `Vec<u8>`。
 ///
@@ -2108,6 +2282,9 @@ pub fn render_headless(
     width: u32,
     height: u32,
     preedit: Option<&PreeditOverlay>,
+    // T-0601: 光标 quad(s) (None = headless 测试 / CLI screenshot 不需光标).
+    // 与 [`Renderer::draw_frame`] 同语义, 见 [`CursorInfo`] doc.
+    cursor: Option<&CursorInfo>,
 ) -> Result<(Vec<u8>, u32, u32)> {
     if width == 0 || height == 0 {
         return Err(anyhow!(
@@ -2591,7 +2768,26 @@ pub fn render_headless(
         }
     }
 
-    // 重新算 vertex count (preedit 已可能 append cell underline + glyph)
+    // T-0601: cursor quad(s). 与 Renderer::draw_frame 同源 — Block / Underline /
+    // Beam / HollowBlock 走 cell pass REPLACE, alpha glyph 路径 (preedit 字 / 主
+    // grid 字) 已在前文 append. visible=false 时 no-op (DECRST 25 / IME preedit).
+    if let Some(c) = cursor {
+        let cursor_color = color_for_vertex_with_srgb(c.color, is_srgb);
+        append_cursor_quads_to_cell_bytes(
+            &mut cell_vertex_bytes,
+            c,
+            cols,
+            rows,
+            cell_w_px,
+            cell_h_px,
+            surface_w,
+            surface_h,
+            titlebar_y_offset_px,
+            cursor_color,
+        );
+    }
+
+    // 重新算 vertex count (preedit 已可能 append cell underline + glyph + cursor)
     let cell_vertex_count = (cell_vertex_bytes.len() / VERTEX_BYTES) as u32;
     let glyph_vertex_count = (glyph_vertex_bytes.len() / GLYPH_VERTEX_BYTES) as u32;
 
@@ -2952,6 +3148,289 @@ mod tests {
             HIDPI_SCALE, 2,
             "T-0404 hardcode 2x 简化版 — 派单 Out 段明示不接 wl_output.scale event \
              (用户硬偏好); 改此常数前先看 docs/audit/2026-04-25-T-0404-review.md"
+        );
+    }
+
+    // ---------- T-0601 cursor quad 单测 (派单 In #D) ----------
+
+    /// 厚度常数锁: 防"顺手改成 1 像素 / 0 像素 / 4 像素"。改时同步 reviewer 看
+    /// 三源 PNG verify 是否仍清晰可见.
+    #[test]
+    fn cursor_thickness_is_2() {
+        assert_eq!(CURSOR_THICKNESS_PX, 2, "T-0601 厚度锁 (logical px)");
+    }
+
+    /// 工具: 构造一个 800×600 logical / cell 10×25 logical (× HIDPI_SCALE=2 →
+    /// 1600×1200 physical / cell 20×50 phys) 的固定参数集合.
+    fn cursor_test_geom() -> (f32, f32, f32, f32, f32) {
+        let surface_w = 800.0 * HIDPI_SCALE as f32;
+        let surface_h = 600.0 * HIDPI_SCALE as f32;
+        let cell_w = CELL_W_PX * HIDPI_SCALE as f32;
+        let cell_h = CELL_H_PX * HIDPI_SCALE as f32;
+        let titlebar_offset = 0.0; // 测试用 0, 几何简单
+        (surface_w, surface_h, cell_w, cell_h, titlebar_offset)
+    }
+
+    fn cursor_color_white() -> [f32; 3] {
+        [1.0, 1.0, 1.0]
+    }
+
+    /// Block: 整 cell 1 quad = 6 vertex × VERTEX_BYTES.
+    #[test]
+    fn cursor_block_emits_six_vertices() {
+        let (sw, sh, cw, ch, off) = cursor_test_geom();
+        let cursor = CursorInfo {
+            col: 5,
+            line: 10,
+            visible: true,
+            style: CursorStyle::Block,
+            color: crate::term::Color {
+                r: 0xff,
+                g: 0xff,
+                b: 0xff,
+            },
+        };
+        let mut bytes = Vec::new();
+        append_cursor_quads_to_cell_bytes(
+            &mut bytes,
+            &cursor,
+            80,
+            24,
+            cw,
+            ch,
+            sw,
+            sh,
+            off,
+            cursor_color_white(),
+        );
+        assert_eq!(bytes.len(), 6 * VERTEX_BYTES, "Block = 1 quad = 6 vertices");
+    }
+
+    /// Underline / Beam: 各 1 quad = 6 vertex.
+    #[test]
+    fn cursor_underline_and_beam_emit_six_vertices_each() {
+        let (sw, sh, cw, ch, off) = cursor_test_geom();
+        for style in [CursorStyle::Underline, CursorStyle::Beam] {
+            let cursor = CursorInfo {
+                col: 0,
+                line: 0,
+                visible: true,
+                style,
+                color: crate::term::Color {
+                    r: 0xff,
+                    g: 0xff,
+                    b: 0xff,
+                },
+            };
+            let mut bytes = Vec::new();
+            append_cursor_quads_to_cell_bytes(
+                &mut bytes,
+                &cursor,
+                80,
+                24,
+                cw,
+                ch,
+                sw,
+                sh,
+                off,
+                cursor_color_white(),
+            );
+            assert_eq!(
+                bytes.len(),
+                6 * VERTEX_BYTES,
+                "{:?} = 1 quad = 6 vertices",
+                style
+            );
+        }
+    }
+
+    /// HollowBlock: 4 边 = 4 quad = 24 vertex.
+    #[test]
+    fn cursor_hollow_block_emits_four_quads() {
+        let (sw, sh, cw, ch, off) = cursor_test_geom();
+        let cursor = CursorInfo {
+            col: 1,
+            line: 2,
+            visible: true,
+            style: CursorStyle::HollowBlock,
+            color: crate::term::Color {
+                r: 0xff,
+                g: 0xff,
+                b: 0xff,
+            },
+        };
+        let mut bytes = Vec::new();
+        append_cursor_quads_to_cell_bytes(
+            &mut bytes,
+            &cursor,
+            80,
+            24,
+            cw,
+            ch,
+            sw,
+            sh,
+            off,
+            cursor_color_white(),
+        );
+        assert_eq!(
+            bytes.len(),
+            4 * 6 * VERTEX_BYTES,
+            "HollowBlock = 4 边 = 4 quad = 24 vertices"
+        );
+    }
+
+    /// visible=false → no-op (DECRST 25 / IME preedit 路径).
+    #[test]
+    fn cursor_invisible_emits_zero_vertices() {
+        let (sw, sh, cw, ch, off) = cursor_test_geom();
+        let cursor = CursorInfo {
+            col: 5,
+            line: 5,
+            visible: false,
+            style: CursorStyle::Block,
+            color: crate::term::Color {
+                r: 0xff,
+                g: 0xff,
+                b: 0xff,
+            },
+        };
+        let mut bytes = Vec::new();
+        append_cursor_quads_to_cell_bytes(
+            &mut bytes,
+            &cursor,
+            80,
+            24,
+            cw,
+            ch,
+            sw,
+            sh,
+            off,
+            cursor_color_white(),
+        );
+        assert!(bytes.is_empty(), "visible=false 必须 no-op");
+    }
+
+    /// 越界 (col >= cols / line >= rows): no-op (派单已知陷阱: resize race).
+    #[test]
+    fn cursor_out_of_bounds_emits_zero_vertices() {
+        let (sw, sh, cw, ch, off) = cursor_test_geom();
+        for (col, line) in [(80, 5), (5, 24), (200, 200)] {
+            let cursor = CursorInfo {
+                col,
+                line,
+                visible: true,
+                style: CursorStyle::Block,
+                color: crate::term::Color {
+                    r: 0xff,
+                    g: 0xff,
+                    b: 0xff,
+                },
+            };
+            let mut bytes = Vec::new();
+            append_cursor_quads_to_cell_bytes(
+                &mut bytes,
+                &cursor,
+                80,
+                24,
+                cw,
+                ch,
+                sw,
+                sh,
+                off,
+                cursor_color_white(),
+            );
+            assert!(bytes.is_empty(), "out-of-bounds ({col}, {line}) 必须 no-op");
+        }
+    }
+
+    /// Block 顶点 NDC 范围: cursor (0, 0) 占 cell (0..cw, 0..ch) 物理 px, NDC
+    /// 左上 (-1, +1), 右下 (cw/sw*2-1, 1-ch/sh*2). 验左上角 + 右下角顶点值.
+    #[test]
+    fn cursor_block_at_origin_has_correct_ndc_corners() {
+        let (sw, sh, cw, ch, off) = cursor_test_geom();
+        let cursor = CursorInfo {
+            col: 0,
+            line: 0,
+            visible: true,
+            style: CursorStyle::Block,
+            color: crate::term::Color {
+                r: 0xff,
+                g: 0xff,
+                b: 0xff,
+            },
+        };
+        let mut bytes = Vec::new();
+        append_cursor_quads_to_cell_bytes(
+            &mut bytes,
+            &cursor,
+            80,
+            24,
+            cw,
+            ch,
+            sw,
+            sh,
+            off,
+            cursor_color_white(),
+        );
+        // 第 1 顶点 = TL (left, top) = (-1, +1). 顺序: pos[2 f32] + color[3 f32].
+        let x = f32::from_ne_bytes(bytes[0..4].try_into().unwrap());
+        let y = f32::from_ne_bytes(bytes[4..8].try_into().unwrap());
+        assert!((x - (-1.0)).abs() < 1e-5, "TL.x 应 = -1.0, got {x}");
+        assert!((y - 1.0).abs() < 1e-5, "TL.y 应 = +1.0, got {y}");
+
+        // 第 3 顶点 = BR. 偏移 = 2 × VERTEX_BYTES (= 40 字节).
+        let br_off = 2 * VERTEX_BYTES;
+        let bx = f32::from_ne_bytes(bytes[br_off..br_off + 4].try_into().unwrap());
+        let by = f32::from_ne_bytes(bytes[br_off + 4..br_off + 8].try_into().unwrap());
+        let expected_bx = cw / sw * 2.0 - 1.0;
+        let expected_by = 1.0 - ch / sh * 2.0;
+        assert!(
+            (bx - expected_bx).abs() < 1e-5,
+            "BR.x 应 ~ {expected_bx}, got {bx}"
+        );
+        assert!(
+            (by - expected_by).abs() < 1e-5,
+            "BR.y 应 ~ {expected_by}, got {by}"
+        );
+    }
+
+    /// Beam (左侧竖线): 顶点位于 cell 左边, 厚度 = thickness_px (× HIDPI_SCALE).
+    /// 验 BR.x = cell_x0 + thickness_px (NDC 换算).
+    #[test]
+    fn cursor_beam_left_edge_thickness_correct() {
+        let (sw, sh, cw, ch, off) = cursor_test_geom();
+        let cursor = CursorInfo {
+            col: 3,
+            line: 4,
+            visible: true,
+            style: CursorStyle::Beam,
+            color: crate::term::Color {
+                r: 0xff,
+                g: 0xff,
+                b: 0xff,
+            },
+        };
+        let mut bytes = Vec::new();
+        append_cursor_quads_to_cell_bytes(
+            &mut bytes,
+            &cursor,
+            80,
+            24,
+            cw,
+            ch,
+            sw,
+            sh,
+            off,
+            cursor_color_white(),
+        );
+        // BR (vertex idx 2): pos.x = (cell_x0 + thickness) / sw * 2 - 1
+        let br_off = 2 * VERTEX_BYTES;
+        let bx = f32::from_ne_bytes(bytes[br_off..br_off + 4].try_into().unwrap());
+        let thickness_px = CURSOR_THICKNESS_PX as f32 * HIDPI_SCALE as f32;
+        let expected = (3.0 * cw + thickness_px) / sw * 2.0 - 1.0;
+        assert!(
+            (bx - expected).abs() < 1e-5,
+            "Beam BR.x 应 ~ {expected}, got {bx}"
         );
     }
 }

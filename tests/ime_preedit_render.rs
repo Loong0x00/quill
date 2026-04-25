@@ -101,6 +101,7 @@ fn preedit_overlay_renders_underline_to_png() {
         LOGICAL_W,
         LOGICAL_H,
         Some(&preedit),
+        None, // T-0601: 本测试聚焦 preedit, 不画 cursor
     )
     .expect("render_headless preedit failed");
 
@@ -204,6 +205,7 @@ fn no_preedit_means_no_underline() {
         LOGICAL_W,
         LOGICAL_H,
         None,
+        None, // T-0601: 本测试是 preedit=None 回归保护, cursor 也设 None
     )
     .expect("render_headless no preedit failed");
 
@@ -253,6 +255,7 @@ fn empty_preedit_text_means_no_underline() {
         LOGICAL_W,
         LOGICAL_H,
         Some(&preedit),
+        None, // T-0601: 本测试聚焦 empty preedit no-op, cursor 也设 None
     )
     .expect("render_headless empty preedit failed");
 

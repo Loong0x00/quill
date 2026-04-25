@@ -30,3 +30,8 @@ pub use render::render_headless;
 // 自有 struct (INV-010, 不漏 wayland-protocols 类型). PREEDIT_UNDERLINE_PX
 // 常数同步 re-export 给测试 / Phase 6 计算用。
 pub use render::{PreeditOverlay, PREEDIT_UNDERLINE_PX};
+
+// T-0601: 光标 quad 入参 (集成测试 tests/cursor_render_e2e.rs + window.rs
+// idle callback 用). quill 自有 struct + enum (INV-010, 不漏 alacritty
+// CursorShape). CURSOR_THICKNESS_PX 常数同步 re-export 给测试位置算用.
+pub use render::{CursorInfo, CursorStyle, CURSOR_THICKNESS_PX};

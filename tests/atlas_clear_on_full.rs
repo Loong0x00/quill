@@ -116,6 +116,7 @@ fn atlas_full_triggers_clear_no_panic() {
         LOGICAL_W,
         LOGICAL_H,
         None,
+        None, // T-0601: atlas full 测试聚焦 atlas 路径, 不画 cursor
     );
 
     let (rgba, physical_w, physical_h) =
@@ -160,6 +161,7 @@ fn atlas_clear_then_renders_visible_pixels() {
             LOGICAL_W,
             LOGICAL_H,
             None,
+            None, // T-0601
         )
         .expect("render_headless pass 1 (atlas full path) should not panic");
     }
@@ -180,6 +182,7 @@ fn atlas_clear_then_renders_visible_pixels() {
         LOGICAL_W,
         LOGICAL_H,
         None,
+        None, // T-0601: pass 2 ASCII 路径不画 cursor
     )
     .expect("render_headless pass 2 after atlas full should not panic");
 

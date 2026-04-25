@@ -1,8 +1,8 @@
 # T-0601 光标渲染 (cursor block / underline)
 
 **Phase**: 6 (daily-drive polish)
-**Assigned**: (open)
-**Status**: open
+**Assigned**: writer-T0601
+**Status**: in-review
 **Budget**: tokenBudget=80k (单文件 src/wl/render.rs + Term::cursor 接入)
 **Dependencies**: T-0301 (alacritty_terminal Term) / T-0407 (cell pipeline) / T-0408 (headless screenshot)
 **Priority**: P0 (user 实测反馈窗口缺光标, daily-drive 体感不对)
