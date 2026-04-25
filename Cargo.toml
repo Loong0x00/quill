@@ -8,6 +8,7 @@ authors = ["Loong0x00 <loong.0x00@gmail.com>"]
 alacritty_terminal = "0.26"
 anyhow = "1"
 calloop = { version = "0.14", features = ["signals"] }
+cosmic-text = "0.12"
 libc = "0.2"
 pollster = "0.4"
 portable-pty = "0.9"

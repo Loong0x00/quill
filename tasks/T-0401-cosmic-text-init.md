@@ -2,7 +2,7 @@
 
 **Phase**: 4
 **Assigned**: writer-T0401
-**Status**: claimed
+**Status**: in-review
 **Budget**: tokenBudget=80k (lead 派单)
 **Dependencies**: T-0305 (Color + draw_cells) / T-0306 (cell px 常数化)
 
