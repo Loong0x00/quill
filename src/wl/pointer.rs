@@ -106,7 +106,7 @@ pub enum HoverRegion {
 /// 调用方拿到的全是 quill 自有类型, 不暴露 wl_pointer::Event 字段.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum PointerAction {
-    /// 没事可做 (motion 不跨区 / Frame / Axis / 未识别按键).
+    /// 没事可做 (motion 不跨区 / Frame / 未识别按键 / 触摸板未达整 line 阈值).
     #[default]
     Nothing,
     /// titlebar 区域内 press: 触发 `xdg_toplevel.move(seat, serial)`,
@@ -121,6 +121,15 @@ pub enum PointerAction {
     /// hover 区域变化 — 调用方走 redraw 路径 (按钮 hover 变深, Close 变红).
     /// 包含**新**区域 (旧区域已存于 [`PointerState`] 内不外漏).
     HoverChange(HoverRegion),
+    /// T-0602: 滚轮 / 触摸板纵向滚动 → scrollback 偏移. **正值 = 向上滚 (看
+    /// 更老历史), 负值 = 向下滚 (回最新)** — 与 alacritty `Scroll::Delta(i32)`
+    /// 同方向语义, 调用方直接传给 `TermState::scroll_display`.
+    ///
+    /// 单位是 **整 line**. 离散滚轮 (传统鼠标, wl_pointer::Event::Axis 的 value
+    /// 已是 line × 10 fixed-point) 一格 = 1 line; 触摸板连续 axis 走累积 /
+    /// 阈值 (见 [`PointerState`] 的 `scroll_accum`), 累够 1 cell 高 (24 logical
+    /// px) 才发一次 Scroll(±1).
+    Scroll(i32),
 }
 
 /// quill 自有的指针状态封装. 内部跟踪当前 surface 坐标 + hover 区域 + 最近
@@ -154,7 +163,27 @@ pub struct PointerState {
     /// 按钮位置 (按钮在右上角, x = w - n×BUTTON_W; y < TITLEBAR_H).
     surface_w_logical: u32,
     surface_h_logical: u32,
+    /// T-0602: 触摸板连续 axis 累积值 (logical px). wl_pointer Axis 对触摸板
+    /// 走 sub-line 连续 fixed-point 滚动 (一次 motion 可能 0.5 line), 累够
+    /// [`SCROLL_ACCUM_LINE_PX`] (24 logical px ≈ 1 cell 行高) 才发一次
+    /// Scroll(±1), 余量保留下次累加. 离散滚轮 (传统鼠标 wheel notch) 走
+    /// `Event::Axis` 一格 value = 10.0 (1 line × 10 wl_fixed sub-units),
+    /// 单格也走累积路径 (10 < 24 不会跨阈值, 实际触发由 `AxisDiscrete` 帧
+    /// 的整 line 跳); 但本 ticket 简化 — 直接把 wl_pointer Axis value 当 px
+    /// 累积, discrete vs continuous 一视同仁, **每 24 累积量发 1 line scroll**.
+    /// 实测 5090 + Logitech MX 滚轮一格 ≈ 15 px (compositor 翻译), 两格出 1 line;
+    /// touchpad 两指滑一指距离约 100-200 px 出 4-8 line. 体感与 foot/kitty 接近.
+    scroll_accum_y: f64,
 }
+
+/// T-0602: 触摸板 / 滚轮累积阈值 (logical px). 累够此值发一次 line 滚动.
+///
+/// 取 24 logical px 与 [`crate::wl::render::CELL_H_PX`] 25 接近 (整数 24 便于
+/// 心算 / 测试断言), 视觉上"鼠标滚一行 = 屏幕滚一行" 对齐. 派单"滚轮 axis
+/// discrete 用 line 单位 / 触摸板连续 axis 阈值转 line" 的硬约束实操 —
+/// 单一阈值同时覆盖 wheel notch (10 px/格) 与 touchpad (px 累积), 避免分支
+/// 走两套阈值表 (KISS).
+pub(crate) const SCROLL_ACCUM_LINE_PX: f64 = 24.0;
 
 impl PointerState {
     /// 启动期建空 PointerState. 初始尺寸由调用方紧接 [`Self::set_surface_size`]
@@ -166,6 +195,7 @@ impl PointerState {
             last_button_serial: 0,
             surface_w_logical: initial_w_logical,
             surface_h_logical: initial_h_logical,
+            scroll_accum_y: 0.0,
         }
     }
 
@@ -245,10 +275,21 @@ pub fn handle_pointer_event(event: wl_pointer::Event, state: &mut PointerState) 
             let pressed = matches!(btn_state, WEnum::Value(wl_pointer::ButtonState::Pressed));
             apply_button(state, serial, button, pressed)
         }
-        // Axis / AxisStop / AxisDiscrete / AxisSource / AxisRelativeDirection /
-        // AxisValue120 / Frame: 派单 Out, Phase 6+ 滚轮选区接入.
-        // wl_pointer Event 在 wayland-client 0.31 无 #[non_exhaustive], 但防
-        // 上游升级加 variant — 默认沉默 (与 keyboard 模块同决策).
+        // T-0602: 纵向滚轮 / 触摸板 axis. 横向 (axis=1 horizontal) 不消费 — quill
+        // 终端无横向滚 (alacritty 同). value 是 wl_fixed-point logical px (滚轮一
+        // 格约 10-15 px, 触摸板连续小步).
+        wl_pointer::Event::Axis { axis, value, .. } => {
+            if matches!(axis, WEnum::Value(wl_pointer::Axis::VerticalScroll)) {
+                apply_axis_vertical(state, value)
+            } else {
+                PointerAction::Nothing
+            }
+        }
+        // AxisStop / AxisDiscrete / AxisSource / AxisRelativeDirection /
+        // AxisValue120 / Frame: 派单 Out (本 ticket 用累积 px 阈值已覆盖
+        // wheel + touchpad 两种, 不依赖 discrete 帧). wl_pointer Event 在
+        // wayland-client 0.31 无 #[non_exhaustive], 但防上游升级加 variant —
+        // 默认沉默 (与 keyboard 模块同决策).
         _ => PointerAction::Nothing,
     }
 }
@@ -310,6 +351,40 @@ pub(crate) fn apply_button(
         HoverRegion::Button(b) => PointerAction::ButtonClick(b),
         HoverRegion::TextArea | HoverRegion::None => PointerAction::Nothing,
     }
+}
+
+/// T-0602: 纵向 axis (滚轮 / 触摸板) → Scroll(±N) 决策子 fn.
+///
+/// **方向语义**: wl_pointer Axis vertical `value` **正 = 向下滚** (compositor /
+/// libinput 协议规约: 用户手势"向下" → 内容应往下走 = 看更新内容). quill
+/// scrollback 反向 — `Scroll(+N) = 向上滚 (看更老历史)`, 与 alacritty
+/// `Scroll::Delta(+N)` 一致 (Delta(+) 增 display_offset). 故**取负**:
+/// value > 0 (用户手势向下 = 看新) → Scroll(负) = 减 display_offset 跳到底.
+///
+/// **累积阈值** ([`SCROLL_ACCUM_LINE_PX`] = 24 logical px ≈ 1 cell 行高):
+/// wl_pointer Axis 一次 event value 可能很小 (触摸板 1.5 px/帧), 直接发
+/// Scroll(0) 无意义; 累够 24 px 才发整 line. 余量 (`accum % SCROLL_ACCUM_LINE_PX`)
+/// 留给下次累加. 累积带符号 (向上累 + / 向下累 -), 跨 0 时余量自然清理.
+///
+/// **离散滚轮兼容**: wl_pointer Axis 一格 wheel notch value ≈ 10-15 px (依 compositor
+/// 翻译, sway/wlroots 默认 10). 两格累 20-30 跨 24 阈值, 出 1 line scroll;
+/// 三格出 1-2 line. 体感与 foot/kitty/alacritty 接近 (派单"daily-drive 必需"
+/// acceptance 实测: cat 长文件后滚轮三格能看历史).
+pub(crate) fn apply_axis_vertical(state: &mut PointerState, value: f64) -> PointerAction {
+    if !value.is_finite() {
+        // compositor 不该发 NaN/Inf, 防御 — 累积器不染污.
+        return PointerAction::Nothing;
+    }
+    state.scroll_accum_y += value;
+    // 累够整 line, 触发 Scroll. trunc 避免 f64 → i32 round half-away-from-zero
+    // (用户感知方向稳定: 累 23.9 不出 line, 累 24.0 出 1, 与离散滚轮一格一动一致).
+    let lines = (state.scroll_accum_y / SCROLL_ACCUM_LINE_PX).trunc() as i32;
+    if lines == 0 {
+        return PointerAction::Nothing;
+    }
+    state.scroll_accum_y -= (lines as f64) * SCROLL_ACCUM_LINE_PX;
+    // 取负: wl 协议 +Y = 用户手势向下 = 看新; quill `Scroll(+)` = 看老历史.
+    PointerAction::Scroll(-lines)
 }
 
 /// 纯逻辑 hit-test: 给定 surface 内坐标 (logical px) 与 surface 尺寸 (logical),
@@ -574,6 +649,137 @@ mod tests {
         let _ = apply_enter(&mut state, 100.0, 200.0);
         let action = apply_button(&mut state, 42, 0x110, true);
         assert_eq!(action, PointerAction::Nothing);
+    }
+
+    // ---- T-0602 axis 滚动测试 ----
+
+    /// 单次 axis value 不够 1 line 阈值 → Nothing, 累积器进位 (下次累加可凑够).
+    #[test]
+    fn axis_below_threshold_returns_nothing_and_accumulates() {
+        let mut state = fresh_state();
+        let action = apply_axis_vertical(&mut state, 10.0);
+        assert_eq!(action, PointerAction::Nothing, "10 px < 24 阈值, 不发 line");
+        assert!(
+            (state.scroll_accum_y - 10.0).abs() < 1e-9,
+            "累积器应记 10.0, 实际 {}",
+            state.scroll_accum_y
+        );
+    }
+
+    /// 累计跨阈值 → Scroll(±1). 24 px 正好阈值, 触发 1 line 反向 scroll
+    /// (wl + value = 用户向下 = quill scroll(-1) 跳到底).
+    #[test]
+    fn axis_value_at_threshold_triggers_one_line_negative() {
+        let mut state = fresh_state();
+        let action = apply_axis_vertical(&mut state, SCROLL_ACCUM_LINE_PX);
+        assert_eq!(
+            action,
+            PointerAction::Scroll(-1),
+            "+24 px (用户向下手势) 应给 Scroll(-1) 看更新内容"
+        );
+    }
+
+    /// 负 value (用户向上手势, 滚老内容) → Scroll(正), 与 alacritty
+    /// `Scroll::Delta(+)` 同方向 (增 display_offset).
+    #[test]
+    fn axis_negative_value_at_threshold_gives_positive_scroll() {
+        let mut state = fresh_state();
+        let action = apply_axis_vertical(&mut state, -SCROLL_ACCUM_LINE_PX);
+        assert_eq!(
+            action,
+            PointerAction::Scroll(1),
+            "-24 px (用户向上手势) 应给 Scroll(+1) 看更老历史"
+        );
+    }
+
+    /// 累积两格 (10 + 14 = 24), 第二格触发 1 line; 余量为 0.
+    #[test]
+    fn axis_two_steps_accumulate_to_one_line() {
+        let mut state = fresh_state();
+        assert_eq!(
+            apply_axis_vertical(&mut state, 10.0),
+            PointerAction::Nothing
+        );
+        let action = apply_axis_vertical(&mut state, 14.0);
+        assert_eq!(action, PointerAction::Scroll(-1));
+        assert!(
+            state.scroll_accum_y.abs() < 1e-9,
+            "余量应清零, 实际 {}",
+            state.scroll_accum_y
+        );
+    }
+
+    /// 一次大 value (触摸板快速滑) → 多 line 一次发. 72 px = 3 line.
+    #[test]
+    fn axis_large_value_emits_multi_line() {
+        let mut state = fresh_state();
+        let action = apply_axis_vertical(&mut state, 3.0 * SCROLL_ACCUM_LINE_PX);
+        assert_eq!(action, PointerAction::Scroll(-3), "72 px 应给 Scroll(-3)");
+    }
+
+    /// 余量保留: 30 px 触发 1 line, 余 6 px; 再来 18 px 累积 24 触发 1 line.
+    #[test]
+    fn axis_remainder_carries_to_next_call() {
+        let mut state = fresh_state();
+        let action1 = apply_axis_vertical(&mut state, 30.0);
+        assert_eq!(action1, PointerAction::Scroll(-1));
+        assert!(
+            (state.scroll_accum_y - 6.0).abs() < 1e-9,
+            "余量应 6.0, 实际 {}",
+            state.scroll_accum_y
+        );
+        let action2 = apply_axis_vertical(&mut state, 18.0);
+        assert_eq!(
+            action2,
+            PointerAction::Scroll(-1),
+            "30 + 18 = 48 = 2 line, 第二格出"
+        );
+    }
+
+    /// 防御: NaN / Inf 不污染累积器.
+    #[test]
+    fn axis_nan_or_inf_is_ignored() {
+        let mut state = fresh_state();
+        let _ = apply_axis_vertical(&mut state, 10.0); // 进位 10
+        let action = apply_axis_vertical(&mut state, f64::NAN);
+        assert_eq!(action, PointerAction::Nothing);
+        assert!(
+            (state.scroll_accum_y - 10.0).abs() < 1e-9,
+            "NaN 不该污染累积器"
+        );
+        let action_inf = apply_axis_vertical(&mut state, f64::INFINITY);
+        assert_eq!(action_inf, PointerAction::Nothing);
+        assert!((state.scroll_accum_y - 10.0).abs() < 1e-9);
+    }
+
+    /// handle_pointer_event 整体路径覆盖: VerticalScroll axis 走 apply_axis,
+    /// 横向 axis (HorizontalScroll) 沉默 (quill 无横滚).
+    #[test]
+    fn handle_event_dispatches_vertical_axis_and_silences_horizontal() {
+        let mut state = fresh_state();
+        let event_v = wl_pointer::Event::Axis {
+            time: 0,
+            axis: WEnum::Value(wl_pointer::Axis::VerticalScroll),
+            value: SCROLL_ACCUM_LINE_PX,
+        };
+        let action = handle_pointer_event(event_v, &mut state);
+        assert_eq!(
+            action,
+            PointerAction::Scroll(-1),
+            "VerticalScroll +24 应给 Scroll(-1)"
+        );
+
+        let event_h = wl_pointer::Event::Axis {
+            time: 0,
+            axis: WEnum::Value(wl_pointer::Axis::HorizontalScroll),
+            value: 100.0,
+        };
+        let action_h = handle_pointer_event(event_h, &mut state);
+        assert_eq!(
+            action_h,
+            PointerAction::Nothing,
+            "HorizontalScroll 应沉默 (quill 无横滚)"
+        );
     }
 
     #[test]

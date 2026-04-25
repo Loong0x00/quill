@@ -1008,6 +1008,7 @@ pub fn run_window() -> Result<()> {
         pointer_seat: None,
         is_maximized: false,
         presentation_dirty: false,
+        pending_scroll_lines: 0,
         text_input_manager,
         text_input: None,
         ime_state: ImeState::new(),
@@ -1186,6 +1187,21 @@ pub fn run_window() -> Result<()> {
             let Some(t) = term.as_mut() else {
                 return;
             };
+            // T-0602: 消费 Dispatch<WlPointer> / Dispatch<WlKeyboard> 累积的
+            // scrollback line 数. State 拿不到 term (在 LoopData 兄弟字段), 所以
+            // 滚动决定推到 idle 回放. scroll_display 内部已置 dirty, 不再单独
+            // 触发 — 后续 is_dirty 检查自然命中 redraw 路径.
+            if state.pending_scroll_lines != 0 {
+                let n = state.pending_scroll_lines;
+                t.scroll_display(n);
+                tracing::trace!(
+                    target: "quill::scroll",
+                    delta = n,
+                    new_offset = t.display_offset(),
+                    "scrollback applied"
+                );
+                state.pending_scroll_lines = 0;
+            }
             // T-0504: 检查 term cell 内容 dirty || presentation (CSD hover) dirty.
             // 任一为真即重画. presentation_dirty 由 Dispatch<WlPointer> 在
             // HoverChange 时置位, 重画后清.
@@ -1262,10 +1278,13 @@ pub fn run_window() -> Result<()> {
 
             let draw_result = match text_system.as_mut() {
                 Some(ts) => {
-                    // 收集每行的文本快照, 喂给 draw_frame shape。t.line_text(row)
-                    // 给完整一行的 String (含末尾空白)。`rows` 行 × ~80 字符每行
-                    // = ~7 KiB Vec, 与 cells Vec 同数量级。
-                    let row_texts: Vec<String> = (0..rows).map(|row| t.line_text(row)).collect();
+                    // 收集每行的文本快照, 喂给 draw_frame shape。
+                    // T-0602: 走 `display_text` 而非 `line_text` — 跟 cells_iter
+                    // 同源 (display_offset 自动偏移), scrollback 时显示历史行字
+                    // 形与 cell 块对齐. line_text 直接读 active grid 不感知滚动,
+                    // 用户滚到顶却看到 active 内容是派单 In #D 真因.
+                    // `rows` 行 × ~80 字符每行 = ~7 KiB Vec, 与 cells Vec 同数量级。
+                    let row_texts: Vec<String> = (0..rows).map(|row| t.display_text(row)).collect();
                     r.draw_frame(
                         ts,
                         &cells,
@@ -1364,6 +1383,13 @@ struct State {
     /// idle callback 检查 `term.is_dirty() || state.presentation_dirty` 决定
     /// 是否重画; 重画后置 false. 与 INV-006 resize_dirty 同布尔脏标记套路.
     presentation_dirty: bool,
+    /// T-0602: 累积待应用的 scrollback line 数. Dispatch<WlPointer> /
+    /// Dispatch<WlKeyboard> 拿不到 term (term 在 LoopData 不在 State), 所以
+    /// 把 Scroll(±N) 暂存于此, 由 idle callback (有 LoopData 全字段访问) 一次
+    /// 性消费 + 调 `term.scroll_display(n)` + 清零. 累积语义: 同帧多次滚轮 +
+    /// PgUp 合并为一次 scroll_display, 避免 alacritty 内部多次 mark_fully_damaged.
+    /// 单帧 (16 ms) 内多次累积是常态 (滚轮 + 触摸板 axis 一次 frame 可发多 event).
+    pending_scroll_lines: i32,
     // T-0505: zwp_text_input_v3 (TIv3) IME 协议绑定 (fcitx5 / ibus 中文输入).
     text_input_manager: Option<ZwpTextInputManagerV3>,
     text_input: Option<ZwpTextInputV3>,
@@ -2013,9 +2039,26 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
-        let action = handle_key_event(event, &mut state.keyboard_state);
+        // T-0602: handle_key_event 需当前 viewport rows 算 PageUp/PageDown 半屏 /
+        // 整屏量. State 拿不到 term (在 LoopData), 走 cells_from_surface_px
+        // 推导 — 与 propagate_resize_if_dirty 同源 fn, 永远跟 surface 当前尺寸
+        // 同步; resize 中 race 也只是 ±1 行差, 不影响功能.
+        let (_cols, rows) = cells_from_surface_px(state.core.width, state.core.height);
+        let rows_u16 = rows.min(u16::MAX as usize) as u16;
+        let action = handle_key_event(event, &mut state.keyboard_state, rows_u16);
         match action {
             KeyboardAction::Nothing => {}
+            KeyboardAction::Scroll(delta) => {
+                // T-0602: 累积到 State.pending_scroll_lines, 由 idle callback 消费.
+                // saturating_add 防极端连按 PgUp 溢出 i32 (实际不可能, 但廉价防御).
+                state.pending_scroll_lines = state.pending_scroll_lines.saturating_add(delta);
+                tracing::trace!(
+                    target: "quill::keyboard",
+                    delta,
+                    pending = state.pending_scroll_lines,
+                    "PageUp/PageDown queued for scrollback"
+                );
+            }
             KeyboardAction::WriteToPty(bytes) => {
                 write_keyboard_bytes(state, &bytes);
             }
@@ -2141,6 +2184,19 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                     "xdg_toplevel.move (titlebar drag)"
                 );
                 state.window.move_(seat, serial);
+            }
+            PointerAction::Scroll(delta) => {
+                // T-0602: 滚轮 / 触摸板累积到 State.pending_scroll_lines, 由
+                // idle callback 一次性应用到 term.scroll_display. 与 keyboard
+                // PgUp/Dn 同 sink — 同帧多 source 滚动合并避免 alacritty 内部
+                // mark_fully_damaged 多次开销.
+                state.pending_scroll_lines = state.pending_scroll_lines.saturating_add(delta);
+                tracing::trace!(
+                    target: "quill::pointer",
+                    delta,
+                    pending = state.pending_scroll_lines,
+                    "axis scroll queued"
+                );
             }
             PointerAction::ButtonClick(button) => match button {
                 WindowButton::Minimize => {

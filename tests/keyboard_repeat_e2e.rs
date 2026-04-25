@@ -67,7 +67,7 @@ fn make_state(rate: i32, delay: i32) -> KeyboardState {
         .load_default_us_keymap()
         .expect("us keymap (装 xkeyboard-config 包?)");
     let info = wl_keyboard::Event::RepeatInfo { rate, delay };
-    let _ = handle_key_event(info, &mut state);
+    let _ = handle_key_event(info, &mut state, 24);
     state
 }
 
@@ -99,7 +99,7 @@ fn calloop_timer_repeat_accumulates_bytes() {
     // press 'a' → 拿 StartRepeat 字节 (跟 window.rs 真路径一样 push 到累积器
     // 模拟"立即写一次"). 注: 真路径中 Dispatch<WlKeyboard> 调
     // `write_keyboard_bytes` 写 PTY, 这里直接 append 到 accumulated.
-    let action = handle_key_event(pressed(KEY_A), &mut data.keyboard_state);
+    let action = handle_key_event(pressed(KEY_A), &mut data.keyboard_state, 24);
     match action {
         KeyboardAction::StartRepeat { bytes } => {
             data.accumulated.extend_from_slice(&bytes);
@@ -157,7 +157,7 @@ fn release_stops_accumulation() {
         rate_per_sec: 100,
     };
 
-    let _ = handle_key_event(pressed(KEY_BACKSPACE), &mut data.keyboard_state);
+    let _ = handle_key_event(pressed(KEY_BACKSPACE), &mut data.keyboard_state, 24);
     let timer = Timer::from_duration(Duration::from_millis(5));
     let _token = loop_handle
         .insert_source(timer, |_d, _m, data: &mut TestData| {
@@ -181,7 +181,7 @@ fn release_stops_accumulation() {
     );
 
     // release: tick_repeat 此后返 None
-    let action = handle_key_event(released(KEY_BACKSPACE), &mut data.keyboard_state);
+    let action = handle_key_event(released(KEY_BACKSPACE), &mut data.keyboard_state, 24);
     assert_eq!(action, KeyboardAction::StopRepeat);
 
     // 再跑 80ms — timer 下次 fire 看 None 走 Drop, 之后无新累积.
@@ -216,8 +216,8 @@ fn modifier_change_stops_accumulation_via_state() {
     };
 
     // 起步 modifier=0
-    let _ = handle_key_event(modifiers(0), &mut data.keyboard_state);
-    let _ = handle_key_event(pressed(KEY_A), &mut data.keyboard_state);
+    let _ = handle_key_event(modifiers(0), &mut data.keyboard_state, 24);
+    let _ = handle_key_event(pressed(KEY_A), &mut data.keyboard_state, 24);
     let timer = Timer::from_duration(Duration::from_millis(10));
     let _token = loop_handle
         .insert_source(timer, |_d, _m, data: &mut TestData| {
@@ -237,7 +237,7 @@ fn modifier_change_stops_accumulation_via_state() {
     assert!(before >= 2, "modifier 变化前应累积 ≥2 字节, 实得 {before}");
 
     // 按 Shift (mask 变化) → StopRepeat
-    let action = handle_key_event(modifiers(1 << 0), &mut data.keyboard_state);
+    let action = handle_key_event(modifiers(1 << 0), &mut data.keyboard_state, 24);
     assert_eq!(action, KeyboardAction::StopRepeat);
 
     run_for(&mut event_loop, &mut data, Duration::from_millis(100));
