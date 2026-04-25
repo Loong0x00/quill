@@ -536,11 +536,21 @@ impl TermState {
     /// **副作用**:置 `self.dirty = true`。即使 `bytes` 空切片也置(没改变就
     /// 多画一次,成本小于漏画)。下游 [`is_dirty`] / [`clear_dirty`] 消费。
     ///
+    /// **T-0602: 非空字节自动 reset_display 跳到底部**. 用户滚 scrollback 看
+    /// 历史时, 子进程吐新输出 (例 cron 日志 / shell 自动 prompt 重画) 应该
+    /// 把视图跳回最新, 与 alacritty / xterm / kitty / foot 行为一致 — 否则
+    /// 用户看不到新内容只能手动 PgDn. 空 advance (no-op) 不重置, 让 term
+    /// dirty / wakeup 路径不影响滚动状态.
+    ///
     /// [`is_dirty`]: Self::is_dirty
     /// [`clear_dirty`]: Self::clear_dirty
     pub fn advance(&mut self, bytes: &[u8]) {
         self.processor.advance(&mut self.term, bytes);
         self.dirty = true;
+        // T-0602: 新输入到达 → 跳到底 (语义同 alacritty `Event::PtyWrite` 路径).
+        if !bytes.is_empty() {
+            self.reset_display();
+        }
     }
 
     /// 返回当前光标位置(viewport 坐标 [`CellPos`])。
@@ -590,15 +600,26 @@ impl TermState {
     /// viewport 内所有可见 cell 的迭代器,带位置。给 T-0305 全量重画用。
     ///
     /// 一次调用产生 `rows × cols` 个 [`CellRef`](典型 80×24 = 1920)。
-    /// 不走 scrollback,不包含历史行 —— 一帧重画 viewport 全部 cell。
+    /// 一帧重画 viewport 全部 cell。
     ///
-    /// `CellRef` 只暴露 `pos + c`,暂不带 fg/bg color —— 本 ticket scope
-    /// 是"API 搭好",T-0305 色块渲染先用 `c == ' '` 判空 / 非空画块,颜色
-    /// 跟 style 等 Phase 3 后期补(加字段不破坏下游,因为 CellRef 是 struct
-    /// 不是 tuple)。
+    /// **T-0602 scrollback 接入**: 走 alacritty `display_iter` (它内部已用
+    /// `display_offset()` 做 viewport 起点偏移), `display_offset > 0` 时迭代
+    /// 起点是 `Line(-display_offset)`, 产出的 `point.line` 为负. CellsIter
+    /// `next()` 加上 `display_offset` 偏移把负 line 映射回 `0..rows` viewport
+    /// 坐标 — 渲染调用方 (window.rs idle / draw_frame) 拿到的 `pos.line`
+    /// 永远在 `0..rows`, 不感知 scrollback. cursor 渲染 (T-0601) 同源走
+    /// `cursor_pos()` (alacritty 内部 cursor 坐标永远在 active grid, 不随
+    /// scrollback 漂); scrollback 时 `cursor_visible` 返 false (避免 cursor
+    /// 画在历史行上, 与 alacritty/foot/kitty 一致).
+    ///
+    /// `CellRef` 暴露 `pos + c + fg + bg`, T-0305+ 色块渲染 / T-0403+ 字形
+    /// 渲染共用一个数据通道。
     pub fn cells_iter(&self) -> CellsIter<'_> {
         CellsIter {
             inner: self.term.grid().display_iter(),
+            // T-0602: 把 display_iter 产出的负 line (scrollback) 偏回 viewport.
+            // display_offset == 0 时本字段为 0, 行为与 T-0304/T-0305 完全等价.
+            display_offset: self.term.grid().display_offset(),
         }
     }
 
@@ -648,7 +669,16 @@ impl TermState {
     /// 光标是否可见(`TermMode::SHOW_CURSOR` bit)。bash 启动后默认可见;
     /// 某些全屏程序(vim / less)会切 DECRST 25(`ESC[?25l`)隐藏,
     /// DECSET 25(`ESC[?25h`)恢复。T-0305 渲染判断"要不要画光标"。
+    ///
+    /// **T-0602: scrollback 时强制返 false**. `display_offset > 0` (用户滚到
+    /// 历史) 时 alacritty 内部 cursor 仍指向 active grid 的位置, 但视觉上
+    /// 应不画 — 否则 cursor 会出现在与当前历史无关的行上. alacritty / foot /
+    /// kitty 等终端均如此. 用户输入 (任何键) 触发 PTY 字节回响, `advance` 路径
+    /// 自动 `reset_display` 跳到底, cursor 重新可见.
     pub fn cursor_visible(&self) -> bool {
+        if self.display_offset() > 0 {
+            return false;
+        }
         self.term.mode().contains(TermMode::SHOW_CURSOR)
     }
 
@@ -681,6 +711,92 @@ impl TermState {
     /// 永远返当前值。
     pub fn dimensions(&self) -> (usize, usize) {
         (self.term.columns(), self.term.screen_lines())
+    }
+
+    // ---------- T-0602 scrollback 滚动 API ----------
+    //
+    // `cells_iter` / `display_text` / `cursor_visible` 已自动跟随 `display_offset`
+    // (cells_iter 内 remap line, display_text 取负 line 偏移, cursor_visible
+    // 在 offset > 0 时返 false). 调用方仅需 `scroll_display(±N)` 推 / 拉
+    // viewport, 无需理解 alacritty 内部 `Scroll` enum 或负 `Line(i32)` 路径.
+    //
+    // 类型隔离 (INV-010): 入参出参全 i32 / usize quill 自有类型, 不暴露
+    // alacritty `Scroll` / `Line` enum.
+
+    /// 滚动 scrollback viewport. **正值 = 向上滚 (看更老历史), 负值 = 向下滚
+    /// (回最新)** — 与 [`crate::wl::keyboard::KeyboardAction::Scroll`] /
+    /// [`crate::wl::pointer::PointerAction::Scroll`] 同方向语义.
+    ///
+    /// 走 alacritty `Term::scroll_display(Scroll::Delta(delta))`, 内部:
+    /// - 增 / 减 `grid.display_offset` (clamp 到 `[0, history_size]`)
+    /// - 重置 vi-mode cursor 到 viewport 内
+    /// - mark_fully_damaged (我们不读 alacritty damage, 自走 dirty 标志)
+    ///
+    /// **副作用**: 置 `self.dirty = true` — viewport 内容已变 (新行从 history
+    /// 进入 viewport), 渲染层下次 idle 看到 dirty 重画.
+    ///
+    /// **delta=0 是 no-op**: 不滚, 但 mark dirty (与 [`Self::advance`] 空切片
+    /// 同保守策略 — 多画一帧 << 漏画). 调用方上层 (Dispatch) 已过滤
+    /// 0 line 累积不发, 但本 fn 容忍.
+    ///
+    /// **clamp 边界**: 正过头 → 截到 `history_size` (最旧历史顶); 负过头 →
+    /// 截到 0 (回 viewport active). 不 panic / 不 wrap.
+    ///
+    /// 测试覆盖见 `tests::scroll_display_*`.
+    pub fn scroll_display(&mut self, delta: i32) {
+        use alacritty_terminal::grid::Scroll;
+        self.term.scroll_display(Scroll::Delta(delta));
+        self.dirty = true;
+    }
+
+    /// 当前 scrollback 偏移. `0` = 在底 (active grid, 无历史滚出), `>0` = 滚到
+    /// 历史区 (值 = 离底多少行); 上限是 [`Self::scrollback_size`].
+    ///
+    /// 渲染层 / IME cursor_rectangle 路径用此值判断"是否在 scrollback 模式"
+    /// (滚动时 IME cursor 跟 cell 不再对齐, 调用方按需做 fallback). T-0602 内部
+    /// `cursor_visible` 也读此值在 > 0 时返 false.
+    pub fn display_offset(&self) -> usize {
+        self.term.grid().display_offset()
+    }
+
+    /// 跳到底 (active grid). 等同 `scroll_display(-(display_offset as i32))`,
+    /// 但走 alacritty `Scroll::Bottom` 语义更显式 (不依赖 i32 算术), 且 O(1)
+    /// 内部直接置 `display_offset = 0`.
+    ///
+    /// 调用时机: `advance` 收到非空字节 (T-0602 hook, 见 [`Self::advance`] 文档)
+    /// — 子进程吐新输出自动跳回最新, 与 alacritty / foot / kitty 一致.
+    /// 也可手动调用 (Phase 6+ 加 "End 键跳底" / "Esc 退 scrollback" 时).
+    ///
+    /// **副作用**: 置 `self.dirty = true` (viewport 内容会从历史回到 active).
+    /// `display_offset` 已是 0 时 alacritty 内部 no-op, 但仍置 dirty (语义
+    /// 一致, 调用方不必区分"真重置 vs 假重置").
+    pub fn reset_display(&mut self) {
+        use alacritty_terminal::grid::Scroll;
+        self.term.scroll_display(Scroll::Bottom);
+        self.dirty = true;
+    }
+
+    /// 读取 viewport 内某行 (`0..rows`) 的字符, **跟 [`Self::display_offset`]
+    /// 自动同步**. `display_offset == 0` 时等价 [`Self::line_text`]; 滚到历史时
+    /// 返 history 行的内容.
+    ///
+    /// 渲染层 (`window.rs::idle` collect row_texts → `draw_frame`) 应走本方法
+    /// 而非 [`Self::line_text`] — 后者直接读 active grid 第 N 行, 不感知 scrollback,
+    /// 用户滚到顶却看到 active grid 的内容会"看不到历史" (派单 In #D 真因).
+    ///
+    /// alacritty `grid[Line(line - display_offset)]` 路径: viewport 行 `row` 在
+    /// 滚动时映射到 alacritty `Line(row as i32 - display_offset as i32)`. 当
+    /// display_offset=10, row=0 时映射 Line(-10) (10 行前的历史行).
+    ///
+    /// 越界 row (>= rows) 走 alacritty 内部 grid index, 上面会 panic; 本 API
+    /// 不做 bounds check (与 `line_text` 一致, 调用方应用 dimensions 校验).
+    pub fn display_text(&self, line: usize) -> String {
+        use alacritty_terminal::index::{Column, Line};
+        let grid = self.term.grid();
+        let alac_line = Line(line as i32 - grid.display_offset() as i32);
+        let row = &grid[alac_line];
+        let cols = grid.columns();
+        (0..cols).map(|c| row[Column(c)].c).collect()
     }
 
     // ---------- T-0304 scrollback API ----------
@@ -766,8 +882,20 @@ impl TermState {
 /// `GridIterator<Cell>` 的 `Indexed<&Cell>` 重映射成我们自己的 [`CellRef`]
 /// —— 隔离上游类型,T-0305 / T-0303 只对本模块 API 编码,不直接抓
 /// `alacritty_terminal::term::cell::Cell` / `alacritty::index::Point`。
+///
+/// **T-0602 scrollback 偏移** (`display_offset` 字段): alacritty `display_iter()`
+/// 在 `display_offset > 0` 时迭代起点是 `Line(-display_offset)`, 产出 `Indexed.point.line`
+/// 为负 (`-display_offset..-display_offset+screen_lines`). `CellPos::from_alacritty`
+/// 的 `.max(0) as usize` 会把所有负 line 全 clamp 到 0, 导致 scrollback 行
+/// 全部塞到 viewport 第 0 行. **本字段在 next() 给负 line 加上 display_offset
+/// 偏量, 把 scrollback 区域映射回 0..screen_lines viewport 坐标** —— 渲染调用
+/// 方 (window.rs idle) 拿到的 pos.line 永远在 viewport 范围, 不感知 scrollback.
 pub struct CellsIter<'a> {
     inner: alacritty_terminal::grid::GridIterator<'a, alacritty_terminal::term::cell::Cell>,
+    /// 当前 `display_offset` 快照. 0 时本 iterator 行为与 T-0304 等价
+    /// (CellPos::from_alacritty 直读). > 0 时 next() 把负 line 加偏量映射回
+    /// 0..screen_lines viewport.
+    display_offset: usize,
 }
 
 impl<'a> Iterator for CellsIter<'a> {
@@ -775,13 +903,19 @@ impl<'a> Iterator for CellsIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next().map(|indexed| {
-            // 走模块私有 `CellPos::from_alacritty` / `Color::from_alacritty`,
+            // T-0602: scrollback 偏移补正 — display_iter 在 display_offset > 0
+            // 时产出负 line, 此处加 display_offset 让 line 落回 [0, screen_lines).
+            // display_offset == 0 时本加法 no-op (保持 T-0304 路径行为).
+            //
+            // 仍走模块私有 `CellPos::from_alacritty` / `Color::from_alacritty`,
             // 不经 `From` trait —— 防止 alacritty 类型漏到公共 API
             // (见 `CellPos::from_alacritty` / `Color::from_alacritty` 文档)。
             // T-0305:fg/bg 解析在迭代时一起做,渲染层拿到的就是已解析 RGB,
             // 不再分支 Spec/Named/Indexed。
+            let mut pos_alac = indexed.point;
+            pos_alac.line += self.display_offset;
             CellRef {
-                pos: CellPos::from_alacritty(indexed.point),
+                pos: CellPos::from_alacritty(pos_alac),
                 c: indexed.cell.c,
                 fg: Color::from_alacritty(indexed.cell.fg),
                 bg: Color::from_alacritty(indexed.cell.bg),
@@ -1426,6 +1560,201 @@ mod tests {
         let mut t3 = TermState::new(80, 24);
         t3.resize(5, 0);
         assert_eq!(t3.dimensions(), (5, 1), "(5,0) 应 clamp 到 (5,1)");
+    }
+
+    // ---------- T-0602 scrollback 滚动 API 单测 ----------
+
+    /// 初始 display_offset 为 0 (在底, viewport 显示 active grid).
+    #[test]
+    fn display_offset_zero_initially() {
+        let t = TermState::new(80, 24);
+        assert_eq!(t.display_offset(), 0);
+    }
+
+    /// 写超 viewport 后 scroll_display(+N) 增 display_offset, 走 alacritty
+    /// `Scroll::Delta(+)` 路径; clamp 到 history_size 上限.
+    #[test]
+    fn scroll_display_positive_increments_offset() {
+        let mut t = TermState::new(80, 24);
+        for i in 0..50 {
+            t.advance(format!("line_{:02}\r\n", i).as_bytes());
+        }
+        let history = t.scrollback_size();
+        assert!(history >= 25, "前置: scrollback >= 25");
+
+        // 滚 5 line
+        t.scroll_display(5);
+        assert_eq!(
+            t.display_offset(),
+            5,
+            "scroll_display(+5) 应让 display_offset = 5"
+        );
+        // 再滚 5
+        t.scroll_display(5);
+        assert_eq!(t.display_offset(), 10);
+
+        // clamp: 滚到顶
+        t.scroll_display(99999);
+        assert_eq!(
+            t.display_offset(),
+            history,
+            "正向过头应 clamp 到 history_size = {}",
+            history
+        );
+    }
+
+    /// 负 scroll_display 减 display_offset, clamp 到 0.
+    #[test]
+    fn scroll_display_negative_decrements_offset_and_clamps_to_zero() {
+        let mut t = TermState::new(80, 24);
+        for i in 0..50 {
+            t.advance(format!("line_{:02}\r\n", i).as_bytes());
+        }
+        t.scroll_display(20);
+        assert!(t.display_offset() > 0, "前置: 应已滚到历史");
+
+        t.scroll_display(-5);
+        assert_eq!(t.display_offset(), 15);
+
+        // 负过头 clamp 到 0
+        t.scroll_display(-9999);
+        assert_eq!(t.display_offset(), 0, "负向过头应 clamp 到 0");
+    }
+
+    /// scroll_display 应置 dirty (重画路径需要).
+    #[test]
+    fn scroll_display_sets_dirty() {
+        let mut t = TermState::new(80, 24);
+        for i in 0..50 {
+            t.advance(format!("line_{:02}\r\n", i).as_bytes());
+        }
+        t.clear_dirty();
+        assert!(!t.is_dirty(), "前置 clean");
+        t.scroll_display(5);
+        assert!(t.is_dirty(), "scroll_display 后应 dirty");
+    }
+
+    /// reset_display 把 display_offset 直接置 0 (跳到底).
+    #[test]
+    fn reset_display_jumps_to_bottom() {
+        let mut t = TermState::new(80, 24);
+        for i in 0..50 {
+            t.advance(format!("line_{:02}\r\n", i).as_bytes());
+        }
+        t.scroll_display(10);
+        assert_eq!(t.display_offset(), 10, "前置: 滚到 10");
+        t.reset_display();
+        assert_eq!(t.display_offset(), 0, "reset 后应跳到底");
+    }
+
+    /// **T-0602 关键**: advance 收非空字节自动 reset_display, 子进程吐新输出
+    /// 时用户视图自动跳回最新 — 与 alacritty / xterm 一致.
+    #[test]
+    fn advance_with_nonempty_bytes_auto_resets_display() {
+        let mut t = TermState::new(80, 24);
+        for i in 0..50 {
+            t.advance(format!("line_{:02}\r\n", i).as_bytes());
+        }
+        t.scroll_display(10);
+        assert_eq!(t.display_offset(), 10, "前置: 滚到 10");
+
+        // 喂新字节
+        t.advance(b"NEW");
+        assert_eq!(
+            t.display_offset(),
+            0,
+            "新输入到达应自动 reset_display 跳到底"
+        );
+    }
+
+    /// 空 advance 不重置 display (no-op 不该影响滚动状态).
+    #[test]
+    fn advance_with_empty_bytes_does_not_reset_display() {
+        let mut t = TermState::new(80, 24);
+        for i in 0..50 {
+            t.advance(format!("line_{:02}\r\n", i).as_bytes());
+        }
+        t.scroll_display(10);
+        assert_eq!(t.display_offset(), 10);
+        t.advance(b"");
+        assert_eq!(t.display_offset(), 10, "空 advance 不该改 display_offset");
+    }
+
+    /// **T-0602 cells_iter 关键**: 滚动后 cells_iter 产出的 pos.line 仍在
+    /// `0..rows`, 内容来自历史行 (派单 In #D 真因 — `CellPos::from_alacritty`
+    /// 的 `.max(0) as usize` 不再让所有 scrollback row 全塌到 line 0).
+    #[test]
+    fn cells_iter_after_scroll_keeps_viewport_lines_and_shows_history() {
+        let mut t = TermState::new(80, 24);
+        for i in 0..50 {
+            t.advance(format!("L{:02}\r\n", i).as_bytes());
+        }
+        // 滚 10 line 看历史
+        t.scroll_display(10);
+        let cells: Vec<_> = t.cells_iter().collect();
+        // 数量仍 80 × 24 (viewport 不变)
+        assert_eq!(cells.len(), 80 * 24, "cells_iter 数量永远 = cols × rows");
+        // 每个 pos.line 必须在 [0, rows)
+        for cr in &cells {
+            assert!(
+                cr.pos.line < 24,
+                "scrollback 后 pos.line 应仍 < rows, 实际 {}",
+                cr.pos.line
+            );
+        }
+        // 第 0 行字符应来自历史 (不是 active 最末行); 取第 0 行 80 个 cell 拼字符串
+        let row0: String = cells
+            .iter()
+            .filter(|cr| cr.pos.line == 0)
+            .map(|cr| cr.c)
+            .collect();
+        assert!(
+            row0.starts_with("L"),
+            "scroll_display(10) 后 viewport 第 0 行应是某历史行 'L..', 实际: {:?}",
+            &row0[..10.min(row0.len())]
+        );
+    }
+
+    /// display_text 跟 display_offset 同步.
+    #[test]
+    fn display_text_follows_display_offset() {
+        let mut t = TermState::new(80, 24);
+        for i in 0..50 {
+            t.advance(format!("L{:02}\r\n", i).as_bytes());
+        }
+        let active_row0 = t.display_text(0);
+        // active row 0 应是最末 24 行的开头
+        assert!(
+            active_row0.starts_with("L"),
+            "active 第 0 行应是某 'L..', 实际: {:?}",
+            &active_row0[..10.min(active_row0.len())]
+        );
+
+        t.scroll_display(10);
+        let scrolled_row0 = t.display_text(0);
+        // 滚后 row 0 应是更早的历史行, 与 active 不同
+        assert_ne!(
+            active_row0, scrolled_row0,
+            "scroll_display 后 display_text(0) 应换内容"
+        );
+        assert!(scrolled_row0.starts_with("L"));
+    }
+
+    /// cursor_visible 在 scrollback 时应返 false (与 alacritty / foot / kitty 一致).
+    #[test]
+    fn cursor_visible_false_when_scrolled() {
+        let mut t = TermState::new(80, 24);
+        for i in 0..50 {
+            t.advance(format!("L{:02}\r\n", i).as_bytes());
+        }
+        assert!(t.cursor_visible(), "前置: 在底时 cursor 可见");
+        t.scroll_display(5);
+        assert!(
+            !t.cursor_visible(),
+            "scrollback (display_offset > 0) 时 cursor 应隐藏"
+        );
+        t.reset_display();
+        assert!(t.cursor_visible(), "回底后 cursor 应重新可见");
     }
 
     /// `resize` 后必须置 `dirty=true`(沿袭 [`advance`] 模式)。clear → resize

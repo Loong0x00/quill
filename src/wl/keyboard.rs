@@ -135,7 +135,7 @@ impl KeyboardState {
 }
 
 /// `handle_key_event` 的副作用描述: 翻译完一次 wl_keyboard event 后告诉调用方
-/// 要不要往 PTY 写字节。
+/// 要不要往 PTY 写字节 / 滚 scrollback。
 ///
 /// 抽 enum 而非直接 `Option<Vec<u8>>` 是 conventions §3 套路 (类比
 /// `WindowAction`), 给将来扩展空间 — 例如 Phase 6 加 "焦点切走 → 清 IME
@@ -149,14 +149,27 @@ pub enum KeyboardAction {
     /// 往 PTY master 写这串字节 (UTF-8)。空 vec 已被 `Nothing` 路径吃掉,
     /// 这里 vec 至少 1 字节。
     WriteToPty(Vec<u8>),
+    /// T-0602: PageUp / PageDown → 滚 scrollback 整 line. **正值 = 向上滚 (看
+    /// 更老历史), 负值 = 向下滚 (回最新)** — 与 alacritty `Scroll::Delta(i32)` /
+    /// quill [`crate::wl::pointer::PointerAction::Scroll`] 同方向语义.
+    ///
+    /// 不发字节给 PTY (传统终端 PageUp/Down 是终端自处理 scrollback, 不写入
+    /// 子 shell stdin — alacritty / foot / kitty 同). 调用方走
+    /// `TermState::scroll_display(delta)`.
+    Scroll(i32),
 }
 
 /// 接 wl_keyboard 协议事件 → 算 [`KeyboardAction`]。
 ///
+/// **rows 入参** (T-0602): PageUp / PageDown 的滚动量需当前 viewport 行数算
+/// (半屏 = rows/2, Shift+PgUp 整屏 = rows). 调用方传当前 `TermState::dimensions().1`
+/// (或 [`crate::wl::window::cells_from_surface_px`] 推导值). 非 PgUp/PgDn 路径
+/// 不读 rows, 入参对它们透明; 测试可以传任意非 0 值.
+///
 /// **纯逻辑** (无 IO, 不写 PTY, 不调 wl request): 调用方 (`wl/window.rs`
 /// 的 `Dispatch<WlKeyboard>`) 据返回 action 决定是否调
-/// `pty.write(&bytes)`。INV-005 calloop 单线程不阻塞: 调用方拿到字节后
-/// 走 `pty.write` (master fd O_NONBLOCK, INV-009), WouldBlock 直接丢 (派单
+/// `pty.write(&bytes)` 或 `term.scroll_display(delta)`. INV-005 calloop 单线程不阻塞:
+/// 调用方拿到字节后走 `pty.write` (master fd O_NONBLOCK, INV-009), WouldBlock 直接丢 (派单
 /// 允许)。
 ///
 /// 协议事件分派表:
@@ -180,7 +193,11 @@ pub enum KeyboardAction {
 ///   实际 wl_keyboard 简化只暴露一个 effective group)。我们对 depressed/
 ///   latched/locked layout 全填 0, group 落 effective — 这是 sway/foot/mako
 ///   等 client 的标准做法。
-pub fn handle_key_event(event: wl_keyboard::Event, state: &mut KeyboardState) -> KeyboardAction {
+pub fn handle_key_event(
+    event: wl_keyboard::Event,
+    state: &mut KeyboardState,
+    rows: u16,
+) -> KeyboardAction {
     match event {
         wl_keyboard::Event::Keymap { format, fd, size } => {
             handle_keymap_event(state, format, fd, size);
@@ -198,7 +215,7 @@ pub fn handle_key_event(event: wl_keyboard::Event, state: &mut KeyboardState) ->
             key,
             state: key_state,
             ..
-        } => key_press_action(state, key, key_state),
+        } => key_press_action(state, key, key_state, rows),
         wl_keyboard::Event::Modifiers {
             mods_depressed,
             mods_latched,
@@ -285,6 +302,7 @@ fn key_press_action(
     state: &mut KeyboardState,
     evdev_keycode: u32,
     key_state: WEnum<KeyState>,
+    rows: u16,
 ) -> KeyboardAction {
     let pressed = matches!(key_state, WEnum::Value(KeyState::Pressed));
     if !pressed {
@@ -313,6 +331,17 @@ fn key_press_action(
     // 串更稳。其它键全走 xkbcommon utf8 默认 (Ctrl+letter / Shift+letter /
     // dead key / compose 全交给 xkbcommon)。
     let keysym = xkb_state.key_get_one_sym(xkb_keycode);
+
+    // T-0602: PageUp / PageDown → scrollback. 不发字节给 PTY (传统终端 PgUp/Dn
+    // 是终端自处理 scrollback). Shift modifier 区分半屏 vs 整屏 (xterm /
+    // foot / kitty 同). Shift 状态查 xkb_state STATE_MODS_EFFECTIVE — 包含
+    // depressed + latched + locked, 与 xkbcommon utf8 内部 modifier composition
+    // 同视图.
+    let shift_active = xkb_state.mod_name_is_active(xkb::MOD_NAME_SHIFT, xkb::STATE_MODS_EFFECTIVE);
+    if let Some(action) = scroll_keysym_override(keysym, rows, shift_active) {
+        return action;
+    }
+
     if let Some(bytes) = terminal_keysym_override(keysym) {
         return KeyboardAction::WriteToPty(bytes);
     }
@@ -324,6 +353,50 @@ fn key_press_action(
     }
     let bytes = utf8.into_bytes();
     KeyboardAction::WriteToPty(bytes)
+}
+
+/// T-0602: PageUp (keysym 0xff55) / PageDown (0xff56) → 滚 scrollback.
+///
+/// **量级**:
+/// - 不带 Shift: 半屏 = `rows / 2` lines (24-行 viewport → 12 lines, 与 less /
+///   man / vim Ctrl-D 同感).
+/// - 带 Shift: 整屏 = `rows` lines (整页跳, 同 PgDn 在 vim 的 normal page).
+///
+/// **方向**:
+/// - PageUp = 看更老历史 = `Scroll(+N)` (与 alacritty `Scroll::Delta(+)` 增
+///   display_offset 同方向).
+/// - PageDown = 跳到底 = `Scroll(-N)`.
+///
+/// **rows == 0 防御**: viewport 行数 0 (启动期 race / 极端 resize) 半屏量也是 0,
+/// 直接发 `Scroll(0)` 不如沉默 — 返 None 让上游走默认 (无字节, 不滚). 0 行
+/// 终端无内容可滚.
+///
+/// **why scrollback 不发字节**: 派单 In #B "不发 PTY (传统终端 PageUp/Down 不
+/// 写 stdin, 是终端自处理)". xterm / foot / alacritty / kitty 同决策 — PgUp/Dn
+/// 在 terminal emulator 层吃掉, 不走 stdin (less / vim 等程序自有内部 PgUp 处理,
+/// 通过 ESC[5~/ESC[6~ 序列传, 但 quill 当前简化只接 scrollback, application
+/// PgUp escape 留给 Phase 6+).
+fn scroll_keysym_override(
+    keysym: xkb::Keysym,
+    rows: u16,
+    shift_active: bool,
+) -> Option<KeyboardAction> {
+    if rows == 0 {
+        return None;
+    }
+    let raw = keysym.raw();
+    let lines = if shift_active {
+        rows as i32
+    } else {
+        (rows as i32 / 2).max(1)
+    };
+    match raw {
+        // PageUp keysym = 0xff55 (xkeysym keysymdef.h: XK_Page_Up / XK_Prior).
+        0xff55 => Some(KeyboardAction::Scroll(lines)),
+        // PageDown keysym = 0xff56 (XK_Page_Down / XK_Next).
+        0xff56 => Some(KeyboardAction::Scroll(-lines)),
+        _ => None,
+    }
 }
 
 /// terminal-style keysym 重写表。命中返 `Some(bytes)`, 不命中返 `None` 让
@@ -433,6 +506,10 @@ mod tests {
 
     /// 集成单测帮助: 把 evdev keycode 喂进 handle_key_event, 走真 us keymap。
     /// 直接构造 wl_keyboard::Event::Key 模拟 wayland event 派发。
+    /// rows=24 (与 80x24 默认 viewport 对齐). 非 PgUp/Dn 路径不读 rows, 测试
+    /// 沿用即可; T-0602 PgUp/Dn 测试自带 rows 参数显式断言量级.
+    const TEST_ROWS: u16 = 24;
+
     fn press(state: &mut KeyboardState, evdev_key: u32) -> KeyboardAction {
         // wl_keyboard::Event::Key 的字段有 serial/time/key/state, 我们只关心 key/state。
         let event = wl_keyboard::Event::Key {
@@ -441,7 +518,7 @@ mod tests {
             key: evdev_key,
             state: WEnum::Value(KeyState::Pressed),
         };
-        handle_key_event(event, state)
+        handle_key_event(event, state, TEST_ROWS)
     }
 
     fn release(state: &mut KeyboardState, evdev_key: u32) -> KeyboardAction {
@@ -451,7 +528,7 @@ mod tests {
             key: evdev_key,
             state: WEnum::Value(KeyState::Released),
         };
-        handle_key_event(event, state)
+        handle_key_event(event, state, TEST_ROWS)
     }
 
     fn set_modifiers(state: &mut KeyboardState, depressed: u32) {
@@ -462,7 +539,7 @@ mod tests {
             mods_locked: 0,
             group: 0,
         };
-        let _ = handle_key_event(event, state);
+        let _ = handle_key_event(event, state, TEST_ROWS);
     }
 
     /// 'a' key (evdev KEY_A = 30) 单按 → b"a"。最基本路径, 派单 acceptance 第一条。
@@ -593,7 +670,7 @@ mod tests {
             rate: 25,
             delay: 600,
         };
-        let action = handle_key_event(event, &mut state);
+        let action = handle_key_event(event, &mut state, TEST_ROWS);
         assert_eq!(action, KeyboardAction::Nothing);
         assert_eq!(state.repeat_info(), (25, 600), "RepeatInfo 应被记录");
     }
@@ -610,5 +687,119 @@ mod tests {
             KeyboardAction::WriteToPty(b"\t".to_vec()),
             "Tab 应给 \\t (HT)"
         );
+    }
+
+    // ---- T-0602 PageUp / PageDown scrollback ----
+
+    /// PageUp keysym (0xff55) → KeyboardAction::Scroll(+rows/2). 24 rows 半屏 12.
+    /// `scroll_keysym_override` 直接走 keysym 路径, 不依赖 us keymap (派单"单测
+    /// 覆盖 PageUp keysym → KeyboardAction::Scroll(N) 决策").
+    #[test]
+    fn page_up_keysym_returns_scroll_half_page_up() {
+        // Use of Keysym constructor: xkbcommon::xkb::Keysym::new(raw)
+        let pgup = xkb::Keysym::new(0xff55);
+        let action = scroll_keysym_override(pgup, 24, false);
+        assert_eq!(
+            action,
+            Some(KeyboardAction::Scroll(12)),
+            "PageUp (24 rows / 2 = 12) 应给 Scroll(+12) 看更老历史"
+        );
+    }
+
+    /// PageDown keysym (0xff56) → Scroll(-rows/2).
+    #[test]
+    fn page_down_keysym_returns_scroll_half_page_down() {
+        let pgdn = xkb::Keysym::new(0xff56);
+        let action = scroll_keysym_override(pgdn, 24, false);
+        assert_eq!(
+            action,
+            Some(KeyboardAction::Scroll(-12)),
+            "PageDown 应给 Scroll(-12) 跳到底"
+        );
+    }
+
+    /// Shift+PageUp → 整屏 = rows.
+    #[test]
+    fn shift_page_up_returns_full_page_up() {
+        let pgup = xkb::Keysym::new(0xff55);
+        let action = scroll_keysym_override(pgup, 24, true);
+        assert_eq!(
+            action,
+            Some(KeyboardAction::Scroll(24)),
+            "Shift+PageUp 应给 Scroll(+24) 整屏"
+        );
+    }
+
+    /// Shift+PageDown → 整屏负向.
+    #[test]
+    fn shift_page_down_returns_full_page_down() {
+        let pgdn = xkb::Keysym::new(0xff56);
+        let action = scroll_keysym_override(pgdn, 24, true);
+        assert_eq!(action, Some(KeyboardAction::Scroll(-24)));
+    }
+
+    /// 非 PgUp/Dn keysym 走 None 让上游回退到 terminal_keysym_override / utf8 路径.
+    #[test]
+    fn non_pageup_keysym_passthrough() {
+        let a = xkb::Keysym::new(0x0061); // 'a'
+        assert_eq!(scroll_keysym_override(a, 24, false), None);
+        let backspace = xkb::Keysym::new(0xff08);
+        assert_eq!(scroll_keysym_override(backspace, 24, false), None);
+    }
+
+    /// rows == 0 (启动期 race) 防御 — 返 None 让 utf8 路径吃掉 (pgup keysym 本
+    /// 身无 utf8, 最终落 Nothing).
+    #[test]
+    fn page_up_with_zero_rows_returns_none() {
+        let pgup = xkb::Keysym::new(0xff55);
+        assert_eq!(scroll_keysym_override(pgup, 0, false), None);
+    }
+
+    /// 极小 viewport (1 行) 仍发非 0 line 滚 — `.max(1)` 保单调.
+    #[test]
+    fn page_up_with_one_row_yields_one_line_scroll() {
+        let pgup = xkb::Keysym::new(0xff55);
+        // rows=1 → rows/2 = 0, .max(1) = 1
+        assert_eq!(
+            scroll_keysym_override(pgup, 1, false),
+            Some(KeyboardAction::Scroll(1)),
+            "1-行 viewport 半屏量应至少 1 line"
+        );
+    }
+
+    /// PgUp 走 us keymap + handle_key_event 整路径 (KEY_PAGEUP = 104 evdev).
+    /// 本 test 验路径接通, 不再断言 lines 数 (scroll_keysym_override 单测已锁).
+    #[test]
+    fn page_up_evdev_path_returns_scroll() {
+        let mut state = KeyboardState::new().expect("ctx new");
+        state.load_default_us_keymap().expect("keymap");
+        // KEY_PAGEUP = 104 (linux/input-event-codes.h)
+        let event = wl_keyboard::Event::Key {
+            serial: 0,
+            time: 0,
+            key: 104,
+            state: WEnum::Value(KeyState::Pressed),
+        };
+        let action = handle_key_event(event, &mut state, 24);
+        assert_eq!(
+            action,
+            KeyboardAction::Scroll(12),
+            "evdev KEY_PAGEUP → us keymap → keysym 0xff55 → Scroll(+12)"
+        );
+    }
+
+    /// PageDown evdev (KEY_PAGEDOWN = 109) → Scroll(-rows/2).
+    #[test]
+    fn page_down_evdev_path_returns_scroll() {
+        let mut state = KeyboardState::new().expect("ctx new");
+        state.load_default_us_keymap().expect("keymap");
+        let event = wl_keyboard::Event::Key {
+            serial: 0,
+            time: 0,
+            key: 109,
+            state: WEnum::Value(KeyState::Pressed),
+        };
+        let action = handle_key_event(event, &mut state, 24);
+        assert_eq!(action, KeyboardAction::Scroll(-12));
     }
 }
