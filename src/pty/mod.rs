@@ -25,7 +25,7 @@
 //!
 //! `PtyHandle` 的五个 pub 方法全部填实。
 
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::os::fd::RawFd;
 
 use anyhow::{anyhow, Context, Result};
@@ -61,10 +61,7 @@ impl PtyHandle {
     /// 的构造入口。`cols`/`rows` 在 Phase 2 由 T-0202 硬编码 80x24,Phase 3 T-0306
     /// 接窗口 resize 后才会真动态传入。
     pub fn spawn_shell(cols: u16, rows: u16) -> Result<Self> {
-        // T-0410 hotfix: 加 `-i` interactive flag, 否则 bash 在某些环境下当
-        // 非交互模式跑, 用户敲到 prompt 的命令找不到时直接 exit 127 (T-0205
-        // 把 shell exit 传播给 quill exit, 表现为窗口闪退). `-li` 是
-        // login + interactive, 跟 alacritty/ghostty 默认行为一致.
+        // T-0410 hotfix: 加 `-i` interactive flag.
         Self::spawn_program("bash", &["-li"], cols, rows)
     }
 
@@ -208,13 +205,25 @@ impl PtyHandle {
         if bytes.is_empty() {
             return Ok(0);
         }
-        let mut writer = self.master.take_writer().map_err(io::Error::other)?;
+        // T-0410 hotfix: 直接 libc::write 到 raw fd, 避开 portable-pty
+        // take_writer 每次 dup+drop 的潜在 fd 生命周期 bug (user 实测单字
+        // 闪退). raw fd 已 O_NONBLOCK (INV-009), write 在 buffer 满返
+        // EAGAIN 不阻塞 (INV-005).
         loop {
-            match writer.write(bytes) {
-                Ok(n) => return Ok(n),
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
+            // SAFETY: raw_fd 是 portable-pty master fd, 由 PtyHandle 持有
+            // 直到 drop, 此处 write 是只调 syscall 不动 fd 所有权.
+            #[allow(unsafe_code)]
+            let n = unsafe {
+                libc::write(self.raw_fd(), bytes.as_ptr() as *const libc::c_void, bytes.len())
+            };
+            if n >= 0 {
+                return Ok(n as usize);
             }
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
         }
     }
 
