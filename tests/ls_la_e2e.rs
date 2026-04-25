@@ -34,8 +34,9 @@
 //!
 //! GNU coreutils `ls` 第一行 `total N` 在中文 locale 下被翻译为 `总计 N`。
 //! 测试断 `'total'` 字面, 必须强制英文 locale。直接 `std::env::set_var("LANG", "C")`
-//! 会与 cargo test 默认并行执行的其它测试互相干扰 (Rust 1.79+ 显式把
-//! `set_var` 标 `unsafe`, 因为它非线程安全), 改用 `/usr/bin/env LANG=C LC_ALL=C`
+//! 会与 cargo test 默认并行执行的其它测试互相干扰 (POSIX `setenv` 非线程安全;
+//! Rust 1.79+ 在 edition 2024 把 `set_var` 标 hard `unsafe`, edition 2021 现仍
+//! 是 warn 但底层 race 同样存在), 改用 `/usr/bin/env LANG=C LC_ALL=C`
 //! 包装只影响当前子进程 env, 无全局副作用 — 这是配套 `tests/pty_echo.rs`
 //! (echo 输出与 locale 无关) 不需要 locale 兜底的延伸做法。
 //!

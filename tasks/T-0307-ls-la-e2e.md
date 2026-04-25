@@ -2,7 +2,7 @@
 
 **Phase**: 3 (Phase 3 收尾)
 **Assigned**: writer-T0307
-**Status**: in-review
+**Status**: merged
 **Budget**: tokenBudget=40k (lead 派单)
 **Dependencies**: T-0201 (PtyHandle::spawn_program) / T-0301 (TermState::advance) / T-0302 (cells_iter / line_text) / T-0306 (term.resize)
 

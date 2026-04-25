@@ -73,7 +73,7 @@ Lead 决定:**T-0104 + Phase 2 PTY 并行推进**。理由:
 
 ---
 
-## Phase 3 — VT 解析 + 屏幕状态 6/7 (2026-04-25)
+## Phase 3 — VT 解析 + 屏幕状态 ✅ 7/7 完工 (2026-04-25)
 
 **产出**:屏幕上看见 ASCII 字符,哪怕丑。
 
@@ -86,6 +86,9 @@ Lead 决定:**T-0104 + Phase 2 PTY 并行推进**。理由:
 - [x] `T-0304` 滚动 buffer 基础 (ScrollbackPos + scrollback_size/line_text/cells_iter) ✅ merged
 - [x] `T-0305` 色块渲染 (Color + CellRef fg/bg + draw_cells wgpu pipeline + idle callback) ✅ merged
 - [x] `T-0306` Wayland resize → term/pty 同步 (cell px 常数化 + propagate_resize_if_dirty + Renderer::resize) ✅ merged
+- [x] `T-0307` ls -la 端到端集成测试 (PTY → Term → grid 内容验证, 89 tests) ✅ merged
+
+**里程碑**:Phase 3 完工。`cargo run` 起 5090 wgpu Vulkan 窗口 → bash prompt 字符位置以浅灰色块排成一行 (深蓝背景, 10×25 px cell), 拉窗口 cols/rows 跟随 surface (TIOCSWINSZ 通知 shell), 端到端 ls -la 在 grid 里能找到 total + drwx。下一阶段 Phase 4 cosmic-text 字形渲染。
 - `T-0305` **每 cell 一色块**先渲染(无字体,`█` 式 block 填 cell 背景色)
 - `T-0306` resize → term.resize + ioctl TIOCSWINSZ 同步 PTY
 - `T-0307` 测试:`ls -la` 输出,检查 grid 里字符位置
@@ -183,4 +186,5 @@ Lead 决定:**T-0104 + Phase 2 PTY 并行推进**。理由:
 - 2026-04-25 T-0304 scrollback merged. **per-ticket fresh agent 范式首跑**. 写码-T0304 30 min 完工 73 tests 全绿派单 100% 对齐. 中间踩到 Claude Code routing bug: 中文 agent name (写码-T0304/审码-T0304) 触发 SendMessage swap (to=A 实际投到 B), 审码空 idle 没收到 spawn prompt. 写码 fresh agent 完全靠 conventions.md + handoff §5 内化, 准确识别 self-review 灾难拒绝执行. kill 重 spawn ASCII name (reviewer-T0304) 后审码顺利 +1. Phase 3 进度 4/7. 教训: agent name 强制 ASCII (memory ⭐⭐⭐ feedback_agent_name_ascii_only)
 - 2026-04-25 T-0305 色块渲染 merged. Phase 3 视觉里程碑达成: 跑 cargo run 第一次"看见东西". writer-T0305 943 行 diff 跨 src/term + src/wl/render + src/wl/window 三模块 + WGSL inline shader, 77 tests 全绿. fg vs bg 决策 goal-driven 偏离派单 (派单写 bg, 实际用 fg 因 bg 在深蓝清屏不可见违反 goal "看见 prompt 字符位置"), writer 主动告知, reviewer 独立判 ✅ 接受 (Goal binding > Scope wording). Lead 跟进同步更新 INV-002 加 cell_pipeline / cell_vertex_buffer 字段说明. Phase 3 进度 5/7
 - 2026-04-25 T-0306 Wayland resize merged. 87 tests (+10), 427 行 diff 跨 4 文件. 关键决策 propagate_resize_if_dirty 抽到 drive_wayland (而非 WindowHandler::configure 派单原位置, 因 Dispatch trait 没 term 引用), reviewer 独立验证 trait signature + LoopData 拓扑 ✅ 接受. Renderer::resize 必需新增 (派单未列, writer 补正确 — Outdated/Lost 重配只用旧 self.config, 不显式 resize 拖窗口 surface 永远停 800×600). Lead 跟进 INV-002 全字段同步 (10 字段含 cell_buffer_capacity / surface_is_srgb 全列, 标 POD 顺序无关). Phase 3 进度 6/7, 剩 T-0307 ls -la e2e
+- 2026-04-25 **T-0307 merged → Phase 3 ✅ 7/7 完工**. 89 tests (+2 ls_la_e2e, 0.01s × 2). 单文件 +212 行, 零生产代码改动. 2 偏离主动告知 reviewer 独立判全接受: viewport++scrollback (Goal binding > Scope wording 第二次应用) + env LANG=C 包装 (POSIX setenv 非线程安全 + Rust 2024 unsafe). reviewer 还独立 verify "Rust 1.79+ unsafe set_var" writer 措辞略夸大 (实际 edition 2024 才 hard error, edition 2021 仍 warn), Lead 跟进修 module doc 更精确. Phase 3 → Phase 4 转折点 spawn auditor-mainline 跨 ticket 全局审计 (并发跑, 不阻塞)
 - (后续每个阶段起止在这追加)
