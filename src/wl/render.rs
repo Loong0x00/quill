@@ -116,9 +116,15 @@ pub struct Renderer {
 /// **shelf packing 算法**: 维护 `(cursor_x, cursor_y, row_height)` 三个 u32 状态。
 /// 每来一个 glyph: 若 `cursor_x + width > ATLAS_W` 则换行
 /// (`cursor_y += row_height; cursor_x = 0; row_height = 0`); 若新行 `cursor_y +
-/// height > ATLAS_H` 则 `panic!("atlas overflow")` (派单"atlas 满了 panic + log
-/// 不要现在做 LRU, T-0406 解决")。Phase 4 atlas 容量足够 (2048² / 16×24 ≈ 10000
-/// 字符, 远超 ASCII + 常用 CJK)。
+/// height > ATLAS_H` 则 **T-0406 clear-on-full** — 清 allocations + reset cursor,
+/// 当前 glyph 重新走 shelf 分配 (atlas 远大于单 glyph 必装得下)。Phase 4 atlas
+/// 容量足够 (2048² / 16×24 ≈ 10000 字符, 远超 ASCII + 常用 CJK), clear 触发条件
+/// 罕见; 触发时 1 帧 hiccup 重 raster 当帧可见字, 用户基本看不见。
+///
+/// **why clear-on-full 不是真 LRU** (派单 KISS): 真 LRU 需 per-slot last_use
+/// timestamp + slab allocator + free-list, 跟当前 shelf packing 不兼容; 终端字符
+/// 集稳定 (~ASCII 95 + 常用 CJK 几千), atlas 满几乎不发生, clear 等价单帧 cache
+/// reset。ROADMAP "T-0406 LRU" 命名沿用历史。
 ///
 /// **R8Unorm 选择**: cosmic-text Mask 内容是 8-bit alpha 单通道, R8Unorm
 /// 自然映射, 4MiB GPU 内存 (2048×2048×1 byte) RTX 5090 32GB 完全无压力。
@@ -1375,8 +1381,10 @@ impl Renderer {
     /// - cache hit (allocations 已有): 直接返
     /// - 新字形: rasterize → 找空位 (`cursor_x + width <= ATLAS_W`, 否则换行
     ///   `cursor_y += row_height; cursor_x = 0; row_height = 0`)
-    /// - 高度满 (`cursor_y + height > ATLAS_H`): `panic!("atlas overflow")` 派单
-    ///   硬约束 "T-0406 LRU 是 future, 现在 panic"
+    /// - 高度满 (`cursor_y + height > ATLAS_H`): **T-0406 clear-on-full** —
+    ///   清 allocations + reset cursor 后 fall through 到下方 shelf packing,
+    ///   当前 raster 在 (0, 0) 重新分配 (atlas 远大于单 glyph 必装得下)。
+    ///   tracing::warn! 一行 hiccup 提示, 用户不可见。
     /// - 上传 bitmap 到 texture (queue.write_texture, R8Unorm 单通道, 行无 padding)
     ///
     /// 零尺寸 raster (空格 / zero-width): 仍 insert 一条 zero-size slot 进 HashMap
@@ -1418,18 +1426,30 @@ impl Renderer {
             atlas.cursor_x = 0;
             atlas.row_height = 0;
         }
-        // 高度满 → panic (派单硬约束: atlas 满了 panic + log "atlas overflow",
-        // T-0406 加 LRU 解决, 不在本 ticket scope)
+        // T-0406 clear-on-full: atlas 满 → 清 allocations + reset shelf cursor。
+        // 当前 raster (clear 后) cursor=0,0, ATLAS_W×ATLAS_H 远大于单 glyph 必装得下,
+        // 直接 fall through 到下方 `let x = atlas.cursor_x` 走 shelf packing。
+        //
+        // why clear-on-full 不是真 LRU: 真 LRU 需 per-slot last_use timestamp + slab
+        // allocator + free-list, 跟当前 shelf packing 不兼容; clear-on-full 是 KISS
+        // 等价物 (终端字符集稳定, 满几乎不触发, 触发时 1 帧 hiccup 重 raster 当帧
+        // 可见字, 用户基本看不见)。ROADMAP "T-0406 LRU" 命名沿用历史。
+        //
+        // why 不 clear texture: 新 raster 通过 queue.write_texture 覆盖旧像素, 旧 uv
+        // 已 invalidated (allocations 清了无 caller 引用), 不会有视觉残留。
+        // bind_group / view / sampler 全保留 (zero GPU resource churn)。
+        //
+        // 跨帧 cache 失效后果: 下一帧重 raster 当帧所有可见字 (~1920 个 ASCII 满屏
+        // 在 17pt × HIDPI 下, ~50ms 量级 hiccup)。终端使用场景下此触发条件极罕见。
         if atlas.cursor_y + raster.height > ATLAS_H {
-            panic!(
-                "glyph atlas overflow at ({}, {}); atlas {}×{} 满, T-0406 LRU 是 future。\
-                 当前 allocations.len = {}",
-                atlas.cursor_x,
-                atlas.cursor_y,
-                ATLAS_W,
-                ATLAS_H,
+            tracing::warn!(
+                "glyph atlas full (allocations={}), clearing for re-raster",
                 atlas.allocations.len()
             );
+            atlas.allocations.clear();
+            atlas.cursor_x = 0;
+            atlas.cursor_y = 0;
+            atlas.row_height = 0;
         }
         let x = atlas.cursor_x;
         let y = atlas.cursor_y;
@@ -1772,16 +1792,21 @@ pub fn render_headless(
                         atlas_cursor_x = 0;
                         atlas_row_height = 0;
                     }
+                    // T-0406 clear-on-full (同 Renderer::allocate_glyph_slot 路径
+                    // 语义对齐): atlas 满 → 清 allocations + reset shelf cursor。
+                    // headless 路径与 Renderer 路径共享语义, T-0406 之前是 anyhow Err
+                    // (调用方退出 code != 0); 改 clear-on-full 让 headless screenshot
+                    // 在大字符集场景仍能产 PNG (派单 In #D acceptance + 派单"完工
+                    // 后大量字符变化不会 panic, 而是 1 帧 hiccup")。
                     if atlas_cursor_y + raster.height > ATLAS_H {
-                        return Err(anyhow!(
-                            "headless glyph atlas overflow at ({}, {}); atlas {}×{} 满 — \
-                             Phase 4 ASCII 路径不应触发, allocations.len = {}",
-                            atlas_cursor_x,
-                            atlas_cursor_y,
-                            ATLAS_W,
-                            ATLAS_H,
+                        tracing::warn!(
+                            "headless glyph atlas full (allocations={}), clearing for re-raster",
                             allocations.len()
-                        ));
+                        );
+                        allocations.clear();
+                        atlas_cursor_x = 0;
+                        atlas_cursor_y = 0;
+                        atlas_row_height = 0;
                     }
                     let x = atlas_cursor_x;
                     let y = atlas_cursor_y;
