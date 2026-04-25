@@ -11,3 +11,9 @@ pub use window::run_window;
 // ([`WindowCore`] + [`WindowEvent`] + [`handle_event`])公开,内部活动回调
 // 也走同一条路径(见 `window.rs::State::configure`)。
 pub use window::{handle_event, WindowAction, WindowCore, WindowEvent};
+
+// T-0404: HiDPI 整数缩放常数, text 子系统 (shape_line font_size) 与 render
+// (Renderer::resize / cell px) 共享单一来源, 改一处即可。
+// `mod render` 自身保持私有 (INV-010: wgpu 类型不出本模块), 仅 const u32 通过
+// 此 re-export 以 `crate::wl::HIDPI_SCALE` 路径暴露给 text 模块。
+pub use render::HIDPI_SCALE;

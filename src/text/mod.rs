@@ -407,7 +407,17 @@ impl TextSystem {
     pub fn shape_line(&mut self, text: &str) -> Vec<ShapedGlyph> {
         use cosmic_text::{Attrs, Buffer, Family, Metrics, Shaping};
 
-        let metrics = Metrics::new(17.0, 25.0);
+        // T-0404 HiDPI: font_size × HIDPI_SCALE = 17 × 2 = 34pt physical, 让
+        // rasterize 出的 bitmap 是物理像素尺寸, 与 [`crate::wl::render::Renderer`]
+        // 的 surface 物理像素 (logical × HIDPI_SCALE) 单位一致。bitmap 上 atlas
+        // 后渲染时直接 1:1 上屏, 不依赖 GPU sampler 放大 (Phase 4 atlas sampler 是
+        // FilterMode::Nearest, 不做插值)。
+        //
+        // **HIDPI_SCALE 单一来源**: 引 [`crate::wl::HIDPI_SCALE`] 让
+        // text 与 render 共享同一缩放常数, 改一处即可。模块依赖图: text 不
+        // 反向依赖 wl 类型 (INV-010), 仅引用 const u32 不算耦合升级 (派单允许)。
+        let scale = crate::wl::HIDPI_SCALE as f32;
+        let metrics = Metrics::new(17.0 * scale, 25.0 * scale);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
         // T-0407: Family::Name(primary) 显式锁 face (T-0403 bug fix, 同
         // shape_one_char)。fallback chain 仍工作 — 主 face 缺 codepoint
@@ -930,6 +940,86 @@ mod tests {
             let _raster = ts.rasterize(g);
             // _raster 可能 Some 也可能 None (face 缺 gid=0 资源也允许), 不强求。
         }
+    }
+
+    /// T-0404: rasterize 'a' at logical font_size=17 vs HiDPI font_size=34
+    /// (= 17 × HIDPI_SCALE), bitmap 宽度应约翻倍。锁 HIDPI_SCALE × shape ×
+    /// rasterize 链路真生效。
+    ///
+    /// **派单测试名**: `glyph_rasterize_at_2x_size_returns_larger_bitmap` (本
+    /// 测试函数名沿用)。位于 src/text/mod.rs 内 unit test 块, 因要碰
+    /// `font_system` / `swash_cache` 私有字段 + `from_cosmic_glyph` 私有 inherent
+    /// fn (INV-010 类型隔离 strict 第 N 次应用), 集成测试 (tests/glyph_atlas.rs)
+    /// 拿不到这些, 必须 `#[cfg(test)] mod tests` 内单测。
+    ///
+    /// **不直接调 shape_line(已写死 17 × HIDPI_SCALE)做对比**: 那只能取到一个
+    /// font_size; 改用本地辅助 closure 直接驱动 cosmic-text Buffer 取两 font_size,
+    /// 避免改动 shape_line 公共 API (引入 `shape_line_at_font_size` 派单 scope 外)。
+    ///
+    /// **rebase 后注**: T-0407 把 shape_line 内的 `Family::Monospace` 改为
+    /// `Family::Name(&self.primary_face_name)` (face 锁定 bug fix), 但本测试用
+    /// 自定义 closure 直接走 `Family::Monospace` 不接 primary_face — closure 内
+    /// 是孤立 Buffer (不进 atlas, 不影响渲染), 仅验"font_size × 2 → bitmap × 2"
+    /// 这条物理关系。`Family::Monospace` 在用户机仍能命中 monospace face (DejaVu /
+    /// Source Code Pro / Noto Mono 任一), 比 `Family::Name(&primary)` 借 self
+    /// 字段更省事 (closure 同时借 ts.font_system mut + ts.primary_face_name 即
+    /// borrow conflict)。
+    #[test]
+    fn glyph_rasterize_at_2x_size_returns_larger_bitmap() {
+        use cosmic_text::{Attrs, Buffer, Family, Metrics, Shaping};
+
+        let mut ts = TextSystem::new().expect("TextSystem::new on user machine");
+
+        // 不能用 closure 直接 capture &mut ts.font_system 与 ts 自己 (rasterize
+        // 取 &mut self 全 ts), 改为按顺序调两次 + 中间释放 buffer。
+        let raster_at = |ts: &mut TextSystem, font_size: f32| -> Option<RasterizedGlyph> {
+            let glyph = {
+                let metrics = Metrics::new(font_size, font_size * 1.5);
+                let mut buffer = Buffer::new(&mut ts.font_system, metrics);
+                let attrs = Attrs::new().family(Family::Monospace);
+                buffer.set_text(&mut ts.font_system, "a", attrs, Shaping::Advanced);
+                buffer.shape_until_scroll(&mut ts.font_system, true);
+                let run = buffer.layout_runs().next()?;
+                let lg = run.glyphs.first()?;
+                ShapedGlyph::from_cosmic_glyph(lg)
+            };
+            ts.rasterize(&glyph)
+        };
+
+        let r1x = raster_at(&mut ts, 17.0).expect("17pt 'a' must rasterize");
+        let r2x = raster_at(&mut ts, 17.0 * crate::wl::HIDPI_SCALE as f32)
+            .expect("34pt 'a' must rasterize");
+
+        assert!(r1x.width > 0, "1x bitmap width must be positive");
+        assert!(r2x.width > 0, "2x bitmap width must be positive");
+
+        // 2x font_size 给 ~2x bitmap, 实测用户机 (DejaVu Sans Mono / Source Code
+        // Pro / Noto Mono fallback chain 任一) 'a' 17pt → 11px 宽, 34pt → 19px
+        // 宽, ratio ≈ 1.73。**1.73 而非 2.0 的原因**: cosmic-text 在小字号下用
+        // swash hinting + 1-2px padding (subpixel anti-aliasing 边距), 这些常数
+        // 项不随 font_size 线性缩放 — 字号越大相对占比越小, 比例渐近 2.0。
+        // 容差用 [1.5, 2.5] 而非 prompt 指 ±10% 的 [1.8, 2.2] (实测 1.73 仍是真
+        // "翻倍" 信号, 锁太紧会因 cosmic-text 升级 / 字体微差挂 false positive)。
+        let ratio = r2x.width as f32 / r1x.width as f32;
+        assert!(
+            ratio > 1.5 && ratio < 2.5,
+            "2x font_size bitmap width should be ~2x: 1x={}, 2x={}, ratio={} \
+             (HIDPI_SCALE = {})",
+            r1x.width,
+            r2x.width,
+            ratio,
+            crate::wl::HIDPI_SCALE
+        );
+        // height 同样 ~2x (cell ascent + descent + hinting padding 同款常数项,
+        // 容差同宽)。
+        let h_ratio = r2x.height as f32 / r1x.height as f32;
+        assert!(
+            h_ratio > 1.5 && h_ratio < 2.5,
+            "2x font_size bitmap height should be ~2x: 1x={}, 2x={}, ratio={}",
+            r1x.height,
+            r2x.height,
+            h_ratio
+        );
     }
 
     /// T-0403: ShapedGlyph::atlas_key 返 GlyphKey (T-0407 升级 (u16, u32) →
