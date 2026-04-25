@@ -94,6 +94,23 @@ pub struct Renderer {
 /// 留 Phase 6 soak 验证有需要再说。
 const VERTS_PER_CELL: usize = 6;
 
+/// **cell 像素宽度** —— Phase 3 临时常数(T-0306)。Phase 4 字形渲染时改为
+/// `cosmic-text` 测出的字体 advance 宽度替换。
+///
+/// 为啥 hardcode:T-0305 之前 `cell_w_px = surface_w / cols`,即 cells 拉伸填满
+/// surface —— cols/rows 写死 80×24 时拖窗口 cells 跟着变大,但 grid 不能多显示。
+/// T-0306 反过来:cell px 是常数,`cols = surface_w / CELL_W_PX`(window.rs
+/// configure callback 算),拖窗口能显示更多 cells(bash 真能多显示行/列)。
+///
+/// 10×25 取自 GNOME 默认终端 monospace 字体的近似(DejaVu Sans Mono 11pt ≈
+/// 10px advance × 22px ascent + 3px line gap)。Phase 4 字形测量后会被字体
+/// 真实 metrics 替代,届时本常数删除,`Renderer` 持 `cell_w_px / cell_h_px: f32`
+/// 字段动态更新(同时把 `crate::wl::window` configure callback 里的换算迁过来)。
+pub const CELL_W_PX: f32 = 10.0;
+
+/// **cell 像素高度** —— Phase 3 临时常数。配套见 [`CELL_W_PX`]。
+pub const CELL_H_PX: f32 = 25.0;
+
 /// 每顶点字节数:`pos[2 f32] + color[3 f32]` = 20 字节。手算固化,WGSL 端
 /// 与本常量必须一致(见 [`CELL_WGSL`])。
 const VERTEX_BYTES: usize = 5 * std::mem::size_of::<f32>();
@@ -239,6 +256,32 @@ impl Renderer {
         })
     }
 
+    /// Wayland configure 后把新 surface 像素尺寸推给 wgpu —— 更新 `self.config`
+    /// 并 `surface.configure`。T-0306 接通 wayland resize 链路时由
+    /// [`crate::wl::window`] 在 `core.resize_dirty` 被置后调用,与
+    /// `term.resize` / `pty.resize` 同步。
+    ///
+    /// **幂等**:width/height 与当前 config 完全一致时跳过 surface.configure
+    /// (避免无谓重建 swapchain)。`width == 0 || height == 0` 也跳过(SurfaceConfiguration
+    /// 不接受 0,wgpu 内部 panic)—— 与 [`Self::new`] 的 `.max(1)` 同思路,但
+    /// 这里直接 return 让调用方知道"什么都没做",而非静默 clamp 到 1×1
+    /// (1×1 surface 几乎无用,跳过更老实)。
+    ///
+    /// **draw_cells 的 NDC 换算**(`x / surface_w * 2 - 1`)读 `self.config.width
+    /// / height`,所以 resize 后下一次 draw_cells 自动用新尺寸,不需要额外通知。
+    pub fn resize(&mut self, width: u32, height: u32) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        if width == self.config.width && height == self.config.height {
+            return;
+        }
+        self.config.width = width;
+        self.config.height = height;
+        self.surface.configure(&self.device, &self.config);
+        tracing::debug!(width, height, "wgpu surface reconfigured (resize)");
+    }
+
     /// 拿到下一帧 texture,清屏,present。Acquire 失败(Outdated / Lost /
     /// Timeout / Occluded)作为非致命回到 `Ok(())`,让上层跳过这帧 —— resize
     /// 期间很常见。Validation 这种上游异常按错误抛。
@@ -335,12 +378,16 @@ impl Renderer {
         self.ensure_cell_pipeline();
         self.ensure_cell_buffer(cols, rows);
 
-        // Step 2: 算 cell pixel size + 构建顶点。整数除余下边距 Phase 4 再细化
-        // (派单允许),但 cell_w/cell_h 至少各 1 像素防零除(派单提示)。
+        // Step 2: cell pixel size 走常数 [`CELL_W_PX`] / [`CELL_H_PX`](T-0306
+        // 改:Phase 3 用 hardcode,Phase 4 字形测量后换字体 metrics)。surface_w /
+        // surface_h 仍是 NDC 换算的分母(像素 → clip space),不能省。
+        // 调用方(window.rs configure callback)按 `cols = surface_w / CELL_W_PX`
+        // 算 cols 推给 term.resize,cells 数量与 cell px 自然匹配 surface,
+        // 余下边距(surface_w % CELL_W_PX)Phase 4 再细化(派单允许)。
         let surface_w = self.config.width.max(1) as f32;
         let surface_h = self.config.height.max(1) as f32;
-        let cell_w_px = (self.config.width as usize / cols).max(1) as f32;
-        let cell_h_px = (self.config.height as usize / rows).max(1) as f32;
+        let cell_w_px = CELL_W_PX;
+        let cell_h_px = CELL_H_PX;
 
         let vertex_bytes =
             self.build_vertex_bytes(cells, cell_w_px, cell_h_px, surface_w, surface_h);
