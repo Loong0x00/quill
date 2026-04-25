@@ -391,10 +391,14 @@ impl Renderer {
         let info = adapter.get_info();
         tracing::info!(backend = ?info.backend, name = %info.name, "wgpu adapter 选中");
 
+        // T-0409 hotfix: downlevel_defaults max_texture_dimension_2d=2048 在
+        // HiDPI ×2 + compositor resize (e.g. 1600×1200 logical → 3200×2400
+        // physical) 下触发 Surface::configure validation panic. 用
+        // adapter.limits() 取实际硬件上限 (Vulkan 5090 = 16384+).
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("quill-device"),
             required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::downlevel_defaults(),
+            required_limits: adapter.limits(),
             experimental_features: wgpu::ExperimentalFeatures::default(),
             memory_hints: wgpu::MemoryHints::default(),
             trace: wgpu::Trace::Off,
@@ -1594,10 +1598,13 @@ pub fn render_headless(
     let info = adapter.get_info();
     tracing::info!(backend = ?info.backend, name = %info.name, "wgpu adapter (headless) 选中");
 
+    // T-0409 hotfix: 同 Renderer::new (line ~394), 用 adapter.limits() 取实际
+    // 硬件上限. headless 路径未来若加 6K 渲染需求 (--headless-screenshot 大尺寸)
+    // 同样需要 > 2048 max_texture_dimension_2d.
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("quill-headless-device"),
         required_features: wgpu::Features::empty(),
-        required_limits: wgpu::Limits::downlevel_defaults(),
+        required_limits: adapter.limits(),
         experimental_features: wgpu::ExperimentalFeatures::default(),
         memory_hints: wgpu::MemoryHints::default(),
         trace: wgpu::Trace::Off,
