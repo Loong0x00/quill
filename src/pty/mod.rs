@@ -61,7 +61,11 @@ impl PtyHandle {
     /// 的构造入口。`cols`/`rows` 在 Phase 2 由 T-0202 硬编码 80x24,Phase 3 T-0306
     /// 接窗口 resize 后才会真动态传入。
     pub fn spawn_shell(cols: u16, rows: u16) -> Result<Self> {
-        Self::spawn_program("bash", &["-l"], cols, rows)
+        // T-0410 hotfix: 加 `-i` interactive flag, 否则 bash 在某些环境下当
+        // 非交互模式跑, 用户敲到 prompt 的命令找不到时直接 exit 127 (T-0205
+        // 把 shell exit 传播给 quill exit, 表现为窗口闪退). `-li` 是
+        // login + interactive, 跟 alacritty/ghostty 默认行为一致.
+        Self::spawn_program("bash", &["-li"], cols, rows)
     }
 
     /// 起任意程序(给 T-0206 集成测试用,将来也可能服务 Phase 6 的 shell 配置)。
