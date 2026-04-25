@@ -963,6 +963,42 @@ pub fn run_window() -> Result<()> {
                     })
                 }
             };
+
+            // T-0601: 构造 CursorInfo (派单 In #C). 光标位置 / 形状 / SHOW_CURSOR
+            // 都从 term 拿; preedit 显示时强制 visible=false (光标位置与 preedit
+            // 起点同 col/line, 主流 IME 风格隐光标显 preedit, 也防视觉重叠).
+            // 颜色用 term 默认 cursor 色 #ffffff (已在 named_color_rgb 内定, 此
+            // 处与 preedit underline 同色 — 视觉上 cursor 块 vs preedit 下划线
+            // 互斥不会同时出现, 复用色不冲突).
+            //
+            // INV-010: term::CursorShape → render::CursorStyle 显式 match, 上游
+            // 加 shape variant 时 compile error 在此一处捕获. Hidden 折叠到
+            // visible=false (term::CursorShape::Hidden 来自 alacritty 内部状
+            // 态, SHOW_CURSOR 模式独立).
+            let cursor_info: Option<crate::wl::render::CursorInfo> = {
+                use crate::term::CursorShape;
+                let pos = t.cursor_pos();
+                let shape = t.cursor_shape();
+                let style = match shape {
+                    CursorShape::Block => Some(crate::wl::render::CursorStyle::Block),
+                    CursorShape::Underline => Some(crate::wl::render::CursorStyle::Underline),
+                    CursorShape::Beam => Some(crate::wl::render::CursorStyle::Beam),
+                    CursorShape::HollowBlock => Some(crate::wl::render::CursorStyle::HollowBlock),
+                    CursorShape::Hidden => None,
+                };
+                style.map(|s| crate::wl::render::CursorInfo {
+                    col: pos.col,
+                    line: pos.line,
+                    visible: t.cursor_visible() && preedit_overlay.is_none(),
+                    style: s,
+                    color: crate::term::Color {
+                        r: 0xff,
+                        g: 0xff,
+                        b: 0xff,
+                    },
+                })
+            };
+
             let draw_result = match text_system.as_mut() {
                 Some(ts) => {
                     // 收集每行的文本快照, 喂给 draw_frame shape。t.line_text(row)
@@ -977,6 +1013,7 @@ pub fn run_window() -> Result<()> {
                         &row_texts,
                         hover,
                         preedit_overlay.as_ref(),
+                        cursor_info.as_ref(),
                     )
                 }
                 None => r.draw_cells(&cells, cols, rows),

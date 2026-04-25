@@ -64,6 +64,7 @@ fn render_csd_with_shell_prompt() -> (Vec<u8>, u32, u32) {
         LOGICAL_W,
         LOGICAL_H,
         None,
+        None, // T-0601: CSD 测试聚焦 titlebar 几何, 不画 cursor
     )
     .expect("render_headless failed")
 }
