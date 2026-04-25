@@ -1,8 +1,8 @@
 # T-0304 滚动 buffer 基础
 
 **Phase**: 3
-**Assigned**: (open)
-**Status**: open
+**Assigned**: 写码-T0304
+**Status**: claimed
 **Budget**: tokenBudget=50k (lead 派单)
 **Dependencies**: T-0302 (CellPos 已就绪) / T-0303 (cursor API 完整)
 
