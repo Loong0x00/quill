@@ -13,7 +13,6 @@ pollster = "0.4"
 portable-pty = "0.9"
 raw-window-handle = "0.6"
 smithay-client-toolkit = "0.19"
-thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # client_system 切换到 libwayland C 后端 —— wgpu/Vulkan 需要真实 wl_display / wl_surface
