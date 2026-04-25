@@ -2,6 +2,7 @@
 //! (T-0102)。对外只暴露 [`run_window`] 一个入口,隐藏 SCTK / wayland-client /
 //! wgpu 的全部原始类型。后续 ticket 接 calloop / resize。
 
+mod keyboard;
 mod render;
 mod window;
 

@@ -40,11 +40,12 @@ use calloop::{EventLoop, Interest, LoopSignal, Mode, PostAction};
 use crate::pty::PtyHandle;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
-    delegate_compositor, delegate_output, delegate_registry, delegate_xdg_shell,
+    delegate_compositor, delegate_output, delegate_registry, delegate_seat, delegate_xdg_shell,
     delegate_xdg_window,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
+    seat::{Capability, SeatHandler, SeatState},
     shell::{
         xdg::{
             window::{Window, WindowConfigure, WindowDecorations, WindowHandler},
@@ -56,10 +57,11 @@ use smithay_client_toolkit::{
 use wayland_backend::client::WaylandError;
 use wayland_client::{
     globals::registry_queue_init,
-    protocol::{wl_output, wl_surface},
-    Connection, EventQueue, Proxy, QueueHandle,
+    protocol::{wl_keyboard, wl_output, wl_seat, wl_surface},
+    Connection, Dispatch, EventQueue, Proxy, QueueHandle,
 };
 
+use super::keyboard::{handle_key_event, KeyboardAction, KeyboardState};
 use super::render::Renderer;
 
 const INITIAL_WIDTH: u32 = 800;
@@ -607,6 +609,9 @@ pub fn run_window() -> Result<()> {
     window.commit();
 
     // State 字段顺序固化 INV-001(renderer→window→conn)+ pty 放最后(T-0202 Lead + 审码)。
+    // T-0501 加: seat_state / keyboard_state / keyboard 三字段位于 core 与 pty 之间,
+    // 不破坏 INV-001 链条 (它们都不持 wgpu/wayland 裸指针, 仅 SCTK/wayland-client
+    // safe wrapper, drop 顺序无 UB 风险)。
     let mut state = State {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
@@ -614,6 +619,10 @@ pub fn run_window() -> Result<()> {
         window,
         conn: conn.clone(),
         core: WindowCore::new(INITIAL_WIDTH, INITIAL_HEIGHT),
+        seat_state: SeatState::new(&globals, &qh),
+        keyboard_state: KeyboardState::new()
+            .context("KeyboardState::new 失败 (xkbcommon Context 初始化)")?,
+        keyboard: None,
         pty: None,
     };
 
@@ -841,6 +850,18 @@ struct State {
     window: Window,
     conn: Connection,
     core: WindowCore,
+    // T-0501: SeatState + KeyboardState + 当前绑定的 wl_keyboard。
+    // SeatState 是 SCTK helper, 监听 wl_seat 全局 + capabilities 变化, 不持
+    // wgpu / wayland 裸指针 (仅 wayland-client safe wrapper); 放此处不破坏
+    // INV-001 链条 — 与 OutputState / RegistryState 同性质 (POD-like, 上游
+    // 自管 drop)。
+    seat_state: SeatState,
+    keyboard_state: KeyboardState,
+    /// 当前绑定的 wl_keyboard (capabilities 含 Keyboard 时由 SeatHandler::
+    /// new_capability 创建); 移除 keyboard capability 时 Some→None。
+    /// drop 顺序: WlKeyboard 是 wayland Proxy (handle), drop 时发 release
+    /// request 给 compositor, 不依赖 wgpu, 放尾部安全。
+    keyboard: Option<wl_keyboard::WlKeyboard>,
     // `pty` **位于 State 最后一位**(Lead + 审码 2026-04-25 拍板,见 T-0202 ticket):
     // - PTY 持 Linux fd + 子进程句柄,与 wl / wgpu 资源生命周期正交,放最后避免
     //   跟 INV-001 的 renderer→window→conn 链条耦合,不需要新建 INV。
@@ -1023,9 +1044,146 @@ impl ProvidesRegistryState for State {
 
 delegate_compositor!(State);
 delegate_output!(State);
+delegate_seat!(State);
 delegate_xdg_shell!(State);
 delegate_xdg_window!(State);
 delegate_registry!(State);
+
+impl SeatHandler for State {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seat_state
+    }
+
+    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {
+        // 新 seat 出现 (compositor 启动期 / 用户插入新键盘 hub) — 不立即 bind
+        // keyboard, 等 new_capability(Keyboard) 才 bind。这是 SCTK 标准模式,
+        // 让 capability 路径单一。
+    }
+
+    fn new_capability(
+        &mut self,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability == Capability::Keyboard && self.keyboard.is_none() {
+            // wl_seat::get_keyboard 返 raw WlKeyboard, 我们走自己的
+            // Dispatch<WlKeyboard, ()> impl (派单 In #C, 不用 SCTK keyboard
+            // 模块的 KeyboardHandler — INV-010 类型隔离, KeyboardState 是
+            // quill 自有, 不偷渡 SCTK keyboard 类型)。
+            //
+            // user_data = () : 我们用 State 字段 self.keyboard 跟踪当前绑定,
+            // 不需要 per-keyboard 用户数据。
+            let kb = seat.get_keyboard(qh, ());
+            tracing::info!("wl_seat capability Keyboard 出现, wl_keyboard 已绑定");
+            self.keyboard = Some(kb);
+        }
+    }
+
+    fn remove_capability(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability == Capability::Keyboard {
+            // capability 移除 (用户拔键盘 hub / compositor 切 seat 配置) —
+            // drop 当前 wl_keyboard, 后续 Key event 不会再来。新 capability
+            // 出现时 new_capability 会重 bind。
+            if let Some(kb) = self.keyboard.take() {
+                kb.release();
+                tracing::info!("wl_seat capability Keyboard 移除, wl_keyboard 释放");
+            }
+        }
+    }
+
+    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {
+        // seat 整个移除 — 当前 wl_keyboard 一并失效, 走 take 释放。
+        if let Some(kb) = self.keyboard.take() {
+            kb.release();
+        }
+    }
+}
+
+/// wl_keyboard 协议事件 → 转 [`handle_key_event`] → bytes → `PtyHandle::write`。
+///
+/// **why 自己实现 Dispatch 而非 SCTK KeyboardHandler** (INV-010 + 派单 In #C):
+/// SCTK 0.19 的 keyboard 模块虽然封装了 keymap 加载 / modifier 同步, 但它的
+/// `KeyEvent` struct 把 `xkbcommon::xkb::Keysym` 字段暴露在 trait 边界, 让
+/// quill 必须 import xkbcommon 类型走过 SCTK 这一层 — 类型隔离半破。本项目
+/// 走 raw `Dispatch<WlKeyboard>` + 自己持 `KeyboardState` (内部封 xkbcommon),
+/// quill 公共 API (`handle_key_event` 入参 `wl_keyboard::Event`, 出参
+/// `KeyboardAction`) 全 quill 自有 / wayland-client 协议类型, 不漏 xkbcommon。
+///
+/// **PTY write 路径**: KeyboardAction::WriteToPty(bytes) → self.pty.write(&bytes)。
+/// master fd O_NONBLOCK (INV-009), WouldBlock 视为背压**丢字节** (派单 In #D
+/// 允许)。daily drive 罕见, paste 大段时可能丢 — Phase 6 加 paste throttle 解。
+impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &wl_keyboard::WlKeyboard,
+        event: wl_keyboard::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        let action = handle_key_event(event, &mut state.keyboard_state);
+        match action {
+            KeyboardAction::Nothing => {}
+            KeyboardAction::WriteToPty(bytes) => {
+                let Some(pty) = state.pty.as_ref() else {
+                    tracing::warn!(
+                        target: "quill::keyboard",
+                        n = bytes.len(),
+                        "WriteToPty 时 pty=None, 丢字节"
+                    );
+                    return;
+                };
+                match pty.write(&bytes) {
+                    Ok(n) if n == bytes.len() => {
+                        tracing::trace!(
+                            target: "quill::keyboard",
+                            n,
+                            "wrote keyboard bytes to pty"
+                        );
+                    }
+                    Ok(n) => {
+                        // partial write — PTY 内核 buffer 几乎满。剩余字节
+                        // **派单允许丢** (背压策略, 不阻塞主循环)。
+                        tracing::warn!(
+                            target: "quill::keyboard",
+                            wrote = n,
+                            total = bytes.len(),
+                            "pty.write 部分写入, 剩余字节丢弃 (背压)"
+                        );
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // O_NONBLOCK fd buffer 满 — daily drive 罕见, paste 大
+                        // 段可能撞到。派单 In #D 接受丢字节, Phase 6 paste
+                        // throttle 解。
+                        tracing::warn!(
+                            target: "quill::keyboard",
+                            n = bytes.len(),
+                            "pty.write WouldBlock, 字节丢弃 (背压, INV-005 不重试)"
+                        );
+                    }
+                    Err(e) => {
+                        // 其它 IO 错 (EBADF / EIO 等) — pty 可能已死, 主循环
+                        // 由 pty_read_tick EOF 路径处理退出, 这里仅 warn。
+                        tracing::warn!(
+                            target: "quill::keyboard",
+                            error = %e,
+                            n = bytes.len(),
+                            "pty.write 失败 (非 WouldBlock)"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
