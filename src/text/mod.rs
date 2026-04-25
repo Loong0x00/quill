@@ -424,6 +424,16 @@ impl TextSystem {
         // (例 CJK '中' 在 DejaVu Sans Mono 不含) cosmic-text 自动 fallback
         // 到 Noto CJK 等; 这是想要的 (T-0405 scope), 此处只锁主 face。
         // emoji face fallback 由 `apply_emoji_blacklist` post-process 拒绝。
+        //
+        // **T-0405 verify 路径** (集成测试 `tests/cjk_fallback_e2e.rs`):
+        // 用户机已装 noto-fonts-cjk + adobe-source-han-sans, fc-list :lang=zh
+        // 命中 → cosmic-text fontdb fallback chain 自动给 CJK codepoint 切到
+        // 这两 face 之一 (primary DejaVu Sans Mono 不含 CJK glyph), face_id
+        // 不同于 primary_face_id; [`GlyphKey`] face_id 维度 (T-0407) 让 CJK
+        // fallback face 与主 face 不撞 atlas slot。CI 无 CJK face 时退化到
+        // 主 face .notdef tofu (`apply_emoji_blacklist` 不接管 — 不在黑名单),
+        // 显主 face 豆腐字形而非崩溃。T-0405 测试以用户机为准, CI 退化路径
+        // 接受 (派单 Acceptance "用户机为准, CI 退化作 follow-up")。
         let attrs = Attrs::new().family(Family::Name(&self.primary_face_name));
 
         buffer.set_text(&mut self.font_system, text, attrs, Shaping::Advanced);
@@ -795,12 +805,18 @@ mod tests {
     /// 切换到 Noto CJK 处理 '你' '好',回到 Latin face 处理 'a' 'b' 'c')。
     /// 用户机 noto-fonts-cjk 装齐;CI 无 CJK 字体 cosmic-text 仍走 .notdef
     /// fallback 5 个 glyph 不少 — 关键是 `glyphs.len() == 5` + 不 panic。
-    /// CJK 双宽性质 (东亚字 advance ≈ 2x ASCII) 由字体设计保证, **本测试
-    /// 不做 advance 数值断言** (CI 退化到 tofu 时 advance 可能 ≈ ASCII 宽,
-    /// 不能用 advance 区分 CJK / ASCII)。
+    ///
+    /// **T-0405: CJK 双宽 advance 软性断言** (派单 In #B 可选项): T-0407 face
+    /// lock + emoji 排除已锁主 face, 用户机 / CI 走真 CJK fallback face (Noto
+    /// CJK / Source Han Sans), 该 face 设计上 CJK glyph advance ≈ 2 × ASCII
+    /// (东亚 monospace 双宽传统)。**软性 assert**: 若 CJK fallback 真触发
+    /// (`你_face_id != ascii_face_id`) 锁双宽 (±10% 容差); CI 退化到主 face
+    /// tofu 时跳过该 assert (主 face 'a' 与 '你' 同走 .notdef → advance 同源
+    /// 不能区分双宽)。
     #[test]
     fn shape_line_mixed_cjk_returns_glyphs() {
         let mut ts = TextSystem::new().expect("TextSystem::new on user machine");
+        let primary = ts.primary_face_id();
         let glyphs = ts.shape_line("你好abc");
         assert_eq!(
             glyphs.len(),
@@ -816,6 +832,51 @@ mod tests {
                 g.x_advance
             );
             assert_eq!(g.y_advance, 0.0, "horizontal text y_advance is 0");
+        }
+
+        // T-0405 软性双宽 assert: 仅当 CJK fallback 真触发 (你_face != primary)
+        // 才锁。否则 (CI 退化到主 face .notdef) 主 face 'a' 与 '你' 走同 face
+        // tofu, advance 同源不能区分 — 跳过 assert 不挂 CI。
+        let cjk_face = glyphs[0].face_id();
+        let ascii_face = glyphs[2].face_id();
+        if cjk_face != primary && cjk_face != ascii_face {
+            // CJK fallback 真触发, 锁"CJK 显著宽于 ASCII"作 monospace 双宽特征。
+            //
+            // **range [1.4, 2.4] 而非 ±10% [1.8, 2.2]**: 实测用户机
+            // (Noto CJK / Source Han Sans CJK + DejaVu Sans Mono ASCII) 给
+            // ratio ≈ 1.67 — Noto CJK glyph advance = 1.0em (CJK 设计标准),
+            // DejaVu Sans Mono Latin advance ≈ 0.6em (Latin monospace 设计窄于
+            // 1em), 比例落在 1/0.6 ≈ 1.67 而非"严格 2x"。"≈ 2x"是东亚 monospace
+            // 的近似传统说法 (Source Han Sans / Noto Sans Mono CJK + 同 face
+            // 的 Latin 才严格 2:1; 跨 face fallback 比例由两 face 设计决定)。
+            // [1.4, 2.4] 接受 Noto-CJK + DejaVu / Source-Han + Source-Code 等
+            // 真实组合, 锁"CJK 显著宽于 ASCII"信号 (区分 fallback 真触发 vs
+            // 主 face .notdef 同宽退化)。
+            let cjk_adv = glyphs[0].x_advance;
+            let ascii_adv = glyphs[2].x_advance;
+            assert!(
+                ascii_adv > 0.0,
+                "ASCII 'a' advance must be > 0 (got {})",
+                ascii_adv
+            );
+            let ratio = cjk_adv / ascii_adv;
+            assert!(
+                (1.4..=2.4).contains(&ratio),
+                "CJK monospace 双宽特征: '你' advance / 'a' advance 应 ∈ [1.4, 2.4] \
+                 (实测 1.67 用户机, ±0.3 余量给字体组合); \
+                 实测 cjk={}, ascii={}, ratio={} (CJK fallback face_id={}, primary={})",
+                cjk_adv,
+                ascii_adv,
+                ratio,
+                cjk_face,
+                primary
+            );
+        } else {
+            eprintln!(
+                "shape_line_mixed_cjk: CJK fallback 未触发 (cjk_face={} == primary={} or \
+                 == ascii_face={}); 跳过双宽 assert (CI 退化路径)",
+                cjk_face, primary, ascii_face
+            );
         }
     }
 
