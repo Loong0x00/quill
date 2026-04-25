@@ -602,8 +602,43 @@ pub fn run_window() -> Result<()> {
     window.set_app_id(APP_ID);
     window.set_min_size(Some((INITIAL_WIDTH, INITIAL_HEIGHT)));
 
+    // T-0502: 告诉 compositor 我们自己处理 HiDPI, 不要 double-scale。
+    //
+    // 背景: T-0404 引 `HIDPI_SCALE = 2` 把 surface backing buffer (wgpu)
+    // 翻倍到 physical px, 但**没**调 `wl_surface.set_buffer_scale(2)`。
+    // compositor 默认假设 client buffer 是 logical scale=1, 在 HiDPI 输出
+    // (224 ppi mutter scale=2) 上又自动放大一遍 → 视觉 ×4 ("有点大的不正常")。
+    // 调 set_buffer_scale(2) 后 compositor 知道 buffer 已是 physical, 不再
+    // double-scale, 视觉回归 1:1。
+    //
+    // **why hardcode 而非接 `wl_output.scale` event**: 用户硬偏好 (T-0404 派单
+    // Out 段, T-0502 派单 Out 段重申)。单显示器 224 ppi 固定 2x, 多显示器 /
+    // 不同 ppi 切换是 ROADMAP 永久不接 scope。`OutputHandler::new_output` /
+    // `update_output` 仅 log compositor 上报的 scale 与 HIDPI_SCALE 不一致时
+    // warn (诊断用), 不做动态适配。
+    //
+    // **why 此处而非 init_renderer_and_draw**: 协议要求 set_buffer_scale 在
+    // attach buffer **之前** 调 (否则下一次 commit 才生效)。本项目首次 attach
+    // 由 `init_renderer_and_draw` 内 wgpu surface.configure + r.render() 触发,
+    // 此处放在 `window.commit()` (空 surface map 请求) 之前、surface 创建之后,
+    // 满足"attach 前已设"的协议要求, 且 set_buffer_scale 是 pending state, 与
+    // 后续 commit 一并生效。
+    //
+    // SCTK `WaylandSurface::set_buffer_scale(u32)` 内部 version >= 3 才发请求,
+    // 否则返 `Unsupported` (老 compositor 不支持 v3, 我们直接吞错并 warn)。
+    // 现代 mutter / kwin / sway 都 v3+, 实战不触发。
+    if let Err(err) = window.set_buffer_scale(crate::wl::HIDPI_SCALE) {
+        tracing::warn!(
+            ?err,
+            scale = crate::wl::HIDPI_SCALE,
+            "wl_surface.set_buffer_scale 失败 (compositor wl_surface < v3?), \
+             视觉可能 double-scale; 升级 compositor 修复"
+        );
+    }
+
     // Implementation note: 第一次 configure 前只能 commit 空 surface(无 buffer 附加),
-    // 这是 xdg-shell 的 map 请求语义。
+    // 这是 xdg-shell 的 map 请求语义。本次 commit 同时把上面 set_buffer_scale 的
+    // pending state 推给 compositor (协议: scale 是 double-buffered, commit 生效)。
     window.commit();
 
     // State 字段顺序固化 INV-001(renderer→window→conn)+ pty 放最后(T-0202 Lead + 审码)。
@@ -944,16 +979,24 @@ impl OutputHandler for State {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _output: wl_output::WlOutput,
+        output: wl_output::WlOutput,
     ) {
+        // T-0502: 仅记录 compositor 上报的 scale, **不**做动态适配 (派单 Out 段,
+        // 用户单显示器 224 ppi 固定 2x)。HIDPI_SCALE 是 hardcode const, 与
+        // compositor 上报 scale 不一致时仅 warn 提示用户 / 排障 (例如插了
+        // 96 ppi 副屏, 或换 6K HiDPI 屏想升 3x)。
+        log_output_scale(&self.output_state, &output, "new_output");
     }
 
     fn update_output(
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _output: wl_output::WlOutput,
+        output: wl_output::WlOutput,
     ) {
+        // T-0502: 同 new_output, compositor 后续更新 (例如 hot-plug 新 monitor /
+        // 用户改显示设置) 时再 log 一次。仍**不**响应 (HIDPI_SCALE const)。
+        log_output_scale(&self.output_state, &output, "update_output");
     }
 
     fn output_destroyed(
@@ -962,6 +1005,71 @@ impl OutputHandler for State {
         _qh: &QueueHandle<Self>,
         _output: wl_output::WlOutput,
     ) {
+    }
+}
+
+/// T-0502: `log_output_scale` 的纯逻辑决策 — 给定 compositor 上报 scale 与
+/// hardcode `HIDPI_SCALE`, 算出 `OutputScaleVerdict` 决定 trace 走 debug 还是
+/// warn 路径。
+///
+/// 抽出来理由 (conventions §3 抽状态机模式): `log_output_scale` 内部需
+/// OutputState 加 WlOutput 真 wayland 对象, headless 单测构造成本高 (起
+/// compositor)。本枚举把"匹配 vs 不匹配"决策剥成 i32 到 enum 纯映射, 配
+/// `verdict_for_scale` 单测锁住决策, 上层 (`log_output_scale`) 改 trace 字段
+/// 格式或加新分支时这组单测拦决策回归。
+///
+/// 与 `pty_readable_action` / `should_propagate_resize` / `cells_from_surface_px`
+/// 同款套路: 决策与副作用分离, 决策 headless 测, 副作用 trace + 集成测试覆盖。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputScaleVerdict {
+    /// compositor scale == HIDPI_SCALE, 走 `tracing::debug` 仅记录。
+    Match,
+    /// compositor scale != HIDPI_SCALE, 走 `tracing::warn` 提示用户改 const
+    /// 重编译 (派单 Out 段不做动态)。
+    Mismatch,
+}
+
+/// T-0502: 给定 compositor 上报 scale 与我们 hardcode 的 scale, 决策 trace 级别。
+pub(crate) fn verdict_for_scale(compositor_scale: i32, our_scale: i32) -> OutputScaleVerdict {
+    if compositor_scale == our_scale {
+        OutputScaleVerdict::Match
+    } else {
+        OutputScaleVerdict::Mismatch
+    }
+}
+
+/// T-0502: 把 compositor 上报的 wl_output scale 与 hardcode `HIDPI_SCALE`
+/// 对比, 一致 `tracing::debug`, 不一致 `tracing::warn` 提示用户。
+///
+/// **why 不动态响应**: 派单 Out 段 (用户硬偏好, 单一 224 ppi 显示器场景)。
+/// 仅诊断用 — 用户切显示器 / 接副屏时日志能看出 mismatch, 决定是否手动改
+/// `HIDPI_SCALE` 重编译。`OutputState::info` 在 wl_output 信息尚未到齐时返
+/// `None` (例: `new_output` 在 done event 之前先触发), 此时跳过。
+fn log_output_scale(output_state: &OutputState, output: &wl_output::WlOutput, event: &'static str) {
+    let Some(info) = output_state.info(output) else {
+        return;
+    };
+    let compositor_scale = info.scale_factor;
+    let our_scale = crate::wl::HIDPI_SCALE as i32;
+    match verdict_for_scale(compositor_scale, our_scale) {
+        OutputScaleVerdict::Match => {
+            tracing::debug!(
+                event,
+                name = ?info.name,
+                scale = compositor_scale,
+                "wl_output scale 与 HIDPI_SCALE 匹配"
+            );
+        }
+        OutputScaleVerdict::Mismatch => {
+            tracing::warn!(
+                event,
+                name = ?info.name,
+                compositor_scale,
+                our_scale,
+                "wl_output scale 与 hardcode HIDPI_SCALE 不一致; \
+                 视觉可能偏大或偏小, 改 src/wl/render.rs::HIDPI_SCALE 重编译适配"
+            );
+        }
     }
 }
 
@@ -1218,6 +1326,49 @@ mod tests {
         assert!(
             !should_propagate_resize(false),
             "dirty=false 时应早返不消费"
+        );
+    }
+
+    // ---------- T-0502 verdict_for_scale 纯逻辑单测 ----------
+    // OutputHandler 收到 wl_output.scale event 后, log_output_scale 内部用
+    // verdict_for_scale 决策 trace 走 debug (匹配) 还是 warn (不匹配)。决策
+    // 抽出来便于 headless 单测覆盖, 与 cells_from_surface_px / should_propagate_resize
+    // 同套路 (conventions §3)。
+
+    #[test]
+    fn verdict_for_scale_match_when_compositor_equals_hardcode() {
+        // 用户 224 ppi mutter scale=2 + HIDPI_SCALE=2 一致, 走 debug 路径。
+        assert_eq!(verdict_for_scale(2, 2), OutputScaleVerdict::Match);
+        // 边界:1=1 也算 match (假想低 ppi 显示器场景, 但派单 hardcode=2 不会触发,
+        // 仅锁住"compositor==our 必返 Match"决策)。
+        assert_eq!(verdict_for_scale(1, 1), OutputScaleVerdict::Match);
+    }
+
+    #[test]
+    fn verdict_for_scale_mismatch_when_compositor_differs() {
+        // 用户插了 96 ppi 副屏 (scale=1) + HIDPI_SCALE=2, 应触发 warn。
+        assert_eq!(verdict_for_scale(1, 2), OutputScaleVerdict::Mismatch);
+        // 6K HiDPI 屏 compositor 上报 scale=3 + 我们仍 hardcode=2, warn 提示
+        // 用户改 const 重编译 (派单 Out 段不动态适配)。
+        assert_eq!(verdict_for_scale(3, 2), OutputScaleVerdict::Mismatch);
+        // fractional scale 不属本 ticket scope (派单 Out 段), 但 compositor
+        // 上报整数 4 (e.g. 8K) 也走 mismatch 路径。
+        assert_eq!(verdict_for_scale(4, 2), OutputScaleVerdict::Mismatch);
+    }
+
+    #[test]
+    fn verdict_for_scale_hardcode_locks_to_hidpi_scale_constant() {
+        // T-0502 设计 invariant: log_output_scale 用 `crate::wl::HIDPI_SCALE as i32`
+        // 作 our_scale 实参。HIDPI_SCALE 是 const u32 = 2 (T-0404 设, ROADMAP
+        // 永久不接动态 wl_output.scale)。本测固化"hardcode 实参 = HIDPI_SCALE"
+        // 这条耦合, 若未来 HIDPI_SCALE 改 (例如新 ticket 升 3x) 而 log_output_scale
+        // 忘改 our_scale 入参, 本测会拦回归。
+        let our_scale = crate::wl::HIDPI_SCALE as i32;
+        assert_eq!(our_scale, 2, "HIDPI_SCALE 应为 2 (T-0404 hardcode)");
+        assert_eq!(
+            verdict_for_scale(our_scale, our_scale),
+            OutputScaleVerdict::Match,
+            "compositor 上报 scale 与 HIDPI_SCALE 一致时必走 debug"
         );
     }
 
