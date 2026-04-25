@@ -1,8 +1,8 @@
 # T-0407 字体 face 锁定 + emoji 排除 + atlas key 加 face_id (T-0403 字形 bug fix)
 
 **Phase**: 4
-**Assigned**: (open)
-**Status**: open
+**Assigned**: writer-T0407
+**Status**: claimed
 **Budget**: tokenBudget=80k (中型 fix)
 **Dependencies**: T-0403 (glyph atlas + draw_frame 已合并但有 bug)
 **Priority**: P0 (Phase 4 字形渲染当前 broken, T-0404 暂停等本单)
