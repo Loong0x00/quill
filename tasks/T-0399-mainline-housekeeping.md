@@ -1,8 +1,8 @@
 # T-0399 Mainline Housekeeping (Phase 3 → Phase 4 转折点)
 
 **Phase**: 3 (转折点)
-**Assigned**: (open)
-**Status**: open
+**Assigned**: writer-T0399
+**Status**: claimed
 **Budget**: tokenBudget=80k (lead 派单)
 **Dependencies**: 全 Phase 1-3 ticket merged
 
