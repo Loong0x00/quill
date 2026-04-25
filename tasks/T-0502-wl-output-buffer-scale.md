@@ -2,7 +2,7 @@
 
 **Phase**: 5
 **Assigned**: writer-T0502
-**Status**: in-review
+**Status**: merged
 **Budget**: tokenBudget=80k (中小, 主要 src/wl/window.rs + src/wl/render.rs)
 **Dependencies**: T-0404 (HIDPI_SCALE=2 hardcode), T-0409 (wgpu adapter limits 已修)
 **Priority**: P0 (修当前窗口大小不正常 bug)
