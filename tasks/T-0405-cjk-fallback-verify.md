@@ -2,7 +2,7 @@
 
 **Phase**: 4
 **Assigned**: writer-T0405
-**Status**: in-review
+**Status**: merged
 **Budget**: tokenBudget=40k (简化版)
 **Dependencies**: T-0407 (face lock + emoji 黑名单 + GlyphKey) / T-0408 (headless screenshot 自验)
 
