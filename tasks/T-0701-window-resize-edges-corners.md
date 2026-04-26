@@ -2,7 +2,7 @@
 
 **Phase**: 7 (CSD 完整化)
 **Assigned**: writer-T0701
-**Status**: claimed
+**Status**: in-review
 **Budget**: tokenBudget=120k (跨 wl_pointer hit-test + xdg_toplevel.resize 协议)
 **Dependencies**: T-0504 (CSD titlebar + wl_pointer + hit_test)
 **Priority**: P1 (CSD 完整性 — 当前窗口 size hardcode, 拖不动 resize)
