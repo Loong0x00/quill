@@ -1,8 +1,8 @@
 # T-0608 多 tab ghostty 风 (单进程多 PTY/Term, 标签条 UI, 拖拽换序)
 
 **Phase**: 6+ (架构改动, daily-drive feel)
-**Assigned**: (open)
-**Status**: open
+**Assigned**: writer-T0608
+**Status**: claimed
 **Budget**: tokenBudget=500k (跨 LoopData 重构 + 多 PTY fd 注册 + 多 Term
 状态 + 标签条 UI + hit_test + 拖拽换序 + 切换键)
 **Dependencies**: T-0504 (PointerState + hit_test) / T-0603 (keyboard
