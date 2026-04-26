@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use quill::pty::PtyHandle;
 use quill::term::TermState;
 use quill::text::TextSystem;
-use quill::wl::{render_headless, HIDPI_SCALE};
+use quill::wl::{render_headless, CELL_W_PX, HIDPI_SCALE};
 
 const LOGICAL_W: u32 = 800;
 const LOGICAL_H: u32 = 600;
@@ -216,4 +216,59 @@ fn cjk_glyph_uses_fallback_face_not_primary() {
     // 的 tofu 时 gid 可能为 0 — 接受两路径 (派单 Acceptance "豆腐也算非空")。
     let gid = glyphs[0].glyph_id;
     let _ = gid; // 不强 assert, 留作 trace
+}
+
+/// T-0801 In #C: shape "你好" 后两 CJK 字形像素跨度应 ≈ 2 × CELL_W_PX_phys
+/// (中文字间无空隙, 跟 alacritty 视觉一致)。
+///
+/// **why 走 shape API 不走 PNG 像素扫**: shape_line 后 `glyph[1].x_offset -
+/// glyph[0].x_offset` 直接锁"第 1 字到第 2 字像素跨度 = 2 × CELL_W_PX_phys"
+/// 这条数学不变式; 比 PNG 像素扫 (扫描线找字形 black bbox 算跨度) 更精准 +
+/// 不依赖 cell_h 假设, T-0405 PNG 测试已验真画到屏幕, 本测试聚焦 advance
+/// 数学严等。
+///
+/// **派单 In #C 字面**: "tests/cjk_fallback_e2e.rs 加 '你好 hello' PNG 验中文字
+/// 间无空隙 (第 1 字到第 2 字像素跨度 = 2 × CELL_W_PX physical)" — 实装走
+/// shape API 锁 advance 数学等价, 偏离主动告知见 commit body。
+///
+/// **CI 退化路径**: 若主 face .notdef tofu (无 CJK face), 自然 advance ≈
+/// CELL_W_PX_phys 不触发 wide, 跨度变 1 × CELL_W_PX_phys — eprintln warn 跳过
+/// (与 fn 2 同款退化路径处理)。
+#[test]
+fn cjk_chars_spaced_at_double_cell_width_pixel_span() {
+    let mut ts = TextSystem::new().expect("TextSystem::new on user machine");
+    let primary = ts.primary_face_id();
+    let glyphs = ts.shape_line("你好");
+    assert_eq!(
+        glyphs.len(),
+        2,
+        "shape '你好' must yield 2 glyphs (got {})",
+        glyphs.len()
+    );
+    let cjk_face = glyphs[0].face_id();
+    if cjk_face == primary {
+        eprintln!(
+            "cjk_chars_spaced_at_double_cell_width_pixel_span: CJK fallback 未触发 \
+             (cjk_face={} == primary={}); 跳过严宽 assert (CI 退化路径)",
+            cjk_face, primary
+        );
+        return;
+    }
+    let cell_w_phys = CELL_W_PX * (HIDPI_SCALE as f32);
+    let double_w = 2.0 * cell_w_phys;
+
+    // 第 1 字到第 2 字像素跨度: glyph[1].x_offset - glyph[0].x_offset
+    // (cosmic-text x_offset 是 line-relative 累积位置, T-0801 force_cjk_double_advance
+    // 后 cascade 严按 forced advance 推进, 居中量在 glyph[0] 与 glyph[1] 上互相抵消
+    // 不影响跨度) 必严等 2 × CELL_W_PX_phys。
+    let span = glyphs[1].x_offset - glyphs[0].x_offset;
+    assert!(
+        (span - double_w).abs() < 0.001,
+        "T-0801 pixel span: '你' → '好' 跨度应严等 2 × CELL_W_PX_phys = {} \
+         (got {} = glyphs[1].x_offset {} - glyphs[0].x_offset {})",
+        double_w,
+        span,
+        glyphs[1].x_offset,
+        glyphs[0].x_offset
+    );
 }
