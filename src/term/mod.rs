@@ -573,7 +573,10 @@ impl TermState {
         // 对 daily-drive 偏紧 (一周 cargo build verbose + Claude Code 对话就快满). 拉到
         // 100K 行 ≈ 100 MB 内存预算, 现代主机 (5090 64GB) 完全 fit, 长跑 trace / 大输出
         // 命令 (find / / cargo build verbose / pacman -Syu) 都能保留. 200 MB 才警觉.
-        let config = Config { scrolling_history: 100_000, ..Config::default() };
+        let config = Config {
+            scrolling_history: 100_000,
+            ..Config::default()
+        };
         // T-0617: title 起步空字符串. listener / TermState / TabInstance 共享同
         // 一份 Rc<RefCell<String>>. listener 是 owned (alacritty Term::new 接 owned),
         // 我们在构造前先建 Rc, 再 clone 给 listener; TermState 自己也 clone 一份
@@ -639,21 +642,23 @@ impl TermState {
     /// **副作用**:置 `self.dirty = true`。即使 `bytes` 空切片也置(没改变就
     /// 多画一次,成本小于漏画)。下游 [`is_dirty`] / [`clear_dirty`] 消费。
     ///
-    /// **T-0602: 非空字节自动 reset_display 跳到底部**. 用户滚 scrollback 看
-    /// 历史时, 子进程吐新输出 (例 cron 日志 / shell 自动 prompt 重画) 应该
-    /// 把视图跳回最新, 与 alacritty / xterm / kitty / foot 行为一致 — 否则
-    /// 用户看不到新内容只能手动 PgDn. 空 advance (no-op) 不重置, 让 term
-    /// dirty / wakeup 路径不影响滚动状态.
+    /// **T-0618: PTY 输出不再自动 reset_display 跳底**. T-0602 误读 alacritty
+    /// 行为 — alacritty 的 `Event::PtyWrite` 路径是**用户类型** 触发跳底, 不是
+    /// PTY 输出. 实际主流终端 (alacritty / foot / kitty / iTerm2 / ghostty) 全
+    /// 一致: 用户已滚到 scrollback 中 (display_offset > 0) 时, 子进程新输出**不动
+    /// viewport** — 否则 `pacman -Syu` / `cargo build` 长输出每行都把用户拉回底,
+    /// 完全无法看历史. 用户主动操作 (键盘类型 / 粘贴 / End / Ctrl+End) 才跳底.
+    /// 用户跳底走 `write_keyboard_bytes` / paste 路径, 直接调 `reset_display`.
+    ///
+    /// alacritty_terminal `Grid` 内部新行 push 时不重置 `display_offset` (ring
+    /// buffer 加 top, viewport 起点跟着 offset 不变), 行为天然正确. 本 fn 仅
+    /// `processor.advance` + 标 dirty.
     ///
     /// [`is_dirty`]: Self::is_dirty
     /// [`clear_dirty`]: Self::clear_dirty
     pub fn advance(&mut self, bytes: &[u8]) {
         self.processor.advance(&mut self.term, bytes);
         self.dirty = true;
-        // T-0602: 新输入到达 → 跳到底 (语义同 alacritty `Event::PtyWrite` 路径).
-        if !bytes.is_empty() {
-            self.reset_display();
-        }
     }
 
     /// 返回当前光标位置(viewport 坐标 [`CellPos`])。
@@ -1815,10 +1820,11 @@ mod tests {
         assert_eq!(t.display_offset(), 0, "reset 后应跳到底");
     }
 
-    /// **T-0602 关键**: advance 收非空字节自动 reset_display, 子进程吐新输出
-    /// 时用户视图自动跳回最新 — 与 alacritty / xterm 一致.
+    /// **T-0618 反转 T-0602**: advance 收非空字节**不**自动 reset_display, 子进程
+    /// 吐新输出时**保持** viewport 在用户滚动位置 — 与 alacritty / foot / kitty /
+    /// iTerm2 / ghostty 主流终端一致 (用户键盘类型 / 粘贴才跳底, PTY 输出不动).
     #[test]
-    fn advance_with_nonempty_bytes_auto_resets_display() {
+    fn advance_with_nonempty_bytes_does_not_reset_display() {
         let mut t = TermState::new(80, 24);
         for i in 0..50 {
             t.advance(format!("line_{:02}\r\n", i).as_bytes());
@@ -1826,12 +1832,12 @@ mod tests {
         t.scroll_display(10);
         assert_eq!(t.display_offset(), 10, "前置: 滚到 10");
 
-        // 喂新字节
+        // 喂新字节 (模拟 PTY 子进程输出)
         t.advance(b"NEW");
         assert_eq!(
             t.display_offset(),
-            0,
-            "新输入到达应自动 reset_display 跳到底"
+            10,
+            "T-0618: PTY 输出不该 reset_display, viewport 应保持用户滚动位置"
         );
     }
 

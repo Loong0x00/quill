@@ -392,16 +392,14 @@ pub struct PointerState {
     /// 按钮位置 (按钮在右上角, x = w - n×BUTTON_W; y < TITLEBAR_H).
     surface_w_logical: u32,
     surface_h_logical: u32,
-    /// T-0602: 触摸板连续 axis 累积值 (logical px). wl_pointer Axis 对触摸板
-    /// 走 sub-line 连续 fixed-point 滚动 (一次 motion 可能 0.5 line), 累够
-    /// [`SCROLL_ACCUM_LINE_PX`] (24 logical px ≈ 1 cell 行高) 才发一次
-    /// Scroll(±1), 余量保留下次累加. 离散滚轮 (传统鼠标 wheel notch) 走
-    /// `Event::Axis` 一格 value = 10.0 (1 line × 10 wl_fixed sub-units),
-    /// 单格也走累积路径 (10 < 24 不会跨阈值, 实际触发由 `AxisDiscrete` 帧
-    /// 的整 line 跳); 但本 ticket 简化 — 直接把 wl_pointer Axis value 当 px
-    /// 累积, discrete vs continuous 一视同仁, **每 24 累积量发 1 line scroll**.
-    /// 实测 5090 + Logitech MX 滚轮一格 ≈ 15 px (compositor 翻译), 两格出 1 line;
-    /// touchpad 两指滑一指距离约 100-200 px 出 4-8 line. 体感与 foot/kitty 接近.
+    /// T-0618: 滚轮累积器废弃. T-0602 用 `Axis` smooth value 累 24 px → 1 line,
+    /// 但 mutter 给 `Axis` 的 value 跟物理速度变 (慢转 8 px / 快转 30 px), 阈值
+    /// 化导致体感"滚一下随机出 0-2 line". 改走 wl_pointer 1.21+ 的 `AxisValue120`
+    /// 离散事件 — 一个 wheel notch 必然 ±120, 直接乘 [`WHEEL_LINES_PER_NOTCH`]
+    /// = 3 (alacritty/foot/gnome-terminal 默认) 出整 line, 跟物理速度无关. 字段
+    /// 保留 0 仅为防 PointerState binary layout 大改 (本字段 unused, 编译器警告
+    /// 可借 `#[allow(dead_code)]`, T-0619+ 真删).
+    #[allow(dead_code)]
     scroll_accum_y: f64,
     /// T-0703-fix: 最近 wl_pointer.Enter event 的 serial. `wl_pointer.set_cursor`
     /// 协议要求传 **enter serial** (不是 button event serial — 那条是
@@ -479,7 +477,14 @@ pub(crate) const RESIZE_CORNER_PX: f64 = 8.0;
 /// discrete 用 line 单位 / 触摸板连续 axis 阈值转 line" 的硬约束实操 —
 /// 单一阈值同时覆盖 wheel notch (10 px/格) 与 touchpad (px 累积), 避免分支
 /// 走两套阈值表 (KISS).
+#[allow(dead_code)] // T-0618: deprecated, kept for legacy test referencing
 pub(crate) const SCROLL_ACCUM_LINE_PX: f64 = 24.0;
+
+/// **T-0618: 滚轮一格 (notch) 滚多少行**. 3 行 = alacritty / foot / gnome-terminal
+/// 默认, daily-drive 标配 (滚 5 次翻一屏 ~24 行). 通过 wl_pointer.AxisValue120
+/// 事件接收离散 notch 计数 (Wayland 1.21+, mutter ≥ 45 / sway ≥ 1.8 全支持),
+/// value120 = ±120 / notch 是协议规约. 1 notch 出 3 line scroll, 跟物理速度无关.
+pub(crate) const WHEEL_LINES_PER_NOTCH: i32 = 3;
 
 /// T-0608: tab drag 阈值 (logical px). 派单 In #F "拖动 < 5 logical px → 视为
 /// click". 鼠标按下到松开总移动 < 此值视为 click; ≥ 此值视为 drag.
@@ -668,21 +673,23 @@ pub fn handle_pointer_event(
             let pressed = matches!(btn_state, WEnum::Value(wl_pointer::ButtonState::Pressed));
             apply_button(state, serial, button, pressed, alt_active)
         }
-        // T-0602: 纵向滚轮 / 触摸板 axis. 横向 (axis=1 horizontal) 不消费 — quill
-        // 终端无横向滚 (alacritty 同). value 是 wl_fixed-point logical px (滚轮一
-        // 格约 10-15 px, 触摸板连续小步).
-        wl_pointer::Event::Axis { axis, value, .. } => {
+        // T-0618: 纵向滚轮走 AxisValue120 (Wayland 1.21+ 离散 notch 协议),
+        // 1 notch = ±120 → 3 lines. 不再走 Axis smooth path — mutter 给 Axis
+        // 的 value 跟物理速度变, 体感不稳. 触摸板暂不支持 (user 不用).
+        // 横向 (HorizontalScroll) 不消费 — quill 终端无横向滚.
+        wl_pointer::Event::AxisValue120 { axis, value120 } => {
             if matches!(axis, WEnum::Value(wl_pointer::Axis::VerticalScroll)) {
-                apply_axis_vertical(state, value)
+                apply_axis_value120(value120)
             } else {
                 PointerAction::Nothing
             }
         }
-        // AxisStop / AxisDiscrete / AxisSource / AxisRelativeDirection /
-        // AxisValue120 / Frame: 派单 Out (本 ticket 用累积 px 阈值已覆盖
-        // wheel + touchpad 两种, 不依赖 discrete 帧). wl_pointer Event 在
-        // wayland-client 0.31 无 #[non_exhaustive], 但防上游升级加 variant —
-        // 默认沉默 (与 keyboard 模块同决策).
+        // T-0618: Axis (smooth) 现在 ignore — discrete notch 走 AxisValue120 已
+        // 覆盖 daily-drive 鼠标. 触摸板要支持时再实装 AxisSource 区分 wheel /
+        // finger, finger 走 px / cell_h 累积. 当前 user 不用触摸板, 简化逻辑.
+        wl_pointer::Event::Axis { .. } => PointerAction::Nothing,
+        // AxisStop / AxisDiscrete / AxisSource / AxisRelativeDirection / Frame:
+        // 不消费 (AxisDiscrete 是 AxisValue120 的老前辈, mutter ≥ 45 已发后者).
         _ => PointerAction::Nothing,
     }
 }
@@ -962,20 +969,40 @@ pub(crate) fn apply_button(
 /// 翻译, sway/wlroots 默认 10). 两格累 20-30 跨 24 阈值, 出 1 line scroll;
 /// 三格出 1-2 line. 体感与 foot/kitty/alacritty 接近 (派单"daily-drive 必需"
 /// acceptance 实测: cat 长文件后滚轮三格能看历史).
+#[allow(dead_code)] // T-0618: deprecated, 保留签名防老测试 / 触摸板复活时直接补
 pub(crate) fn apply_axis_vertical(state: &mut PointerState, value: f64) -> PointerAction {
-    if !value.is_finite() {
-        // compositor 不该发 NaN/Inf, 防御 — 累积器不染污.
+    // T-0618: deprecated. Axis smooth path 在 dispatch 已 short-circuit 不再调用.
+    // 保留 fn 签名仅给老测试 + 万一有 caller 漏改. 触摸板支持时复活.
+    let _ = (state, value);
+    PointerAction::Nothing
+}
+
+/// T-0618: 纵向 AxisValue120 (Wayland 1.21+ 离散滚轮 notch) → Scroll(±N) 决策.
+///
+/// **协议**: value120 = ±120 / 物理 wheel notch (向下 = +120, 向上 = -120). 高分辨率
+/// 滚轮 (Logitech MX hi-res 模式) 可发 ±15/30/60 等小步, 累计达 120 即 1 notch.
+/// 我们目前简化按"每个事件 value120 作整 notch fraction" 处理, 即 lines =
+/// value120 × WHEEL_LINES_PER_NOTCH / 120, integer divide round 向 0.
+///
+/// **方向语义**: wl 协议 +value120 = 向下 (看新内容); quill scrollback 反向
+/// (Scroll(+) = 向上看老历史) → 取负, 与 [`apply_axis_vertical`] 同决策.
+///
+/// **为啥不再累积**: T-0602 的 24 px 阈值在 mutter 上体感不稳 (Axis value 随
+/// 速度变), AxisValue120 是协议规约的整 notch 计数, 直接乘 3 出 line, 跟物理
+/// 速度 / compositor 翻译都无关. 1 notch = 3 line 是 alacritty / foot / GNOME
+/// 默认.
+pub(crate) fn apply_axis_value120(value120: i32) -> PointerAction {
+    if value120 == 0 {
         return PointerAction::Nothing;
     }
-    state.scroll_accum_y += value;
-    // 累够整 line, 触发 Scroll. trunc 避免 f64 → i32 round half-away-from-zero
-    // (用户感知方向稳定: 累 23.9 不出 line, 累 24.0 出 1, 与离散滚轮一格一动一致).
-    let lines = (state.scroll_accum_y / SCROLL_ACCUM_LINE_PX).trunc() as i32;
-    if lines == 0 {
+    // value120 / 120 → notch 计数 (integer divide round 向 0; 高分滚轮多个事件
+    // 累计才到 120, 单独小步出 0 = Nothing, 体感是"积累到一格才滚").
+    let notches = value120 / 120;
+    if notches == 0 {
         return PointerAction::Nothing;
     }
-    state.scroll_accum_y -= (lines as f64) * SCROLL_ACCUM_LINE_PX;
-    // 取负: wl 协议 +Y = 用户手势向下 = 看新; quill `Scroll(+)` = 看老历史.
+    let lines = notches * WHEEL_LINES_PER_NOTCH;
+    // 取负: wl +value120 = 向下手势 = 看新内容; quill Scroll(+) = 老历史.
     PointerAction::Scroll(-lines)
 }
 
@@ -1505,134 +1532,109 @@ mod tests {
         assert!(!state.autoscroll_active);
     }
 
-    // ---- T-0602 axis 滚动测试 ----
+    // ---- T-0618 AxisValue120 滚轮测试 (取代 T-0602 24 px 阈值) ----
 
-    /// 单次 axis value 不够 1 line 阈值 → Nothing, 累积器进位 (下次累加可凑够).
+    /// T-0618: AxisValue120 = +120 (1 notch 向下) → Scroll(-3) 看新内容.
     #[test]
-    fn axis_below_threshold_returns_nothing_and_accumulates() {
-        let mut state = fresh_state();
-        let action = apply_axis_vertical(&mut state, 10.0);
-        assert_eq!(action, PointerAction::Nothing, "10 px < 24 阈值, 不发 line");
-        assert!(
-            (state.scroll_accum_y - 10.0).abs() < 1e-9,
-            "累积器应记 10.0, 实际 {}",
-            state.scroll_accum_y
-        );
-    }
-
-    /// 累计跨阈值 → Scroll(±1). 24 px 正好阈值, 触发 1 line 反向 scroll
-    /// (wl + value = 用户向下 = quill scroll(-1) 跳到底).
-    #[test]
-    fn axis_value_at_threshold_triggers_one_line_negative() {
-        let mut state = fresh_state();
-        let action = apply_axis_vertical(&mut state, SCROLL_ACCUM_LINE_PX);
+    fn axis_value120_one_notch_down_gives_neg_three_lines() {
+        let action = apply_axis_value120(120);
         assert_eq!(
             action,
-            PointerAction::Scroll(-1),
-            "+24 px (用户向下手势) 应给 Scroll(-1) 看更新内容"
+            PointerAction::Scroll(-3),
+            "+120 (1 notch 向下手势) 应给 Scroll(-3) 看更新内容"
         );
     }
 
-    /// 负 value (用户向上手势, 滚老内容) → Scroll(正), 与 alacritty
-    /// `Scroll::Delta(+)` 同方向 (增 display_offset).
+    /// T-0618: AxisValue120 = -120 (1 notch 向上) → Scroll(+3) 看老历史.
     #[test]
-    fn axis_negative_value_at_threshold_gives_positive_scroll() {
-        let mut state = fresh_state();
-        let action = apply_axis_vertical(&mut state, -SCROLL_ACCUM_LINE_PX);
+    fn axis_value120_one_notch_up_gives_pos_three_lines() {
+        let action = apply_axis_value120(-120);
         assert_eq!(
             action,
-            PointerAction::Scroll(1),
-            "-24 px (用户向上手势) 应给 Scroll(+1) 看更老历史"
+            PointerAction::Scroll(3),
+            "-120 (1 notch 向上手势) 应给 Scroll(+3) 看更老历史"
         );
     }
 
-    /// 累积两格 (10 + 14 = 24), 第二格触发 1 line; 余量为 0.
+    /// T-0618: 多 notch 一次发 (压住滚轮快速滚) → multiple lines.
     #[test]
-    fn axis_two_steps_accumulate_to_one_line() {
+    fn axis_value120_multi_notches_emit_multi_lines() {
+        let action = apply_axis_value120(360);
+        assert_eq!(
+            action,
+            PointerAction::Scroll(-9),
+            "+360 = 3 notches × 3 lines"
+        );
+    }
+
+    /// T-0618: 高分滚轮小步 (< 120) → Nothing, 不出 line.
+    #[test]
+    fn axis_value120_sub_notch_returns_nothing() {
+        let action = apply_axis_value120(60);
+        assert_eq!(
+            action,
+            PointerAction::Nothing,
+            "60 < 120 (半 notch 高分滚轮), integer divide 出 0 → 不动"
+        );
+    }
+
+    /// T-0618: 0 → Nothing.
+    #[test]
+    fn axis_value120_zero_returns_nothing() {
+        assert_eq!(apply_axis_value120(0), PointerAction::Nothing);
+    }
+
+    /// T-0618: 老 Axis smooth path 已 deprecated, 任何 value 返 Nothing.
+    #[test]
+    fn axis_smooth_value_now_returns_nothing() {
         let mut state = fresh_state();
         assert_eq!(
-            apply_axis_vertical(&mut state, 10.0),
+            apply_axis_vertical(&mut state, 100.0),
+            PointerAction::Nothing,
+            "T-0618: smooth Axis path 不再消费, 全走 AxisValue120"
+        );
+        assert_eq!(
+            apply_axis_vertical(&mut state, -50.0),
             PointerAction::Nothing
         );
-        let action = apply_axis_vertical(&mut state, 14.0);
-        assert_eq!(action, PointerAction::Scroll(-1));
-        assert!(
-            state.scroll_accum_y.abs() < 1e-9,
-            "余量应清零, 实际 {}",
-            state.scroll_accum_y
-        );
     }
 
-    /// 一次大 value (触摸板快速滑) → 多 line 一次发. 72 px = 3 line.
+    /// T-0618: handle_pointer_event 整体路径覆盖: VerticalScroll AxisValue120
+    /// 走 apply_axis_value120, smooth Axis 沉默 (T-0618 deprecated), 横向 (HorizontalScroll)
+    /// 也沉默 (quill 无横滚).
     #[test]
-    fn axis_large_value_emits_multi_line() {
+    fn handle_event_dispatches_vertical_axis_value120_and_silences_others() {
         let mut state = fresh_state();
-        let action = apply_axis_vertical(&mut state, 3.0 * SCROLL_ACCUM_LINE_PX);
-        assert_eq!(action, PointerAction::Scroll(-3), "72 px 应给 Scroll(-3)");
-    }
-
-    /// 余量保留: 30 px 触发 1 line, 余 6 px; 再来 18 px 累积 24 触发 1 line.
-    #[test]
-    fn axis_remainder_carries_to_next_call() {
-        let mut state = fresh_state();
-        let action1 = apply_axis_vertical(&mut state, 30.0);
-        assert_eq!(action1, PointerAction::Scroll(-1));
-        assert!(
-            (state.scroll_accum_y - 6.0).abs() < 1e-9,
-            "余量应 6.0, 实际 {}",
-            state.scroll_accum_y
-        );
-        let action2 = apply_axis_vertical(&mut state, 18.0);
-        assert_eq!(
-            action2,
-            PointerAction::Scroll(-1),
-            "30 + 18 = 48 = 2 line, 第二格出"
-        );
-    }
-
-    /// 防御: NaN / Inf 不污染累积器.
-    #[test]
-    fn axis_nan_or_inf_is_ignored() {
-        let mut state = fresh_state();
-        let _ = apply_axis_vertical(&mut state, 10.0); // 进位 10
-        let action = apply_axis_vertical(&mut state, f64::NAN);
-        assert_eq!(action, PointerAction::Nothing);
-        assert!(
-            (state.scroll_accum_y - 10.0).abs() < 1e-9,
-            "NaN 不该污染累积器"
-        );
-        let action_inf = apply_axis_vertical(&mut state, f64::INFINITY);
-        assert_eq!(action_inf, PointerAction::Nothing);
-        assert!((state.scroll_accum_y - 10.0).abs() < 1e-9);
-    }
-
-    /// handle_pointer_event 整体路径覆盖: VerticalScroll axis 走 apply_axis,
-    /// 横向 axis (HorizontalScroll) 沉默 (quill 无横滚).
-    #[test]
-    fn handle_event_dispatches_vertical_axis_and_silences_horizontal() {
-        let mut state = fresh_state();
-        let event_v = wl_pointer::Event::Axis {
-            time: 0,
+        let event_v120 = wl_pointer::Event::AxisValue120 {
             axis: WEnum::Value(wl_pointer::Axis::VerticalScroll),
-            value: SCROLL_ACCUM_LINE_PX,
+            value120: 120,
         };
-        let action = handle_pointer_event(event_v, &mut state, false);
+        let action = handle_pointer_event(event_v120, &mut state, false);
         assert_eq!(
             action,
-            PointerAction::Scroll(-1),
-            "VerticalScroll +24 应给 Scroll(-1)"
+            PointerAction::Scroll(-3),
+            "VerticalScroll +120 (1 notch 向下) 应给 Scroll(-3)"
         );
 
-        let event_h = wl_pointer::Event::Axis {
-            time: 0,
+        let event_h120 = wl_pointer::Event::AxisValue120 {
             axis: WEnum::Value(wl_pointer::Axis::HorizontalScroll),
-            value: 100.0,
+            value120: 120,
         };
-        let action_h = handle_pointer_event(event_h, &mut state, false);
         assert_eq!(
-            action_h,
+            handle_pointer_event(event_h120, &mut state, false),
             PointerAction::Nothing,
             "HorizontalScroll 应沉默 (quill 无横滚)"
+        );
+
+        let event_smooth = wl_pointer::Event::Axis {
+            time: 0,
+            axis: WEnum::Value(wl_pointer::Axis::VerticalScroll),
+            value: 100.0,
+        };
+        assert_eq!(
+            handle_pointer_event(event_smooth, &mut state, false),
+            PointerAction::Nothing,
+            "T-0618: smooth Axis 不再消费"
         );
     }
 

@@ -4184,7 +4184,15 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
 /// 让 `KeyboardAction::WriteToPty` 与 `KeyboardAction::StartRepeat` 共用 — 两
 /// 者都需要 "立即写一次" 语义, 与 INV-009 (master fd O_NONBLOCK) + INV-005
 /// (calloop 不重试 WouldBlock) 一致.
-fn write_keyboard_bytes(state: &State, bytes: &[u8]) {
+fn write_keyboard_bytes(state: &mut State, bytes: &[u8]) {
+    // T-0618: 用户键盘输入 → 跳底 (alacritty Event::PtyWrite 路径语义). PTY 输出
+    // 不跳 (subprocess output keep viewport) 在 TermState::advance T-0618 改动覆盖.
+    // 跳底必须在写 PTY 之前, 否则 echo 回来在 advance 阶段 viewport 已 follow 走.
+    state
+        .tabs_unchecked_mut()
+        .active_mut()
+        .term_mut()
+        .reset_display();
     // T-0608: 走 active tab 的 PTY (键盘 focus 跟 active tab 一致).
     let pty = state.tabs_unchecked().active().pty();
     match pty.write(bytes) {

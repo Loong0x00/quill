@@ -137,29 +137,29 @@ fn scroll_changes_render_and_reset_returns_active() {
     );
 }
 
-/// scroll → advance(non-empty) 应自动 reset 到底 (T-0602 advance hook).
+/// **T-0618 反转 T-0602**: scroll → advance(non-empty) **不**自动 reset 到底.
+/// 主流终端 (alacritty / foot / kitty / iTerm2 / ghostty) 全一致: PTY 输出不动
+/// 用户 viewport, 用户键盘类型 / 粘贴才跳底 (走 write_keyboard_bytes 路径).
 ///
-/// 与 `term::tests::advance_with_nonempty_bytes_auto_resets_display` 同语义,
-/// 此处加端到端 render 路径走一遍验整链不挂掉 (display_offset 触底 + render
+/// 此处加端到端 render 路径走一遍验整链不挂掉 (display_offset 保持 + render
 /// 仍能产生有效 RGBA).
 #[test]
-fn advance_after_scroll_auto_resets_in_render_chain() {
+fn advance_after_scroll_keeps_display_offset_in_render_chain() {
     let mut ts = TextSystem::new().expect("TextSystem::new");
     let mut term = populate_term_with_100_lines();
 
     term.scroll_display(20);
     assert_eq!(term.display_offset(), 20);
 
-    // 喂 1 字节 → advance hook 应 reset_display
+    // 喂 1 字节 (模拟 PTY 子进程输出) → display_offset 应保持 20
     term.advance(b"Z");
     assert_eq!(
         term.display_offset(),
-        0,
-        "advance(non-empty) 后 display_offset 应自动 = 0"
+        20,
+        "T-0618: PTY 输出不该 reset_display, viewport 应保持用户滚动位置"
     );
 
-    // render 应反映 active 内容 (含末尾的新 'Z'); 这里只验偏移已置 0,
-    // 视觉上由其它 test (scroll_changes_render_*) 端到端覆盖.
+    // render 整链不挂; 视觉上由其它 test (scroll_changes_render_*) 端到端覆盖.
     let (rgba, w, h) = render_term_to_rgba(&term, &mut ts);
     assert_eq!(rgba.len(), (w as usize) * (h as usize) * 4);
 }
