@@ -458,6 +458,11 @@ pub const TAB_ROUNDED_RADIUS_PX: f32 = 6.0;
 /// 与 ghostty / macOS 风格 traffic light 按钮一致.
 pub const WINDOW_BUTTON_RADIUS_PX: f32 = 12.0;
 
+/// **T-0618 follow-up: 窗口按钮 (titlebar 上 Min/Max/Close + 左侧 +) 距 surface 边缘
+/// 内缩** (logical px). 6 logical = 12 physical. user 实测按钮贴 0 px 视觉太挤,
+/// 拉 6 px 让按钮跟边缘有呼吸感. 跟 macOS / Windows 11 主流窗口装饰一致.
+pub const WINDOW_BUTTON_INSET_PX: f32 = 6.0;
+
 /// **T-0615: + 按钮 box 默认背景** (浅深灰 #444444).
 /// 平时 box bg 与 tab bar bg #1c1c1c 同 → 几乎不可见; hover 时换 #6a (border 同色),
 /// box 浮现.  实测后觉得无 box bg 太朴素, 给底色 #2c2c2c 让 box 平时也淡浮现.
@@ -1160,11 +1165,13 @@ fn append_titlebar_vertices(
 
     // 2. 三按钮 (右上角, 右→左 Close / Maximize / Minimize). 视觉与
     //    [`crate::wl::pointer::hit_test`] 严格一致 (单一来源 const, 同源 BTN_W).
-    let close_x_min = surface_w - btn_w;
-    let close_x_max = surface_w;
-    let max_x_min = surface_w - 2.0 * btn_w;
+    // T-0618 follow-up: 加 WINDOW_BUTTON_INSET_PX 内缩防贴边.
+    let inset = WINDOW_BUTTON_INSET_PX * hidpi;
+    let close_x_min = surface_w - btn_w - inset;
+    let close_x_max = surface_w - inset;
+    let max_x_min = close_x_min - btn_w;
     let max_x_max = close_x_min;
-    let min_x_min = surface_w - 3.0 * btn_w;
+    let min_x_min = max_x_min - btn_w;
     let min_x_max = max_x_min;
 
     // T-0615: 按钮 bg 仅在 hover 时画 (圆形, rounded pipeline). 非 hover 时不画
@@ -1308,8 +1315,8 @@ fn append_titlebar_vertices(
     //    一直可见 (单 tab / 多 tab 都显), 单 tab 时 tab bar 完全隐藏 + 按钮还在.
     //    跟右侧三按钮同 24×24 logical bbox + 圆形 hover bg.
     {
-        let newtab_x_min = 0.0;
-        let newtab_x_max = btn_w;
+        let newtab_x_min = inset;
+        let newtab_x_max = inset + btn_w;
         if let HoverRegion::TabBarPlus = hover {
             let bg = color_for_vertex_with_srgb(BUTTON_BG_HOVER, is_srgb);
             append_rounded_quad_px(
@@ -1324,9 +1331,9 @@ fn append_titlebar_vertices(
                 btn_radius_phys,
             );
         }
-        // + icon: 横竖两条 stroke quad, 中心点 (btn_w/2, btn_h/2). 走 rounded_out
-        // (radius=0 矩形) 让 icon 在 hover bg 之上.
-        let cx = btn_w / 2.0;
+        // + icon: 横竖两条 stroke quad, 中心点 (inset + btn_w/2, btn_h/2).
+        // 走 rounded_out (radius=0 矩形) 让 icon 在 hover bg 之上.
+        let cx = inset + btn_w / 2.0;
         let cy = btn_h / 2.0;
         let icon_size = btn_h - 2.0 * icon_pad;
         // 横线
@@ -1496,20 +1503,20 @@ pub(crate) fn append_tab_bar_vertices(
             );
         }
 
-        // T-0615: close × hover 红圆 bg (rounded pipeline). 非 hover 不画 bg.
-        // close × glyph 由 [`Renderer::append_close_icon_glyph`] / render_headless
-        // inline 单独画 (cell pipeline 之上 glyph pipeline). 这里只画 hover bg.
+        // T-0618 follow-up: close − 始终可见 (不再 hover-only 红圆). 用户视觉
+        // 一直清楚每 tab 哪里点关闭, 不用试探 hover. hover 时圆 bg 变深灰
+        // (#444 与 active tab 同色, 取代 T-0615 的 #cc4444 大红 — 太刺眼).
+        let close_diameter = close_w.min(bar_h - 2.0 * tab_inset_y_phys);
+        let close_cx = body_x1 - close_w / 2.0;
+        let close_cy = bar_y0 + bar_h / 2.0;
+        let close_x0 = close_cx - close_diameter / 2.0;
+        let close_y0 = close_cy - close_diameter / 2.0;
+        let close_x1 = close_cx + close_diameter / 2.0;
+        let close_y1 = close_cy + close_diameter / 2.0;
+        // hover bg (subtle, 非红): 圆形 #444 (跟 active tab 同色). 仅 hover 画.
+        let close_radius = close_diameter / 2.0;
         if let HoverRegion::TabClose(idx) = hover {
             if idx == i {
-                // close 圆 bbox 居中右侧, 直径 ~16 phys (与 close_w 接近).
-                let close_diameter = close_w.min(bar_h - 2.0 * tab_inset_y_phys);
-                let close_cx = body_x1 - close_w / 2.0;
-                let close_cy = bar_y0 + bar_h / 2.0;
-                let close_x0 = close_cx - close_diameter / 2.0;
-                let close_y0 = close_cy - close_diameter / 2.0;
-                let close_x1 = close_cx + close_diameter / 2.0;
-                let close_y1 = close_cy + close_diameter / 2.0;
-                let radius = close_diameter / 2.0;
                 append_rounded_quad_px(
                     rounded_out,
                     close_x0,
@@ -1518,11 +1525,27 @@ pub(crate) fn append_tab_bar_vertices(
                     close_y1,
                     surface_w,
                     surface_h,
-                    tab_close_red,
-                    radius,
+                    active_bg,
+                    close_radius,
                 );
             }
         }
+        // − 横线 (close icon, 始终可见). icon 中心居中, 长度 = close_diameter
+        // × 0.5 (留 padding). stroke 厚 stroke_w_close = 2 phys px (HiDPI).
+        let stroke_w_close = 2.0 * hidpi;
+        let icon_half_w = close_diameter * 0.25;
+        append_rounded_quad_px(
+            rounded_out,
+            close_cx - icon_half_w,
+            close_cy - stroke_w_close / 2.0,
+            close_cx + icon_half_w,
+            close_cy + stroke_w_close / 2.0,
+            surface_w,
+            surface_h,
+            color_for_vertex_with_srgb(BUTTON_ICON, is_srgb),
+            0.0,
+        );
+        let _ = tab_close_red; // T-0618 follow-up: deprecated 红圆 bg, 留 const 防外部 ref
     }
 
     // 4. tab bar 底部细线分隔 (与 cell 区分开)
@@ -6321,10 +6344,10 @@ mod tests {
             HoverRegion::None,
         );
         let n_verts = rounded_out.len() / ROUNDED_VERTEX_BYTES;
-        // T-0618: 仅 active tab body 1 quad × 6 = 6 顶点 (无 + box / 无 + icon).
+        // T-0618 follow-up: active body (1 quad) + close − icon (1 quad) = 2 quad × 6 = 12 顶点.
         assert_eq!(
-            n_verts, 6,
-            "T-0618: default tab bar rounded 应只含 active body (1 quad × 6), got {n_verts}"
+            n_verts, 12,
+            "T-0618 follow-up: default tab bar rounded 含 active body + close − icon (2 quad × 6), got {n_verts}"
         );
         // 验找到 elem_radius == TAB_ROUNDED_RADIUS_PX × HIDPI_SCALE (active body)
         let expected_tab_radius = TAB_ROUNDED_RADIUS_PX * HIDPI_SCALE as f32;
@@ -6359,11 +6382,11 @@ mod tests {
             1,
             HoverRegion::None,
         );
-        // T-0618: 3 tabs, 仅 active idx=1 画 body (1 quad × 6 = 6 顶点).
+        // T-0618 follow-up: 3 tabs, active idx=1 body (1) + 3 tab close − strokes (3) = 4 quad × 6 = 24
         let n_verts = rounded_out.len() / ROUNDED_VERTEX_BYTES;
         assert_eq!(
-            n_verts, 6,
-            "T-0618: 3 tab + active=1 时 rounded 仅 active body 1 quad × 6 = 6, got {n_verts}",
+            n_verts, 24,
+            "T-0618 follow-up: 3 tab + active=1 含 active body + 3 close − strokes (4 quad × 6), got {n_verts}",
         );
     }
 
@@ -6383,11 +6406,11 @@ mod tests {
             0,
             HoverRegion::Tab(2),
         );
-        // T-0618: active body (idx=0, 1) + hover body (idx=2, 1) = 2 quad × 6 = 12
+        // T-0618 follow-up: active body (1) + hover body (1) + 3 close − strokes (3) = 5 quad × 6 = 30
         let n_verts = rounded_out.len() / ROUNDED_VERTEX_BYTES;
         assert_eq!(
-            n_verts, 12,
-            "T-0618: 3 tab + active=0 + hover idx=2 应含 2 quad × 6 = 12, got {n_verts}",
+            n_verts, 30,
+            "T-0618 follow-up: 3 tab + active=0 + hover idx=2 + 3 close − strokes = 5 quad × 6, got {n_verts}",
         );
     }
 
@@ -6407,11 +6430,11 @@ mod tests {
             0,
             HoverRegion::TabClose(0),
         );
-        // T-0618: active body (idx=0) + close 红圆 = 2 quad × 6 = 12 顶点
+        // T-0618 follow-up: active body (1) + close hover bg (1) + 3 close − strokes (3) = 5 quad × 6 = 30
         let n_verts = rounded_out.len() / ROUNDED_VERTEX_BYTES;
         assert_eq!(
-            n_verts, 12,
-            "T-0618: hover TabClose(0) 应含 2 quad × 6 = 12 (active + close 红圆), got {n_verts}",
+            n_verts, 30,
+            "T-0618 follow-up: hover TabClose(0) 含 active + close hover bg + 3 close − strokes (5 quad × 6), got {n_verts}",
         );
     }
 }
