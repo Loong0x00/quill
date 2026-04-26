@@ -346,6 +346,34 @@ pub struct PreeditOverlay {
 /// 2 logical = 4 physical (HIDPI_SCALE=2), 视觉清晰且不喧宾夺主。
 pub const CURSOR_THICKNESS_PX: u32 = 2;
 
+/// **T-0604: 光标 cell 左/右内缩** (logical px, render 内部 × HIDPI_SCALE).
+///
+/// 1 logical = 2 physical (HIDPI_SCALE=2), 总宽减 4 physical px. 让 cursor
+/// quad 不接触相邻 cell 边缘, 避开"字形 advance > CELL_W_PX 时上一字形像素
+/// 溢出本 cell 左侧" 的视觉误盖 (T-0604 user 实测 'a' 后 cursor 视觉盖字符
+/// 右半 — 真因是 cell 几何不是协议: cosmic-text DejaVu Sans Mono 17pt
+/// advance ~11 px > CELL_W_PX = 10 logical, 字形右缘溢出到下一 cell 左 1 px,
+/// cursor 在下一 cell 左 1 px 内开画就盖到溢出像素).
+///
+/// **why 不直接校准 CELL_W_PX**: 改 cell 宽度跨 render / window / term 大改
+/// (cols/rows 重算, surface 几何全链路), Phase 6+ 单独 ticket 如需; 本 ticket
+/// 只做视觉对齐主流终端 (alacritty / xterm / foot 同套 inset 套路) 不动 cell
+/// 几何契约。
+pub const CURSOR_INSET_PX: u32 = 1;
+
+/// **T-0604: cell.bg default skip 比较常数**, 与 [`crate::term::Color::DEFAULT_BG`]
+/// 同源 (`#000000`). render 模块复制 inline literal 而非引用 src/term 私有
+/// const, 沿袭本模块 [`TITLEBAR_BG`] / [`BUTTON_BG_HOVER`] / render_headless
+/// 内联 `fg_default` 同套路 (term::Color 默认值 const 模块私有, 不暴露)。
+///
+/// **改动同步**: 若 src/term/mod.rs::Color::DEFAULT_BG 改值, 本常数必须同步;
+/// reviewer 走 grep 校对。
+const CELL_BG_DEFAULT: crate::term::Color = crate::term::Color {
+    r: 0x00,
+    g: 0x00,
+    b: 0x00,
+};
+
 /// T-0601: 光标渲染入参。draw_frame / render_headless 在 (col, line) cell 位
 /// 置按 [`CursorStyle`] 绘制 quad (Block 整 cell 反色, Underline 底部横线,
 /// Beam 左侧竖线, HollowBlock 4 边框, Hidden 跳过)。
@@ -1225,6 +1253,19 @@ impl Renderer {
         for cell in cells {
             // 稀疏渲染:空白 cell 不贡献顶点,深蓝清屏在该位置显露。
             if cell.c == ' ' {
+                continue;
+            }
+            // T-0604: cell.bg 等于默认 bg (`#000000`, `Color::DEFAULT_BG`) 时跳过
+            // vertex 生成 — alacritty / xterm / foot 标准做法 ("default bg 不画",
+            // 让 clear color #0a1030 透出, 视觉对齐主流终端)。
+            // 仅 [`CellColorSource::Bg`] 路径需此跳过 (Phase 4 主路径); Fg 路径
+            // (Phase 3 fallback) cell.bg 不参与染色, 该跳过分支 no-op 但为语义
+            // 一致仍执行 — 实测 fg 路径下 cell.bg 默认仍是 DEFAULT_BG, "跳过" 不
+            // 区分 source 反而误抹 fg 色块视觉锚点 (T-0305 acceptance), 故 source
+            // 限定 Bg。
+            // WIDE_CHAR_SPACER cell 同走此路径 (alacritty CJK 双宽 spacer cell
+            // bg 默认黑) → spacer 不画 → CJK 字之间无黑色空隙 (派单 Bug 2 自动修)。
+            if matches!(color_source, CellColorSource::Bg) && cell.bg == CELL_BG_DEFAULT {
                 continue;
             }
             let x0_px = cell.pos.col as f32 * cell_w_px;
@@ -2150,9 +2191,16 @@ fn append_cursor_quads_to_cell_bytes(
         return;
     }
     let thickness_px = CURSOR_THICKNESS_PX as f32 * HIDPI_SCALE as f32;
-    let cell_x0 = cursor.col as f32 * cell_w_px;
+    // T-0604: cell x 方向左右各内缩 [`CURSOR_INSET_PX`] logical (= 2 physical),
+    // 总宽减 4 physical. 让 cursor quad 不接触相邻 cell 边缘, 避开"字形 advance >
+    // CELL_W_PX 时上一字形像素溢出本 cell 左侧"的视觉误盖 (派单 Bug 3 真因)。
+    // y 方向不内缩 — 字形 advance 是 x 方向, y 上下溢出非典型 ASCII / CJK 路径。
+    // 4 形状 (Block / Underline / Beam / HollowBlock) 共用 cell_x0 / cell_x1 算
+    // push_quad, 一处 inset 4 形状全 inset.
+    let inset_px = CURSOR_INSET_PX as f32 * HIDPI_SCALE as f32;
+    let cell_x0 = cursor.col as f32 * cell_w_px + inset_px;
     let cell_y0 = cursor.line as f32 * cell_h_px + y_offset_px;
-    let cell_x1 = cell_x0 + cell_w_px;
+    let cell_x1 = cursor.col as f32 * cell_w_px + cell_w_px - inset_px;
     let cell_y1 = cell_y0 + cell_h_px;
 
     // 闭包: 给定 px 矩形 push 6 顶点 (CCW: TL→BL→BR + TL→BR→TR), 与
@@ -2441,6 +2489,13 @@ pub fn render_headless(
         Vec::with_capacity(cells.len() * VERTS_PER_CELL * VERTEX_BYTES);
     for cell in cells {
         if cell.c == ' ' {
+            continue;
+        }
+        // T-0604: 与 Renderer::build_vertex_bytes Bg 路径同语义跳过 default bg
+        // — render_headless 走 cell.bg 染色 (上方 line 注释引 T-0407 D fix), 默认
+        // bg cell 跳过让 clear color #0a1030 透出, alacritty / xterm / foot 标准
+        // 做法。WIDE_CHAR_SPACER cell 同走此路径 (派单 Bug 2 自动修)。
+        if cell.bg == CELL_BG_DEFAULT {
             continue;
         }
         let x0_px = cell.pos.col as f32 * cell_w_px;
@@ -3343,8 +3398,10 @@ mod tests {
         }
     }
 
-    /// Block 顶点 NDC 范围: cursor (0, 0) 占 cell (0..cw, 0..ch) 物理 px, NDC
-    /// 左上 (-1, +1), 右下 (cw/sw*2-1, 1-ch/sh*2). 验左上角 + 右下角顶点值.
+    /// Block 顶点 NDC 范围: cursor (0, 0) 占 cell x ∈ (inset_px, cw - inset_px),
+    /// y ∈ (0, ch) physical px (T-0604 inset 后 x 内缩 inset_px). NDC 左上
+    /// (inset_px / sw * 2 - 1, +1), 右下 ((cw - inset_px) / sw * 2 - 1,
+    /// 1 - ch / sh * 2). 验左上角 + 右下角顶点值.
     #[test]
     fn cursor_block_at_origin_has_correct_ndc_corners() {
         let (sw, sh, cw, ch, off) = cursor_test_geom();
@@ -3372,21 +3429,27 @@ mod tests {
             off,
             cursor_color_white(),
         );
-        // 第 1 顶点 = TL (left, top) = (-1, +1). 顺序: pos[2 f32] + color[3 f32].
+        // T-0604: inset 后 cell 实际占 x ∈ (inset_px, cw - inset_px)。
+        let inset_px = CURSOR_INSET_PX as f32 * HIDPI_SCALE as f32;
+        // 第 1 顶点 = TL (left, top). 顺序: pos[2 f32] + color[3 f32].
         let x = f32::from_ne_bytes(bytes[0..4].try_into().unwrap());
         let y = f32::from_ne_bytes(bytes[4..8].try_into().unwrap());
-        assert!((x - (-1.0)).abs() < 1e-5, "TL.x 应 = -1.0, got {x}");
+        let expected_tx = inset_px / sw * 2.0 - 1.0;
+        assert!(
+            (x - expected_tx).abs() < 1e-5,
+            "TL.x 应 ~ {expected_tx} (inset 后), got {x}"
+        );
         assert!((y - 1.0).abs() < 1e-5, "TL.y 应 = +1.0, got {y}");
 
         // 第 3 顶点 = BR. 偏移 = 2 × VERTEX_BYTES (= 40 字节).
         let br_off = 2 * VERTEX_BYTES;
         let bx = f32::from_ne_bytes(bytes[br_off..br_off + 4].try_into().unwrap());
         let by = f32::from_ne_bytes(bytes[br_off + 4..br_off + 8].try_into().unwrap());
-        let expected_bx = cw / sw * 2.0 - 1.0;
+        let expected_bx = (cw - inset_px) / sw * 2.0 - 1.0;
         let expected_by = 1.0 - ch / sh * 2.0;
         assert!(
             (bx - expected_bx).abs() < 1e-5,
-            "BR.x 应 ~ {expected_bx}, got {bx}"
+            "BR.x 应 ~ {expected_bx} (inset 后), got {bx}"
         );
         assert!(
             (by - expected_by).abs() < 1e-5,
@@ -3423,14 +3486,317 @@ mod tests {
             off,
             cursor_color_white(),
         );
-        // BR (vertex idx 2): pos.x = (cell_x0 + thickness) / sw * 2 - 1
+        // T-0604 inset: cell_x0 = 3 * cw + inset_px (左缘内缩), Beam BR.x =
+        // cell_x0 + thickness_px.
         let br_off = 2 * VERTEX_BYTES;
         let bx = f32::from_ne_bytes(bytes[br_off..br_off + 4].try_into().unwrap());
         let thickness_px = CURSOR_THICKNESS_PX as f32 * HIDPI_SCALE as f32;
-        let expected = (3.0 * cw + thickness_px) / sw * 2.0 - 1.0;
+        let inset_px = CURSOR_INSET_PX as f32 * HIDPI_SCALE as f32;
+        let expected = (3.0 * cw + inset_px + thickness_px) / sw * 2.0 - 1.0;
         assert!(
             (bx - expected).abs() < 1e-5,
-            "Beam BR.x 应 ~ {expected}, got {bx}"
+            "Beam BR.x 应 ~ {expected} (inset + thickness), got {bx}"
         );
+    }
+
+    // ---- T-0604 cell.bg default skip + cursor inset 测试 ----
+
+    /// 厚度常数锁: 防"顺手改成 0 / 2 / 4 像素". 改动需配合三源 PNG verify 视觉
+    /// 字符紧贴 cursor 但不被覆盖.
+    #[test]
+    fn cursor_inset_is_one_logical_px() {
+        assert_eq!(
+            CURSOR_INSET_PX, 1,
+            "T-0604 cursor cell 内缩 (logical px), 1 logical = 2 physical (HIDPI=2)"
+        );
+    }
+
+    /// `CELL_BG_DEFAULT` 与 `crate::term::Color::DEFAULT_BG` 同源 (`#000000`).
+    /// 防 src/term 改 DEFAULT_BG 值后本模块漂移 — 派单约束 src/term 不动, 本测试
+    /// 锁住改动同步契约.
+    #[test]
+    fn cell_bg_default_matches_alacritty_default() {
+        assert_eq!(CELL_BG_DEFAULT.r, 0x00);
+        assert_eq!(CELL_BG_DEFAULT.g, 0x00);
+        assert_eq!(CELL_BG_DEFAULT.b, 0x00);
+    }
+
+    /// 工具: 构造一个 cell 用于 build_vertex_bytes 测试.
+    fn cell_with_bg(c: char, bg: crate::term::Color) -> crate::term::CellRef {
+        crate::term::CellRef {
+            pos: crate::term::CellPos { col: 0, line: 0 },
+            c,
+            fg: crate::term::Color {
+                r: 0xd3,
+                g: 0xd3,
+                b: 0xd3,
+            },
+            bg,
+        }
+    }
+
+    /// build_vertex_bytes(Bg path): cell.bg = DEFAULT_BG → 0 vertex (派单 §A
+    /// 主路径 — 跳过 default bg 让 clear color 透出, alacritty / xterm / foot
+    /// 标准做法).
+    #[test]
+    fn build_vertex_bytes_skips_default_bg_under_bg_source() {
+        let cells = vec![cell_with_bg('a', CELL_BG_DEFAULT)];
+        let renderer = MaybeRenderer::sentinel();
+        let bytes = renderer.build_vertex_bytes(
+            &cells,
+            20.0, // cell_w_px (任意)
+            50.0, // cell_h_px (任意)
+            1600.0,
+            1200.0,
+            CellColorSource::Bg,
+            0.0,
+        );
+        assert!(
+            bytes.is_empty(),
+            "default bg cell 应跳过 vertex 生成 (alacritty 标准, T-0604), got {} bytes",
+            bytes.len()
+        );
+    }
+
+    /// build_vertex_bytes(Bg path): cell.bg = explicit (非 default) → 6 vertex
+    /// (vim / ls --color 等 explicit 高亮路径维持渲染, 不被本 ticket 误删).
+    #[test]
+    fn build_vertex_bytes_keeps_explicit_bg_under_bg_source() {
+        let red = crate::term::Color {
+            r: 0xff,
+            g: 0x00,
+            b: 0x00,
+        };
+        let cells = vec![cell_with_bg('a', red)];
+        let renderer = MaybeRenderer::sentinel();
+        let bytes = renderer.build_vertex_bytes(
+            &cells,
+            20.0,
+            50.0,
+            1600.0,
+            1200.0,
+            CellColorSource::Bg,
+            0.0,
+        );
+        assert_eq!(
+            bytes.len(),
+            6 * VERTEX_BYTES,
+            "explicit bg cell 必须画 6 vertex (1 quad)"
+        );
+    }
+
+    /// build_vertex_bytes(Fg path): T-0305 fallback 视觉契约 — fg 色块作锚点, 跳
+    /// 过路径 only Bg 走, Fg 路径不能被新跳过逻辑误抹 (cell.bg = DEFAULT 时 Fg
+    /// 路径仍画 fg 色块).
+    #[test]
+    fn build_vertex_bytes_keeps_fg_path_for_default_bg_cell() {
+        let cells = vec![cell_with_bg('a', CELL_BG_DEFAULT)];
+        let renderer = MaybeRenderer::sentinel();
+        let bytes = renderer.build_vertex_bytes(
+            &cells,
+            20.0,
+            50.0,
+            1600.0,
+            1200.0,
+            CellColorSource::Fg,
+            0.0,
+        );
+        assert_eq!(
+            bytes.len(),
+            6 * VERTEX_BYTES,
+            "Fg 路径 (Phase 3 fallback) 不受 default bg 跳过影响"
+        );
+    }
+
+    /// 空格 cell 仍跳过 (既有契约不破): cell.c = ' ' 优先短路, 与 default bg
+    /// 跳过逻辑独立。
+    #[test]
+    fn build_vertex_bytes_still_skips_space_cell() {
+        let red = crate::term::Color {
+            r: 0xff,
+            g: 0x00,
+            b: 0x00,
+        };
+        // 空格 cell 即使 bg = explicit 红, 也优先跳过 (空格短路在 default bg
+        // 检查之前).
+        let cells = vec![cell_with_bg(' ', red)];
+        let renderer = MaybeRenderer::sentinel();
+        let bytes = renderer.build_vertex_bytes(
+            &cells,
+            20.0,
+            50.0,
+            1600.0,
+            1200.0,
+            CellColorSource::Bg,
+            0.0,
+        );
+        assert!(bytes.is_empty(), "空格 cell 仍优先跳过");
+    }
+
+    /// cursor inset 几何: Block 4 顶点 x 范围严格在 cell [col*cw + inset, col*cw +
+    /// cw - inset], 不到 cell 左/右边缘 (派单 §C: 字形溢出像素不被覆盖).
+    #[test]
+    fn cursor_block_x_range_is_inset_from_cell_edges() {
+        let (sw, sh, cw, ch, off) = cursor_test_geom();
+        let cursor = CursorInfo {
+            col: 5,
+            line: 3,
+            visible: true,
+            style: CursorStyle::Block,
+            color: crate::term::Color {
+                r: 0xff,
+                g: 0xff,
+                b: 0xff,
+            },
+        };
+        let mut bytes = Vec::new();
+        append_cursor_quads_to_cell_bytes(
+            &mut bytes,
+            &cursor,
+            80,
+            24,
+            cw,
+            ch,
+            sw,
+            sh,
+            off,
+            cursor_color_white(),
+        );
+        let inset_px = CURSOR_INSET_PX as f32 * HIDPI_SCALE as f32;
+        // cell 左边缘 NDC vs 实际 TL.x — 应严格大于 cell 边缘 (左缘内缩).
+        let cell_left_ndc = (5.0 * cw) / sw * 2.0 - 1.0;
+        let cell_right_ndc = (5.0 * cw + cw) / sw * 2.0 - 1.0;
+        let tl_x = f32::from_ne_bytes(bytes[0..4].try_into().unwrap());
+        let br_off = 2 * VERTEX_BYTES;
+        let br_x = f32::from_ne_bytes(bytes[br_off..br_off + 4].try_into().unwrap());
+        assert!(
+            tl_x > cell_left_ndc + 1e-6,
+            "TL.x ({tl_x}) 应严格大于 cell 左缘 NDC ({cell_left_ndc}, inset {inset_px} phys)"
+        );
+        assert!(
+            br_x < cell_right_ndc - 1e-6,
+            "BR.x ({br_x}) 应严格小于 cell 右缘 NDC ({cell_right_ndc}, inset {inset_px} phys)"
+        );
+    }
+
+    /// HollowBlock inset 后 4 边框 x 仍在 [cell_x0+inset, cell_x1-inset] 内
+    /// (4 quad 共 24 顶点).
+    #[test]
+    fn cursor_hollow_block_x_range_is_inset() {
+        let (sw, sh, cw, ch, off) = cursor_test_geom();
+        let cursor = CursorInfo {
+            col: 7,
+            line: 0,
+            visible: true,
+            style: CursorStyle::HollowBlock,
+            color: crate::term::Color {
+                r: 0xff,
+                g: 0xff,
+                b: 0xff,
+            },
+        };
+        let mut bytes = Vec::new();
+        append_cursor_quads_to_cell_bytes(
+            &mut bytes,
+            &cursor,
+            80,
+            24,
+            cw,
+            ch,
+            sw,
+            sh,
+            off,
+            cursor_color_white(),
+        );
+        // 24 顶点 (4 quad × 6).
+        assert_eq!(bytes.len(), 4 * 6 * VERTEX_BYTES);
+        // 扫描所有顶点 x: max ≤ cell_right_ndc - 1e-6, min ≥ cell_left_ndc + 1e-6.
+        let cell_left_ndc = (7.0 * cw) / sw * 2.0 - 1.0;
+        let cell_right_ndc = (7.0 * cw + cw) / sw * 2.0 - 1.0;
+        let n_verts = bytes.len() / VERTEX_BYTES;
+        for i in 0..n_verts {
+            let off_v = i * VERTEX_BYTES;
+            let x = f32::from_ne_bytes(bytes[off_v..off_v + 4].try_into().unwrap());
+            assert!(
+                x >= cell_left_ndc - 1e-6,
+                "vertex {i} x ({x}) 不应越过 cell 左缘 NDC ({cell_left_ndc})"
+            );
+            assert!(
+                x <= cell_right_ndc + 1e-6,
+                "vertex {i} x ({x}) 不应越过 cell 右缘 NDC ({cell_right_ndc})"
+            );
+        }
+    }
+
+    // ---- 测试辅助: 构造一个不真起 wgpu 的 sentinel Renderer 跑纯 vertex 数学
+    // (build_vertex_bytes 实际只读 self.surface_is_srgb, 其余字段 vertex 数学不
+    // 用; sRGB false 让 color_for_vertex 走简单 byte/255 分支). MaybeRenderer
+    // 是 #[cfg(test)] 工具, 与 T-0408 render_headless 走 `surface_is_srgb`
+    // 显式参数策略一致, 不引入运行时依赖. ----
+    struct MaybeRenderer {
+        surface_is_srgb: bool,
+    }
+
+    impl MaybeRenderer {
+        fn sentinel() -> Self {
+            Self {
+                surface_is_srgb: false,
+            }
+        }
+
+        /// 转发到 build_vertex_bytes 的纯 vertex 数学版本 — 复制 Renderer 同名
+        /// 方法 body, 仅替换 self.surface_is_srgb 路径. 测试不引入 wgpu 资源.
+        #[allow(clippy::too_many_arguments)]
+        fn build_vertex_bytes(
+            &self,
+            cells: &[crate::term::CellRef],
+            cell_w_px: f32,
+            cell_h_px: f32,
+            surface_w: f32,
+            surface_h: f32,
+            color_source: CellColorSource,
+            y_offset_px: f32,
+        ) -> Vec<u8> {
+            let mut out: Vec<u8> = Vec::with_capacity(cells.len() * VERTS_PER_CELL * VERTEX_BYTES);
+            for cell in cells {
+                if cell.c == ' ' {
+                    continue;
+                }
+                if matches!(color_source, CellColorSource::Bg) && cell.bg == CELL_BG_DEFAULT {
+                    continue;
+                }
+                let x0_px = cell.pos.col as f32 * cell_w_px;
+                let y0_px = cell.pos.line as f32 * cell_h_px + y_offset_px;
+                let x1_px = x0_px + cell_w_px;
+                let y1_px = y0_px + cell_h_px;
+                let left = x0_px / surface_w * 2.0 - 1.0;
+                let right = x1_px / surface_w * 2.0 - 1.0;
+                let top = 1.0 - y0_px / surface_h * 2.0;
+                let bottom = 1.0 - y1_px / surface_h * 2.0;
+                let color = color_for_vertex_with_srgb(
+                    match color_source {
+                        CellColorSource::Fg => cell.fg,
+                        CellColorSource::Bg => cell.bg,
+                    },
+                    self.surface_is_srgb,
+                );
+                let verts: [[f32; 2]; 6] = [
+                    [left, top],
+                    [left, bottom],
+                    [right, bottom],
+                    [left, top],
+                    [right, bottom],
+                    [right, top],
+                ];
+                for v in verts {
+                    out.extend_from_slice(&v[0].to_ne_bytes());
+                    out.extend_from_slice(&v[1].to_ne_bytes());
+                    out.extend_from_slice(&color[0].to_ne_bytes());
+                    out.extend_from_slice(&color[1].to_ne_bytes());
+                    out.extend_from_slice(&color[2].to_ne_bytes());
+                }
+            }
+            out
+        }
     }
 }

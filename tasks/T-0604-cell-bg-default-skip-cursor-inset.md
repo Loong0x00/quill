@@ -1,8 +1,8 @@
 # T-0604 cell.bg default skip + CJK spacer + cursor inset (视觉对齐主流终端)
 
 **Phase**: 6 (polish)
-**Assigned**: (open)
-**Status**: open
+**Assigned**: writer-T0604
+**Status**: in-review
 **Budget**: tokenBudget=80k (单文件 src/wl/render.rs build_vertex_bytes / append_cursor_quads + 测试)
 **Dependencies**: T-0407 (cell.bg 渲染路径) / T-0405 (CJK fallback) / T-0601 (cursor render)
 **Priority**: P0 (user 实测视觉糟糕, 每字一块黑底, CJK 中间黑空隙, cursor 盖最后字)
