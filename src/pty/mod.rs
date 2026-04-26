@@ -61,8 +61,17 @@ impl PtyHandle {
     /// 的构造入口。`cols`/`rows` 在 Phase 2 由 T-0202 硬编码 80x24,Phase 3 T-0306
     /// 接窗口 resize 后才会真动态传入。
     pub fn spawn_shell(cols: u16, rows: u16) -> Result<Self> {
-        // T-0410 hotfix: 加 `-i` interactive flag.
-        Self::spawn_program("bash", &["-li"], cols, rows)
+        // T-0618 follow-up: 读 $SHELL 用户实际默认 shell (zsh / fish / etc),
+        // 不再硬编码 bash. user .zshrc / .config/fish/config.fish 里加的 PATH
+        // (例 npm prefix / asdf / nvm) 才能加载, 否则 `claude` 等命令找不到.
+        // fallback /bin/bash 仅 $SHELL 不存在或为空时.
+        let shell = std::env::var("SHELL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "/bin/bash".to_string());
+        // -l = login shell (加载 .zprofile / .bash_profile), -i = interactive
+        // (加载 .zshrc / .bashrc + 启 readline). 两个 flag 主流 shell 都认.
+        Self::spawn_program(&shell, &["-li"], cols, rows)
     }
 
     /// 起任意程序(给 T-0206 集成测试用,将来也可能服务 Phase 6 的 shell 配置)。
