@@ -114,38 +114,38 @@ Lead 决定:**T-0104 + Phase 2 PTY 并行推进**。理由:
 
 ---
 
-## Phase 5 — fcitx5 输入法 (5-7 天, 最坑)
+## Phase 5 — Wayland daily-drive 全套 ✅ 收尾完成 (2026-04-25/26)
 
-**产出**:中文输入能敲,候选框显示正确。
+**实际产出** (远超原派单"fcitx5 only"范围):
+- T-0501 wl_keyboard + xkbcommon → PTY ✅
+- T-0502 wl_output.scale + set_buffer_scale (修双重 HiDPI 放大) ✅
+- T-0503 xdg-decoration 协议接入 (GNOME 政策性不支持 SSD 说明) ✅
+- T-0410 hotfix v2 PtyHandle::write libc::write (修单字符闪退 take_writer fd bug) ✅
+- T-0504 CSD 自画 titlebar + 3 按钮 + wl_pointer ✅
+- T-0505 fcitx5 text-input-v3 (preedit + commit + cursor_rectangle, 中文输入) ✅
 
-关键 ticket:
-- `T-0501` `wayland-scanner` 生成 `text-input-unstable-v3` 绑定
-- `T-0502` 绑定 `ZwpTextInputV3` 到主 surface
-- `T-0503` preedit string 渲染(下划线风格)
-- `T-0504` commit → 转发到 PTY
-- `T-0505` `cursor_rectangle` 正确上报(让 fcitx5 候选框定位)
-- `T-0506` 焦点切换不丢 IME 状态
-- `T-0507` 手测:输中文段落,所有 preedit / 候选 / commit 路径正常
-
-**里程碑**:能在 quill 里用 fcitx5-rime 输中文,Claude Code session 里打字流畅。
-
-**预警**:这阶段文档少,兼容性 bug 多,留 buffer 时间,必要时把 ticket 再拆一遍。
+**里程碑达成**:user 实测 cargo run --release 跑 sudo pacman -Syu / fcitx5-rime 输中文成功。
 
 ---
 
-## Phase 6 — 打磨 + daily drive (持续 1-2 周)
+## Phase 6 — 打磨 + daily drive ✅ 三并行合 + polish 进行中 (2026-04-26)
 
-**产出**:从 Alacritty / Foot 迁到 quill 做主力终端。
+**已合**:
+- T-0601 cursor render (block / underline / beam / hollow 4 形, P0) ✅
+- T-0602 scrollback (滚轮 + PageUp/PageDown + Term::scroll_display, P1) ✅
+- T-0603 keyboard repeat (calloop Timer + 长按重发, P1) ✅
+- auditor-codebase 整体审码 A 级 pass (INV-001..010 跨 ticket 真守 + 0 unwrap/expect + 0 TODO/FIXME) ✅
 
-关键 ticket:
-- `T-0601` soak test 框架:跑满 1h 监控 RSS 不增 >10%
-- `T-0602` 内存泄漏排查(heaptrack / valgrind 若适用)
-- `T-0603` 键位绑定基础(Ctrl+C / Ctrl+V / 复制粘贴)
-- `T-0604` 选择文本 + 鼠标滚动
-- `T-0605` 首批 daily drive bug 修复(留半周)
-- `T-0606` 配置文件格式(TOML,先支持 font-size / font-family / color)
+**polish 中**:
+- T-0604 cell.bg default skip + CJK spacer + cursor inset (修视觉 bug: 每字黑底 / CJK 黑空隙 / cursor 盖字) 派单中
 
-**里程碑**:`exec quill` 进 login shell,跑 Claude Code 8 小时不闪退。
+**待派**:
+- T-0605 内存泄漏 soak 1h (RSS 漂移 < 10%)
+- T-0606 配置文件 (TOML, font-size / color / scrollback 上限)
+- T-0607 复制粘贴 (wl_data_device, Ctrl+Shift+C/V)
+- T-0608 键位绑定基础
+
+**里程碑**:`exec quill` 进 login shell, Claude Code 8h 不闪退。
 
 ---
 
@@ -200,4 +200,7 @@ Lead 决定:**T-0104 + Phase 2 PTY 并行推进**。理由:
 - 2026-04-25 Phase 4 进度 6/8: T-0405 CJK fallback simplify (T-0407 face lock 已部分覆盖, 缩简为 verify 中文 fallback 1 单) + T-0406 LRU cache 待派
 - 2026-04-25 **T-0405 merged (CJK verify, T-0408 三源 PNG verify SOP 首战)**: 集成测试 cjk_chars_render_to_png_via_noto_fallback (PtyHandle::spawn_program("printf", &["你好 hello\n"]) → render_headless 800×600 logical → PngEncoder 写 /tmp/cjk_test.png) + cjk_glyph_uses_fallback_face_not_primary (shape "你" face_id ≠ primary_face_id verify CJK fallback 真触发到 Noto CJK / Source Han Sans). shape_line_mixed_cjk 双宽 advance 软性 assert range [1.4, 2.4] (跨 face fallback 实测 ratio=1.67, 严 2:1 仅同 face 内才命中). **三源 PNG verify SOP 全程零 user 截图依赖**: writer Read PNG 自验 + Lead Read PNG 验 "你 好  hello" 浅灰深蓝 + reviewer Read PNG 第三源验, 三源全一致. 3 文件 +283/-5, 122 tests (+2). INV-001..010 全维持, 派单 Out 清单全未动 (零 src/wl/src/pty/main.rs/invariants/Cargo.toml 改). reviewer audit 4 项偏离全接受 (ratio range 跨 face 设计真相 + test 2 face_id verify 是 T-0407 audit P3-4 落地). **agent 自验视觉模式实战首战**: 不依赖 user 截图反馈循环, 1 单走完 5 步流程 + 三源 audit 1 round pass. Phase 4 进度 7/8 (T-0406 LRU 最后一单)
 - 2026-04-25 **T-0406 merged → 🎉 Phase 4 8/8 收尾完成**: glyph atlas clear-on-full (KISS, 替代 T-0403 panic 遗留路径). 改 src/wl/render.rs::allocate_glyph_slot + render_headless 双源同改 (writer 主动告知偏离 #1 跨函数同改, reviewer accept), atlas 满 → tracing::warn! + 清 allocations + reset shelf cursor (cursor_x/cursor_y/row_height) → fall through shelf packing 当帧重 raster (1 帧 hiccup, 用户基本看不见). **不真 LRU**: ROADMAP "T-0406 LRU" 命名沿用历史, 真 LRU 需 slab + 单槽位驱逐 + free-list 跟当前 shelf packing 不兼容; clear-on-full KISS 等价 (终端字符集稳定). 零 GPU resource churn (texture/bind_group/view/sampler 全保留). 3 文件 +259/-24 (含集成测试 atlas_clear_on_full.rs 2 测试: full → clear no panic + clear 后视觉像素 ≥300). 124 tests (+2). 三源 PNG verify atlas baseline /tmp/T-0406-baseline.png 一致 (cell 90 / glyph 90 / atlas 12 与 T-0405/0407/0408 同源). INV-010 第 12 次零真违规. **Phase 4 全收尾**: T-0401-0408 (8/8) 全合, ASCII prompt 真显示 + HiDPI 2x + headless screenshot + CJK fallback verify + atlas full-safe 全到位. 下阶段 Phase 5 fcitx5 输入法
+- 2026-04-25 **Phase 5 全收尾 (T-0501/0502/0503/0410/0504/0505)**: 5 ticket + 1 hotfix 跨 wl_keyboard / set_buffer_scale / xdg-decoration / PtyHandle::write libc::write fix / CSD 自画 titlebar+wl_pointer / fcitx5 text-input-v3. 跨 ticket 三并行 + 二并行 (T-0501/0502/0503 同时跑 + T-0504/0505 同时跑) git auto merge 多次冲突 Lead 手解 (window.rs imports / WindowCore 字段 / draw_frame 签名 / impl Dispatch trait 多源加 variant). T-0410 hotfix v2 真因深挖: portable-pty take_writer 每次 dup+drop fd 跟 calloop epoll 注册 fd 冲突 (假说), 改 libc::write to raw_fd 直修 — 避开抽象. user 实测 sudo pacman -Syu 全完成. fcitx5-rime 中文输入路径打通 (preedit 下划线 + commit + cursor_rectangle 上报). GNOME mutter 政策性不支持 SSD → CSD 自画 (T-0504, ~600 行 pointer.rs + render titlebar pipeline + hit-test). 199 tests (+50 from Phase 4 124 baseline)
+- 2026-04-26 **Phase 6 三并行合 (T-0601/0602/0603) + auditor-codebase A 级 pass**: T-0601 cursor render (block/underline/beam/hollow 4 形, P0) + T-0602 scrollback (滚轮 24px 阈值 + PageUp/Down 半屏 + Term::scroll_display + display_text 替代 line_text + advance auto-reset, P1) + T-0603 keyboard repeat (calloop Timer + KeyboardState 状态机 + modifier 变化 cancel + apply_repeat_request 单一消费者跟 propagate_resize_if_dirty INV-006 同套路, P1). 三并行真 git merge 冲突 (src/wl/window.rs WindowCore 字段 + src/wl/keyboard.rs KeyboardAction 多 variant + src/wl/render.rs draw_frame 签名), Lead 手解保留所有 variant. 257 tests (+58 from Phase 5 199). auditor-codebase 落 docs/audit/2026-04-26-codebase-overview-review.md (496 行) **A 级 pass**: INV-001..010 跨 ticket grep 真验全守 / 0 unwrap/expect 生产代码 / 0 TODO/FIXME / 13 unsafe 全 SAFETY: / ADR 0001-0007 一致 / 17 直接 dep 211 transitive 全锁 — agent 评 "代码质量在项目范围内优于行业平均, 主要功劳是 conventions §3 抽决策状态机模式 (4 模块) + INV-010 类型隔离 12+ 次 + per-ticket fresh agent + 结构化 docs handoff orchestration 物理化"
+- 2026-04-26 **T-0604 派单中 (cell.bg default skip + CJK spacer + cursor inset)**: User 实测三视觉 bug 同源 (每字黑底 / CJK 字间黑空隙 / cursor 盖最后字), 真因不是协议问题 — alacritty default cell.bg=黑 #000000, T-0407 D fix 让 draw_frame 走 cell.bg 默认 cell 都画黑覆盖 #0a1030 清屏色. cursor.col 数据正确 (Lead 加 trace 验证 'a' 后 col=18 = prompt 17 + 1, vt100 标准), 但字形 advance > CELL_W_PX 像素溢出, cursor 在下一 cell 的左边缘覆盖溢出像素 → 视觉像盖字. 修 build_vertex_bytes 对 DEFAULT_BG 跳过 vertex (alacritty/xterm/foot 标准做法) + cursor cell inset 1 logical px
 - (后续每个阶段起止在这追加)
