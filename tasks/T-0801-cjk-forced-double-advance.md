@@ -2,7 +2,7 @@
 
 **Phase**: 8 (polish++, terminal correctness)
 **Assigned**: writer-T0801
-**Status**: claimed
+**Status**: in-review
 **Budget**: tokenBudget=80k (单文件 src/text/mod.rs shape_line 后处理 + render glyph 接入)
 **Dependencies**: T-0405 (CJK fallback) / T-0604 (cell.bg default skip)
 **Priority**: P1 (user 实测 CJK 字间空隙明显, 主流终端无)
