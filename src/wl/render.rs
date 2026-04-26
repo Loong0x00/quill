@@ -732,52 +732,10 @@ fn append_titlebar_vertices(
     let stroke_w = 2.0 * hidpi;
     let icon_pad = 6.0 * hidpi; // 按钮内边距, icon 不贴边
 
-    // 3.1 Close: 两条对角线 (×) 走 stair-stepped 小矩形模拟 (cell pipeline
-    // 无 rotation transform, 真斜线只能用 small quad 阶梯近似). 派单 #D
-    // 原文 "Close = 两条对角线", 阶梯近似仍读为 × 视觉.
-    {
-        let cx_min = close_x_min + icon_pad;
-        let cx_max = close_x_max - icon_pad;
-        let cy_min = icon_pad;
-        let cy_max = btn_h - icon_pad;
-        let span_x = cx_max - cx_min;
-        let span_y = cy_max - cy_min;
-        // 12 段阶梯 (HiDPI×2 下 24 logical 内 ~12 物理 step), 每段 step_w
-        // 物理像素宽 stroke_w 高 stroke_w. 对角 √2 倍 stroke 视觉略粗
-        // 但读得出 ×.
-        let segments: usize = 12;
-        let dx = span_x / segments as f32;
-        let dy = span_y / segments as f32;
-        for i in 0..segments {
-            let t = i as f32 + 0.5;
-            // 主对角 (左上 → 右下)
-            let x = cx_min + dx * t;
-            let y = cy_min + dy * t;
-            append_quad_px(
-                out,
-                x - stroke_w / 2.0,
-                y - stroke_w / 2.0,
-                x + stroke_w / 2.0,
-                y + stroke_w / 2.0,
-                surface_w,
-                surface_h,
-                icon_color,
-            );
-            // 副对角 (右上 → 左下)
-            let x2 = cx_max - dx * t;
-            let y2 = cy_min + dy * t;
-            append_quad_px(
-                out,
-                x2 - stroke_w / 2.0,
-                y2 - stroke_w / 2.0,
-                x2 + stroke_w / 2.0,
-                y2 + stroke_w / 2.0,
-                surface_w,
-                surface_h,
-                icon_color,
-            );
-        }
-    }
+    // 3.1 Close × icon: T-0606 hotfix 起改走 glyph pipeline (cosmic-text shape
+    // "×" U+00D7 atlas raster 自带抗锯齿) 在 Renderer::append_close_icon_glyph
+    // 内 append, 此处不再画 stair-stepped 阶梯 quad (肉眼锯齿). minimize/maximize
+    // 仍走下方 stroke quad path (横竖矩形不需抗锯齿).
 
     // 3.2 Maximize: 矩形框 (4 边)
     {
@@ -1701,6 +1659,19 @@ impl Renderer {
             title_color,
         );
 
+        // T-0606 hotfix: close 按钮 × icon 走 cosmic-text "×" (U+00D7) 经 glyph
+        // pipeline 渲染, atlas raster 自带 freetype/swash 抗锯齿. 之前 12 段
+        // stair-stepped 小矩形阶梯画对角线 (cell pipeline 无 rotation), 用户
+        // 实测肉眼可见锯齿. minimize/maximize 是横竖 quad 不 affected, 仍走
+        // append_titlebar_vertices 内的 stroke quad path.
+        self.append_close_icon_glyph(
+            text_system,
+            &mut glyph_vertex_bytes,
+            surface_w,
+            surface_h,
+            title_color,
+        );
+
         // T-0505: preedit overlay (派单 In #D). 在 cursor cell 起点之后绘制
         // preedit 字 + 底部下划线。preedit 字走 glyph pass (alpha-blended),
         // 下划线走 cell pass (REPLACE color rect, append 到 cell_vertex_bytes).
@@ -2308,6 +2279,69 @@ impl Renderer {
                 glyph_vertex_bytes.extend_from_slice(&glyph_color[1].to_ne_bytes());
                 glyph_vertex_bytes.extend_from_slice(&glyph_color[2].to_ne_bytes());
             }
+        }
+    }
+
+    /// T-0606 hotfix: shape "×" (U+00D7) + raster + atlas + 居中放 close 按钮.
+    /// 走 glyph pipeline (跟 title 同 path) 自带抗锯齿, 修阶梯近似的肉眼锯齿.
+    fn append_close_icon_glyph(
+        &mut self,
+        text_system: &mut TextSystem,
+        glyph_vertex_bytes: &mut Vec<u8>,
+        surface_w: f32,
+        surface_h: f32,
+        glyph_color: [f32; 3],
+    ) {
+        let glyphs = text_system.shape_line("\u{00D7}");
+        let glyph = match glyphs.first() {
+            Some(g) if g.x_advance.is_finite() => g,
+            _ => return,
+        };
+        let slot = match self.allocate_glyph_slot(text_system, glyph) {
+            Some(s) => s,
+            None => return,
+        };
+        if slot.width == 0 || slot.height == 0 {
+            return;
+        }
+        // close button 中心 (px). 跟 hit_test / append_titlebar_vertices 同源:
+        // close button 占右上角 BUTTON_W × BUTTON_H, x ∈ [surface_w - btn_w, surface_w].
+        let hidpi = HIDPI_SCALE as f32;
+        let btn_w = BUTTON_W_LOGICAL_PX as f32 * hidpi;
+        let btn_h = BUTTON_H_LOGICAL_PX as f32 * hidpi;
+        let center_x = surface_w - btn_w / 2.0;
+        let center_y = btn_h / 2.0;
+        // 居中: glyph 起绘 = center - slot.width/2 + bearing_x 偏移. baseline
+        // 风格: glyph 中心 ≈ center_y, 用 (center_y + slot.height/2 - bearing_y)
+        // 算 y_top 让 glyph bbox 中央对 center_y.
+        let x_left = center_x - slot.width as f32 / 2.0;
+        let y_top = center_y - slot.height as f32 / 2.0;
+        let x_right = x_left + slot.width as f32;
+        let y_bot = y_top + slot.height as f32;
+        let ndc_left = x_left / surface_w * 2.0 - 1.0;
+        let ndc_right = x_right / surface_w * 2.0 - 1.0;
+        let ndc_top = 1.0 - y_top / surface_h * 2.0;
+        let ndc_bot = 1.0 - y_bot / surface_h * 2.0;
+        let uv_l = slot.uv_min[0];
+        let uv_r = slot.uv_max[0];
+        let uv_t = slot.uv_min[1];
+        let uv_b = slot.uv_max[1];
+        let verts: [([f32; 2], [f32; 2]); 6] = [
+            ([ndc_left, ndc_top], [uv_l, uv_t]),
+            ([ndc_left, ndc_bot], [uv_l, uv_b]),
+            ([ndc_right, ndc_bot], [uv_r, uv_b]),
+            ([ndc_left, ndc_top], [uv_l, uv_t]),
+            ([ndc_right, ndc_bot], [uv_r, uv_b]),
+            ([ndc_right, ndc_top], [uv_r, uv_t]),
+        ];
+        for (pos, uv) in verts {
+            glyph_vertex_bytes.extend_from_slice(&pos[0].to_ne_bytes());
+            glyph_vertex_bytes.extend_from_slice(&pos[1].to_ne_bytes());
+            glyph_vertex_bytes.extend_from_slice(&uv[0].to_ne_bytes());
+            glyph_vertex_bytes.extend_from_slice(&uv[1].to_ne_bytes());
+            glyph_vertex_bytes.extend_from_slice(&glyph_color[0].to_ne_bytes());
+            glyph_vertex_bytes.extend_from_slice(&glyph_color[1].to_ne_bytes());
+            glyph_vertex_bytes.extend_from_slice(&glyph_color[2].to_ne_bytes());
         }
     }
 
