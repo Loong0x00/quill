@@ -569,7 +569,11 @@ impl TermState {
     /// [`clear_dirty`]: Self::clear_dirty
     pub fn new(cols: u16, rows: u16) -> Self {
         let size = TermSize::new(cols as usize, rows as usize);
-        let config = Config::default();
+        // T-0617 follow-up: scrollback 默认 10K 行 (alacritty_terminal Config::default)
+        // 对 daily-drive 偏紧 (一周 cargo build verbose + Claude Code 对话就快满). 拉到
+        // 100K 行 ≈ 100 MB 内存预算, 现代主机 (5090 64GB) 完全 fit, 长跑 trace / 大输出
+        // 命令 (find / / cargo build verbose / pacman -Syu) 都能保留. 200 MB 才警觉.
+        let config = Config { scrolling_history: 100_000, ..Config::default() };
         // T-0617: title 起步空字符串. listener / TermState / TabInstance 共享同
         // 一份 Rc<RefCell<String>>. listener 是 owned (alacritty Term::new 接 owned),
         // 我们在构造前先建 Rc, 再 clone 给 listener; TermState 自己也 clone 一份
