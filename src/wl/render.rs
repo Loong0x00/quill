@@ -357,13 +357,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let s = mask.surface_size;
     let cx = clamp(p.x, r, s.x - r);
     let cy = clamp(p.y, r, s.y - r);
-    let dx = p.x - cx;
-    let dy = p.y - cy;
-    let d = sqrt(dx * dx + dy * dy);
-    if (d > r + 1.0) {
+    let corner_dist = vec2<f32>(p.x - cx, p.y - cy);
+    // T-0616: squircle SDF (与 cell shader 同决策) — 视觉一致性: 4 角 mask 走
+    // 同公式, 否则字形被圆弧 mask 而 bg 被 squircle mask 致角处错位.
+    let d = squircle_sdf(corner_dist, r, SQUIRCLE_EXPONENT);
+    if (d > 1.0) {
         discard;
     }
-    let aa = clamp(r + 0.5 - d, 0.0, 1.0);
+    let aa = clamp(0.5 - d, 0.0, 1.0);
     return vec4<f32>(in.color, alpha * mask.alpha_live * aa);
 }
 "#;
@@ -744,6 +745,91 @@ pub(crate) fn corner_distance(
     (dx * dx + dy * dy).sqrt()
 }
 
+/// **T-0616: squircle (super-ellipse) 曲率指数**.
+///
+/// L^n 范数, n=5.0 是 Apple iOS / macOS 圆角实测值 (Mike Swanson 2018 反编译
+/// app icon mask 分析). n=2 退化为普通圆弧. n=4..6 视觉接近, n=5 是单一来源
+/// 锁死 (派单 重点 review #1: "不需要也不应该手工调到 4.5 / 5.5"). live
+/// 渲染路径恒走此值; headless 测试可走 [`HEADLESS_SQUIRCLE_EXPONENT_OVERRIDE`]
+/// 切 n=2 与 n=5 PNG 对比 (见 tests/squircle_sdf_e2e.rs).
+pub(crate) const SQUIRCLE_EXPONENT: f32 = 5.0;
+
+/// **T-0616: CPU squircle SDF** (signed distance, 与 WGSL 端 `squircle_sdf` 同
+/// 公式).
+///
+/// `p`: 距角中心向量 (任意象限, 内部取 abs); `radius`: 角半径; `n`: 曲率指数
+/// (5.0 = squircle, 2.0 = 圆). 返回 signed distance: 负 = 内, 0 = 边界, 正 = 外.
+///
+/// 抽 free fn 给单测覆盖数学性质 (派单 In #D), wgsl 端走 inline shader 算
+/// 同公式 (`squircle_sdf` fn 由 [`squircle_fn_wgsl`] 注入). `#[allow(dead_code)]`:
+/// 非 test build 调用方仅 wgsl, Rust 端只 cfg(test) 用.
+#[allow(dead_code)]
+pub(crate) fn squircle_sdf(p: (f32, f32), radius: f32, n: f32) -> f32 {
+    let ax = p.0.abs();
+    let ay = p.1.abs();
+    (ax.powf(n) + ay.powf(n)).powf(1.0 / n) - radius
+}
+
+/// **T-0616: 共享 WGSL squircle helper fragment** (注入到 cell / glyph / rounded
+/// 三 shader 头部). WGSL 不支持跨 shader import, 用 Rust 端 [`build_shader_source`]
+/// `format!()` 拼接到 shader body 前.
+///
+/// 接口与 派单 In #A 字面一致: `squircle_sdf(p, radius, n)` 取 n 作 fn 参数 (而非
+/// WGSL `const`), 让 fn 内 `pow(., n)` 可在 unit test 里走不同 n 值 — call site
+/// 用 `SQUIRCLE_EXPONENT` 常量传入.
+const SQUIRCLE_FN_WGSL: &str = r#"
+fn squircle_sdf(p: vec2<f32>, radius: f32, n: f32) -> f32 {
+    let ap = abs(p);
+    return pow(pow(ap.x, n) + pow(ap.y, n), 1.0 / n) - radius;
+}
+"#;
+
+/// **T-0616: 拼装最终 shader source string**. 把 [`SQUIRCLE_FN_WGSL`] + WGSL `const
+/// SQUIRCLE_EXPONENT` 注入到 body (CELL_WGSL / GLYPH_WGSL / ROUNDED_WGSL) 前面.
+///
+/// `exponent` 是注入到 WGSL 端 `const SQUIRCLE_EXPONENT: f32 = ...` 的字面量值.
+/// live 渲染路径走 [`SQUIRCLE_EXPONENT`] (5.0); 测试路径可走
+/// [`current_squircle_exponent`] 取 thread_local override (n=2 vs n=5 PNG 对比).
+///
+/// `{exponent:.6}` 6 位小数足以无损 round-trip (f32 mantissa 23 bit ≈ 7 dec digits).
+fn build_shader_source(body: &str, exponent: f32) -> String {
+    format!("const SQUIRCLE_EXPONENT: f32 = {exponent:.6};\n{SQUIRCLE_FN_WGSL}\n{body}")
+}
+
+// **T-0616: headless 路径 squircle 指数 override**. 默认 [`SQUIRCLE_EXPONENT`]
+// (5.0). 集成测试 (`tests/squircle_sdf_e2e.rs`) 在 `render_headless` 之前 set
+// 走 [`set_headless_squircle_exponent`] 注入 n=2 (圆弧 baseline) 或 n=5
+// (squircle), 让 PNG 输出可对比 4 角差异.
+//
+// why thread_local Cell 而非 render_headless 入参: 同 HEADLESS_TAB_OVERRIDE /
+// HEADLESS_HOVER_OVERRIDE 决策 — 不破坏 render_headless 现有签名 (24 个集成测试
+// 已锁), 加参致全部回归改写工作量 >> 1 个 thread_local 字段.
+//
+// 注释走 `//` 而非 `///` 因 thread_local! 是 macro, rustdoc 不展开 doc comment
+// (compiler unused_doc_comments warn).
+thread_local! {
+    pub(crate) static HEADLESS_SQUIRCLE_EXPONENT_OVERRIDE: std::cell::Cell<f32> =
+        const { std::cell::Cell::new(SQUIRCLE_EXPONENT) };
+}
+
+/// **T-0616: 取当前 squircle exponent** (thread_local override 兜底
+/// [`SQUIRCLE_EXPONENT`]).
+fn current_squircle_exponent() -> f32 {
+    HEADLESS_SQUIRCLE_EXPONENT_OVERRIDE.with(|c| c.get())
+}
+
+/// **T-0616: 测试调用前 set 当前 squircle 指数, 后续 `render_headless` 内 pipeline
+/// 创建时走此值**. 测试末尾走 [`reset_headless_squircle_exponent`] 兜底防串测.
+pub fn set_headless_squircle_exponent(exponent: f32) {
+    HEADLESS_SQUIRCLE_EXPONENT_OVERRIDE.with(|c| c.set(exponent));
+}
+
+/// **T-0616: 重置 squircle 指数 override 到默认 ([`SQUIRCLE_EXPONENT`] = 5.0)**.
+/// 测试末尾或 setUp 调.
+pub fn reset_headless_squircle_exponent() {
+    HEADLESS_SQUIRCLE_EXPONENT_OVERRIDE.with(|c| c.set(SQUIRCLE_EXPONENT));
+}
+
 /// WGSL shader 内联(派单 "WGSL 内联在 render.rs,跟现有 clear pass 风格一致,
 /// 别拆文件")。两个 stage:
 /// - vertex: pass-through pos + color
@@ -794,13 +880,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let s = mask.surface_size;
     let cx = clamp(p.x, r, s.x - r);
     let cy = clamp(p.y, r, s.y - r);
-    let dx = p.x - cx;
-    let dy = p.y - cy;
-    let d = sqrt(dx * dx + dy * dy);
-    if (d > r + 1.0) {
+    let corner_dist = vec2<f32>(p.x - cx, p.y - cy);
+    // T-0616: squircle (L^n) SDF 取代圆弧 length()-r — 视觉跟 Apple iOS 圆角
+    // continuous-curvature 对齐. d 已 signed: 负 = rounded rect 内, 0 = 边界,
+    // > 1 = AA 带外 (discard). n=SQUIRCLE_EXPONENT (5.0) 由 build_shader_source
+    // 注入, 测试路径切 n=2 退化为圆.
+    let d = squircle_sdf(corner_dist, r, SQUIRCLE_EXPONENT);
+    if (d > 1.0) {
         discard;
     }
-    let aa = clamp(r + 0.5 - d, 0.0, 1.0);
+    let aa = clamp(0.5 - d, 0.0, 1.0);
     let final_a = mask.alpha_live * aa;
     return vec4<f32>(in.color * final_a, final_a);
 }
@@ -882,13 +971,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let s = mask.surface_size;
     let cx = clamp(p.x, r, s.x - r);
     let cy = clamp(p.y, r, s.y - r);
-    let dx = p.x - cx;
-    let dy = p.y - cy;
-    let d = sqrt(dx * dx + dy * dy);
-    if (d > r + 1.0) {
+    let corner_dist = vec2<f32>(p.x - cx, p.y - cy);
+    // T-0616: squircle SDF (与 cell / glyph shader 同决策).
+    let d = squircle_sdf(corner_dist, r, SQUIRCLE_EXPONENT);
+    if (d > 1.0) {
         discard;
     }
-    let surface_aa = clamp(r + 0.5 - d, 0.0, 1.0);
+    let surface_aa = clamp(0.5 - d, 0.0, 1.0);
 
     // per-element corner mask (per-vertex bounds + radius)
     var elem_aa: f32 = 1.0;
@@ -900,13 +989,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let yM = in.elem_bounds.w;
         let ecx = clamp(p.x, xm + er, xM - er);
         let ecy = clamp(p.y, ym + er, yM - er);
-        let edx = p.x - ecx;
-        let edy = p.y - ecy;
-        let ed = sqrt(edx * edx + edy * edy);
-        if (ed > er + 1.0) {
+        let edist = vec2<f32>(p.x - ecx, p.y - ecy);
+        // T-0616: per-element 圆角同 squircle 化. fast-path (elem_radius == 0)
+        // 不动 — 派单 红线 / 重点 review #2.
+        let ed = squircle_sdf(edist, er, SQUIRCLE_EXPONENT);
+        if (ed > 1.0) {
             discard;
         }
-        elem_aa = clamp(er + 0.5 - ed, 0.0, 1.0);
+        elem_aa = clamp(0.5 - ed, 0.0, 1.0);
     }
 
     let final_a = mask.alpha_live * surface_aa * elem_aa;
@@ -2090,11 +2180,14 @@ impl Renderer {
         if self.cell_pipeline.is_some() {
             return;
         }
+        // T-0616: build_shader_source 注入 squircle helper + SQUIRCLE_EXPONENT
+        // 常量到 shader body 前. live 渲染走 SQUIRCLE_EXPONENT (5.0).
+        let shader_src = build_shader_source(CELL_WGSL, SQUIRCLE_EXPONENT);
         let shader = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("quill-cells-shader"),
-                source: wgpu::ShaderSource::Wgsl(CELL_WGSL.into()),
+                source: wgpu::ShaderSource::Wgsl(shader_src.into()),
             });
         // T-0610 part 2: cell pipeline group=1 持 corner mask uniform (group=0 空,
         // cell shader 无 group=0 binding). 与 glyph pipeline (group=0 atlas +
@@ -2916,11 +3009,13 @@ impl Renderer {
                 return;
             }
         };
+        // T-0616: 同 cell pipeline 注入 squircle helper.
+        let shader_src = build_shader_source(GLYPH_WGSL, SQUIRCLE_EXPONENT);
         let shader = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("quill-glyph-shader"),
-                source: wgpu::ShaderSource::Wgsl(GLYPH_WGSL.into()),
+                source: wgpu::ShaderSource::Wgsl(shader_src.into()),
             });
         // T-0610 part 2: glyph pipeline group=0 atlas + group=1 corner mask. 与
         // cell pipeline 共享 group=1 BGL — 统一 corner mask uniform binding.
@@ -3025,11 +3120,13 @@ impl Renderer {
         if self.rounded_pipeline.is_some() {
             return;
         }
+        // T-0616: 同 cell / glyph 注入 squircle helper.
+        let shader_src = build_shader_source(ROUNDED_WGSL, SQUIRCLE_EXPONENT);
         let shader = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("quill-rounded-shader"),
-                source: wgpu::ShaderSource::Wgsl(ROUNDED_WGSL.into()),
+                source: wgpu::ShaderSource::Wgsl(shader_src.into()),
             });
         let corner_bgl = create_corner_mask_bgl(&self.device);
         let layout = self
@@ -4690,9 +4787,12 @@ fn create_headless_cell_pipeline(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
 ) -> wgpu::RenderPipeline {
+    // T-0616: headless 路径走 current_squircle_exponent — 测试可经
+    // set_headless_squircle_exponent 切 n=2 (圆) / n=5 (squircle) 对比 PNG.
+    let shader_src = build_shader_source(CELL_WGSL, current_squircle_exponent());
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("quill-headless-cells-shader"),
-        source: wgpu::ShaderSource::Wgsl(CELL_WGSL.into()),
+        source: wgpu::ShaderSource::Wgsl(shader_src.into()),
     });
     let corner_bgl = create_corner_mask_bgl(device);
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -4761,9 +4861,11 @@ fn create_headless_glyph_pipeline(
     bgl: &wgpu::BindGroupLayout,
     format: wgpu::TextureFormat,
 ) -> wgpu::RenderPipeline {
+    // T-0616: 同 cell headless, 走 current_squircle_exponent.
+    let shader_src = build_shader_source(GLYPH_WGSL, current_squircle_exponent());
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("quill-headless-glyph-shader"),
-        source: wgpu::ShaderSource::Wgsl(GLYPH_WGSL.into()),
+        source: wgpu::ShaderSource::Wgsl(shader_src.into()),
     });
     let corner_bgl = create_corner_mask_bgl(device);
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -4862,9 +4964,11 @@ fn create_headless_rounded_pipeline(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
 ) -> wgpu::RenderPipeline {
+    // T-0616: 同 cell / glyph headless, 走 current_squircle_exponent.
+    let shader_src = build_shader_source(ROUNDED_WGSL, current_squircle_exponent());
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("quill-headless-rounded-shader"),
-        source: wgpu::ShaderSource::Wgsl(ROUNDED_WGSL.into()),
+        source: wgpu::ShaderSource::Wgsl(shader_src.into()),
     });
     let corner_bgl = create_corner_mask_bgl(device);
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -5845,6 +5949,118 @@ mod tests {
         // (5, 5) 已脱离顶角圆环: d = (r-5)*sqrt(2) = 11*sqrt(2) ≈ 15.6 < r → keep
         let d3 = corner_distance(5.0, 5.0, sw, sh, r);
         assert!(d3 < r, "远离顶角 (5,5) d ({d3}) 应 < r ({r}) (keep 路径)");
+    }
+
+    // === T-0616 squircle SDF 数学性质 (派单 In #D, 重点 review #5) ===
+
+    /// squircle_sdf 中心点: signed distance = -radius (深 inside).
+    #[test]
+    fn squircle_sdf_at_center_returns_negative_radius() {
+        let d = squircle_sdf((0.0, 0.0), 10.0, 5.0);
+        assert!(
+            (d - (-10.0)).abs() < 1e-5,
+            "center signed-d 应 = -radius (-10), got {d}"
+        );
+    }
+
+    /// squircle_sdf 在轴向边界 (radius, 0): signed distance = 0 (恰好边界).
+    /// 同 (0, radius) 也是 0.
+    #[test]
+    fn squircle_sdf_on_axis_boundary_returns_zero() {
+        for (px, py) in [(10.0, 0.0), (0.0, 10.0), (-10.0, 0.0), (0.0, -10.0)] {
+            let d = squircle_sdf((px, py), 10.0, 5.0);
+            assert!(d.abs() < 1e-5, "axis 边界 ({px}, {py}) 应 = 0, got {d}");
+        }
+    }
+
+    /// squircle_sdf 对角点 (r/sqrt(2), r/sqrt(2)) ≈ (7.07, 7.07): squircle 边界
+    /// 比圆 "鼓" — n=5 时 (7.07^5 + 7.07^5)^(1/5) ≈ 8.13 > radius 10? 不对,
+    /// 让我重算: 7.07^5 ≈ 17847.8, sum = 35695.6, ^(1/5) ≈ 8.13 (因 5 次方根
+    /// 让和增长慢). 8.13 - 10 = -1.87 → squircle 内部 (圆边界外, squircle 内部
+    /// = squircle 比圆"胖").
+    /// 派单 重点 review #5: squircle 比圆"鼓" → 对角点应 略 < 0 (squircle 内,
+    /// 比 circle 边界更外).
+    #[test]
+    fn squircle_sdf_on_diagonal_is_inside_squircle_when_on_circle_boundary() {
+        let r = 10.0_f32;
+        let half = r / 2.0_f32.sqrt(); // ≈ 7.07
+        let d = squircle_sdf((half, half), r, 5.0);
+        assert!(
+            d < 0.0,
+            "圆对角边界点 (~7.07, 7.07) 在 n=5 squircle 内 → signed-d 应 < 0, got {d}"
+        );
+        // 圆 (n=2) 对角同点应 ≈ 0 (即圆边界)
+        let d_circle = squircle_sdf((half, half), r, 2.0);
+        assert!(
+            d_circle.abs() < 1e-4,
+            "n=2 退化为圆, (7.07, 7.07) 应 ≈ 0 (圆边界), got {d_circle}"
+        );
+    }
+
+    /// squircle_sdf n=2 退化为普通圆: squircle_sdf((3,4), 5, 2) ≈ length((3,4)) - 5
+    /// = 5 - 5 = 0 (within 1e-5). 派单 重点 review #5 数学保险.
+    #[test]
+    fn squircle_sdf_n2_degenerates_to_circle() {
+        let d = squircle_sdf((3.0, 4.0), 5.0, 2.0);
+        assert!(
+            d.abs() < 1e-5,
+            "n=2 (3,4)→ length 5, signed-d 应 = 0 (圆边界), got {d}"
+        );
+        // 圆内点 (3,3): length sqrt(18) ≈ 4.24, d = -0.76
+        let d2 = squircle_sdf((3.0, 3.0), 5.0, 2.0);
+        let expected = (18.0_f32).sqrt() - 5.0;
+        assert!(
+            (d2 - expected).abs() < 1e-5,
+            "n=2 (3,3) signed-d 应 = sqrt(18)-5 ≈ -0.76, got {d2}"
+        );
+    }
+
+    /// squircle_sdf 抗负坐标对称: |p|^n 让 (-x, -y) 与 (x, y) 同距离.
+    #[test]
+    fn squircle_sdf_is_symmetric_in_quadrants() {
+        let r = 10.0;
+        let n = 5.0;
+        let d_pp = squircle_sdf((6.0, 8.0), r, n);
+        let d_pn = squircle_sdf((6.0, -8.0), r, n);
+        let d_np = squircle_sdf((-6.0, 8.0), r, n);
+        let d_nn = squircle_sdf((-6.0, -8.0), r, n);
+        assert!((d_pp - d_pn).abs() < 1e-5);
+        assert!((d_pp - d_np).abs() < 1e-5);
+        assert!((d_pp - d_nn).abs() < 1e-5);
+    }
+
+    /// SQUIRCLE_EXPONENT 常数锁: 5.0 (Apple iOS). 派单 重点 review #1: "不需要
+    /// 也不应该手工调到 4.5 / 5.5".
+    #[test]
+    fn squircle_exponent_locked_to_apple_ios_value() {
+        assert_eq!(
+            SQUIRCLE_EXPONENT, 5.0,
+            "Apple iOS 圆角实测 (Mike Swanson 2018) — Lead 不批准前不动"
+        );
+    }
+
+    /// build_shader_source 注入 SQUIRCLE_EXPONENT const + helper fn 到 body 前面.
+    /// reviewer 可读出 shader 实际 fed 给 wgpu 的样子.
+    #[test]
+    fn build_shader_source_prepends_exponent_const_and_helper_fn() {
+        let body =
+            "@vertex fn vs_main() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0); }";
+        let src = build_shader_source(body, 5.0);
+        assert!(
+            src.contains("const SQUIRCLE_EXPONENT: f32 = 5"),
+            "WGSL const SQUIRCLE_EXPONENT 应注入, got:\n{src}"
+        );
+        assert!(
+            src.contains("fn squircle_sdf"),
+            "squircle_sdf fn 应注入, got:\n{src}"
+        );
+        assert!(src.ends_with(body), "body 应保留在 source 末尾");
+        // n=2 baseline 路径
+        let src2 = build_shader_source(body, 2.0);
+        assert!(
+            src2.contains("const SQUIRCLE_EXPONENT: f32 = 2"),
+            "n=2 注入应见 = 2, got:\n{src2}"
+        );
     }
 
     /// build_corner_mask_uniform 字节布局: std140 [f32; 4] little-endian, 16 字节.
