@@ -64,6 +64,7 @@ use wayland_client::{
     Connection, Dispatch, EventQueue, Proxy, QueueHandle,
 };
 
+use super::dnd::{build_drop_command, parse_uri_list};
 use super::keyboard::{handle_key_event, KeyboardAction, KeyboardState};
 use super::pointer::{
     handle_pointer_event, quill_edge_to_wayland, xcursor_names_for, CursorShape, PointerAction,
@@ -1406,6 +1407,256 @@ fn apply_paste_request(data: &mut LoopData) {
     }
 }
 
+/// T-0611: DnD Drop 读取的中间状态 (与 [`PasteReadState`] 同套路, 加 mime 字段
+/// 让 EOF 路径决定 uri-list parse 还是 plain paste).
+///
+/// `mime` 用于 EOF 时分支:
+/// - `text/uri-list` / `application/x-kde-cutselection` → parse_uri_list +
+///   build_drop_command (shell escape).
+/// - `text/plain;charset=utf-8` / `text/plain` → 直接当字面文本 paste (拖文本
+///   块场景, 派单 In #B fallback).
+struct DropReadState {
+    buf: Vec<u8>,
+    fd: Option<std::os::fd::OwnedFd>,
+    bracketed: bool,
+    mime: String,
+}
+
+/// T-0611: 消费 `state.pending_drop` — 真触发 `offer.receive` + 启动 calloop
+/// Generic source 异步读 pipe, EOF 时 parse uri-list / shell escape /
+/// bracketed wrap / pty.write.
+///
+/// 与 [`apply_paste_request`] 同 pipe + calloop 异步读路径 (派单 In #A "走 T-0607
+/// paste pipe 同款"). 不同点: mime 选 `dnd_accepted_mime` 而非 hardcode
+/// text/plain;charset=utf-8; EOF 路径多一道 uri-list 解析 + shell escape +
+/// build_drop_command 转换; 完成后必 `offer.finish()` (wl_data_offer v3+ 要求,
+/// sctk 0.19 / wayland-client 0.31 已自动 v3 bind, 缺 finish 会让 source side
+/// 永远不返还 cursor). leave 路径 destroy offer.
+fn apply_drop_request(data: &mut LoopData) {
+    if !data.state.pending_drop {
+        return;
+    }
+    data.state.pending_drop = false;
+
+    // 取 offer + 接受的 mime. 若 None / None 直接走 cancel 路径 (offer destroy).
+    let mime = match data.state.dnd_accepted_mime.clone() {
+        Some(m) => m,
+        None => {
+            tracing::debug!(
+                target: "quill::pointer",
+                "DnD drop 但未 accept 任何 mime, 跳过 (源端将看到拖动失败)"
+            );
+            // Drop 后协议无 finish 时 source 看不到失败, 但我们没接受过 mime
+            // — destroy offer 让协议状态干净. 不破坏 source.
+            if let Some(offer) = data.state.dnd_current_offer.take() {
+                offer.destroy();
+            }
+            data.state.dnd_current_offer_mimes.clear();
+            return;
+        }
+    };
+    let offer = match data.state.dnd_current_offer.as_ref() {
+        Some(o) => o,
+        None => {
+            tracing::debug!(
+                target: "quill::pointer",
+                "DnD drop 但 dnd_current_offer=None (race?), 跳过"
+            );
+            data.state.dnd_accepted_mime = None;
+            data.state.dnd_current_offer_mimes.clear();
+            return;
+        }
+    };
+
+    let (read_fd, write_fd) = match make_paste_pipe() {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::warn!(
+                target: "quill::pointer",
+                error = %e,
+                "DnD: 创建 pipe 失败, 跳过"
+            );
+            return;
+        }
+    };
+
+    offer.receive(mime.clone(), write_fd.as_fd());
+    drop(write_fd);
+
+    let bracketed = data
+        .state
+        .tabs_unchecked()
+        .active()
+        .term()
+        .is_bracketed_paste();
+    let drop_state = std::rc::Rc::new(std::cell::RefCell::new(DropReadState {
+        buf: Vec::new(),
+        fd: Some(read_fd),
+        bracketed,
+        mime: mime.clone(),
+    }));
+    let drop_state_for_cb = drop_state.clone();
+    let raw_fd = drop_state
+        .borrow()
+        .fd
+        .as_ref()
+        .expect("just set Some")
+        .as_raw_fd();
+    // SAFETY: raw_fd 来自 drop_state.fd (OwnedFd); OwnedFd 在 RefCell 内持续到
+    // PostAction::Remove 后被 take + drop 关闭, 与 paste_read_tick 同 pattern,
+    // INV-001 同源 — calloop 0.14 在 epoll_ctl(EPOLL_CTL_DEL) 后的 close 容忍
+    // EBADF.
+    #[allow(unsafe_code)]
+    let borrowed_fd: BorrowedFd<'static> = unsafe { BorrowedFd::borrow_raw(raw_fd) };
+    let result = data.loop_handle.insert_source(
+        Generic::new(borrowed_fd, Interest::READ, Mode::Level),
+        move |_readiness, _fd, data: &mut LoopData| drop_read_tick(data, &drop_state_for_cb),
+    );
+    match result {
+        Ok(_token) => {
+            tracing::debug!(
+                target: "quill::pointer",
+                mime = %mime,
+                bracketed,
+                "DnD: started async read pipe"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                target: "quill::pointer",
+                ?err,
+                "calloop insert_source(drop pipe) 失败 — 跳过本次 drop"
+            );
+        }
+    }
+}
+
+/// T-0611: drop pipe readable callback. 读字节累积, EOF 时:
+/// - 按 mime 分支: text/uri-list → parse + build_drop_command shell escape;
+///   text/plain → 字面 paste.
+/// - bracketed paste 包装 (跟 active term mode).
+/// - pty.write to active tab.
+/// - offer.finish() (v3+ 协议要求) + offer.destroy() + 清 DnD state.
+/// - 返 PostAction::Remove.
+fn drop_read_tick(
+    data: &mut LoopData,
+    drop_state: &std::rc::Rc<std::cell::RefCell<DropReadState>>,
+) -> std::io::Result<PostAction> {
+    let raw_fd = match drop_state.borrow().fd.as_ref() {
+        Some(fd) => fd.as_raw_fd(),
+        None => return Ok(PostAction::Remove),
+    };
+    let mut chunk = [0u8; 4096];
+    loop {
+        // SAFETY: raw_fd 来自 drop_state.fd (OwnedFd), 上面 borrow 已校验 Some;
+        // libc::read 不转移所有权, 仅读字节. errno 通过 last_os_error 拿. 与
+        // paste_read_tick 同 pattern.
+        #[allow(unsafe_code)]
+        let n = unsafe { libc::read(raw_fd, chunk.as_mut_ptr() as *mut _, chunk.len()) };
+        if n > 0 {
+            drop_state
+                .borrow_mut()
+                .buf
+                .extend_from_slice(&chunk[..n as usize]);
+            continue;
+        }
+        if n == 0 {
+            // EOF — compositor 写完关 fd. parse + bracketed wrap + pty.write.
+            let (buf, bracketed, mime) = {
+                let mut s = drop_state.borrow_mut();
+                (std::mem::take(&mut s.buf), s.bracketed, s.mime.clone())
+            };
+            let raw = String::from_utf8_lossy(&buf).to_string();
+            let cmdline = match mime.as_str() {
+                "text/uri-list" | "application/x-kde-cutselection" => {
+                    let paths = parse_uri_list(&raw);
+                    if paths.is_empty() {
+                        tracing::debug!(
+                            target: "quill::pointer",
+                            mime = %mime,
+                            raw_len = raw.len(),
+                            "DnD: uri-list 解析空 (无 file:// 或全 reject), 跳过 pty.write"
+                        );
+                        String::new()
+                    } else {
+                        build_drop_command(&paths)
+                    }
+                }
+                _ => raw, // text/plain* — 字面 paste.
+            };
+            if !cmdline.is_empty() {
+                let wrapped = bracketed_paste_wrap(&cmdline, bracketed);
+                let pty = data.state.tabs_unchecked().active().pty();
+                match pty.write(&wrapped) {
+                    Ok(n) if n == wrapped.len() => {
+                        tracing::debug!(
+                            target: "quill::pointer",
+                            n,
+                            bracketed,
+                            mime = %mime,
+                            "DnD: wrote bytes to pty"
+                        );
+                    }
+                    Ok(n) => {
+                        tracing::warn!(
+                            target: "quill::pointer",
+                            wrote = n,
+                            total = wrapped.len(),
+                            "DnD: pty.write 部分写入, 剩余字节丢弃 (背压)"
+                        );
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        tracing::warn!(
+                            target: "quill::pointer",
+                            n = wrapped.len(),
+                            "DnD: pty.write WouldBlock, 字节丢弃 (背压, INV-005 不重试)"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "quill::pointer",
+                            error = %e,
+                            "DnD: pty.write 失败"
+                        );
+                    }
+                }
+            }
+
+            // 协议 v3+ 要求 finish + destroy. 与 CLIPBOARD selection offer 不同
+            // (那条 offer 由 compositor 管生命周期).
+            if let Some(offer) = data.state.dnd_current_offer.take() {
+                offer.finish();
+                offer.destroy();
+            }
+            data.state.dnd_current_offer_mimes.clear();
+            data.state.dnd_accepted_mime = None;
+
+            drop_state.borrow_mut().fd = None;
+            return Ok(PostAction::Remove);
+        }
+        // n < 0
+        let err = std::io::Error::last_os_error();
+        match err.kind() {
+            std::io::ErrorKind::WouldBlock => return Ok(PostAction::Continue),
+            std::io::ErrorKind::Interrupted => continue,
+            _ => {
+                tracing::warn!(
+                    target: "quill::pointer",
+                    error = %err,
+                    "DnD: read failed"
+                );
+                drop_state.borrow_mut().fd = None;
+                if let Some(offer) = data.state.dnd_current_offer.take() {
+                    offer.destroy();
+                }
+                data.state.dnd_current_offer_mimes.clear();
+                data.state.dnd_accepted_mime = None;
+                return Ok(PostAction::Remove);
+            }
+        }
+    }
+}
+
 /// T-0608: 消费 `state.pending_tab_op`, 真执行 tab 操作 — 新建 spawn + 注册
 /// PTY fd / 关闭 drop + remove fd / 切 active / 拖拽 reorder.
 ///
@@ -1793,6 +2044,12 @@ fn drive_wayland(data: &mut LoopData) -> std::io::Result<PostAction> {
     }
     apply_paste_request(data);
 
+    // Step 3.7.5 (T-0611): DnD drop 消费 — 走 offer.receive + pipe 异步读
+    // (与 paste 同 pipe 套路) + uri-list parse + shell escape + bracketed wrap
+    // + pty.write. 与 paste 解耦不复用 PasteSource 是因为 mime 选择不同
+    // (text/uri-list 而非 text/plain;charset=utf-8) + EOF 路径多一道解析.
+    apply_drop_request(data);
+
     // Step 3.8 (T-0608): tab 操作消费 — 新建 / 关闭 / 切换 / 拖拽 reorder.
     // 与 selection / repeat 同套路 — Dispatch 路径只 set pending_tab_op,
     // 这里真 spawn 子 shell + insert/remove calloop source + 切 active.
@@ -2073,6 +2330,13 @@ pub fn run_window() -> Result<()> {
         tabs: None,
         pending_tab_op: None,
         last_tab_drag_x: 0.0,
+        // T-0611: DnD 状态全空起步. compositor 在拖入时发 DataOffer + Enter,
+        // 我们填充; Leave / Drop 后清.
+        incoming_offer_mimes: Vec::new(),
+        dnd_current_offer: None,
+        dnd_current_offer_mimes: Vec::new(),
+        dnd_accepted_mime: None,
+        pending_drop: false,
     };
 
     // T-0608/T-0202/T-0108: spawn 第一个 tab 的子 shell + 把 master fd 注册进
@@ -2607,6 +2871,33 @@ struct State {
     /// T-0608: tab drag 期间最后一次 motion 的 logical x. EndTabDrag 时按此 x
     /// 算 target_idx (派单 In #F).
     pub(crate) last_tab_drag_x: f64,
+    /// T-0611: 当前最近创建的 incoming offer 的 mime 列表. compositor 协议序:
+    /// `DataOffer` event 创建 offer 对象, 紧跟着 N 个 `Offer` events 推 mime,
+    /// 然后 `Enter` (DnD) 或 `Selection` (CLIPBOARD) 把它声明为当前 owner.
+    /// `Dispatch<WlDataDevice>::DataOffer` 重置本字段为空 Vec, 每个
+    /// `Dispatch<WlDataOffer>::Offer` 推一条 mime, `Enter` 时 take 转给
+    /// `dnd_current_offer_mimes`. CLIPBOARD selection 路径暂不读 mime (派单仅
+    /// hardcode text/plain;charset=utf-8 paste).
+    incoming_offer_mimes: Vec<String>,
+    /// T-0611: 当前正活动的 DnD 拖入 offer (compositor 在 `Enter` 时 set, `Leave`
+    /// 或 `Drop` 之后我们清). 与 `data_current_offer` (CLIPBOARD selection)
+    /// 物理类型同 (`WlDataOffer`) 但语义独立 — DnD 拖动期是临时 offer, drop 时
+    /// 真消费, leave 时 destroy 不消费.
+    dnd_current_offer: Option<WlDataOffer>,
+    /// T-0611: `Enter` 时从 `incoming_offer_mimes` 转入的 mime 列表 (拖入 source
+    /// 提供的全 mime 列表). 用于 `Drop` 路径选 mime (text/uri-list 优先) 走
+    /// `offer.receive`. `Leave` / `Drop` 之后清空.
+    dnd_current_offer_mimes: Vec<String>,
+    /// T-0611: 我们对当前 DnD offer 接受的 mime (从 `dnd_current_offer_mimes`
+    /// 优先级选). `None` = 不接受 (调用 `offer.accept(serial, None)`, source
+    /// 拖入会显示 "禁止" 光标; Drop 不消费). `Some(mime)` = 接受该 mime, 拖入
+    /// 显示 "可放下" 光标.
+    dnd_accepted_mime: Option<String>,
+    /// T-0611: 拖入 Drop 待消费. `Dispatch<WlDataDevice>::Drop` 置 true, 由
+    /// [`apply_drop_request`] 在 dispatch_pending 后调 `offer.receive` + 启动
+    /// calloop Generic source 异步读 pipe → uri-list parse → shell escape →
+    /// bracketed wrap → pty.write. 与 `pending_paste_request` 同 pipe 模式.
+    pub(crate) pending_drop: bool,
 }
 
 impl State {
@@ -3286,7 +3577,9 @@ impl Dispatch<WlDataDeviceManager, ()> for State {
 }
 
 /// `Dispatch<WlDataDevice>`: 接 data_offer + selection events (与 PRIMARY device
-/// 同套路, 仅协议 path 不同).
+/// 同套路, 仅协议 path 不同). T-0611 起 + DnD 路径 (Enter / Motion / Drop /
+/// Leave) — 与 CLIPBOARD selection 共享 `Dispatch<WlDataOffer>` 但 owner 状态独立
+/// (`dnd_current_offer` vs `data_current_offer`).
 impl Dispatch<WlDataDevice, ()> for State {
     fn event(
         state: &mut Self,
@@ -3298,7 +3591,12 @@ impl Dispatch<WlDataDevice, ()> for State {
     ) {
         match event {
             wl_data_device::Event::DataOffer { id } => {
-                tracing::trace!(target: "quill::pointer", "CLIPBOARD data_offer received");
+                // 协议: DataOffer 创建新 WlDataOffer 对象, 紧跟着 N 个 Offer
+                // events 推 mime, 然后 Enter (DnD) / Selection (CLIPBOARD) 标
+                // 记 owner. 重置 incoming_offer_mimes 以 capture 新 offer 的
+                // mime 列表 (T-0611 In #B).
+                state.incoming_offer_mimes.clear();
+                tracing::trace!(target: "quill::pointer", "data_offer received (CLIPBOARD or DnD)");
                 let _ = id;
             }
             wl_data_device::Event::Selection { id } => {
@@ -3312,6 +3610,64 @@ impl Dispatch<WlDataDevice, ()> for State {
                     "CLIPBOARD selection event"
                 );
             }
+            // T-0611 DnD: compositor 通知拖入 surface (incoming_offer_mimes
+            // 已由前序 Offer events 填充). 选 mime + accept(serial, mime) 通知
+            // source 我们接受 — wayland-client 0.31 里 wl_data_offer.accept 是
+            // method, 接 (serial, Option<String>).
+            wl_data_device::Event::Enter {
+                serial,
+                surface: _,
+                x,
+                y,
+                id,
+            } => {
+                // 接管 mime 列表 + offer.
+                state.dnd_current_offer_mimes = std::mem::take(&mut state.incoming_offer_mimes);
+                // 旧 DnD offer (race / 未 Leave) 兜底 destroy.
+                if let Some(prev) = state.dnd_current_offer.take() {
+                    prev.destroy();
+                }
+                state.dnd_current_offer = id;
+                // T-0611 In #B: 选优先 mime. text/uri-list > application/x-kde-cutselection >
+                // text/plain;charset=utf-8 > text/plain. 没匹配 → None (不接受).
+                let chosen = pick_dnd_mime(&state.dnd_current_offer_mimes);
+                if let Some(offer) = state.dnd_current_offer.as_ref() {
+                    // accept(serial, Option<String>) — None 拒绝, Some 接受.
+                    offer.accept(serial, chosen.clone());
+                }
+                state.dnd_accepted_mime = chosen.clone();
+                tracing::debug!(
+                    target: "quill::pointer",
+                    x, y, mimes = ?state.dnd_current_offer_mimes,
+                    accepted = ?chosen,
+                    "DnD enter"
+                );
+            }
+            wl_data_device::Event::Motion { time, x, y } => {
+                // 派单 Out: hover 高亮拖入区是 P2, 这里仅 trace. 不消费副作用.
+                let _ = (time, x, y);
+                tracing::trace!(target: "quill::pointer", time, x, y, "DnD motion");
+            }
+            wl_data_device::Event::Drop => {
+                // 协议: Drop 表示 source 已松开. 我们若已 accept 一个 mime, 触
+                // 发 receive (走 pipe 异步读). pending_drop 让 drive_wayland
+                // step 3.7 真消费 (Dispatch 路径拿不到 LoopHandle).
+                state.pending_drop = true;
+                tracing::debug!(
+                    target: "quill::pointer",
+                    accepted = ?state.dnd_accepted_mime,
+                    "DnD drop event (pending_drop set)"
+                );
+            }
+            wl_data_device::Event::Leave => {
+                // 协议: 拖出 surface (未 drop). 清 offer + 已 accept 的 mime.
+                if let Some(offer) = state.dnd_current_offer.take() {
+                    offer.destroy();
+                }
+                state.dnd_current_offer_mimes.clear();
+                state.dnd_accepted_mime = None;
+                tracing::debug!(target: "quill::pointer", "DnD leave");
+            }
             _ => {}
         }
     }
@@ -3321,11 +3677,15 @@ impl Dispatch<WlDataDevice, ()> for State {
     ]);
 }
 
-/// `Dispatch<WlDataOffer>`: 收到 offer mime types (类似 PRIMARY offer). drag-and-drop
-/// 路径 (派单 Out P3) 还有 source_actions / action 等 event, 这里不消费.
+/// `Dispatch<WlDataOffer>`: 收到 offer mime types. CLIPBOARD selection / DnD
+/// Enter 共享同款 WlDataOffer 协议对象, 由后续 device event (`Selection` /
+/// `Enter`) 才决定 owner. T-0611: Offer 事件都累积进 `incoming_offer_mimes`,
+/// 让 `Enter` / `Selection` 路径 take.
+///
+/// 派单 Out P3 还有 source_actions / action 等 event, 这里不消费.
 impl Dispatch<WlDataOffer, ()> for State {
     fn event(
-        _state: &mut Self,
+        state: &mut Self,
         _proxy: &WlDataOffer,
         event: wl_data_offer::Event,
         _data: &(),
@@ -3333,9 +3693,42 @@ impl Dispatch<WlDataOffer, ()> for State {
         _qh: &QueueHandle<Self>,
     ) {
         if let wl_data_offer::Event::Offer { mime_type } = event {
-            tracing::trace!(target: "quill::pointer", mime = %mime_type, "CLIPBOARD offer mime");
+            tracing::trace!(target: "quill::pointer", mime = %mime_type, "data offer mime");
+            state.incoming_offer_mimes.push(mime_type);
         }
     }
+}
+
+/// T-0611: 从 source offer 的 mime 列表选最优 mime 我们能消费.
+///
+/// 优先级 (派单 In #B):
+/// 1. `text/uri-list` — RFC 2483 标准 file:// URI per line, Nautilus / Files /
+///    KDE 都给.
+/// 2. `application/x-kde-cutselection` — KDE 文件管理特有 (跟 text/uri-list 同
+///    格式, 历史包袱).
+/// 3. `text/plain;charset=utf-8` — 拖文本 (非 file) 的 fallback. 真"拖文本块"
+///    场景, 把字面文本 paste 进来.
+/// 4. `text/plain` — 老式无 charset 的文本.
+///
+/// 没匹配返 `None` — 例如拖图片只给 `image/png`, 我们不消费.
+///
+/// **why 字符串字面量比较 而非 enum**: mime 类型可扩展 (Phase 8 可能加 image/*),
+/// 字面量列表更易维护. 不引入 mime crate (派单约束).
+fn pick_dnd_mime(mimes: &[String]) -> Option<String> {
+    const PRIORITY: &[&str] = &[
+        "text/uri-list",
+        "application/x-kde-cutselection",
+        "text/plain;charset=utf-8",
+        "text/plain",
+    ];
+    for want in PRIORITY {
+        for m in mimes {
+            if m == want {
+                return Some((*want).to_string());
+            }
+        }
+    }
+    None
 }
 
 /// `Dispatch<WlDataSource>`: 我们创建的 CLIPBOARD source 反向 event.
