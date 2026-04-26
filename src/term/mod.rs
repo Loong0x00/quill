@@ -698,6 +698,22 @@ impl TermState {
         self.term.mode().contains(TermMode::SHOW_CURSOR)
     }
 
+    /// T-0607: bracketed paste 模式 (DECSET 2004) 是否激活. shell (bash / zsh
+    /// readline) 启动期发 `\x1b[?2004h` 启 bracketed paste, vim / less 等全屏
+    /// 程序也常启. 启用时调用方 (`wl/window.rs` 粘贴路径) 把粘贴内容前后包
+    /// `\x1b[200~ ... \x1b[201~`, 让 shell 区分粘贴 vs 真键入 (避免粘贴 bash
+    /// 命令时每行 Enter 触发执行).
+    ///
+    /// **why 不暴露 TermMode**: alacritty `TermMode::BRACKETED_PASTE` 是上游
+    /// 类型, INV-010 类型隔离要求 quill 公共 API 不暴露 — 抽 bool 单点访问 fn
+    /// 与 [`Self::cursor_visible`] / [`Self::cursor_shape`] 同套路 (alacritty
+    /// `TermMode::SHOW_CURSOR` / `CursorShape` 同处理).
+    ///
+    /// 测试覆盖见 `tests::bracketed_paste_*`.
+    pub fn is_bracketed_paste(&self) -> bool {
+        self.term.mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
     /// 光标形状,见 [`CursorShape`]。**与 [`cursor_visible`] 正交,两个都得查**:
     /// 渲染层伪代码 `if t.cursor_visible() { draw_cursor(t.cursor_shape()) }`。
     ///
@@ -1095,6 +1111,28 @@ mod tests {
         // 空切片也置 dirty(语义:保守 over-draw,不过 advance 本身是 no-op 也置)
         t.advance(b"");
         assert!(t.is_dirty(), "advance 空切片也应置 dirty");
+    }
+
+    /// T-0607: bracketed paste 模式默认关 (DECRST 2004 默认), DECSET 2004
+    /// (`ESC[?2004h`) 开, DECRST 2004 (`ESC[?2004l`) 关. shell readline 启动
+    /// 后通常发 DECSET 2004; 调用方 (粘贴路径) 走 [`TermState::is_bracketed_paste`]
+    /// 决定是否包 `\x1b[200~ ... \x1b[201~`.
+    #[test]
+    fn bracketed_paste_default_off_decset_2004_toggles() {
+        let mut t = TermState::new(80, 24);
+        assert!(
+            !t.is_bracketed_paste(),
+            "初始 bracketed paste 应关 (alacritty 默认)"
+        );
+
+        t.advance(b"\x1b[?2004h");
+        assert!(t.is_bracketed_paste(), "DECSET 2004 后应启 bracketed paste");
+
+        t.advance(b"\x1b[?2004l");
+        assert!(
+            !t.is_bracketed_paste(),
+            "DECRST 2004 后应关 bracketed paste"
+        );
     }
 
     /// 初始 cursor_visible 应为 true(TermMode::SHOW_CURSOR 默认开)。

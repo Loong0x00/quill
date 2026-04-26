@@ -5,6 +5,7 @@
 mod keyboard;
 mod pointer;
 mod render;
+mod selection;
 mod window;
 
 pub use window::run_window;
@@ -47,3 +48,11 @@ pub use render::{CursorInfo, CursorStyle, CURSOR_INSET_PX, CURSOR_THICKNESS_PX};
 // T-0603: 集成测试 tests/keyboard_repeat_e2e.rs 用 KeyboardState +
 // wl_keyboard::Event + KeyboardAction. quill 自有类型 (INV-010).
 pub use keyboard::{handle_key_event, KeyboardAction, KeyboardState};
+
+// T-0607: 鼠标拖选 + 复制 / 粘贴 状态机. 集成测试 tests/selection_e2e.rs 用
+// SelectionState + SelectionMode + selected_cells_* + extract_selection_text +
+// bracketed_paste_wrap. quill 自有类型 (INV-010, 不漏 wayland-protocols).
+pub use selection::{
+    bracketed_paste_wrap, extract_selection_text, modifier_to_selection_mode, pixel_to_cell,
+    selected_cells_block, selected_cells_linear, PasteSource, SelectionMode, SelectionState,
+};

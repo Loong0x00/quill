@@ -155,6 +155,7 @@ fn cursor_block_renders_filled_cell() {
         LOGICAL_H,
         None,
         Some(&cursor),
+        None, // T-0607 selection
     )
     .expect("render_headless block cursor failed");
 
@@ -196,6 +197,7 @@ fn cursor_underline_renders_bottom_strip() {
         LOGICAL_H,
         None,
         Some(&cursor),
+        None, // T-0607 selection
     )
     .expect("render_headless underline cursor failed");
 
@@ -246,6 +248,7 @@ fn cursor_beam_renders_left_strip() {
         LOGICAL_H,
         None,
         Some(&cursor),
+        None, // T-0607 selection
     )
     .expect("render_headless beam cursor failed");
 
@@ -287,6 +290,7 @@ fn cursor_invisible_renders_nothing() {
         LOGICAL_H,
         None,
         Some(&cursor),
+        None, // T-0607 selection
     )
     .expect("render_headless invisible cursor failed");
 
@@ -317,6 +321,7 @@ fn cursor_hollow_block_renders_4_borders() {
         LOGICAL_H,
         None,
         Some(&cursor),
+        None, // T-0607 selection
     )
     .expect("render_headless hollow_block cursor failed");
 
@@ -412,6 +417,7 @@ fn no_cursor_means_no_cursor_pixels() {
         LOGICAL_H,
         None,
         None,
+        None, // T-0607 selection
     )
     .expect("render_headless no cursor failed");
 

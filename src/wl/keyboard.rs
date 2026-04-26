@@ -198,6 +198,37 @@ impl KeyboardState {
     pub(crate) fn has_repeat(&self) -> bool {
         self.current_repeat.is_some()
     }
+
+    /// T-0607: 最近一次 wl_keyboard `Modifiers` event 的 `mods_depressed` mask
+    /// (按住 modifier 的位图; latched / locked 不算). 调用方
+    /// (`Dispatch<WlPointer>` 鼠标按下时) 走 [`crate::wl::selection::modifier_to_selection_mode`]
+    /// 决定 Linear / Block (Alt 按下 → Block).
+    ///
+    /// **why bit mask 而非 bool 字段**: alacritty / foot / kitty 等终端 modifier
+    /// 检测均走 mask, 单 Alt bit 索引由 xkbcommon `xkb_state_mod_name_get_index`
+    /// 给的 dynamic mod_index 决定. 本字段保留 raw mask, 由调用方走
+    /// [`crate::wl::keyboard::xkb_alt_mask_for_state`] 等 helper (后续派单可加)
+    /// 翻译, 与 evdev keycode 同 raw 哲学一致.
+    pub fn last_modifier_mask(&self) -> u32 {
+        self.last_modifier_mask
+    }
+
+    /// T-0607: 当前 xkb modifier mask 是否含 Alt (`Mod1`). xkb 协议 Mod1 通常
+    /// 映射到 Alt (左 Alt / 右 Alt 都走此 bit). 用 xkb_state 取**当前**激活状态
+    /// (考虑 latched / locked / depressed 全部), 再走
+    /// [`xkb::State::mod_name_is_active`] 走"语义 modifier 名" (与硬编码 bit
+    /// position 解耦, 兼容用户改 keymap 把 Alt 重映射到 Mod3 等场景).
+    ///
+    /// xkb_state=None (Keymap event 未到) → 回 false (alacritty / foot 同等保
+    /// 守, modifier 检测在 keymap 加载前不工作不影响 daily drive).
+    pub fn alt_active(&self) -> bool {
+        let Some(s) = self.xkb_state.as_ref() else {
+            return false;
+        };
+        // xkb::ffi::XKB_STATE_MODS_EFFECTIVE — 把 depressed / latched / locked
+        // 三态合并的"语义激活" 视图; 与 alacritty / foot 走 effective 一致.
+        s.mod_name_is_active(xkb::MOD_NAME_ALT, xkb::STATE_MODS_EFFECTIVE)
+    }
 }
 
 /// `handle_key_event` 的副作用描述: 翻译完一次 wl_keyboard event 后告诉调用方
@@ -237,6 +268,13 @@ pub enum KeyboardAction {
     /// T-0602: PageUp / PageDown → 滚 scrollback 整 line. 正值=向上滚 (看老),
     /// 负值=向下滚. 不发 PTY (终端自处理).
     Scroll(i32),
+    /// T-0607: Ctrl+Shift+C → 复制选区到 CLIPBOARD. 调用方
+    /// (`Dispatch<WlKeyboard>`) 走 `state.pending_selection_op =
+    /// Some(SelectionOp::SetClipboard)` 让 drive_wayland step 3.7 真消费.
+    CopyToClipboard,
+    /// T-0607: Ctrl+Shift+V → 粘贴 CLIPBOARD. 调用方走
+    /// `state.pending_paste_request = Some(PasteSource::Clipboard)`.
+    PasteFromClipboard,
 }
 
 /// 接 wl_keyboard 协议事件 → 算 [`KeyboardAction`]。
@@ -458,6 +496,24 @@ fn key_press_action(
     let shift_active = xkb_state.mod_name_is_active(xkb::MOD_NAME_SHIFT, xkb::STATE_MODS_EFFECTIVE);
     if let Some(action) = scroll_keysym_override(keysym, rows, shift_active) {
         return action;
+    }
+
+    // T-0607: Ctrl+Shift+C / Ctrl+Shift+V → CLIPBOARD 复制 / 粘贴 (alacritty /
+    // foot / kitty 同热键). 必须**先于** utf8 路径检测 — Ctrl+C 单独走 utf8
+    // 给 \x03 (SIGINT 字节, 派单不动) 但 Ctrl+Shift+C 我们劫持. xkb keysym 在
+    // Shift 激活时返大写字母 XK_C / XK_V (0x43 / 0x56), 用 raw 比.
+    let ctrl_active = xkb_state.mod_name_is_active(xkb::MOD_NAME_CTRL, xkb::STATE_MODS_EFFECTIVE);
+    if ctrl_active && shift_active {
+        let raw = keysym.raw();
+        // XK_C = 0x43, XK_c = 0x63; Shift active 时 keysym 为大写, 但极端
+        // keymap (Caps Lock 解释差异) 下也接小写 — 都接.
+        if raw == 0x43 || raw == 0x63 {
+            return KeyboardAction::CopyToClipboard;
+        }
+        // XK_V = 0x56, XK_v = 0x76
+        if raw == 0x56 || raw == 0x76 {
+            return KeyboardAction::PasteFromClipboard;
+        }
     }
 
     // T-0603 + T-0602: 算 bytes (BackSpace/Delete override 优先, 否则 utf8),
