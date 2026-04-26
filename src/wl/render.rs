@@ -505,7 +505,7 @@ const WINDOW_CLOSE_BG_HOVER: crate::term::Color = crate::term::Color {
 /// **why 8 logical 而非 12 / 16**: 8 px 是"圆角看得见但不喧宾夺主"的 sweet spot;
 /// 16 px (mutter 系统级 CSD 圆角) 在 800x600 小窗口占比偏大显得"切了块",
 /// ghostty / GTK4 应用主流走 6-10 px 范围。
-pub const CORNER_RADIUS_PX: f32 = 8.0;
+pub const CORNER_RADIUS_PX: f32 = 12.0;
 
 /// **CSD titlebar 配色**.
 const TITLEBAR_BG: crate::term::Color = crate::term::Color {
@@ -2537,13 +2537,9 @@ impl Renderer {
             self.active_tab_idx,
             hover,
         );
-        // T-0606: surface 4 边 1 px 边框, 走 cell pipeline 同 buffer.
-        append_border_vertices(
-            &mut cell_vertex_bytes,
-            surface_w,
-            surface_h,
-            self.surface_is_srgb,
-        );
+        // T-0617: 去掉 1 px 直线边框 — 圆角 + 半透明窗口下, 直边框被 squircle
+        // 角咬出 4 个缺口视觉撕裂. 圆角 alpha 渐变本身就是窗口边界, 不需边框.
+        let _ = &mut cell_vertex_bytes; // append_border_vertices removed
         // cell_vertex_count 在下面的 preedit underline append 后再算 (T-0505)。
 
         // Step 4: shape + raster + atlas allocate + build glyph vertex bytes。
