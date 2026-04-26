@@ -108,9 +108,16 @@ fn rounded_corners_alpha_full_at_center() {
     );
 }
 
-/// 顶角附近 16x16 物理 px 区 (corner_radius_phys = 16) 内应有"显著"的 alpha=0
-/// 像素 (圆形外的"角耳"). 不严格要 ≥ 某数, 而是抽样验"corner ear 真存在 alpha=0
-/// 像素". corner = r * (1 - π/4) / 2 ≈ 1.7 / 16 ≈ 10% 区域是"角耳".
+/// 顶角附近 16x16 物理 px 区 (corner_radius_phys = 16) 内应有 alpha=0 像素
+/// (squircle 外的"角耳"). 不严格要 ≥ 某数, 而是抽样验"corner ear 真存在 alpha=0
+/// 像素".
+///
+/// **T-0616 阈值更新**: 原阈值 ≥ 30 是基于圆形 SDF 的 (角耳 ≈ 256 × (1-π/4) ≈ 55).
+/// 切到 squircle (n=5) 后, 角耳显著缩小. 解析: discard 区 (满足 `(16-x)^5 +
+/// (16-y)^5 > 17^5` ≈ 1419857) 仅含 (0,0..3) + (1,0..1) + (2,0) + (3,0) ≈ 8 像素
+/// (理论值); AA band 让实测 ≈ 6 (smoothstep 让边缘 alpha > 0 不计 alpha=0). 阈值
+/// 放低到 ≥ 3 容忍 driver 实现差异 + AA discard 边界扰动. 验证仍有意义: 区分
+/// squircle 与"完全无 corner mask" (后者 zero_alpha_count == 0).
 #[test]
 fn rounded_corners_top_left_16x16_has_alpha_zero_pixels() {
     let (rgba, physical_w, _physical_h) = render_empty_frame();
@@ -126,11 +133,11 @@ fn rounded_corners_top_left_16x16_has_alpha_zero_pixels() {
             }
         }
     }
-    // r=16 phys, 顶角 16×16 = 256 总像素, 圆形外 "角耳" ≈ 256 × (1 - π/4) ≈ 55 px.
-    // 留余量阈值 30+ (smoothstep AA 边缘可能算非 0).
+    // T-0616: squircle (n=5) 角耳 ≈ 6 px (理论 8, AA 让 2 个 alpha > 0). 圆 (n=2)
+    // 时同区 ~55 px. 阈值 ≥ 3 验"corner ear 仍存在但已 squircle 化".
     assert!(
-        zero_alpha_count >= 30,
-        "顶左 16×16 区应至少有 30 个 alpha=0 像素 (corner ear), 实测 {zero_alpha_count}"
+        zero_alpha_count >= 3,
+        "顶左 16×16 区应至少有 3 个 alpha=0 像素 (squircle corner ear), 实测 {zero_alpha_count}"
     );
 }
 

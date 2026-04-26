@@ -43,6 +43,12 @@ pub use render::{reset_headless_tab_state, set_headless_tab_state};
 // active tab body / + box hover 等视觉测试入口).
 pub use render::{reset_headless_hover_state, set_headless_hover_state};
 
+// T-0616 squircle SDF e2e 测试用: set/reset thread_local squircle 指数 override
+// 让 render_headless 切 n=2 (圆弧 baseline) / n=5 (squircle Apple iOS 风) PNG
+// 对比 4 角差异. 与 HEADLESS_TAB_OVERRIDE / HEADLESS_HOVER_OVERRIDE 同决策 —
+// 不破坏现有 render_headless 签名.
+pub use render::{reset_headless_squircle_exponent, set_headless_squircle_exponent};
+
 // T-0505: PreeditOverlay 入参 (集成测试 tests/ime_preedit_render.rs 用), quill
 // 自有 struct (INV-010, 不漏 wayland-protocols 类型). PREEDIT_UNDERLINE_PX
 // 常数同步 re-export 给测试 / Phase 6 计算用。
