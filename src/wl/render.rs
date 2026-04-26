@@ -59,6 +59,30 @@ fn clear_color_for(format: wgpu::TextureFormat) -> wgpu::Color {
     }
 }
 
+/// T-0802 In #A: 从 surface capabilities 选 present_mode, 偏好 Mailbox 减拖窗口
+/// stutter, fallback Fifo 兼容性兜底.
+///
+/// **why Mailbox**: Fifo (默认 vsync, queue ~3 帧) 在拖窗口 resize 高频 configure
+/// 时 GPU 端 vsync 阻塞累积可见 lag (用户实测 "巨大延迟和滑动"). Mailbox 单帧
+/// queue + 新帧替换旧帧, 不阻塞 vsync, 减拖动 stutter (wgpu 文档"Fast Vsync").
+/// 两者都 no-tearing, 视觉无差别 — 仅时延差.
+///
+/// **why fallback Fifo**: wgpu 文档明示 Mailbox 仅 "DX12 / NVidia Vulkan / Wayland
+/// Vulkan" 支持, AMD Wayland / Intel / 软件 backend 可能无. Fifo "All platforms"
+/// 必有 — 退路保险. AMD 可走 FifoRelaxed (Adaptive Vsync) 但 quill daily-drive
+/// 在 NVIDIA 5090 + Wayland Vulkan, Mailbox 命中, 不引入第三优先级简化决策.
+///
+/// **抽纯 fn 单测覆盖**: `Renderer::new` 内联走 `caps.present_modes` (Vec) 路径
+/// 不可 headless 测 (要真 wl + adapter), 抽决策点纯 fn 同 conventions §3 +
+/// `should_propagate_resize` / `verdict_for_scale` / `decoration_log_decision` 套路.
+pub(crate) fn select_present_mode(modes: &[wgpu::PresentMode]) -> wgpu::PresentMode {
+    if modes.contains(&wgpu::PresentMode::Mailbox) {
+        wgpu::PresentMode::Mailbox
+    } else {
+        wgpu::PresentMode::Fifo
+    }
+}
+
 pub struct Renderer {
     // 字段声明顺序即 drop 顺序(Rust 按声明**正向**析构):
     // surface(第 1)先释放,instance(最后)最后。surface 依赖 instance 保持
@@ -861,17 +885,26 @@ impl Renderer {
         // window.rs 用 logical px 算 cols/rows, 不经过本配置。
         let physical_w = width.max(1).saturating_mul(HIDPI_SCALE);
         let physical_h = height.max(1).saturating_mul(HIDPI_SCALE);
+        // T-0802 In #A: present_mode 偏好 Mailbox (减拖窗口 vsync stutter), fallback
+        // Fifo. caps.present_modes 来自 surface.get_capabilities, 实测 NVIDIA Vulkan
+        // 5090 命中 Mailbox; AMD / Intel / 软件 backend 可能仅 Fifo, 走 fallback.
+        let present_mode = select_present_mode(&caps.present_modes);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
             width: physical_w,
             height: physical_h,
-            present_mode: wgpu::PresentMode::Fifo,
+            present_mode,
             desired_maximum_frame_latency: 2,
             alpha_mode,
             view_formats: vec![],
         };
         surface.configure(&device, &config);
+        tracing::info!(
+            ?present_mode,
+            available = ?caps.present_modes,
+            "wgpu present_mode 选定 (T-0802: Mailbox 偏好减拖窗口 stutter)"
+        );
 
         let clear = clear_color_for(format);
         let surface_is_srgb = format.is_srgb();
@@ -3503,6 +3536,51 @@ mod tests {
         assert!(c.r < 10.0 / 255.0);
         assert!(c.g < 16.0 / 255.0);
         assert!(c.b < 48.0 / 255.0);
+    }
+
+    // ---------- T-0802 In #A select_present_mode 单测 ----------
+    // Renderer::new 内联走 caps.present_modes (真 adapter Vec) 不可 headless 测,
+    // 抽 select_present_mode 纯 fn 锁住"含 Mailbox → Mailbox 否则 Fifo"决策不漂移
+    // (conventions §3 + 与 should_propagate_resize / verdict_for_scale 同套路).
+
+    #[test]
+    fn select_present_mode_prefers_mailbox_when_available() {
+        // NVIDIA Vulkan 5090 + Wayland 实测 caps 含 Fifo / Mailbox / Immediate,
+        // 应选 Mailbox (派单 In #A 偏好减拖窗口 stutter).
+        let modes = [
+            wgpu::PresentMode::Fifo,
+            wgpu::PresentMode::Mailbox,
+            wgpu::PresentMode::Immediate,
+        ];
+        assert_eq!(
+            select_present_mode(&modes),
+            wgpu::PresentMode::Mailbox,
+            "含 Mailbox 必选 Mailbox (派单 In #A 偏好)"
+        );
+    }
+
+    #[test]
+    fn select_present_mode_falls_back_to_fifo_when_no_mailbox() {
+        // AMD / Intel / 软件 backend caps 可能仅 Fifo (+ FifoRelaxed), 走 fallback.
+        let modes = [wgpu::PresentMode::Fifo, wgpu::PresentMode::FifoRelaxed];
+        assert_eq!(
+            select_present_mode(&modes),
+            wgpu::PresentMode::Fifo,
+            "无 Mailbox 必 fallback Fifo (wgpu 文档保 'All platforms' 必有 Fifo)"
+        );
+    }
+
+    #[test]
+    fn select_present_mode_fallback_when_modes_empty() {
+        // 防御性: 理论上 caps.present_modes 至少含 Fifo (wgpu 文档明示),
+        // 但空 slice 输入 (例: 上游 wgpu 升级语义变化 / 某 mock backend) 也
+        // 不 panic, 退到 Fifo (最安全默认).
+        let modes: [wgpu::PresentMode; 0] = [];
+        assert_eq!(
+            select_present_mode(&modes),
+            wgpu::PresentMode::Fifo,
+            "空 modes (防御性) 退 Fifo 不 panic"
+        );
     }
 
     /// T-0404: HIDPI_SCALE 是 hardcode 2x 简化版 (派单 In #A 模块顶部 const)。
