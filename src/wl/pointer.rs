@@ -61,6 +61,7 @@ use wayland_client::WEnum;
 use super::render::{
     BUTTON_H_LOGICAL_PX, BUTTON_W_LOGICAL_PX, TAB_BAR_H_LOGICAL_PX, TAB_CLOSE_W_LOGICAL_PX,
     TAB_MAX_W_LOGICAL_PX, TAB_MIN_W_LOGICAL_PX, TAB_PLUS_W_LOGICAL_PX, TITLEBAR_H_LOGICAL_PX,
+    WINDOW_BUTTON_RADIUS_PX,
 };
 
 /// CSD 三按钮枚举. 对应 xdg_toplevel 协议 set_minimized / set_maximized
@@ -1147,32 +1148,49 @@ pub fn hit_test(x: f64, y: f64, surface_w: u32, surface_h: u32) -> HoverRegion {
         return HoverRegion::TextArea;
     }
 
-    // titlebar 段, 检查三按钮 (右→左 Close / Maximize / Minimize)
-    // 按钮高度 ≤ titlebar (24 ≤ 28), 顶部居中: 上 2px 边距.
-    // 简化: 按钮 y 范围 [0, BUTTON_H_LOGICAL_PX) — 整 titlebar 都按按钮上下
-    // 边占满, 视觉上按钮顶贴 titlebar 顶, 4 px 底边距 (28 - 24 = 4).
+    // **T-0615: 圆形 button hit_test** (派单 In #D + 重点提醒).
+    // 三按钮各 24×24 logical bbox, 圆形 button 视觉 = bbox 内嵌圆 radius=12 logical.
+    // 用 "distance to center < radius" 判 hit — bbox 4 角 (≈22% bbox 面积) 落
+    // titlebar drag (用户在 corner 拖窗口而非 click button), 与 ghostty / macOS
+    // traffic light 体感一致. 内嵌圆覆盖 ~78% bbox 面积, 实际 click target 仍宽裕.
+    //
+    // 仍走 bbox 快速 reject (y < btn_h), 圆形 SDF 仅在 bbox 内算.
     if y < btn_h {
-        let close_x_min = w - btn_w;
-        let close_x_max = w;
-        let max_x_min = w - 2.0 * btn_w;
-        let max_x_max = close_x_min;
-        let min_x_min = w - 3.0 * btn_w;
-        let min_x_max = max_x_min;
+        let radius = WINDOW_BUTTON_RADIUS_PX as f64;
+        let close_cx = w - btn_w / 2.0;
+        let max_cx = w - 1.5 * btn_w;
+        let min_cx = w - 2.5 * btn_w;
+        let cy = btn_h / 2.0;
 
-        if x >= close_x_min && x < close_x_max {
+        if circular_hit(x, y, close_cx, cy, radius) {
             return HoverRegion::Button(WindowButton::Close);
         }
-        if x >= max_x_min && x < max_x_max {
+        if circular_hit(x, y, max_cx, cy, radius) {
             return HoverRegion::Button(WindowButton::Maximize);
         }
-        // min_x_min 可能 < 0 (极小 surface 装不下三按钮); 落到 TitleBar 兜底
-        if min_x_min >= 0.0 && x >= min_x_min && x < min_x_max {
+        // min_cx 可能 < 0 (极小 surface 装不下三按钮); 落到 TitleBar 兜底.
+        if min_cx >= radius && circular_hit(x, y, min_cx, cy, radius) {
             return HoverRegion::Button(WindowButton::Minimize);
         }
     }
 
     // 不在按钮 → titlebar 拖动区
     HoverRegion::TitleBar
+}
+
+/// **T-0615: 圆形 button hit_test 决策** — distance to center < radius.
+/// `circular_hit(x, y, cx, cy, r)` = ((x-cx)² + (y-cy)²) < r². 抽 free fn
+/// 让 `hit_test` (titlebar buttons) + `hit_test_with_tabs` (tab close ×) 共享同
+/// 公式, 单测可独立验. 与 [`crate::wl::render::corner_distance`] 同 SDF 思路但
+/// 接圆心 + 半径 (后者接矩形 + 半径 算到内嵌 corner center 距离).
+///
+/// 派单 In #D 字面: "按 distance to center, < radius 视为 hit". 用平方比较省 sqrt
+/// (微秒级优化, 但更直观 — 不需 sqrt 回原距离).
+pub(crate) fn circular_hit(x: f64, y: f64, cx: f64, cy: f64, radius: f64) -> bool {
+    let dx = x - cx;
+    let dy = y - cy;
+    let r2 = radius * radius;
+    (dx * dx + dy * dy) < r2
 }
 
 #[cfg(test)]
@@ -1977,6 +1995,97 @@ mod tests {
         let names = xcursor_names_for(CursorShape::NeswResize);
         assert_eq!(names, &["size_bdiag", "nesw-resize", "ne-resize"]);
         assert_eq!(names[0], "size_bdiag");
+    }
+
+    // ---------- T-0615 圆形 button hit_test 单测 (派单 In #D + #E) ----------
+
+    /// `circular_hit` 中心 hit (距离 0 < radius).
+    #[test]
+    fn circular_hit_at_center_is_true() {
+        assert!(circular_hit(100.0, 50.0, 100.0, 50.0, 12.0));
+    }
+
+    /// `circular_hit` 圆内点 (距离 < radius) hit.
+    #[test]
+    fn circular_hit_inside_circle_is_true() {
+        // 距中心 5 logical, < 12 → hit
+        assert!(circular_hit(105.0, 50.0, 100.0, 50.0, 12.0));
+        // 距中心 sqrt(50) ≈ 7.07, < 12 → hit
+        assert!(circular_hit(105.0, 55.0, 100.0, 50.0, 12.0));
+    }
+
+    /// `circular_hit` 圆边 (距离 == radius) miss (派单"< radius 视为 hit").
+    #[test]
+    fn circular_hit_on_radius_boundary_is_miss() {
+        assert!(!circular_hit(112.0, 50.0, 100.0, 50.0, 12.0));
+        assert!(!circular_hit(100.0, 38.0, 100.0, 50.0, 12.0));
+    }
+
+    /// `circular_hit` 圆外点 miss.
+    #[test]
+    fn circular_hit_outside_circle_is_false() {
+        // bbox 角 (12, 12) 距中心 = 12 * sqrt(2) ≈ 16.97 > 12 → miss
+        assert!(!circular_hit(112.0, 62.0, 100.0, 50.0, 12.0));
+        // 远点
+        assert!(!circular_hit(200.0, 200.0, 100.0, 50.0, 12.0));
+    }
+
+    /// hit_test Close 圆形覆盖中心 (派单 In #D 圆形 button hit_test).
+    /// Close 中心 (w - btn_w/2, btn_h/2) = (788, 12) (w=800, btn_w=24, btn_h=24).
+    #[test]
+    fn hit_test_circular_close_at_center_returns_close() {
+        // 800×600: Close center (788, 12), point (788, 12) 距中心 0 < 12 → hit
+        assert_eq!(
+            hit_test(788.0, 12.0, 800, 600),
+            HoverRegion::Button(WindowButton::Close)
+        );
+    }
+
+    /// hit_test Close 圆角外区域 (bbox 内但圆外) 落 TitleBar — 派单"圆形 button"
+    /// 视觉与 hit_test 同源, 圆外不算按钮.
+    /// **T-0701 角优先级**: 8×8 corner 在右上角更早接管 (TopRight resize), 故选 x=778
+    /// y=22 — 出 corner / 出顶 edge / 仍在 bbox [776, 800)×[0, 24) 但出圆 (中心
+    /// (788,12), 距=sqrt(100+100)≈14.1 > 12).
+    #[test]
+    fn hit_test_circular_close_outside_circle_falls_to_titlebar() {
+        // 出圆点 (778, 22): 距中心 (788,12) = sqrt(10² + 10²) = 14.14 > 12 → 不算 Close
+        // bbox [776, 800) × [0, 24): 仍在 bbox 内, 但圆外
+        // 不在 corner (8 logical 8×8 在右上角 [792, 800) × [0, 8))
+        // 不在边 (4 logical edge: x ∈ [4, 796), y ∈ [4, 596))
+        assert_eq!(
+            hit_test(778.0, 22.0, 800, 600),
+            HoverRegion::TitleBar,
+            "Close bbox 角点 (圆外) 应落 TitleBar 不是 Close"
+        );
+    }
+
+    /// Maximize 中心 hit. 中心 (w - 1.5*btn_w, btn_h/2) = (764, 12).
+    #[test]
+    fn hit_test_circular_maximize_at_center() {
+        assert_eq!(
+            hit_test(764.0, 12.0, 800, 600),
+            HoverRegion::Button(WindowButton::Maximize)
+        );
+    }
+
+    /// Minimize 中心 hit. 中心 (w - 2.5*btn_w, btn_h/2) = (740, 12).
+    #[test]
+    fn hit_test_circular_minimize_at_center() {
+        assert_eq!(
+            hit_test(740.0, 12.0, 800, 600),
+            HoverRegion::Button(WindowButton::Minimize)
+        );
+    }
+
+    /// 跨按钮 (Close 中心 与 Maximize 中心之间, 都在 bbox 内但都圆外) → TitleBar.
+    /// Close center 788, Max center 764, 中点 776 (= Close bbox 左缘). 取 776 距 Close
+    /// 中心 12 > radius (12 不算 hit), 距 Max 中心 12 > radius. 落 TitleBar.
+    /// **T-0701 角**: 4 logical 边 x < 796 即出右边. 但 776 > 8 corner 左缘, 8 corner
+    /// 是 [792, 800) — 不重叠 776. 766 > 4 edge — 不重叠.
+    #[test]
+    fn hit_test_circular_between_buttons_falls_to_titlebar() {
+        // 776 距 Close center (788) = 12, 距 Max center (764) = 12 — 都不 < 12 → miss
+        assert_eq!(hit_test(776.0, 12.0, 800, 600), HoverRegion::TitleBar);
     }
 
     /// 全 variant 至少 2 个 fallback name (防"单 name 拼错全失败").
