@@ -1235,11 +1235,15 @@ fn apply_selection_op(data: &mut LoopData, qh: &QueueHandle<State>) {
     // 算选区文本. T-0608: 走 active tab 的 term.
     let t = data.state.tabs_unchecked().active().term();
     let (cols, rows) = t.dimensions();
-    // T-0607 已知陷阱 (派单 In #G CJK): display_text 内部跳 WIDE_CHAR_SPACER cell,
-    // 与 selected_cells_* 走 grid col/row 索引一致 — 选区跨 CJK 字 substr 不切坏.
+    // T-0618 follow-up: CJK 选区 cell→char idx 错位修. display_text 跳 spacer
+    // 致 char idx != cell idx — substr_chars 走 cell.col 当 char idx 索引时,
+    // 每个 CJK 在选区里多 1 char 在尾巴 (旧实现的 doc 注释错: 假设两者对齐,
+    // 实际 CJK 占 2 cells / 1 char). 走 display_text_with_spacers 让 char 数 ==
+    // cell 数, 提取后 strip '\0'.
     let text = extract_selection_text(&data.state.selection_state, cols, rows, |line| {
-        t.display_text(line)
+        t.display_text_with_spacers(line)
     });
+    let text = text.replace('\0', "");
     data.state.last_selection_text = Some(text.clone());
 
     let serial = data.state.pointer_state.last_button_serial();
@@ -1318,6 +1322,93 @@ fn apply_selection_op(data: &mut LoopData, qh: &QueueHandle<State>) {
 }
 
 /// T-0607: 消费 `state.pending_paste_request`, 真 trigger offer.receive +
+/// PTY back-pressure 写入: 试 pty.write, 写不完的字节排队 `state.pending_pty_writes`,
+/// 由 [`drain_pending_pty_writes`] 在每个 wayland tick 试 drain.
+///
+/// **why 排队不直接重试**: 重试要等 PTY buffer 排空, 同步轮询 = 阻塞事件循环 =
+/// 键盘卡死. 排队让事件循环继续跑 (键盘 / 鼠标 / 渲染都正常), tick 慢慢 drain.
+///
+/// **why 全队列 + 拼接 vs 多块**: 简化, 单 Vec append 比 VecDeque<Vec<u8>> 易跟
+/// 主路径 (单 syscall 一次写连续内存). 大粘贴典型 < 1MB, 复制开销 << wayland
+/// roundtrip.
+fn queue_or_write_pty(state: &mut State, bytes: &[u8], purpose: &'static str) {
+    if bytes.is_empty() {
+        return;
+    }
+    // 若已有排队, 直接 append — 保证字节顺序 (bracketed paste / DnD URI list
+    // 必须连续, 中间插其他写会破坏 escape 序列).
+    if !state.pending_pty_writes.is_empty() {
+        state.pending_pty_writes.extend_from_slice(bytes);
+        return;
+    }
+    let pty = state.tabs_unchecked().active().pty();
+    match pty.write(bytes) {
+        Ok(n) if n == bytes.len() => {
+            tracing::debug!(target: "quill::pty", purpose, n, "pty write 完整");
+        }
+        Ok(n) => {
+            // 部分写: 剩余排队等下次 tick.
+            tracing::debug!(
+                target: "quill::pty",
+                purpose,
+                wrote = n,
+                queued = bytes.len() - n,
+                "pty 部分写, 剩余排队"
+            );
+            state.pending_pty_writes.extend_from_slice(&bytes[n..]);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            // 全没写, 全排队.
+            tracing::debug!(
+                target: "quill::pty",
+                purpose,
+                queued = bytes.len(),
+                "pty WouldBlock, 全排队"
+            );
+            state.pending_pty_writes.extend_from_slice(bytes);
+        }
+        Err(e) => {
+            tracing::warn!(target: "quill::pty", purpose, error = %e, "pty.write 错误");
+        }
+    }
+}
+
+/// drive_wayland 每 tick 调一次. 试 drain `pending_pty_writes` — 写多少剪多少,
+/// 剩余留下次. 空队列时 no-op (廉价).
+fn drain_pending_pty_writes(state: &mut State) {
+    if state.pending_pty_writes.is_empty() {
+        return;
+    }
+    let pty = state.tabs_unchecked().active().pty();
+    match pty.write(&state.pending_pty_writes) {
+        Ok(n) if n == state.pending_pty_writes.len() => {
+            tracing::debug!(target: "quill::pty", n, "pending writes drained 完");
+            state.pending_pty_writes.clear();
+        }
+        Ok(n) => {
+            tracing::trace!(
+                target: "quill::pty",
+                wrote = n,
+                remaining = state.pending_pty_writes.len() - n,
+                "pending writes 部分 drain"
+            );
+            state.pending_pty_writes.drain(..n);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            // 还是满, 下次再试.
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "quill::pty",
+                error = %e,
+                queued = state.pending_pty_writes.len(),
+                "drain pending writes 错误, 清空 (放弃)"
+            );
+            state.pending_pty_writes.clear();
+        }
+    }
+}
+
 /// 异步读 pipe → bracketed paste 包装 → pty.write.
 ///
 /// **why pipe2 + calloop Generic source 而非 thread**: INV-005 单 EventLoop —
@@ -1331,6 +1422,30 @@ fn apply_paste_request(data: &mut LoopData) {
     let Some(source) = data.state.pending_paste_request.take() else {
         return;
     };
+    // 串行化: 已有 active paste 在 pipe-read 中 → 排队, 当前完成 (paste_read_tick
+    // EOF / Remove) 后处理. 防 mutter 对同一 wl_data_offer 多次 receive 行为
+    // 不稳 (有些 source 给空, 有些重复, 有些把两次合并). ghostty 同决策.
+    // (`paste_in_progress` flag 在下方 source 真注册成功后才 set, 避免 offer
+    // None / pipe 失败等早 return 路径泄漏 flag 致死锁.)
+    //
+    // ⚠️ **KNOWN BUG (T-0618 follow-up, deferred)**: 即使串行化, 大文件连按
+    // Ctrl+Shift+V 两次, 第二次粘贴内容仍可能"乱". 实测 daily-drive 复现.
+    // 怀疑根因: mutter 在 active offer 期间收到第二次 receive 时, 给 read pipe
+    // 的字节流可能被前一次 receive 的残留 / 缓冲污染. 真正修法需:
+    //   (a) 缓存 clipboard 文本 (ghostty 路径) — 第一次读完后, offer 没变就
+    //       从 cache 直接走, 不再走 mutter receive 第二次, 完全规避 IPC 不稳
+    //   (b) 或加 EOF 后强制 drain 一帧, 确保 mutter 完全释放上次 receive 的
+    //       内部状态再发新 receive
+    // 当前 workaround: 用户两次粘贴间隔几秒 / 或别按两次. 后续 ticket 修.
+    if data.state.paste_in_progress {
+        data.state.pending_paste_followups.push_back(source);
+        tracing::debug!(
+            target: "quill::pointer",
+            queued = data.state.pending_paste_followups.len(),
+            "paste in progress, 排队"
+        );
+        return;
+    }
 
     // 取出对应 offer (Primary / Clipboard).
     enum OfferRef<'a> {
@@ -1424,6 +1539,8 @@ fn apply_paste_request(data: &mut LoopData) {
     match result {
         Ok(_token) => {
             tracing::debug!(target: "quill::pointer", ?source, "Paste: started async read pipe");
+            // 注册成功 — 现在正式置 in-progress, 防止后续 Ctrl+Shift+V 并发跑.
+            data.state.paste_in_progress = true;
         }
         Err(err) => {
             tracing::warn!(
@@ -1952,43 +2069,27 @@ fn paste_read_tick(
                 .term_mut()
                 .reset_display();
             // T-0608: 写 active tab 的 PTY (paste 跟 keyboard focus 一致).
-            {
-                let pty = data.state.tabs_unchecked().active().pty();
-                match pty.write(&wrapped) {
-                    Ok(n) if n == wrapped.len() => {
-                        tracing::debug!(
-                            target: "quill::pointer",
-                            n,
-                            bracketed,
-                            "paste: wrote bytes to pty"
-                        );
-                    }
-                    Ok(n) => {
-                        tracing::warn!(
-                            target: "quill::pointer",
-                            wrote = n,
-                            total = wrapped.len(),
-                            "paste: pty.write 部分写入, 剩余字节丢弃 (背压)"
-                        );
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        tracing::warn!(
-                            target: "quill::pointer",
-                            n = wrapped.len(),
-                            "paste: pty.write WouldBlock, 字节丢弃 (背压, INV-005 不重试)"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "quill::pointer",
-                            error = %e,
-                            "paste: pty.write 失败"
-                        );
-                    }
-                }
-            }
+            // **PTY back-pressure 处理**: claudecode (Ink) 渲染慢, PTY buffer
+            // (Linux 默认 4KB) 一次写不下 → pty.write 返 Ok(N) 部分写, 剩余排
+            // 队等下次 tick drain. 之前直接丢弃致 bracketed paste 结束标记
+            // `\x1b[201~` 没送达, claudecode 永远卡 paste 模式吞键盘 (daily-drive
+            // 死锁真因). 普通 bash 排水快不踩.
+            queue_or_write_pty(&mut data.state, &wrapped, "paste");
             // 释放 fd (close), source 一并 remove.
             pasta_state.borrow_mut().fd = None;
+            // active paste 完成 — 清 flag, 把队首 followup (若有) 提到
+            // pending_paste_request, drive_wayland 下一 tick 走 apply_paste_request
+            // 处理 (pipe + receive + 新 source). 这样多次 Ctrl+Shift+V 严格按
+            // 顺序处理.
+            data.state.paste_in_progress = false;
+            if let Some(next) = data.state.pending_paste_followups.pop_front() {
+                data.state.pending_paste_request = Some(next);
+                tracing::debug!(
+                    target: "quill::pointer",
+                    remaining = data.state.pending_paste_followups.len(),
+                    "active paste 完成, 唤起队首 followup"
+                );
+            }
             return Ok(PostAction::Remove);
         }
         // n < 0: errno
@@ -2003,6 +2104,12 @@ fn paste_read_tick(
                     "paste: read failed"
                 );
                 pasta_state.borrow_mut().fd = None;
+                // 失败也要清 in-progress flag + 唤醒 followup, 否则后续 paste 永
+                // 不被处理 (死锁).
+                data.state.paste_in_progress = false;
+                if let Some(next) = data.state.pending_paste_followups.pop_front() {
+                    data.state.pending_paste_request = Some(next);
+                }
                 return Ok(PostAction::Remove);
             }
         }
@@ -2102,6 +2209,10 @@ fn drive_wayland(data: &mut LoopData) -> std::io::Result<PostAction> {
         apply_selection_op(data, &qh);
     }
     apply_paste_request(data);
+
+    // 排空 pending_pty_writes (粘贴 / DnD drop 余量, claudecode 等慢渲染消费方
+    // 走 PTY back-pressure 路径). 每个 tick 重试一次, drained 完毕清空.
+    drain_pending_pty_writes(&mut data.state);
 
     // Step 3.7.5 (T-0611): DnD drop 消费 — 走 offer.receive + pipe 异步读
     // (与 paste 同 pipe 套路) + uri-list parse + shell escape + bracketed wrap
@@ -2361,6 +2472,7 @@ pub fn run_window() -> Result<()> {
         cursor_theme,
         cursor_surface,
         is_maximized: false,
+        is_fullscreen: false,
         presentation_dirty: false,
         pending_scroll_lines: 0,
         text_input_manager,
@@ -2372,6 +2484,9 @@ pub fn run_window() -> Result<()> {
         selection_state: SelectionState::new(),
         pending_selection_op: None,
         pending_paste_request: None,
+        pending_pty_writes: Vec::new(),
+        paste_in_progress: false,
+        pending_paste_followups: std::collections::VecDeque::new(),
         pending_autoscroll_op: None,
         pending_autoscroll_cancel: false,
         primary_selection_manager,
@@ -2396,6 +2511,7 @@ pub fn run_window() -> Result<()> {
         dnd_current_offer_mimes: Vec::new(),
         dnd_accepted_mime: None,
         pending_drop: false,
+        preedit_anchor: None,
     };
 
     // T-0608/T-0202/T-0108: spawn 第一个 tab 的子 shell + 把 master fd 注册进
@@ -2589,22 +2705,64 @@ pub fn run_window() -> Result<()> {
             let Some(tab_list) = state.tabs.as_mut() else {
                 return; // tabs 未初始化 (启动期 race) — 跳过本帧
             };
-            let t = tab_list.active_mut().term_mut();
             // T-0602: 消费 Dispatch<WlPointer> / Dispatch<WlKeyboard> 累积的
             // scrollback line 数. State 拿不到 term (在 LoopData 兄弟字段), 所以
             // 滚动决定推到 idle 回放. scroll_display 内部已置 dirty, 不再单独
             // 触发 — 后续 is_dirty 检查自然命中 redraw 路径.
+            //
+            // alt screen + alternate_scroll → 滚轮转 cursor 键转发 PTY (xterm /
+            // alacritty / foot 标准: 让 claudecode / vim / less / tmux 自处理
+            // transcript 滚动). 否则正常 scroll_display 看 scrollback.
+            //
+            // 协议: n > 0 = wheel up = 看老内容 = cursor up; n < 0 = wheel
+            // down = cursor down. cursor 键序列按 DECCKM (app_cursor_keys)
+            // 选 SS3 (`\x1bOA/B`) 还是 CSI (`\x1b[A/B`).
             if state.pending_scroll_lines != 0 {
                 let n = state.pending_scroll_lines;
-                t.scroll_display(n);
-                tracing::trace!(
-                    target: "quill::scroll",
-                    delta = n,
-                    new_offset = t.display_offset(),
-                    "scrollback applied"
-                );
+                let active = tab_list.active_mut();
+                let term = active.term_mut();
+                let alt_mode = term.is_alt_screen() && term.alternate_scroll_active();
+                let app = term.app_cursor_keys();
+                let arrow_bytes: Option<Vec<u8>> = if alt_mode {
+                    let key: &[u8] = if n > 0 {
+                        if app { b"\x1bOA" } else { b"\x1b[A" }
+                    } else if app {
+                        b"\x1bOB"
+                    } else {
+                        b"\x1b[B"
+                    };
+                    let count = n.unsigned_abs() as usize;
+                    let mut buf = Vec::with_capacity(count * key.len());
+                    for _ in 0..count {
+                        buf.extend_from_slice(key);
+                    }
+                    Some(buf)
+                } else {
+                    term.scroll_display(n);
+                    None
+                };
+                if let Some(buf) = arrow_bytes {
+                    let pty = active.pty_mut();
+                    let _ = pty.write(&buf);
+                    tracing::trace!(
+                        target: "quill::scroll",
+                        delta = n,
+                        app_cursor = app,
+                        bytes = buf.len(),
+                        "alt screen scroll → cursor keys → PTY"
+                    );
+                } else {
+                    tracing::trace!(
+                        target: "quill::scroll",
+                        delta = n,
+                        new_offset = active.term().display_offset(),
+                        "scrollback applied"
+                    );
+                }
                 state.pending_scroll_lines = 0;
             }
+            // 重新拿 term 引用 — alt-screen path 上方已 release.
+            let t = tab_list.active_mut().term_mut();
             // T-0504: 检查 term cell 内容 dirty || presentation (CSD hover) dirty.
             // 任一为真即重画. presentation_dirty 由 Dispatch<WlPointer> 在
             // HoverChange 时置位, 重画后清.
@@ -2643,16 +2801,33 @@ pub fn run_window() -> Result<()> {
             // draw_cells (Phase 3 色块路径)。
             // T-0505: 当 IME 有 preedit 时构造 PreeditOverlay 传入 — 渲染层
             // 在 cursor 当前位置追加 preedit 字 + 下划线。
+            //
+            // **preedit_anchor**: TUI 应用 (Claude Code / vim / fzf) 用 ANSI 光
+            // 标移动 (`\x1b[r;cH`) 不停重画 spinner / status / 输入框, 期间 PTY
+            // 光标跳来跳去. 直接读 t.cursor_pos() 拿到的可能是 TUI 中间帧的位
+            // 置, 不是用户输入区. 锚点策略: 组词 session 开始 (preedit 空→非空)
+            // 抓住 cursor 位置, session 期间用锚点不变, commit/clear (preedit
+            // 非空→空) 释放. 用户感知: preedit 始终在开始组词的位置, 跟周围
+            // TUI 重画无关.
             let preedit_overlay: Option<crate::wl::render::PreeditOverlay> = {
                 let preedit_text = state.ime_state.current_preedit();
                 if preedit_text.is_empty() {
+                    state.preedit_anchor = None;
                     None
                 } else {
-                    let pos = t.cursor_pos();
+                    let (col, line) = match state.preedit_anchor {
+                        Some(a) => a,
+                        None => {
+                            let pos = t.cursor_pos();
+                            let a = (pos.col, pos.line);
+                            state.preedit_anchor = Some(a);
+                            a
+                        }
+                    };
                     Some(crate::wl::render::PreeditOverlay {
                         text: preedit_text.to_owned(),
-                        cursor_col: pos.col,
-                        cursor_line: pos.line,
+                        cursor_col: col,
+                        cursor_line: line,
                     })
                 }
             };
@@ -2842,6 +3017,11 @@ struct State {
     /// 暴露的是 Vec<State>, 接入复杂; 简化: 客户端自跟踪, 与 Adwaita /
     /// alacritty 等 CSD 客户端实践一致.
     is_maximized: bool,
+    /// T-0618 follow-up: 是否全屏 (compositor 通过 configure.state 含
+    /// `WindowState::FULLSCREEN` 通知). hit_test 用此跳 ResizeEdge — 全屏窗口
+    /// 边缘不该可拖 resize (Adwaita / alacritty / GNOME-Terminal 同决策). 用户
+    /// 全屏后鼠标贴边出 N/S/E/W resize 箭头是反 UX.
+    is_fullscreen: bool,
     /// T-0504: presentation-only dirty (CSD titlebar 按钮 hover 高亮变化).
     /// cell 内容未变, term.is_dirty 不会置位, 但 hover 切换需要重画 titlebar.
     /// idle callback 检查 `term.is_dirty() || state.presentation_dirty` 决定
@@ -2878,6 +3058,19 @@ struct State {
     /// 由 [`apply_paste_request`] 在 dispatch_pending 后调 offer.receive +
     /// 启动 calloop Generic source 异步读 pipe.
     pub(crate) pending_paste_request: Option<PasteSource>,
+    /// 待写入 PTY 的字节队列. PTY master fd buffer (Linux 默认 4KB) 一次写不下
+    /// 大粘贴时, 剩余字节存这, drive_wayland 主循环每个 tick 试 drain. 没排空
+    /// 之前不该让 claudecode/shell 看到"半截 bracketed paste" — 那会致 TUI
+    /// 永远卡在 paste 模式吞键盘 (用户实测大粘贴键盘死锁的真因).
+    pub(crate) pending_pty_writes: Vec<u8>,
+    /// 当前是否有 active paste source (pipe 在读). 防止快速连按 Ctrl+Shift+V
+    /// 致两个 pipe 同时跑 — mutter 对同一 wl_data_offer 调两次 receive 行为
+    /// 不稳 (有些 source client 给空数据, 有些重复). active 期间新 paste 请求
+    /// 暂存到 [`State::pending_paste_followups`] 队列, 第一次完成后顺序处理.
+    pub(crate) paste_in_progress: bool,
+    /// active paste 期间堆积的 paste 请求. 当前 paste 完成后 (paste_read_tick
+    /// EOF / Remove) 处理首个, 直至队列排空.
+    pub(crate) pending_paste_followups: std::collections::VecDeque<PasteSource>,
     /// T-0607: 待发的 autoscroll 操作. 由 [`apply_autoscroll_op`] 在
     /// dispatch_pending 后真 schedule / cancel calloop Timer.
     pub(crate) pending_autoscroll_op: Option<AutoScrollOp>,
@@ -2975,6 +3168,11 @@ struct State {
     /// calloop Generic source 异步读 pipe → uri-list parse → shell escape →
     /// bracketed wrap → pty.write. 与 `pending_paste_request` 同 pipe 模式.
     pub(crate) pending_drop: bool,
+    /// IME preedit 锚点 (col, line). 组词 session 开始时 (preedit 由空变非空)
+    /// 抓住当前 term cursor 位置, session 期间不变, commit/clear (preedit
+    /// 回空) 释放. 防 Claude Code 等 TUI 应用在 IME 组词期间用 ANSI 光标移动
+    /// 重画 spinner / status 把 cursor 跳到屏幕别处, 致 preedit 跟着跳。
+    preedit_anchor: Option<(usize, usize)>,
 }
 
 impl State {
@@ -3197,10 +3395,19 @@ impl WindowHandler for State {
     ) {
         let new_w = configure.new_size.0.map(|v| v.get());
         let new_h = configure.new_size.1.map(|v| v.get());
+        // T-0618 follow-up: 同步 maximize / fullscreen 状态. compositor 在
+        // user 按 Win+Up / 双击 titlebar / 拖到屏幕顶 / 系统快捷键全屏 时通过
+        // configure.state 通知. hit_test 据此跳 ResizeEdge.
+        self.is_maximized = configure.is_maximized();
+        self.is_fullscreen = configure.is_fullscreen();
+        self.pointer_state
+            .set_disable_resize(self.is_maximized || self.is_fullscreen);
         tracing::debug!(
             ?new_w,
             ?new_h,
             first = self.core.first_configure,
+            max = self.is_maximized,
+            full = self.is_fullscreen,
             "configure"
         );
 
@@ -4016,6 +4223,32 @@ fn apply_ime_action(action: ImeAction, text_input: &ZwpTextInputV3, state: &mut 
             cursor_begin,
             cursor_end,
         } => {
+            // T-0618 follow-up: preedit 锚点捕获时机改为 IME 事件本身, 而非
+            // render frame. 之前 frame 路径在 claudecode 重画期间撞 cursor 跳
+            // 位的中间帧, 致 anchor 错. 这里离用户按键最近, claudecode 还没
+            // 来得及重画, term cursor 是用户输入框真位置.
+            //
+            // 规则: text 空 → 清 anchor (commit / cancel); text 非空且 anchor
+            // 还 None → 抓 term cursor; 已有 anchor → 保持 (整组词 session 不变).
+            if text.is_empty() {
+                state.preedit_anchor = None;
+            } else if state.preedit_anchor.is_none() {
+                if let Some(t) = state.tabs.as_ref().map(|tl| tl.active().term()) {
+                    let pos = t.cursor_pos();
+                    state.preedit_anchor = Some((pos.col, pos.line));
+                    tracing::debug!(
+                        target: "quill::ime",
+                        col = pos.col,
+                        line = pos.line,
+                        "preedit anchor captured at IME event"
+                    );
+                }
+            }
+            // **关键**: preedit 变化必须 trigger redraw, 否则 IME 字节不到 PTY
+            // (compose 期间 fcitx5 自己持有, 没 PTY 流), term 不 dirty, render
+            // 跳过, preedit 永不显示. 走 presentation_dirty 路径 (跟 hover
+            // 高亮同套路 — cell 内容没变但显示需要刷).
+            state.presentation_dirty = true;
             // current_preedit 已在 handle_text_input_event 内 apply 完成 (
             // ImeState 内部 mutation), 这里仅 trace。渲染层下次 idle callback
             // 走 draw_frame 时读 state.ime_state.current_preedit() 决定 preedit
