@@ -2,7 +2,7 @@
 
 **Phase**: 7
 **Assigned**: writer-T0703
-**Status**: in-review
+**Status**: merged
 **Budget**: tokenBudget=180k (跨 wl_pointer.set_cursor + cursor theme 加载 + cursor-shape-v1 协议)
 **Dependencies**: T-0504 (wl_pointer + hit_test) / T-0701 (resize hit-test)
 **Priority**: P1 (CSD 完整性 — 鼠标 hover resize 边时应该变 ↔, hover textarea 时应该变 I-beam)
