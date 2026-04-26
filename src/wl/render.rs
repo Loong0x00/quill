@@ -146,6 +146,19 @@ pub struct Renderer {
     /// 当前 glyph vertex buffer 容量 (顶点数计)。Phase 4 单帧字符上限粗估
     /// (24 行 × 80 col × 6 顶点 = 11520 vert), 首次分配后 buffer reuse。
     glyph_buffer_capacity: usize,
+    /// **T-0610 part 2: corner mask uniform buffer** (持 wgpu device 引用).
+    /// `[surface_w, surface_h, corner_radius_phys, alpha_live]` 16 字节 std140.
+    /// `Renderer::new` 建好首帧 + `Renderer::resize` 每次 surface 尺寸变更时
+    /// `queue.write_buffer` 推新尺寸. cell + glyph pipeline 共享 (group=1 binding).
+    /// INV-002 字段顺序: 持 device 引用资源, 必须**在 `device` 之前 drop** —
+    /// reviewer-T0610 否决 hotfix 把字段从 device 之后挪到这里 (与 `glyph_*` 同档).
+    corner_uniform_buffer: wgpu::Buffer,
+    /// **T-0610 part 2: corner mask bind group** (持 device 引用 + uniform buffer
+    /// 内部 Arc). bind_group_layout 内嵌 (group=1 single uniform binding,
+    /// FRAGMENT visibility), pipeline 创建时取自 [`Self::corner_bind_group_layout`]
+    /// 复刻 (无单独字段, 与 GlyphAtlas 内部 layout 同套路 — wgpu Arc 计数兜底).
+    /// INV-002: 同 `corner_uniform_buffer`, 必须在 `device` 之前 drop.
+    corner_bind_group: wgpu::BindGroup,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
@@ -165,27 +178,16 @@ pub struct Renderer {
     /// 通过 [`Self::set_tab_state`] 在每帧 draw_frame 之前同步.
     tab_count: usize,
     active_tab_idx: usize,
-    /// **T-0610 part 2: corner mask uniform buffer** (持 wgpu device 引用).
-    /// `[surface_w, surface_h, corner_radius_phys, alpha_live]` 16 字节 std140.
-    /// `Renderer::new` 建好首帧 + `Renderer::resize` 每次 surface 尺寸变更时
-    /// `queue.write_buffer` 推新尺寸. cell + glyph pipeline 共享 (group=1 binding).
-    /// INV-002 字段顺序: 持 device 引用资源, 必须在 `device` 之前 drop, 与
-    /// `glyph_*` 同档. 17 → 19 字段 (Lead follow-up sync docs/invariants.md).
-    corner_uniform_buffer: wgpu::Buffer,
-    /// **T-0610 part 2: corner mask bind group** (持 device 引用 + uniform buffer
-    /// 内部 Arc). bind_group_layout 内嵌 (group=1 single uniform binding,
-    /// FRAGMENT visibility), pipeline 创建时取自 [`Self::corner_bind_group_layout`]
-    /// 复刻 (无单独字段, 与 GlyphAtlas 内部 layout 同套路 — wgpu Arc 计数兜底).
-    corner_bind_group: wgpu::BindGroup,
     /// **T-0610 part 2: live alpha** (CLEAR_ALPHA_LIVE = 0.85 / Opaque fallback 1.0).
     /// `Renderer::new` 据 alpha_mode 决定一次后锁住; `Renderer::resize` 走 update
-    /// uniform 时复用本字段, 不需重查 adapter caps. POD f32 顺序无关.
+    /// uniform 时复用本字段, 不需重查 adapter caps. POD f32 顺序无关, 与
+    /// `surface_is_srgb` 同档.
     ///
     /// **派单偏离声明**: 派单"INV-002 字段加 uniform_buffer + bind_group, 17 → 19"
     /// — 实装加 3 字段 (含 alpha_live), 17 → 20. 理由: alpha_live 必须在 resize
     /// 路径访问 (`update_corner_uniform` 重写 surface_w/h 时必填), 不存字段需在
-    /// resize 重查 adapter caps (重 GPU query, 60Hz resize 不可接受). POD f32
-    /// 顺序无关, 与 `surface_is_srgb` 同档. Lead follow-up sync docs/invariants.md.
+    /// resize 重查 adapter caps (重 GPU query, 60Hz resize 不可接受). Lead follow-up
+    /// sync docs/invariants.md.
     alpha_live: f32,
     // 持有 Instance 避免提前 drop 掉 Vulkan/GL 实例。
     #[allow(dead_code)]
