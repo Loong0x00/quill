@@ -64,11 +64,16 @@ use wayland_client::{
 
 use super::keyboard::{handle_key_event, KeyboardAction, KeyboardState};
 use super::pointer::{
-    handle_pointer_event, quill_edge_to_wayland, PointerAction, PointerState, WindowButton,
+    handle_pointer_event, quill_edge_to_wayland, wp_shape_for, PointerAction, PointerState,
+    WindowButton,
 };
 use super::render::Renderer;
 use crate::ime::{handle_text_input_event, CursorRectangle, ImeAction, ImeState};
 use wayland_client::protocol::wl_pointer;
+use wayland_protocols::wp::cursor_shape::v1::client::{
+    wp_cursor_shape_device_v1::{self, WpCursorShapeDeviceV1},
+    wp_cursor_shape_manager_v1::{self, WpCursorShapeManagerV1},
+};
 use wayland_protocols::wp::text_input::zv3::client::{
     zwp_text_input_manager_v3::{self, ZwpTextInputManagerV3},
     zwp_text_input_v3::{self, ZwpTextInputV3},
@@ -985,6 +990,26 @@ pub fn run_window() -> Result<()> {
         }
     };
 
+    // T-0703: 尝试 bind wp_cursor_shape_manager_v1 (cursor-shape-v1) — 老
+    // compositor (wlroots ≤ 0.17 / Plasma 5) 不导出此 global, bind 失败 →
+    // None, cursor 形状切换退化 (compositor 显示默认箭头, quill 功能不影响).
+    // version 锁 1..=1 — 上游 v2 加 dnd_ask + all_resize 两个 cursor 名 quill
+    // 不需要, 锁 v1 兼容 Plasma 6.0 早期. ADR 0008 详释.
+    let cursor_shape_manager: Option<WpCursorShapeManagerV1> = match globals.bind(&qh, 1..=1, ()) {
+        Ok(m) => {
+            tracing::info!("wp_cursor_shape_manager_v1 bound (compositor 支持 cursor-shape-v1)");
+            Some(m)
+        }
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "wp_cursor_shape_manager_v1 不可用 — cursor 形状切换退化 (compositor \
+                 显示默认箭头); 升级 GNOME 45+ / KDE Plasma 6 / wlroots 0.18+ 启用"
+            );
+            None
+        }
+    };
+
     // State 字段顺序固化 INV-001(renderer→window→conn)+ pty 放最后(T-0202 Lead + 审码)。
     // T-0501 加: seat_state / keyboard_state / keyboard 三字段位于 core 与 pty 之间,
     // 不破坏 INV-001 链条 (它们都不持 wgpu/wayland 裸指针, 仅 SCTK/wayland-client
@@ -1008,6 +1033,8 @@ pub fn run_window() -> Result<()> {
         pointer_state: PointerState::new(INITIAL_WIDTH, INITIAL_HEIGHT),
         pointer: None,
         pointer_seat: None,
+        cursor_shape_manager,
+        cursor_shape_device: None,
         is_maximized: false,
         presentation_dirty: false,
         pending_scroll_lines: 0,
@@ -1374,6 +1401,15 @@ struct State {
     /// PointerAction::StartMove 路径需读此字段. drop 顺序: WlSeat 也是
     /// wayland Proxy, 与 keyboard / pointer 同等放尾部安全.
     pointer_seat: Option<wl_seat::WlSeat>,
+    /// T-0703: wp_cursor_shape_manager_v1 (cursor-shape-v1 协议工厂). 启动期
+    /// registry bind 一次, compositor 不导出 (老 wlroots / Plasma 5) 时为
+    /// `None`, cursor 形状切换退化到 compositor 默认 (log warn). ADR 0008.
+    cursor_shape_manager: Option<WpCursorShapeManagerV1>,
+    /// T-0703: wp_cursor_shape_device_v1 (单 wl_pointer 一个). new_capability
+    /// (Pointer) 时若 manager 已绑则 get_pointer 一次, remove 时 destroy.
+    /// `Some(device)` = cursor-shape-v1 路径活, `None` = 退化 (manager 缺失
+    /// 或 pointer capability 暂无). drop 顺序: 与 wl_pointer 同 Proxy 放尾部.
+    cursor_shape_device: Option<WpCursorShapeDeviceV1>,
     /// T-0504: 当前是否最大化 (toggle 状态). ButtonClick(Maximize) 时反转 →
     /// 调 set_maximized / unset_maximized. WindowConfigure event (configure
     /// 携带 state 数组含 Maximized) 也可同步, 但 sctk 0.19 WindowConfigure
@@ -1746,6 +1782,14 @@ impl SeatHandler for State {
         if capability == Capability::Pointer && self.pointer.is_none() {
             let ptr = seat.get_pointer(qh, ());
             tracing::info!("wl_seat capability Pointer 出现, wl_pointer 已绑定");
+            // T-0703: cursor_shape_manager bind 成功时, 给本 wl_pointer 拿
+            // 一个 device. manager 缺失 (老 compositor) 时 device 留 None,
+            // set_shape 路径自动跳过 (Dispatch<WlPointer> 段守门).
+            if let Some(manager) = self.cursor_shape_manager.as_ref() {
+                let device = manager.get_pointer(&ptr, qh, ());
+                tracing::info!("wp_cursor_shape_device_v1 已绑定 (cursor 形状切换 active)");
+                self.cursor_shape_device = Some(device);
+            }
             self.pointer = Some(ptr);
             self.pointer_seat = Some(seat);
         }
@@ -1775,6 +1819,14 @@ impl SeatHandler for State {
             }
         }
         if capability == Capability::Pointer {
+            // T-0703: cursor_shape_device 跟 wl_pointer 同生命周期 — pointer
+            // 没了 device 自动 inert (协议明示: "When the pointer capability is
+            // removed from the wl_seat, the wp_cursor_shape_device_v1 object
+            // becomes inert"). take 让 Option 变 None, drop 触发 destroy
+            // request (wayland-protocols 生成的 Drop impl).
+            if self.cursor_shape_device.take().is_some() {
+                tracing::info!("wp_cursor_shape_device_v1 释放 (随 Pointer capability 移除)");
+            }
             if let Some(ptr) = self.pointer.take() {
                 ptr.release();
                 tracing::info!("wl_seat capability Pointer 移除, wl_pointer 释放");
@@ -1789,6 +1841,8 @@ impl SeatHandler for State {
         if let Some(kb) = self.keyboard.take() {
             kb.release();
         }
+        // T-0703: cursor_shape_device 与 pointer 同 lifetime, seat 移除即释放.
+        let _ = self.cursor_shape_device.take();
         if let Some(ptr) = self.pointer.take() {
             ptr.release();
         }
@@ -1823,6 +1877,38 @@ pub(crate) fn cursor_rectangle_for_cell(col: usize, line: usize) -> CursorRectan
         y,
         width,
         height,
+    }
+}
+
+/// **T-0703 `Dispatch<WpCursorShapeManagerV1>`**: 与 ZwpTextInputManagerV3 同
+/// 性质 — manager 是工厂对象, 协议零 event (cursor-shape-v1.xml 仅 destroy /
+/// get_pointer / get_tablet_tool_v2 三个 request). 防御性 impl 满足 Dispatch
+/// trait bound, event handler 实际不会被调用. ADR 0008.
+impl Dispatch<WpCursorShapeManagerV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpCursorShapeManagerV1,
+        _event: wp_cursor_shape_manager_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // 协议零 event — Event enum 是空 (生成的 `Event {}`). 不会被调用.
+    }
+}
+
+/// **T-0703 `Dispatch<WpCursorShapeDeviceV1>`**: device 同 manager 也是零 event
+/// (cursor-shape-v1.xml: destroy / set_shape 两个 request, 0 event). 防御性 impl.
+impl Dispatch<WpCursorShapeDeviceV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpCursorShapeDeviceV1,
+        _event: wp_cursor_shape_device_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // 协议零 event.
     }
 }
 
@@ -2161,6 +2247,32 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
         _qh: &QueueHandle<Self>,
     ) {
         let action = handle_pointer_event(event, &mut state.pointer_state);
+        // T-0703: 主 PointerAction 处理后, 顺手取出 pending_cursor_set 下发
+        // wp_cursor_shape_device_v1.set_shape (单一消费者, 与 take_pending /
+        // pending_scroll_lines 同 T-0602/T-0603 套路). 放最前面以便 Enter
+        // event 也走 set_cursor 路径 (协议要求 enter 后必 set 一次, 否则
+        // unspecified — 实测 mutter 显示空白).
+        if let Some((serial, shape)) = state.pointer_state.take_pending_cursor_set() {
+            if let Some(device) = state.cursor_shape_device.as_ref() {
+                let wp_shape = wp_shape_for(shape);
+                tracing::trace!(
+                    target: "quill::pointer",
+                    serial,
+                    ?shape,
+                    "wp_cursor_shape_device_v1.set_shape"
+                );
+                device.set_shape(serial, wp_shape);
+            } else {
+                // 老 compositor 退化路径 — set_shape 无处可调, cursor 维持
+                // compositor 默认箭头. trace 一次便于排障 (是否 manager
+                // 缺失导致体验不一致), 不 warn 防刷屏.
+                tracing::trace!(
+                    target: "quill::pointer",
+                    ?shape,
+                    "cursor shape change requested but cursor_shape_device=None (退化)"
+                );
+            }
+        }
         match action {
             PointerAction::Nothing => {}
             PointerAction::HoverChange(_new_hover) => {
