@@ -38,6 +38,11 @@ pub use render::render_headless;
 // render_headless 输出含多 tab 标签条.
 pub use render::{reset_headless_tab_state, set_headless_tab_state};
 
+// T-0615 ghostty tab polish e2e 测试用: set/reset thread_local hover override
+// 让 render_headless 输出含 hover 圆形 bg / + box 高亮等视觉 (圆形 button hover /
+// active tab body / + box hover 等视觉测试入口).
+pub use render::{reset_headless_hover_state, set_headless_hover_state};
+
 // T-0505: PreeditOverlay 入参 (集成测试 tests/ime_preedit_render.rs 用), quill
 // 自有 struct (INV-010, 不漏 wayland-protocols 类型). PREEDIT_UNDERLINE_PX
 // 常数同步 re-export 给测试 / Phase 6 计算用。

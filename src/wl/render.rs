@@ -146,6 +146,23 @@ pub struct Renderer {
     /// 当前 glyph vertex buffer 容量 (顶点数计)。Phase 4 单帧字符上限粗估
     /// (24 行 × 80 col × 6 顶点 = 11520 vert), 首次分配后 buffer reuse。
     glyph_buffer_capacity: usize,
+    /// **T-0615: rounded element render pipeline** (持 device 引用, INV-002 字段
+    /// 顺序: 在 `device` 之前 drop). 走 [`ROUNDED_WGSL`] shader, 顶点格式 40 字节
+    /// (`pos + color + elem_bounds + elem_radius`). lazy 初始化, 首次 [`Self::draw_frame`]
+    /// 建好.
+    ///
+    /// **派单偏离声明** (Lead follow-up sync docs/invariants.md): INV-002 字段从
+    /// 20 → 23 (加 rounded_pipeline / rounded_vertex_buffer / rounded_buffer_capacity).
+    /// 派单"扩 corner_uniform_buffer 走 element list"被 per-vertex 解法替换 (见
+    /// [`ROUNDED_VERTEX_BYTES`] doc — 共享 uniform 列表致 bg fill 与 button quad
+    /// fragment 都走 element mask 不可分离). uniform_buffer 仍 16 字节不变.
+    rounded_pipeline: Option<wgpu::RenderPipeline>,
+    /// **T-0615: rounded element vertex buffer** (持 device 引用).
+    rounded_vertex_buffer: Option<wgpu::Buffer>,
+    /// **T-0615: rounded element vertex buffer 容量** (顶点数计). titlebar 三按钮
+    /// (3 圆形 = 18 顶点) + tab bar 多 tab (active 1 圆角 + 0~N hover + + box
+    /// rounded + close × hover) ≤ ~50 quads = ~300 顶点, 首次按 actual size 分配.
+    rounded_buffer_capacity: usize,
     /// **T-0610 part 2: corner mask uniform buffer** (持 wgpu device 引用).
     /// `[surface_w, surface_h, corner_radius_phys, alpha_live]` 16 字节 std140.
     /// `Renderer::new` 建好首帧 + `Renderer::resize` 每次 surface 尺寸变更时
@@ -428,6 +445,50 @@ pub const TAB_MIN_W_LOGICAL_PX: u32 = 80;
 /// **T-0608: tab close 按钮 (×) 宽度** (logical px). 16 logical, 占 tab 右侧.
 pub const TAB_CLOSE_W_LOGICAL_PX: u32 = 16;
 
+/// **T-0615: 标签 body / + 按钮 box / tab 内 close 圆角半径** (logical px).
+/// 6 logical = 12 physical (HIDPI×2). 与 ghostty / GTK4 / libadwaita 应用 6-8 px
+/// 范围一致, 视觉"圆角看得见但不喧宾夺主". + 按钮 box / 活动 tab body 共此值,
+/// 视觉一致.
+pub const TAB_ROUNDED_RADIUS_PX: f32 = 6.0;
+
+/// **T-0615: titlebar Min/Max/Close 圆形按钮半径** (logical px).
+/// 12 logical = 24 physical (HIDPI×2). BUTTON_W/H_LOGICAL_PX = 24, 半径正好半宽
+/// → button bbox 视觉等价完全圆形 (rounded rect 半径 ≥ min(w,h)/2 = 圆形).
+/// 与 ghostty / macOS 风格 traffic light 按钮一致.
+pub const WINDOW_BUTTON_RADIUS_PX: f32 = 12.0;
+
+/// **T-0615: + 按钮 box 默认背景** (浅深灰 #444444).
+/// 平时 box bg 与 tab bar bg #1c1c1c 同 → 几乎不可见; hover 时换 #6a (border 同色),
+/// box 浮现.  实测后觉得无 box bg 太朴素, 给底色 #2c2c2c 让 box 平时也淡浮现.
+const PLUS_BUTTON_BG: crate::term::Color = crate::term::Color {
+    r: 0x2c,
+    g: 0x2c,
+    b: 0x2c,
+};
+
+/// **T-0615: + 按钮 box hover 背景** (#444 灰, 跟 active tab body 同梯度).
+const PLUS_BUTTON_BG_HOVER: crate::term::Color = crate::term::Color {
+    r: 0x44,
+    g: 0x44,
+    b: 0x44,
+};
+
+/// **T-0615: tab close × hover 圆形 bg** (红 #cc4444, ghostty / GNOME 风警告色).
+/// 比 BUTTON_BG_CLOSE_HOVER (#e53935) 略低饱和, 与 tab bar 暗灰底视觉协调.
+const TAB_CLOSE_BG_HOVER: crate::term::Color = crate::term::Color {
+    r: 0xcc,
+    g: 0x44,
+    b: 0x44,
+};
+
+/// **T-0615: titlebar Close 按钮 hover 圆形 bg** (派单 In #D 字面 #cc4444).
+/// 取代旧 #e53935, 与 tab close × hover 同色 — 全 close 视觉警告色统一.
+const WINDOW_CLOSE_BG_HOVER: crate::term::Color = crate::term::Color {
+    r: 0xcc,
+    g: 0x44,
+    b: 0x44,
+};
+
 /// **T-0610 part 2: 窗口圆角半径** (logical px, × HIDPI_SCALE 拿 physical).
 ///
 /// 8 logical = 16 physical (HIDPI×2). 与 mutter / GTK4 / ghostty 现代窗口圆角
@@ -460,6 +521,10 @@ const BUTTON_BG_HOVER: crate::term::Color = crate::term::Color {
 };
 
 /// Close 按钮 hover 时背景色 (红, 与 GNOME / KDE 关闭按钮 hover 视觉一致).
+/// **T-0615 弃用**: titlebar Close 走 [`WINDOW_CLOSE_BG_HOVER`] (#cc4444 派单),
+/// tab close × 走 [`TAB_CLOSE_BG_HOVER`] (#cc4444 同色) — 旧 #e53935 太亮.
+/// 留 const 防外部 dependency (本模块内不再引用).
+#[allow(dead_code)]
 const BUTTON_BG_CLOSE_HOVER: crate::term::Color = crate::term::Color {
     r: 0xe5,
     g: 0x39,
@@ -741,6 +806,114 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// **T-0615: 每顶点字节数** (rounded element pipeline) —
+/// `pos[2 f32] + color[3 f32] + elem_bounds[4 f32] + elem_radius[1 f32]` = 40 字节.
+///
+/// **why per-vertex 而非 uniform array** (派单偏离声明):
+/// 派单 In #A 写"corner_uniform_buffer 扩 element list", fragment 内"算 frag 是否
+/// 在任何 element 内". 此设计有缺陷: 同一 fragment 被多 quad 覆盖时 (e.g. bg fill
+/// quad + button rounded quad 都覆盖 button bbox 内 frag), 每个 quad 的 fragment
+/// 都共享同一 uniform 列表 — bg fill quad 的 fragment 在 button bbox 内也会被
+/// element corner mask 切角, 导致 button 圆角处 bg fill 也被 discard, 露出透明
+/// (compositor 让桌面透出, 用户看到的不是 titlebar 而是桌面). 真要的视觉是: 圆角
+/// 处 button bg discard 让 titlebar bg 显出, bg fill 不应被 mask.
+///
+/// **per-vertex 解法**: 每个 vertex 自带 elem_bounds + elem_radius. 非圆角 quad
+/// (bg fill / titlebar bg / cells) 走 elem_radius=0 → fragment shader 跳过 element
+/// mask, 仅走 surface corner mask. 圆角 quad (button bg / tab body bg / + box)
+/// 走 elem_radius>0 → fragment 据 vertex 自带 bounds 算 SDF, 仅在自身 quad 范围
+/// 内 mask. 与 cell shader 路径互不影响.
+///
+/// **why 单独 pipeline 而非扩展 cell pipeline**: 扩展 cell pipeline 需把每 cell
+/// 顶点 20 → 40 字节 (cells 是 hot path: 80×24 cells × 6 顶点 × 20 = 230 KiB
+/// 升 460 KiB, 5090 上仍可忽略, 但全数据流改; 改 build_vertex_bytes / 多 append
+/// 函数 / render_headless 主 cell loop / cell pipeline VertexBufferLayout, ≥ 派单
+/// 边界). 单独 pipeline 隔离 — cell 路径零改动, 仅圆角 quad 走新 pipeline.
+const ROUNDED_VERTEX_BYTES: usize = 10 * std::mem::size_of::<f32>();
+
+/// **T-0615: rounded element WGSL shader** (per-vertex elem_bounds + elem_radius).
+///
+/// 与 [`CELL_WGSL`] 同 vertex/fragment 骨架, 但 fragment 多一层 element corner
+/// mask: 用顶点带的 elem_bounds (vec4<f32>: x_min, y_min, x_max, y_max) 与
+/// elem_radius 算 SDF; elem_radius > 0 时算 distance, > radius+1 → discard, 否则
+/// AA. elem_radius == 0 时 element mask 跳过, 仅 surface corner 决策 (向后兼容,
+/// 但实际上 rounded pipeline 仅用于 elem_radius > 0 quad).
+///
+/// **alpha 处理**: 与 [`CELL_WGSL`] 同 premultiplied (output `vec4(color * a, a)`),
+/// REPLACE blend 让 rounded element 直接覆盖底层 cell pipeline quads.
+const ROUNDED_WGSL: &str = r#"
+struct CornerMask {
+    surface_size: vec2<f32>,
+    corner_radius: f32,
+    alpha_live: f32,
+};
+
+struct VsIn {
+    @location(0) pos: vec2<f32>,
+    @location(1) color: vec3<f32>,
+    @location(2) elem_bounds: vec4<f32>,
+    @location(3) elem_radius: f32,
+};
+
+struct VsOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) color: vec3<f32>,
+    @location(1) elem_bounds: vec4<f32>,
+    @location(2) elem_radius: f32,
+};
+
+@group(1) @binding(0) var<uniform> mask: CornerMask;
+
+@vertex
+fn vs_main(v: VsIn) -> VsOut {
+    var out: VsOut;
+    out.clip = vec4<f32>(v.pos, 0.0, 1.0);
+    out.color = v.color;
+    out.elem_bounds = v.elem_bounds;
+    out.elem_radius = v.elem_radius;
+    return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let p = in.clip.xy;
+    // surface corner mask (与 cell shader 同决策, 共享 group=1 uniform)
+    let r = mask.corner_radius;
+    let s = mask.surface_size;
+    let cx = clamp(p.x, r, s.x - r);
+    let cy = clamp(p.y, r, s.y - r);
+    let dx = p.x - cx;
+    let dy = p.y - cy;
+    let d = sqrt(dx * dx + dy * dy);
+    if (d > r + 1.0) {
+        discard;
+    }
+    let surface_aa = clamp(r + 0.5 - d, 0.0, 1.0);
+
+    // per-element corner mask (per-vertex bounds + radius)
+    var elem_aa: f32 = 1.0;
+    if (in.elem_radius > 0.0) {
+        let er = in.elem_radius;
+        let xm = in.elem_bounds.x;
+        let ym = in.elem_bounds.y;
+        let xM = in.elem_bounds.z;
+        let yM = in.elem_bounds.w;
+        let ecx = clamp(p.x, xm + er, xM - er);
+        let ecy = clamp(p.y, ym + er, yM - er);
+        let edx = p.x - ecx;
+        let edy = p.y - ecy;
+        let ed = sqrt(edx * edx + edy * edy);
+        if (ed > er + 1.0) {
+            discard;
+        }
+        elem_aa = clamp(er + 0.5 - ed, 0.0, 1.0);
+    }
+
+    let final_a = mask.alpha_live * surface_aa * elem_aa;
+    return vec4<f32>(in.color * final_a, final_a);
+}
+"#;
+
 /// 把一个像素矩形 (x0, y0, x1, y1) 加 6 顶点到 vertex buffer (CCW 三角化).
 /// `color` 已是 linear f32x3 (调用方按 sRGB-aware [`color_for_vertex_with_srgb`]
 /// 或 [`Renderer::color_for_vertex`] 预处理过).
@@ -777,6 +950,56 @@ fn append_quad_px(
         out.extend_from_slice(&color[0].to_ne_bytes());
         out.extend_from_slice(&color[1].to_ne_bytes());
         out.extend_from_slice(&color[2].to_ne_bytes());
+    }
+}
+
+/// **T-0615: 圆角 quad 顶点 append** — pos + color + elem_bounds (= quad 自身) +
+/// elem_radius. 顶点输入 rounded element pipeline (走 [`ROUNDED_WGSL`] 走 SDF
+/// corner mask). `elem_radius_phys` ≤ 0 时 element mask 跳过, 退化为矩形 quad
+/// (但仍走独立 pipeline — 实际不会用 0 因为这种情况应直接走 cell pipeline).
+///
+/// **bounds 语义**: bounds = (x0, y0, x1, y1) physical px. fragment 据这 4 点算
+/// 内嵌圆心 (xm+r, ym+r) / (xM-r, ym+r) / ... 算 SDF. 圆形按钮: bounds = 24×24
+/// phys, radius=24 → 半径 ≥ min(w,h)/2, 完全圆形 (全 quad 内除圆心区都 discard).
+///
+/// `clippy::too_many_arguments` allow: 同 [`append_quad_px`] 决策, 8+1 args 都直
+/// 接对应 NDC + 圆角公式输入, 抽 struct 反增间接.
+#[allow(clippy::too_many_arguments)]
+fn append_rounded_quad_px(
+    out: &mut Vec<u8>,
+    x0_px: f32,
+    y0_px: f32,
+    x1_px: f32,
+    y1_px: f32,
+    surface_w: f32,
+    surface_h: f32,
+    color: [f32; 3],
+    elem_radius_phys: f32,
+) {
+    let left = x0_px / surface_w * 2.0 - 1.0;
+    let right = x1_px / surface_w * 2.0 - 1.0;
+    let top = 1.0 - y0_px / surface_h * 2.0;
+    let bottom = 1.0 - y1_px / surface_h * 2.0;
+    let verts: [[f32; 2]; 6] = [
+        [left, top],
+        [left, bottom],
+        [right, bottom],
+        [left, top],
+        [right, bottom],
+        [right, top],
+    ];
+    let bounds = [x0_px, y0_px, x1_px, y1_px];
+    for v in verts {
+        out.extend_from_slice(&v[0].to_ne_bytes());
+        out.extend_from_slice(&v[1].to_ne_bytes());
+        out.extend_from_slice(&color[0].to_ne_bytes());
+        out.extend_from_slice(&color[1].to_ne_bytes());
+        out.extend_from_slice(&color[2].to_ne_bytes());
+        out.extend_from_slice(&bounds[0].to_ne_bytes());
+        out.extend_from_slice(&bounds[1].to_ne_bytes());
+        out.extend_from_slice(&bounds[2].to_ne_bytes());
+        out.extend_from_slice(&bounds[3].to_ne_bytes());
+        out.extend_from_slice(&elem_radius_phys.to_ne_bytes());
     }
 }
 
@@ -860,14 +1083,20 @@ fn append_border_vertices(out: &mut Vec<u8>, surface_w: f32, surface_h: f32, is_
     );
 }
 
+/// **T-0615 重构**: titlebar bar bg → cell pipeline (rect, no rounding); 三按钮
+/// → rounded pipeline (圆形, hover 时背景圆显出, 非 hover 走 transparent). icon
+/// 横竖线 (Min / Max stroke) 仍走 cell pipeline (icon 在按钮中央, 不需 rounded
+/// mask). 派单 In #D 字面 "圆形 ~12 px radius / hover 高亮 / hit_test 改距离".
+#[allow(clippy::too_many_arguments)]
 fn append_titlebar_vertices(
     out: &mut Vec<u8>,
+    rounded_out: &mut Vec<u8>,
     surface_w: f32,
     surface_h: f32,
     is_srgb: bool,
     hover: super::pointer::HoverRegion,
 ) {
-    use super::pointer::{HoverRegion, WindowButton};
+    use crate::wl::pointer::{HoverRegion, WindowButton};
 
     let hidpi = HIDPI_SCALE as f32;
     let titlebar_h = TITLEBAR_H_LOGICAL_PX as f32 * hidpi;
@@ -876,6 +1105,9 @@ fn append_titlebar_vertices(
 
     let titlebar_bg = color_for_vertex_with_srgb(TITLEBAR_BG, is_srgb);
     let icon_color = color_for_vertex_with_srgb(BUTTON_ICON, is_srgb);
+    // T-0615: 圆形按钮半径 (physical px). bbox 24×24 logical = 48×48 phys, 半径
+    // 12 logical = 24 phys 正好 = 半宽 → 完全圆.
+    let btn_radius_phys = WINDOW_BUTTON_RADIUS_PX * hidpi;
 
     // 1. titlebar 整 width 背景
     append_quad_px(
@@ -898,45 +1130,52 @@ fn append_titlebar_vertices(
     let min_x_min = surface_w - 3.0 * btn_w;
     let min_x_max = max_x_min;
 
-    // 按钮背景 (hover 时变深, Close hover 变红)
-    let close_bg = match hover {
-        HoverRegion::Button(WindowButton::Close) => {
-            color_for_vertex_with_srgb(BUTTON_BG_CLOSE_HOVER, is_srgb)
-        }
-        _ => titlebar_bg,
-    };
-    let max_bg = match hover {
-        HoverRegion::Button(WindowButton::Maximize) => {
-            color_for_vertex_with_srgb(BUTTON_BG_HOVER, is_srgb)
-        }
-        _ => titlebar_bg,
-    };
-    let min_bg = match hover {
-        HoverRegion::Button(WindowButton::Minimize) => {
-            color_for_vertex_with_srgb(BUTTON_BG_HOVER, is_srgb)
-        }
-        _ => titlebar_bg,
-    };
-
-    // 按钮背景区 (即使非 hover 也画一层 — 让 hover↔无 hover 切换时按钮位置
-    // 视觉无空洞; titlebar_bg 与按钮 bg 同色, 视觉等价 titlebar 整片色).
-    append_quad_px(
-        out,
-        close_x_min,
-        0.0,
-        close_x_max,
-        btn_h,
-        surface_w,
-        surface_h,
-        close_bg,
-    );
-    append_quad_px(
-        out, max_x_min, 0.0, max_x_max, btn_h, surface_w, surface_h, max_bg,
-    );
-    if min_x_min >= 0.0 {
-        append_quad_px(
-            out, min_x_min, 0.0, min_x_max, btn_h, surface_w, surface_h, min_bg,
+    // T-0615: 按钮 bg 仅在 hover 时画 (圆形, rounded pipeline). 非 hover 时不画
+    // — 用户视觉只看到 icon, hover 后才浮现圆形 bg (ghostty 风). icon 仍画
+    // (走 cell pipeline 横竖 stroke).
+    if let HoverRegion::Button(WindowButton::Close) = hover {
+        let bg = color_for_vertex_with_srgb(WINDOW_CLOSE_BG_HOVER, is_srgb);
+        append_rounded_quad_px(
+            rounded_out,
+            close_x_min,
+            0.0,
+            close_x_max,
+            btn_h,
+            surface_w,
+            surface_h,
+            bg,
+            btn_radius_phys,
         );
+    }
+    if let HoverRegion::Button(WindowButton::Maximize) = hover {
+        let bg = color_for_vertex_with_srgb(BUTTON_BG_HOVER, is_srgb);
+        append_rounded_quad_px(
+            rounded_out,
+            max_x_min,
+            0.0,
+            max_x_max,
+            btn_h,
+            surface_w,
+            surface_h,
+            bg,
+            btn_radius_phys,
+        );
+    }
+    if let HoverRegion::Button(WindowButton::Minimize) = hover {
+        if min_x_min >= 0.0 {
+            let bg = color_for_vertex_with_srgb(BUTTON_BG_HOVER, is_srgb);
+            append_rounded_quad_px(
+                rounded_out,
+                min_x_min,
+                0.0,
+                min_x_max,
+                btn_h,
+                surface_w,
+                surface_h,
+                bg,
+                btn_radius_phys,
+            );
+        }
     }
 
     // 3. 按钮 icons. 走"细线 quad"画法 — 单 line stroke 用一个 thin quad,
@@ -949,15 +1188,20 @@ fn append_titlebar_vertices(
     // 内 append, 此处不再画 stair-stepped 阶梯 quad (肉眼锯齿). minimize/maximize
     // 仍走下方 stroke quad path (横竖矩形不需抗锯齿).
 
-    // 3.2 Maximize: 矩形框 (4 边)
+    // T-0615: icon stroke quads 走 rounded pipeline (radius=0, 矩形). hover 时
+    // rounded button bg (前面 append) 会覆盖 cell pipeline 上的 icon, 所以 icon
+    // 必须走同一 pipeline 在 bg 之后 append 顺序保证 icon 在 bg 之上 (rounded
+    // pipeline ALPHA blend, 后画覆盖前画).
+
+    // 3.2 Maximize: 矩形框 (4 边). 走 rounded_out (radius=0, 矩形).
     {
         let mx_min = max_x_min + icon_pad;
         let mx_max = max_x_max - icon_pad;
         let my_min = icon_pad;
         let my_max = btn_h - icon_pad;
         // 上边
-        append_quad_px(
-            out,
+        append_rounded_quad_px(
+            rounded_out,
             mx_min,
             my_min,
             mx_max,
@@ -965,10 +1209,11 @@ fn append_titlebar_vertices(
             surface_w,
             surface_h,
             icon_color,
+            0.0,
         );
         // 下边
-        append_quad_px(
-            out,
+        append_rounded_quad_px(
+            rounded_out,
             mx_min,
             my_max - stroke_w,
             mx_max,
@@ -976,10 +1221,11 @@ fn append_titlebar_vertices(
             surface_w,
             surface_h,
             icon_color,
+            0.0,
         );
         // 左边
-        append_quad_px(
-            out,
+        append_rounded_quad_px(
+            rounded_out,
             mx_min,
             my_min,
             mx_min + stroke_w,
@@ -987,10 +1233,11 @@ fn append_titlebar_vertices(
             surface_w,
             surface_h,
             icon_color,
+            0.0,
         );
         // 右边
-        append_quad_px(
-            out,
+        append_rounded_quad_px(
+            rounded_out,
             mx_max - stroke_w,
             my_min,
             mx_max,
@@ -998,17 +1245,17 @@ fn append_titlebar_vertices(
             surface_w,
             surface_h,
             icon_color,
+            0.0,
         );
     }
 
-    // 3.3 Minimize: 中间一横线 (位于按钮垂直中点偏下位置, 视觉上像 _)
+    // 3.3 Minimize: 中间一横线 (位于按钮垂直中点偏下位置, 视觉上像 _).
     if min_x_min >= 0.0 {
         let nx_min = min_x_min + icon_pad;
         let nx_max = min_x_max - icon_pad;
-        // 横线 y 位置 = 按钮垂直中点 (icon_pad 内画一横, 不贴底)
         let ny = btn_h / 2.0;
-        append_quad_px(
-            out,
+        append_rounded_quad_px(
+            rounded_out,
             nx_min,
             ny - stroke_w / 2.0,
             nx_max,
@@ -1016,6 +1263,7 @@ fn append_titlebar_vertices(
             surface_w,
             surface_h,
             icon_color,
+            0.0,
         );
     }
 }
@@ -1044,22 +1292,28 @@ const TAB_BAR_BORDER: crate::term::Color = crate::term::Color {
     b: 0x0a,
 };
 
-/// **T-0608: tab bar 顶点 append 入口**. 在 `append_titlebar_vertices` 之后调,
-/// 紧贴 titlebar 下方画 [`TAB_BAR_H_LOGICAL_PX`] (28 logical) 高的标签条.
+/// **T-0608/T-0615: tab bar 顶点 append 入口**. 在 `append_titlebar_vertices`
+/// 之后调, 紧贴 titlebar 下方画 [`TAB_BAR_H_LOGICAL_PX`] (28 logical) 高标签条.
 ///
-/// 视觉布局 (派单 In #C):
-/// - 整 tab bar 背景 (深灰 #1c1c1c)
-/// - 左侧 [`TAB_PLUS_W_LOGICAL_PX`] (28 logical 方) "+" 按钮 (白横竖线段)
-/// - 中间 tab 列表: 每 tab 按 [`tab_body_width`] 宽; active 高亮 #404060,
-///   inactive 透明 (即 tab bar bg); hover 时 #303040
-/// - 每 tab 右侧 [`TAB_CLOSE_W_LOGICAL_PX`] (16 logical) "x" close 按钮 (横线段)
-/// - tab 之间 + tab bar 底部细线分隔
+/// 视觉布局 (派单 In #B + #C, T-0615 polish):
+/// - 整 tab bar 背景 (深灰 #1c1c1c, cell pipeline)
+/// - 左侧 [`TAB_PLUS_W_LOGICAL_PX`] (28 logical 方) "+" 按钮 — 圆角 box (radius
+///   6 logical, rounded pipeline), bg 平时 #2c2c2c 略浮现, hover 时 #444 高亮.
+///   + icon (横竖白线) 走 cell pipeline 居中.
+/// - 中间 tab 列表: 每 tab 按 [`tab_body_width`] 宽; **active 圆角 box** (radius
+///   6 logical, rounded pipeline) 高亮 #444; **inactive 透明** (不画 box, 仅
+///   title 文字, 派单 In #C); **hover inactive** 圆角 #333 半透明. tabs 间 4 px
+///   gap (派单 已知陷阱 "tab 之间 ~4 px gap").
+/// - 每 tab 右侧 [`TAB_CLOSE_W_LOGICAL_PX`] (16 logical) close × — hover 红圆 bg
+///   (rounded pipeline, radius=close_w/2, 全圆形 bg = 红色 #cc4444).
+/// - tab bar 底部细线分隔 (cell pipeline).
 ///
 /// **`#[allow(clippy::too_many_arguments)]`**: 与 `append_titlebar_vertices` 同
-/// 决策 — 抽 struct 反而把 NDC 换算主线变间接.
+/// 决策 — 抽 struct 反把 NDC 换算主线变间接.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn append_tab_bar_vertices(
     out: &mut Vec<u8>,
+    rounded_out: &mut Vec<u8>,
     surface_w: f32,
     surface_h: f32,
     is_srgb: bool,
@@ -1067,7 +1321,7 @@ pub(crate) fn append_tab_bar_vertices(
     active_idx: usize,
     hover: super::pointer::HoverRegion,
 ) {
-    use super::pointer::HoverRegion;
+    use crate::wl::pointer::HoverRegion;
 
     if tab_count == 0 {
         return;
@@ -1089,29 +1343,56 @@ pub(crate) fn append_tab_bar_vertices(
     let hover_bg = color_for_vertex_with_srgb(TAB_HOVER_BG, is_srgb);
     let icon_color = color_for_vertex_with_srgb(BUTTON_ICON, is_srgb);
     let border_color = color_for_vertex_with_srgb(TAB_BAR_BORDER, is_srgb);
+    let plus_bg_normal = color_for_vertex_with_srgb(PLUS_BUTTON_BG, is_srgb);
+    let plus_bg_hover = color_for_vertex_with_srgb(PLUS_BUTTON_BG_HOVER, is_srgb);
+    let tab_close_red = color_for_vertex_with_srgb(TAB_CLOSE_BG_HOVER, is_srgb);
 
-    // 1. tab bar 整 width 背景
+    // T-0615: 圆角半径 (physical px). tab body / + box 都走 6 logical = 12 phys.
+    let tab_radius_phys = TAB_ROUNDED_RADIUS_PX * hidpi;
+    // T-0615: tab 之间 gap (logical 4 px = 8 phys), 让圆角 box 视觉分离.
+    let tab_gap_phys = 4.0 * hidpi;
+    // T-0615: tab body 上下内边距 (让圆角 box 不贴 bar 顶 / 底 stroke 线).
+    let tab_inset_y_phys = 3.0 * hidpi;
+    // T-0615: + button box 内边距 (圆角 box 不贴 bar 边).
+    let plus_inset_phys = 3.0 * hidpi;
+
+    // 1. tab bar 整 width 背景 (rect, cell pipeline)
     append_quad_px(
         out, 0.0, bar_y0, surface_w, bar_y1, surface_w, surface_h, bar_bg,
     );
 
-    // 2. "+" 按钮 (左侧). hover 时 bg 变深.
-    let plus_bg = match hover {
-        HoverRegion::TabBarPlus => hover_bg,
-        _ => bar_bg,
+    // 2. "+" 按钮 (左侧) — T-0615: 圆角 box, rounded pipeline.
+    // box bbox: 内缩 plus_inset_phys, 让 box 视觉离 bar 边一点空隙.
+    let plus_box_x0 = plus_inset_phys;
+    let plus_box_y0 = bar_y0 + plus_inset_phys;
+    let plus_box_x1 = plus_w - plus_inset_phys;
+    let plus_box_y1 = bar_y1 - plus_inset_phys;
+    let plus_box_color = match hover {
+        HoverRegion::TabBarPlus => plus_bg_hover,
+        _ => plus_bg_normal,
     };
-    append_quad_px(
-        out, 0.0, bar_y0, plus_w, bar_y1, surface_w, surface_h, plus_bg,
+    append_rounded_quad_px(
+        rounded_out,
+        plus_box_x0,
+        plus_box_y0,
+        plus_box_x1,
+        plus_box_y1,
+        surface_w,
+        surface_h,
+        plus_box_color,
+        tab_radius_phys,
     );
-    // + icon: 横竖两条线段, 中心点 (plus_w/2, bar_y0 + bar_h/2)
+    // T-0615: + icon 横竖两条线段, 中心点 (plus_w/2, bar_y0 + bar_h/2). 走
+    // rounded_out (radius=0, 矩形) 让 icon 在 + box bg 之上 (rounded pipeline
+    // ALPHA blend, 后 append 覆盖前).
     let stroke_w = 2.0 * hidpi;
-    let icon_pad = 8.0 * hidpi;
+    let icon_pad = 9.0 * hidpi;
     let cx = plus_w / 2.0;
     let cy = bar_y0 + bar_h / 2.0;
     let icon_size = bar_h - 2.0 * icon_pad;
     // 横线
-    append_quad_px(
-        out,
+    append_rounded_quad_px(
+        rounded_out,
         cx - icon_size / 2.0,
         cy - stroke_w / 2.0,
         cx + icon_size / 2.0,
@@ -1119,10 +1400,11 @@ pub(crate) fn append_tab_bar_vertices(
         surface_w,
         surface_h,
         icon_color,
+        0.0,
     );
     // 竖线
-    append_quad_px(
-        out,
+    append_rounded_quad_px(
+        rounded_out,
         cx - stroke_w / 2.0,
         cy - icon_size / 2.0,
         cx + stroke_w / 2.0,
@@ -1130,63 +1412,84 @@ pub(crate) fn append_tab_bar_vertices(
         surface_w,
         surface_h,
         icon_color,
+        0.0,
     );
 
-    // 3. tab 列表: 每 tab body, active 高亮 / hover 高亮.
+    // 3. tab 列表 (T-0615 polish):
+    //    - active tab → 圆角 box (rounded pipeline) bg=#444
+    //    - inactive tab → 透明 (不画 box; 仅 title 在 cell 区, glyph pipeline 渲染)
+    //    - hover inactive → 圆角 box bg=#333 (rounded pipeline)
+    //    - close × hover → 红圆 (rounded pipeline)
     for i in 0..tab_count {
         let tab_x0 = plus_w + i as f32 * body_w;
         let tab_x1 = tab_x0 + body_w;
         if tab_x0 >= surface_w {
             break;
         }
-        let bg = if i == active_idx {
-            active_bg
-        } else if matches!(hover, HoverRegion::Tab(idx) | HoverRegion::TabClose(idx) if idx == i) {
-            hover_bg
-        } else {
-            bar_bg
-        };
-        append_quad_px(
-            out, tab_x0, bar_y0, tab_x1, bar_y1, surface_w, surface_h, bg,
-        );
-        // tab 之间分隔细线 (垂直右边)
-        append_quad_px(
-            out,
-            tab_x1 - stroke_w / 2.0,
-            bar_y0,
-            tab_x1 + stroke_w / 2.0,
-            bar_y1,
-            surface_w,
-            surface_h,
-            border_color,
-        );
+        // T-0615: tab body 圆角 box 内缩 gap/2 形成 tab 间空隙. body bbox y 内缩
+        // tab_inset_y_phys 让 box 视觉脱离 bar 顶/底 stroke 线.
+        let body_x0 = tab_x0 + tab_gap_phys / 2.0;
+        let body_y0 = bar_y0 + tab_inset_y_phys;
+        let body_x1 = tab_x1 - tab_gap_phys / 2.0;
+        let body_y1 = bar_y1 - tab_inset_y_phys;
 
-        // close × icon 在 tab 右侧 close_w 区. 简化画一个 × (两条对角斜线代价高,
-        // 先画"+"风格的横竖一条 — 视觉上是个 + 旋 45° 才像 ×, 当前 cell pipeline
-        // 不支持 rotation. **派单偏离**: close 按钮 icon 在标签条上**仅画底部红
-        // 横线**作 visual cue; 真 × 渲染依赖 glyph pass cosmic-text "×" U+00D7,
-        // 与 titlebar close 按钮同套路 — 后续 ticket 可统一. 当前简化保留交互逻辑
-        // (HoverRegion::TabClose hit_test 仍正确), 视觉上用户能 hover + click).
-        let close_x0 = tab_x1 - close_w;
-        let close_y0 = bar_y0 + bar_h / 2.0 - stroke_w / 2.0;
-        let close_y1 = close_y0 + stroke_w;
-        let close_pad = 4.0 * hidpi;
-        let close_color = match hover {
-            HoverRegion::TabClose(idx) if idx == i => {
-                color_for_vertex_with_srgb(BUTTON_BG_CLOSE_HOVER, is_srgb)
+        let is_active = i == active_idx;
+        let is_hover =
+            matches!(hover, HoverRegion::Tab(idx) | HoverRegion::TabClose(idx) if idx == i);
+        // 仅 active / hover 画 box (inactive 不 hover 时透明仅 title).
+        if is_active {
+            append_rounded_quad_px(
+                rounded_out,
+                body_x0,
+                body_y0,
+                body_x1,
+                body_y1,
+                surface_w,
+                surface_h,
+                active_bg,
+                tab_radius_phys,
+            );
+        } else if is_hover {
+            append_rounded_quad_px(
+                rounded_out,
+                body_x0,
+                body_y0,
+                body_x1,
+                body_y1,
+                surface_w,
+                surface_h,
+                hover_bg,
+                tab_radius_phys,
+            );
+        }
+
+        // T-0615: close × hover 红圆 bg (rounded pipeline). 非 hover 不画 bg.
+        // close × glyph 由 [`Renderer::append_close_icon_glyph`] / render_headless
+        // inline 单独画 (cell pipeline 之上 glyph pipeline). 这里只画 hover bg.
+        if let HoverRegion::TabClose(idx) = hover {
+            if idx == i {
+                // close 圆 bbox 居中右侧, 直径 ~16 phys (与 close_w 接近).
+                let close_diameter = close_w.min(bar_h - 2.0 * tab_inset_y_phys);
+                let close_cx = body_x1 - close_w / 2.0;
+                let close_cy = bar_y0 + bar_h / 2.0;
+                let close_x0 = close_cx - close_diameter / 2.0;
+                let close_y0 = close_cy - close_diameter / 2.0;
+                let close_x1 = close_cx + close_diameter / 2.0;
+                let close_y1 = close_cy + close_diameter / 2.0;
+                let radius = close_diameter / 2.0;
+                append_rounded_quad_px(
+                    rounded_out,
+                    close_x0,
+                    close_y0,
+                    close_x1,
+                    close_y1,
+                    surface_w,
+                    surface_h,
+                    tab_close_red,
+                    radius,
+                );
             }
-            _ => icon_color,
-        };
-        append_quad_px(
-            out,
-            close_x0 + close_pad,
-            close_y0,
-            tab_x1 - close_pad,
-            close_y1,
-            surface_w,
-            surface_h,
-            close_color,
-        );
+        }
     }
 
     // 4. tab bar 底部细线分隔 (与 cell 区分开)
@@ -1200,6 +1503,8 @@ pub(crate) fn append_tab_bar_vertices(
         surface_h,
         border_color,
     );
+    // T-0615 派单偏离: 移除 tab 间垂直分隔线 (圆角 box 视觉已分隔, 多余 stroke
+    // 反而显乱). 与 ghostty / GTK4 风格一致 — 圆角 box 间纯 gap 分隔, 无线条.
 }
 
 /// **T-0610 part 2: corner mask bind group layout descriptor**.
@@ -1442,6 +1747,11 @@ impl Renderer {
             glyph_pipeline: None,
             glyph_vertex_buffer: None,
             glyph_buffer_capacity: 0,
+            // T-0615: rounded element pipeline + buffer lazy init, 首次 draw_frame
+            // 建. INV-002 顺序: device 之前 drop.
+            rounded_pipeline: None,
+            rounded_vertex_buffer: None,
+            rounded_buffer_capacity: 0,
             device,
             queue,
             config,
@@ -2042,6 +2352,8 @@ impl Renderer {
         self.ensure_cell_buffer(cols, rows + TITLEBAR_RESERVED_QUAD_ROWS);
         self.ensure_glyph_atlas();
         self.ensure_glyph_pipeline();
+        // T-0615: rounded element pipeline lazy init.
+        self.ensure_rounded_pipeline();
 
         // Step 2: cell pixel size (与 draw_cells 同源)。
         // T-0404: physical px (× HIDPI_SCALE), 见 draw_cells 同段注释解释 cell
@@ -2107,21 +2419,24 @@ impl Renderer {
                 sel_color,
             );
         }
-        // T-0504: 追加 titlebar + 3 按钮 + icon 顶点到 cell pipeline 同 buffer.
-        // titlebar 与 cell 共用 cell pipeline (同 vertex 格式 pos+color), 一次
-        // draw 同时画完, 视觉无延迟. hover 来自调用方维护的 PointerState.hover().
+        // T-0504/T-0615: 追加 titlebar + 3 按钮 + icon 顶点. 矩形部分 (titlebar bg
+        // / icon stroke) 走 cell pipeline; 圆形按钮 bg (hover 时浮现) 走 rounded
+        // pipeline (rounded_vertex_bytes). hover 来自调用方维护 PointerState.hover().
+        let mut rounded_vertex_bytes: Vec<u8> = Vec::new();
         append_titlebar_vertices(
             &mut cell_vertex_bytes,
+            &mut rounded_vertex_bytes,
             surface_w,
             surface_h,
             self.surface_is_srgb,
             hover,
         );
-        // T-0608: tab bar 顶点 (titlebar 之下, cell 之上). tab_count / active_idx
-        // 来自调用方 (state.tabs); tab_count=0 时本 fn 早返不画 (启动期 race
-        // 兜底, 实战 ≥ 1).
+        // T-0608/T-0615: tab bar 顶点. bar bg / icon stroke / 底部 border 走 cell
+        // pipeline; + box 圆角 + active tab 圆角 + close × hover 红圆 走 rounded
+        // pipeline. tab_count=0 早返 (启动期 race 兜底, 实战 ≥ 1).
         append_tab_bar_vertices(
             &mut cell_vertex_bytes,
+            &mut rounded_vertex_bytes,
             surface_w,
             surface_h,
             self.surface_is_srgb,
@@ -2347,6 +2662,8 @@ impl Renderer {
         // cell_vertex_count 重新算 (preedit underline / cursor quad 可能已 append)
         let cell_vertex_count = (cell_vertex_bytes.len() / VERTEX_BYTES) as u32;
         let glyph_vertex_count = (glyph_vertex_bytes.len() / GLYPH_VERTEX_BYTES) as u32;
+        // T-0615: rounded element vertex count.
+        let rounded_vertex_count = (rounded_vertex_bytes.len() / ROUNDED_VERTEX_BYTES) as u32;
 
         // 调试锚点 (debug 级, 不污染默认 info)
         tracing::debug!(
@@ -2355,11 +2672,12 @@ impl Renderer {
             rows,
             cell_vertex_count,
             glyph_vertex_count,
+            rounded_vertex_count,
             atlas_count = self.glyph_atlas.as_ref().map(|a| a.allocations.len()).unwrap_or(0),
             "draw_frame stats"
         );
 
-        // 上传 cell + glyph vertex 数据 (queue.write_buffer 是 staging-free 快路径)
+        // 上传 cell + glyph + rounded vertex 数据 (queue.write_buffer 快路径)
         if cell_vertex_count > 0 {
             let buf = self.cell_vertex_buffer.as_ref().ok_or_else(|| {
                 anyhow!("cell_vertex_buffer 应已 lazy 初始化(ensure_cell_buffer 后)")
@@ -2372,6 +2690,13 @@ impl Renderer {
                 anyhow!("glyph_vertex_buffer 应已 lazy 初始化(ensure_glyph_buffer 后)")
             })?;
             self.queue.write_buffer(buf, 0, &glyph_vertex_bytes);
+        }
+        if rounded_vertex_count > 0 {
+            self.ensure_rounded_buffer(rounded_vertex_bytes.len());
+            let buf = self.rounded_vertex_buffer.as_ref().ok_or_else(|| {
+                anyhow!("rounded_vertex_buffer 应已 lazy 初始化(ensure_rounded_buffer 后)")
+            })?;
+            self.queue.write_buffer(buf, 0, &rounded_vertex_bytes);
         }
 
         // Step 5: acquire frame (与 draw_cells / render 同档错误分类)
@@ -2437,6 +2762,24 @@ impl Renderer {
                 pass.set_bind_group(1, &self.corner_bind_group, &[]);
                 pass.set_vertex_buffer(0, cell_buf.slice(..));
                 pass.draw(0..cell_vertex_count, 0..1);
+            }
+
+            // T-0615: rounded element pass (圆形 button bg / 圆角 tab body / + box).
+            // 在 cells 之后, glyphs 之前 — REPLACE blend 让圆角 box 覆盖底层 cell
+            // 矩形 quad, glyph (icon / title) 在其上 alpha-blend.
+            if rounded_vertex_count > 0 {
+                let rp = self
+                    .rounded_pipeline
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("rounded_pipeline 应已 lazy 初始化"))?;
+                let rb = self
+                    .rounded_vertex_buffer
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("rounded_vertex_buffer 应已 lazy 初始化"))?;
+                pass.set_pipeline(rp);
+                pass.set_bind_group(1, &self.corner_bind_group, &[]);
+                pass.set_vertex_buffer(0, rb.slice(..));
+                pass.draw(0..rounded_vertex_count, 0..1);
             }
 
             // glyphs pass
@@ -2669,6 +3012,119 @@ impl Renderer {
         });
         self.glyph_vertex_buffer = Some(buf);
         self.glyph_buffer_capacity = alloc_verts;
+    }
+
+    /// **T-0615: lazy 初始化 rounded element render pipeline**. WGSL 内联
+    /// [`ROUNDED_WGSL`], vertex layout 40 字节 (`pos[2 f32] + color[3 f32] +
+    /// elem_bounds[4 f32] + elem_radius[1 f32]`). BlendState::REPLACE 让 rounded
+    /// element bg 直接覆盖底层 cell pipeline quad.
+    ///
+    /// **bind group**: group=1 corner mask uniform (与 cell pipeline 共享 BGL +
+    /// uniform buffer); group=0 空 (rounded pipeline 无 texture / sampler 用).
+    fn ensure_rounded_pipeline(&mut self) {
+        if self.rounded_pipeline.is_some() {
+            return;
+        }
+        let shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("quill-rounded-shader"),
+                source: wgpu::ShaderSource::Wgsl(ROUNDED_WGSL.into()),
+            });
+        let corner_bgl = create_corner_mask_bgl(&self.device);
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("quill-rounded-pipeline-layout"),
+                bind_group_layouts: &[None, Some(&corner_bgl)],
+                immediate_size: 0,
+            });
+        let vertex_attrs = [
+            wgpu::VertexAttribute {
+                offset: 0,
+                shader_location: 0,
+                format: wgpu::VertexFormat::Float32x2,
+            },
+            wgpu::VertexAttribute {
+                offset: (2 * std::mem::size_of::<f32>()) as u64,
+                shader_location: 1,
+                format: wgpu::VertexFormat::Float32x3,
+            },
+            wgpu::VertexAttribute {
+                offset: (5 * std::mem::size_of::<f32>()) as u64,
+                shader_location: 2,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+            wgpu::VertexAttribute {
+                offset: (9 * std::mem::size_of::<f32>()) as u64,
+                shader_location: 3,
+                format: wgpu::VertexFormat::Float32,
+            },
+        ];
+        let pipeline = self
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("quill-rounded-pipeline"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: ROUNDED_VERTEX_BYTES as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &vertex_attrs,
+                    }],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: self.config.format,
+                        // ALPHA_BLENDING: 圆角 AA edge 像素 alpha < 1, 与底层 cell
+                        // pipeline quad blend (cell pipeline 已 REPLACE 写入色块,
+                        // rounded 在其上 alpha blend 圆角 AA 平滑过渡到底层色).
+                        // discard 路径 (圆外 fragment) 完全不写, 底层色保留.
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+        self.rounded_pipeline = Some(pipeline);
+    }
+
+    /// **T-0615: lazy 初始化 / 增长 rounded element vertex buffer**.
+    /// 容量按 `needed_bytes / ROUNDED_VERTEX_BYTES` 顶点数, 首次按 frame 实际
+    /// 需要分配, 后续 reuse (需要更大重建). 与 [`Self::ensure_glyph_buffer`] 同套路.
+    fn ensure_rounded_buffer(&mut self, needed_bytes: usize) {
+        let needed_verts = needed_bytes.div_ceil(ROUNDED_VERTEX_BYTES);
+        if self.rounded_buffer_capacity >= needed_verts && self.rounded_vertex_buffer.is_some() {
+            return;
+        }
+        let alloc_verts = needed_verts.max(1);
+        let size_bytes = (alloc_verts * ROUNDED_VERTEX_BYTES) as u64;
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("quill-rounded-vertex-buffer"),
+            size: size_bytes,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.rounded_vertex_buffer = Some(buf);
+        self.rounded_buffer_capacity = alloc_verts;
     }
 
     /// atlas allocate (含 lazy raster 与 GPU 上传)。返 Some(slot) 当成功 (含 cache
@@ -3568,17 +4024,19 @@ pub fn render_headless(
             sel_color,
         );
     }
-    // T-0504: 追加 titlebar + 3 按钮 + icon 顶点. headless 路径无真鼠标 hover,
-    // 走 HoverRegion::None (按钮全无高亮).
-    // T-0608: 紧接追加 tab bar (与 draw_frame 同顺序, headless 默认 1 tab + active=0,
-    // 集成测试 tests/multi_tab_e2e.rs 通过 [`render_headless_with_tabs`] 入口传
-    // 真 tab_count + active_idx).
+    // T-0504/T-0615: 追加 titlebar + 3 按钮 + icon 顶点. 矩形部分到
+    // cell_vertex_bytes; 圆形按钮 hover bg (rounded element) 到 rounded_vertex_bytes.
+    // headless 路径用 HEADLESS_HOVER_OVERRIDE (默认 None) 注入 hover, 测试可走
+    // hover 视觉验证.
+    let mut rounded_vertex_bytes: Vec<u8> = Vec::new();
+    let hover_override = HEADLESS_HOVER_OVERRIDE.with(|c| c.get());
     append_titlebar_vertices(
         &mut cell_vertex_bytes,
+        &mut rounded_vertex_bytes,
         surface_w,
         surface_h,
         is_srgb,
-        super::pointer::HoverRegion::None,
+        hover_override,
     );
     // T-0608: tab bar (默认 1 tab, active idx 0). 集成测试通过 thread-local
     // [`HEADLESS_TAB_OVERRIDE`] 注入真 tab_count + active_idx — 派单 In #J PNG
@@ -3586,12 +4044,13 @@ pub fn render_headless(
     let (tc, ai) = HEADLESS_TAB_OVERRIDE.with(|c| c.get());
     append_tab_bar_vertices(
         &mut cell_vertex_bytes,
+        &mut rounded_vertex_bytes,
         surface_w,
         surface_h,
         is_srgb,
         tc,
         ai,
-        super::pointer::HoverRegion::None,
+        hover_override,
     );
     // cell_vertex_count 在 preedit underline append 后再算 (T-0505)。
 
@@ -4031,6 +4490,8 @@ pub fn render_headless(
     // 重新算 vertex count (preedit 已可能 append cell underline + glyph + cursor)
     let cell_vertex_count = (cell_vertex_bytes.len() / VERTEX_BYTES) as u32;
     let glyph_vertex_count = (glyph_vertex_bytes.len() / GLYPH_VERTEX_BYTES) as u32;
+    // T-0615: rounded element vertex count.
+    let rounded_vertex_count = (rounded_vertex_bytes.len() / ROUNDED_VERTEX_BYTES) as u32;
 
     let cell_vbuf = if cell_vertex_count > 0 {
         let buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -4058,12 +4519,28 @@ pub fn render_headless(
         None
     };
 
+    // T-0615: rounded element pipeline + buffer (本地, 函数返回 drop, 不污染
+    // [`Renderer`]). 与 Renderer::ensure_rounded_pipeline 同 shader.
+    let rounded_pipeline = create_headless_rounded_pipeline(&device, format);
+    let rounded_vbuf = if rounded_vertex_count > 0 {
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("quill-headless-rounded-vertex"),
+            size: rounded_vertex_bytes.len() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&buf, 0, &rounded_vertex_bytes);
+        Some(buf)
+    } else {
+        None
+    };
+
     tracing::debug!(
         target: "quill::wl::render",
         cols, rows,
         logical_w = width, logical_h = height,
         physical_w, physical_h,
-        cell_vertex_count, glyph_vertex_count,
+        cell_vertex_count, glyph_vertex_count, rounded_vertex_count,
         atlas_count = allocations.len(),
         "render_headless stats"
     );
@@ -4094,6 +4571,13 @@ pub fn render_headless(
             pass.set_bind_group(1, &corner_bind_group, &[]);
             pass.set_vertex_buffer(0, buf.slice(..));
             pass.draw(0..cell_vertex_count, 0..1);
+        }
+        // T-0615: rounded element pass (cells 之后, glyphs 之前).
+        if let Some(buf) = rounded_vbuf.as_ref() {
+            pass.set_pipeline(&rounded_pipeline);
+            pass.set_bind_group(1, &corner_bind_group, &[]);
+            pass.set_vertex_buffer(0, buf.slice(..));
+            pass.draw(0..rounded_vertex_count, 0..1);
         }
         if let Some(buf) = glyph_vbuf.as_ref() {
             pass.set_pipeline(&glyph_pipeline);
@@ -4354,6 +4838,99 @@ fn create_headless_glyph_pipeline(
 thread_local! {
     pub(crate) static HEADLESS_TAB_OVERRIDE: std::cell::Cell<(usize, usize)> =
         const { std::cell::Cell::new((1, 0)) };
+
+    /// **T-0615: headless hover 注入点**. 默认 None (无 hover, 测试视觉与运行
+    /// 时 enter 前一致). 集成测试 (tests/ghostty_tab_polish_e2e.rs) 在
+    /// render_headless 之前 set, 让 PNG 输出含 hover 圆形 bg / + box 高亮等视觉.
+    pub(crate) static HEADLESS_HOVER_OVERRIDE: std::cell::Cell<super::pointer::HoverRegion> =
+        const { std::cell::Cell::new(super::pointer::HoverRegion::None) };
+}
+
+/// **T-0615: headless 测试调用前 set 当前 hover, render_headless append 走此值**.
+pub fn set_headless_hover_state(hover: super::pointer::HoverRegion) {
+    HEADLESS_HOVER_OVERRIDE.with(|c| c.set(hover));
+}
+
+/// **T-0615: 重置 hover override 到 None. 测试末尾 / setUp 调**.
+pub fn reset_headless_hover_state() {
+    HEADLESS_HOVER_OVERRIDE.with(|c| c.set(super::pointer::HoverRegion::None));
+}
+
+/// **T-0615: headless 路径 rounded element pipeline** (与 Renderer::ensure_rounded_pipeline
+/// 同 shader / vertex layout, format 走调用方传入 = Rgba8UnormSrgb).
+fn create_headless_rounded_pipeline(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("quill-headless-rounded-shader"),
+        source: wgpu::ShaderSource::Wgsl(ROUNDED_WGSL.into()),
+    });
+    let corner_bgl = create_corner_mask_bgl(device);
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("quill-headless-rounded-pipeline-layout"),
+        bind_group_layouts: &[None, Some(&corner_bgl)],
+        immediate_size: 0,
+    });
+    let vertex_attrs = [
+        wgpu::VertexAttribute {
+            offset: 0,
+            shader_location: 0,
+            format: wgpu::VertexFormat::Float32x2,
+        },
+        wgpu::VertexAttribute {
+            offset: (2 * std::mem::size_of::<f32>()) as u64,
+            shader_location: 1,
+            format: wgpu::VertexFormat::Float32x3,
+        },
+        wgpu::VertexAttribute {
+            offset: (5 * std::mem::size_of::<f32>()) as u64,
+            shader_location: 2,
+            format: wgpu::VertexFormat::Float32x4,
+        },
+        wgpu::VertexAttribute {
+            offset: (9 * std::mem::size_of::<f32>()) as u64,
+            shader_location: 3,
+            format: wgpu::VertexFormat::Float32,
+        },
+    ];
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("quill-headless-rounded-pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: ROUNDED_VERTEX_BYTES as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &vertex_attrs,
+            }],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            unclipped_depth: false,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            conservative: false,
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
 }
 
 /// T-0608: headless 测试调用前 set tab_count / active_idx, render_headless 内
@@ -5324,5 +5901,354 @@ mod tests {
         let br_y = f32::from_ne_bytes(out[br_off + 4..br_off + 8].try_into().unwrap());
         assert!((br_x - 1.0).abs() < 1e-5, "BR.x = +1, got {br_x}");
         assert!((br_y - (-1.0)).abs() < 1e-5, "BR.y = -1, got {br_y}");
+    }
+
+    // ---------- T-0615 rounded element 单测 (派单 In #E) ----------
+
+    /// `ROUNDED_VERTEX_BYTES` 锁: 防顺手改 vertex layout 致与 wgsl shader 不对齐.
+    /// pos[2 f32] + color[3 f32] + elem_bounds[4 f32] + elem_radius[1 f32] = 10 f32.
+    #[test]
+    fn rounded_vertex_bytes_is_forty() {
+        assert_eq!(
+            ROUNDED_VERTEX_BYTES, 40,
+            "T-0615 rounded vertex 40 字节 = 10 f32 锁 (pos + color + bounds + radius)"
+        );
+    }
+
+    /// `WINDOW_BUTTON_RADIUS_PX` / `TAB_ROUNDED_RADIUS_PX` 锁: 防顺手改与 hit_test
+    /// 距离阈值不一致 (派单 In #D 字面 12 logical / In #B 6 logical).
+    #[test]
+    fn rounded_radius_constants_match_spec() {
+        assert!(
+            (WINDOW_BUTTON_RADIUS_PX - 12.0).abs() < 1e-5,
+            "T-0615 派单 In #D: Min/Max/Close ~12 logical px radius, 实装 {WINDOW_BUTTON_RADIUS_PX}"
+        );
+        assert!(
+            (TAB_ROUNDED_RADIUS_PX - 6.0).abs() < 1e-5,
+            "T-0615 派单 In #B: + box / active tab ~6 logical px radius, 实装 {TAB_ROUNDED_RADIUS_PX}"
+        );
+    }
+
+    /// `append_rounded_quad_px` 输出 1 quad = 6 顶点 × ROUNDED_VERTEX_BYTES.
+    #[test]
+    fn append_rounded_quad_emits_six_vertices() {
+        let mut out = Vec::new();
+        append_rounded_quad_px(
+            &mut out,
+            100.0,
+            100.0,
+            200.0,
+            200.0,
+            1600.0,
+            1200.0,
+            [1.0, 0.0, 0.0],
+            12.0,
+        );
+        assert_eq!(
+            out.len(),
+            6 * ROUNDED_VERTEX_BYTES,
+            "rounded quad = 1 quad = 6 顶点 × 40 字节 = 240 字节"
+        );
+    }
+
+    /// `append_rounded_quad_px` 顶点字段布局: pos / color / bounds / radius
+    /// 与 wgsl `@location(0..3)` 严格对齐. 派单 In #A 锁 vertex layout.
+    #[test]
+    fn append_rounded_quad_vertex_field_layout_is_correct() {
+        let mut out = Vec::new();
+        append_rounded_quad_px(
+            &mut out,
+            100.0,
+            50.0,
+            200.0,
+            150.0,
+            1600.0,
+            1200.0,
+            [0.1, 0.2, 0.3],
+            12.0,
+        );
+        // 第 1 顶点 = TL (left, top) = (100/1600*2-1, 1-50/1200*2) = (-0.875, 0.9166...)
+        let v0_x = f32::from_ne_bytes(out[0..4].try_into().unwrap());
+        let v0_y = f32::from_ne_bytes(out[4..8].try_into().unwrap());
+        let expected_x = 100.0 / 1600.0 * 2.0 - 1.0;
+        let expected_y = 1.0 - 50.0 / 1200.0 * 2.0;
+        assert!(
+            (v0_x - expected_x).abs() < 1e-5,
+            "v0.pos.x = {expected_x}, got {v0_x}"
+        );
+        assert!(
+            (v0_y - expected_y).abs() < 1e-5,
+            "v0.pos.y = {expected_y}, got {v0_y}"
+        );
+        // color 偏移 8 字节 (after pos[2 f32] = 8 byte).
+        let v0_r = f32::from_ne_bytes(out[8..12].try_into().unwrap());
+        assert!((v0_r - 0.1).abs() < 1e-5, "v0.color.r = 0.1, got {v0_r}");
+        // bounds 偏移 20 字节 (after pos+color = 5 f32 = 20 byte).
+        let bx_min = f32::from_ne_bytes(out[20..24].try_into().unwrap());
+        let by_min = f32::from_ne_bytes(out[24..28].try_into().unwrap());
+        let bx_max = f32::from_ne_bytes(out[28..32].try_into().unwrap());
+        let by_max = f32::from_ne_bytes(out[32..36].try_into().unwrap());
+        assert!((bx_min - 100.0).abs() < 1e-5);
+        assert!((by_min - 50.0).abs() < 1e-5);
+        assert!((bx_max - 200.0).abs() < 1e-5);
+        assert!((by_max - 150.0).abs() < 1e-5);
+        // radius 偏移 36 字节 (after pos+color+bounds = 9 f32 = 36 byte).
+        let r = f32::from_ne_bytes(out[36..40].try_into().unwrap());
+        assert!((r - 12.0).abs() < 1e-5, "v0.elem_radius = 12, got {r}");
+    }
+
+    /// `append_rounded_quad_px` 多顶点共享同 elem_bounds + elem_radius (per-vertex
+    /// 但 quad 内 6 顶点同值 — fragment shader 内各 frag 拿到同一组).
+    #[test]
+    fn append_rounded_quad_all_six_vertices_share_bounds_and_radius() {
+        let mut out = Vec::new();
+        append_rounded_quad_px(
+            &mut out,
+            100.0,
+            50.0,
+            200.0,
+            150.0,
+            1600.0,
+            1200.0,
+            [0.1, 0.2, 0.3],
+            12.0,
+        );
+        for i in 0..6 {
+            let v_off = i * ROUNDED_VERTEX_BYTES;
+            let bx_min = f32::from_ne_bytes(out[v_off + 20..v_off + 24].try_into().unwrap());
+            let r = f32::from_ne_bytes(out[v_off + 36..v_off + 40].try_into().unwrap());
+            assert!((bx_min - 100.0).abs() < 1e-5, "v{i}.bounds.x_min = 100");
+            assert!((r - 12.0).abs() < 1e-5, "v{i}.elem_radius = 12");
+        }
+    }
+
+    /// `append_rounded_quad_px` 与 `append_quad_px` (cell pipeline) 不冲突 —
+    /// 两 fn 写入不同 buffer (rounded_out vs out), 字段格式不同.
+    #[test]
+    fn append_rounded_quad_does_not_conflict_with_cell_pipeline_layout() {
+        // rounded 40 byte × 6, cell 20 byte × 6 = cell quad 1/2 大小.
+        let mut rounded = Vec::new();
+        let mut cell = Vec::new();
+        append_rounded_quad_px(
+            &mut rounded,
+            0.0,
+            0.0,
+            100.0,
+            100.0,
+            800.0,
+            600.0,
+            [1.0, 1.0, 1.0],
+            6.0,
+        );
+        append_quad_px(
+            &mut cell,
+            0.0,
+            0.0,
+            100.0,
+            100.0,
+            800.0,
+            600.0,
+            [1.0, 1.0, 1.0],
+        );
+        assert_eq!(rounded.len(), 6 * 40);
+        assert_eq!(cell.len(), 6 * 20);
+    }
+
+    // ---------- T-0615 圆形 button visual (append_titlebar_vertices 整合) ----------
+
+    /// hover Close 时 rounded buffer 应含至少 1 quad (圆形 bg). 非 hover 时 rounded
+    /// buffer 仍含 icon stroke quads (Min/Max/+ icon strokes 移到 rounded), 但 close
+    /// 圆形 bg 仅 hover 时 append.
+    #[test]
+    fn append_titlebar_vertices_hover_close_emits_rounded_button_bg() {
+        use crate::wl::pointer::{HoverRegion, WindowButton};
+        let mut cell_out = Vec::new();
+        let mut rounded_out = Vec::new();
+        let surface_w = 1600.0;
+        let surface_h = 1200.0;
+        append_titlebar_vertices(
+            &mut cell_out,
+            &mut rounded_out,
+            surface_w,
+            surface_h,
+            false,
+            HoverRegion::Button(WindowButton::Close),
+        );
+        // hover Close 时: rounded_out 含 close 圆形 bg (6 顶点) + Min/Max icon
+        // strokes (4 边 max + 1 line min = 5 quad × 6 顶点 = 30) ≥ 36 顶点
+        let n_verts = rounded_out.len() / ROUNDED_VERTEX_BYTES;
+        assert!(
+            n_verts >= 6,
+            "hover Close 时 rounded buffer 必含 ≥ 1 quad (圆形 bg + icon strokes), got {n_verts} 顶点"
+        );
+        // 验某 1 顶点 elem_radius == WINDOW_BUTTON_RADIUS_PX × HIDPI_SCALE
+        let expected_radius = WINDOW_BUTTON_RADIUS_PX * HIDPI_SCALE as f32;
+        let mut found_btn_radius = false;
+        for i in 0..n_verts {
+            let v_off = i * ROUNDED_VERTEX_BYTES;
+            let r = f32::from_ne_bytes(rounded_out[v_off + 36..v_off + 40].try_into().unwrap());
+            if (r - expected_radius).abs() < 1e-5 {
+                found_btn_radius = true;
+                break;
+            }
+        }
+        assert!(
+            found_btn_radius,
+            "hover Close 时 rounded buffer 必含 elem_radius={expected_radius} 顶点 (圆形按钮 bg)"
+        );
+    }
+
+    /// 非 hover 时 (HoverRegion::None), 三按钮 bg 都不画 — 仅 icon strokes
+    /// (Min/Max 的横竖线) 在 rounded buffer.
+    #[test]
+    fn append_titlebar_vertices_no_hover_skips_button_bg() {
+        use crate::wl::pointer::HoverRegion;
+        let mut cell_out = Vec::new();
+        let mut rounded_out = Vec::new();
+        append_titlebar_vertices(
+            &mut cell_out,
+            &mut rounded_out,
+            1600.0,
+            1200.0,
+            false,
+            HoverRegion::None,
+        );
+        let n_verts = rounded_out.len() / ROUNDED_VERTEX_BYTES;
+        // icon strokes: Maximize 4 边 + Minimize 1 横 = 5 quad × 6 = 30 顶点 (无圆形 bg)
+        assert_eq!(
+            n_verts, 30,
+            "非 hover 时 rounded 仅含 Min/Max icon strokes (5 quad × 6 顶点 = 30), got {n_verts}"
+        );
+        // 所有顶点 elem_radius == 0 (icon strokes 矩形)
+        for i in 0..n_verts {
+            let v_off = i * ROUNDED_VERTEX_BYTES;
+            let r = f32::from_ne_bytes(rounded_out[v_off + 36..v_off + 40].try_into().unwrap());
+            assert!(
+                r.abs() < 1e-5,
+                "非 hover 时 rounded 顶点应全 radius=0 (icon strokes), v{i} got {r}"
+            );
+        }
+    }
+
+    /// `append_tab_bar_vertices` 默认配置 (1 tab, active=0, hover None) 应有
+    /// + box rounded + active tab body rounded + + icon strokes.
+    #[test]
+    fn append_tab_bar_vertices_default_emits_rounded_plus_box_and_active_body() {
+        use crate::wl::pointer::HoverRegion;
+        let mut cell_out = Vec::new();
+        let mut rounded_out = Vec::new();
+        append_tab_bar_vertices(
+            &mut cell_out,
+            &mut rounded_out,
+            1600.0,
+            1200.0,
+            false,
+            1,
+            0,
+            HoverRegion::None,
+        );
+        let n_verts = rounded_out.len() / ROUNDED_VERTEX_BYTES;
+        // 至少: + box 1 quad + active tab body 1 quad + + icon 2 quad = 4 quad × 6 = 24 顶点
+        assert!(
+            n_verts >= 24,
+            "default tab bar rounded 应有 ≥ 24 顶点 (+ box + active + + icon), got {n_verts}"
+        );
+        // 验找到 elem_radius == TAB_ROUNDED_RADIUS_PX × HIDPI_SCALE (圆角 box / active body)
+        let expected_tab_radius = TAB_ROUNDED_RADIUS_PX * HIDPI_SCALE as f32;
+        let mut found_tab_radius = false;
+        for i in 0..n_verts {
+            let v_off = i * ROUNDED_VERTEX_BYTES;
+            let r = f32::from_ne_bytes(rounded_out[v_off + 36..v_off + 40].try_into().unwrap());
+            if (r - expected_tab_radius).abs() < 1e-5 {
+                found_tab_radius = true;
+                break;
+            }
+        }
+        assert!(
+            found_tab_radius,
+            "tab bar rounded 必含 elem_radius={expected_tab_radius} 顶点 (圆角 box / active tab)"
+        );
+    }
+
+    /// inactive tab 不画 box (透明), 仅 active tab + + box + icons. 派单 In #C
+    /// "inactive tab 透明背景".
+    #[test]
+    fn append_tab_bar_vertices_inactive_tab_no_body_quad() {
+        use crate::wl::pointer::HoverRegion;
+        let mut cell_out = Vec::new();
+        let mut rounded_out = Vec::new();
+        append_tab_bar_vertices(
+            &mut cell_out,
+            &mut rounded_out,
+            1600.0,
+            1200.0,
+            false,
+            3,
+            1,
+            HoverRegion::None,
+        );
+        // 3 tabs, 仅 active idx=1 画 body (1 quad). 加 + box (1) + + icon (2) = 4 quad
+        let n_verts = rounded_out.len() / ROUNDED_VERTEX_BYTES;
+        assert_eq!(
+            n_verts,
+            4 * 6,
+            "3 tab + active=1 时 rounded buffer 应含 4 quad (+ box + active + + icon h + icon v), got {n_verts}/6 = {} quad",
+            n_verts / 6
+        );
+    }
+
+    /// hover inactive tab 画 hover bg (1 圆角 box). hover active 走 active 路径.
+    #[test]
+    fn append_tab_bar_vertices_hover_inactive_emits_hover_box() {
+        use crate::wl::pointer::HoverRegion;
+        let mut cell_out = Vec::new();
+        let mut rounded_out = Vec::new();
+        // 3 tabs, active=0, hover=Tab(2) 即 hover idx 2 (inactive).
+        append_tab_bar_vertices(
+            &mut cell_out,
+            &mut rounded_out,
+            1600.0,
+            1200.0,
+            false,
+            3,
+            0,
+            HoverRegion::Tab(2),
+        );
+        // 期望: + box (1) + active body (idx=0, 1) + hover body (idx=2, 1) + + icon (2)
+        // = 5 quad
+        let n_verts = rounded_out.len() / ROUNDED_VERTEX_BYTES;
+        assert_eq!(
+            n_verts,
+            5 * 6,
+            "3 tab + active=0 + hover idx=2 应含 5 quad, got {} quad",
+            n_verts / 6
+        );
+    }
+
+    /// hover TabClose 红圆 bg. close × hover 时 rounded buffer 多 1 圆形 quad.
+    #[test]
+    fn append_tab_bar_vertices_hover_close_emits_red_circle() {
+        use crate::wl::pointer::HoverRegion;
+        let mut cell_out = Vec::new();
+        let mut rounded_out = Vec::new();
+        // 3 tabs, active=0, hover=TabClose(0) (active 同 idx).
+        append_tab_bar_vertices(
+            &mut cell_out,
+            &mut rounded_out,
+            1600.0,
+            1200.0,
+            false,
+            3,
+            0,
+            HoverRegion::TabClose(0),
+        );
+        // 期望: + box + active body (idx=0) + close 红圆 + + icon (2) = 5 quad
+        let n_verts = rounded_out.len() / ROUNDED_VERTEX_BYTES;
+        assert_eq!(
+            n_verts,
+            5 * 6,
+            "hover TabClose(0) 应含 5 quad (+ box + active + close 红圆 + + icon ×2), got {} quad",
+            n_verts / 6
+        );
     }
 }
