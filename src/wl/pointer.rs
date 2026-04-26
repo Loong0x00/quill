@@ -1033,10 +1033,14 @@ pub fn tab_body_width(surface_w: u32, tab_count: usize) -> f64 {
 /// 算 tab bar 区. tab_count == 0 时退化到原 hit_test 行为 (无 tab bar UI,
 /// 用作单 tab 兼容路径; 实战 tab_count >= 1 因为 quill 启动期就有一个 tab).
 ///
+/// **T-0617**: tab_count <= 1 时 tab bar 隐藏 (派单 In #B 单 tab 视觉规则),
+/// 退化到 [`hit_test`] 行为 — cell 区直接接 titlebar 下方, 不存在 TabBarPlus /
+/// Tab(idx) / TabClose(idx) 区.
+///
 /// **优先级** (高 → 低, 派单 In #D):
 /// 1. 4 角 / 4 边 (resize)
 /// 2. titlebar 段 (y < TITLEBAR_H): 三按钮 / TitleBar drag
-/// 3. tab bar 段 (TITLEBAR_H ≤ y < TITLEBAR_H + TAB_BAR_H):
+/// 3. tab bar 段 (TITLEBAR_H ≤ y < TITLEBAR_H + TAB_BAR_H, **仅 tab_count > 1**):
 ///    - 左 TAB_PLUS_W 区 → TabBarPlus
 ///    - 之后按 tab_body_width 平均分 → Tab(idx) 或 TabClose(idx)
 /// 4. cell 区 (y ≥ TITLEBAR_H + TAB_BAR_H) → TextArea
@@ -1052,7 +1056,9 @@ pub fn hit_test_with_tabs(
     // TITLEBAR_H + TAB_BAR_H. 路径: 先走原 hit_test, 拿到 TitleBar / TextArea
     // 时根据 y 进一步细化为 tab bar 区或真 cell 区.
     let base = hit_test(x, y, surface_w, surface_h);
-    if tab_count == 0 {
+    // T-0617: 单 tab (count <= 1) 隐藏 tab bar — 派单 In #B + 红线 "单 tab 时
+    // tab area 不存在", click 不应 fall-through 错位.
+    if tab_count <= 1 {
         return base;
     }
     let titlebar_h = TITLEBAR_H_LOGICAL_PX as f64;

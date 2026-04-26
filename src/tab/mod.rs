@@ -19,6 +19,8 @@
 //! - 新建 tab 立即取得**全新** [`TabId`]; close 后不复用 id, 即使 idx
 //!   已被后续 tab 占用 (INV-005 多 fd 注册时用 id 索引 calloop registration token).
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
@@ -103,11 +105,21 @@ pub struct TabInstance {
     term: TermState,
     /// 子 shell 进程 + master fd. INV-009 master fd O_NONBLOCK.
     pty: PtyHandle,
-    /// 当前显示标题. 默认 "shell" (PTY argv[0] basename) — Phase 后期接 OSC 0/2
-    /// 自动更新需重写 [`crate::term::TermState`] 用 `Term<TitleListener>` (派单
-    /// In #H 实装偏离: 当前 title 默认 "shell N", N=tab idx; **OSC title** 由
-    /// 后续 ticket 接). 派单 In #J 接受 default title 测试覆盖.
-    title: String,
+    /// 当前显示标题. **T-0617 起改 `Rc<RefCell<String>>`** 持 [`TermState`]
+    /// 的 OSC title 共享态 (alacritty `EventListener::send_event(Event::Title)`
+    /// 路径写入). 默认空字符串 → 渲染层 fallback 到 [`crate::wl::render::DEFAULT_TITLE`]
+    /// = "quill" (写在 window.rs idle redraw 路径).
+    ///
+    /// **why Rc<RefCell<>>**: alacritty `Term<L>` 接 owned listener, 共享态走
+    /// `Rc<RefCell<String>>`; 单线程 calloop (INV-005) 下 RefCell 借用窗口仅在
+    /// listener `borrow_mut()` (advance 时) 与渲染层 `borrow().clone()` (idle
+    /// 帧前) 之间, 串行执行不冲突. 详见 [`crate::term::TermListener`] doc.
+    ///
+    /// **trivial drop**: `Rc<RefCell<String>>` drop 仅减引用计数 + 字符串 drop,
+    /// 不持 GPU / wayland / pty 句柄, 与原 `String` 同档. INV-010 字段顺序无关 —
+    /// 派单红线"TabInstance 字段顺序违反 — Rc<RefCell> 持 Cell 内部数据, 但
+    /// trivial drop, 顺序无关 — 仍按文档 visual locality 放" 沿 visual locality.
+    title: Rc<RefCell<String>>,
     /// per-tab dirty 标记. 当前未单独读 (term.is_dirty() 已覆盖 cell 内容变化),
     /// 留作未来 inactive tab 累积重画跳过决策. 派单 In #B "per-tab dirty: 仅
     /// active tab dirty 触发渲染" 字面要求, 当前实装走 active tab term.is_dirty
@@ -126,10 +138,13 @@ impl TabInstance {
         let pty = PtyHandle::spawn_shell(cols, rows)
             .context("PtyHandle::spawn_shell 失败 (新 tab 不可建)")?;
         let term = TermState::new(cols, rows);
+        // T-0617: title 与 TermListener 共享同一份 Rc<RefCell<String>>. OSC 0/1/2
+        // 进 advance 时 listener 写, draw_frame 读, 两边都拿同一根 Rc clone.
+        let title = term.title_handle();
         Ok(Self {
             term,
             pty,
-            title: "shell".to_string(),
+            title,
             dirty: true,
             id: TabRegistry::next_id(),
         })
@@ -141,10 +156,15 @@ impl TabInstance {
     pub(crate) fn for_test(title: &str) -> Self {
         let pty = PtyHandle::spawn_program("true", &[], 80, 24)
             .expect("test PtyHandle spawn 'true' 应成功 (CI 环境必备)");
+        let term = TermState::new(80, 24);
+        // T-0617: 测试入参 title 直接写入 term 的 title handle, 让 for_test 路径
+        // 与 spawn 路径同共享语义.
+        let title_handle = term.title_handle();
+        *title_handle.borrow_mut() = title.to_string();
         Self {
-            term: TermState::new(80, 24),
+            term,
             pty,
-            title: title.to_string(),
+            title: title_handle,
             dirty: false,
             id: TabRegistry::next_id(),
         }
@@ -154,13 +174,27 @@ impl TabInstance {
         self.id
     }
 
-    pub fn title(&self) -> &str {
-        &self.title
+    /// 取当前 tab 标题快照. **T-0617 起返 owned `String`** (非 `&str`) 因 title
+    /// 走 `Rc<RefCell<String>>` 共享态: 借 RefCell 内部 string 跨 fn 边界会撞
+    /// `Ref` 长持 borrow 与 listener `borrow_mut()` 冲突 (panic). clone 短借出
+    /// 来即用即扔, 单线程 calloop (INV-005) 下安全.
+    pub fn title(&self) -> String {
+        self.title.borrow().clone()
     }
 
-    /// 设置 tab 标题 (例: 用户 rename / OSC 同步路径 — 后续 ticket).
+    /// 取 title 共享态 `Rc<RefCell<String>>` clone. 渲染层在 idle 帧前用此读
+    /// 最新 title (`tab.title_handle().borrow().clone()`). 与 [`Self::title`]
+    /// 等价但避免重复 clone — `title_handle()` 仅 Rc clone (free 计数加 1),
+    /// 真 string clone 调用方按需要.
+    pub fn title_handle(&self) -> Rc<RefCell<String>> {
+        Rc::clone(&self.title)
+    }
+
+    /// 设置 tab 标题 (例: 用户手动 rename — 当前无 UI 入口, 测试 / 未来 ticket
+    /// 用). OSC 0/1/2 路径走 [`crate::term::TermListener::send_event`] 直接写
+    /// 共享 Rc, 不经此 fn (listener 拿不到 `&mut TabInstance`).
     pub fn set_title(&mut self, title: String) {
-        self.title = title;
+        *self.title.borrow_mut() = title;
     }
 
     pub fn term(&self) -> &TermState {
@@ -501,7 +535,7 @@ mod tests {
         let mut list = TabList::new(TabInstance::for_test("first"));
         list.push(TabInstance::for_test("second"));
         list.set_active(1);
-        assert_eq!(list.active().title(), "second");
+        assert_eq!(list.active().title(), "second".to_string());
     }
 
     /// TabInstance::set_title 更新存值.
@@ -509,7 +543,7 @@ mod tests {
     fn tab_instance_set_title_updates() {
         let mut tab = TabInstance::for_test("orig");
         tab.set_title("new".to_string());
-        assert_eq!(tab.title(), "new");
+        assert_eq!(tab.title(), "new".to_string());
     }
 
     /// TabInstance::dirty 默认 false (test ctor), mark_dirty 后 true, clear 后 false.

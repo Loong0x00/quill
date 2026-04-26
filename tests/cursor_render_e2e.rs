@@ -38,9 +38,10 @@ const ROWS: usize = 24;
 const CELL_W_LOGICAL: usize = 10;
 const CELL_H_LOGICAL: usize = 25;
 const TITLEBAR_H_LOGICAL: usize = 28;
-// T-0608: cell 区起始 y 现在 = titlebar (28) + tab_bar (28) = 56 logical px.
-const TAB_BAR_H_LOGICAL: usize = 28;
-const TOP_RESERVED_LOGICAL: usize = TITLEBAR_H_LOGICAL + TAB_BAR_H_LOGICAL;
+// T-0608: cell 区起始 y = titlebar (28) + tab_bar (28) = 56 logical px (多 tab 时).
+// T-0617: 单 tab 隐藏 tab bar, render_headless 默认 HEADLESS_TAB_OVERRIDE = (1, 0)
+// → tab_bar_h = 0, top_reserved = titlebar 28 logical only.
+const TOP_RESERVED_LOGICAL: usize = TITLEBAR_H_LOGICAL;
 
 const CURSOR_COL: usize = 5;
 const CURSOR_LINE: usize = 10;

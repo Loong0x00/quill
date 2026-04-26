@@ -539,18 +539,10 @@ const BUTTON_ICON: crate::term::Color = crate::term::Color {
     b: 0xd3,
 };
 
-/// **T-0606: 窗口边框线宽度** (logical px, × HIDPI_SCALE 拿 physical).
-/// 1 logical = 2 physical 在 HIDPI×2, 跟主流 CSD outline 同款细线.
-const BORDER_PX: f32 = 1.0;
-
-/// **T-0606: 窗口边框颜色** (亮灰 #6a6a6a). 之前 #4a4a4a 在新背景 #1d1f21 上
-/// 对比度低 user 实测看不见 (T-0610 part 2 corner mask 还把 corner 区边框
-/// discard, 视觉边框感更弱). 提亮 + 跟新背景对比清晰.
-const BORDER_COLOR: crate::term::Color = crate::term::Color {
-    r: 0x6a,
-    g: 0x6a,
-    b: 0x6a,
-};
+// T-0617: 删 `BORDER_PX` / `BORDER_COLOR` const + `append_border_vertices` fn
+// (T-0606 引入的 1 px 直边框). T-0617 Lead 预先 commit (2be7df9) 已 unhook 调用,
+// 圆角 + 半透明窗口下直边框被 squircle 角咬出 4 个缺口视觉撕裂; 圆角 alpha
+// 渐变本身就是窗口边界, 不需边框.
 
 /// **CSD titlebar 在 cell vertex buffer 内额外占的"虚拟 cell 行"数** (T-0504).
 const TITLEBAR_RESERVED_QUAD_ROWS: usize = 64;
@@ -1121,57 +1113,10 @@ fn titlebar_title_baseline_y(titlebar_h_physical: f32) -> f32 {
     titlebar_h_physical - descender_pad_phys
 }
 
-/// **T-0504 CSD titlebar 顶点生成** — 走 cell pipeline (色块, 同 vertex 格式
-/// `pos[2 f32] + color[3 f32]`). 调用方追加到 cell_vertex_bytes 末尾, cell pass
-/// 一次 draw 同时画 cell 与 titlebar.
-///
-/// 视觉布局 (logical px, 与 [`crate::wl::pointer::hit_test`] 同源):
-/// - 顶部 [`TITLEBAR_H_LOGICAL_PX`] (28 logical) 整 width 灰色矩形 (#2c2c2c).
-/// - 三按钮位于 titlebar 右端: Close (右) → Maximize (中) → Minimize (左),
-///   各 [`BUTTON_W_LOGICAL_PX`] × [`BUTTON_H_LOGICAL_PX`] (24×24 logical).
-/// - 按钮 hover 时背景变深 (#4a4a4a); Close hover 变红 (#e53935).
-/// - 按钮 icon (浅灰 #d3d3d3): Close = 两条对角线; Maximize = 矩形框 (4 边);
-///   Minimize = 中间一横线.
-///
-/// 单位: 入参 `surface_w` / `surface_h` 是 **physical px** (NDC 换算分母),
-/// 内部 logical px × HIDPI_SCALE 算 physical 与 surface 单位一致 — 与
-/// [`Renderer::draw_frame`] 内 cell px × HIDPI_SCALE 同套路.
-///
-/// `is_srgb`: surface 是否 sRGB 格式. 同 [`color_for_vertex_with_srgb`].
-/// T-0606: surface 4 边各画一条 1 logical px 边框线, 让窗口跟桌面背景视觉分
-/// 离 (现在裸 surface 边缘融桌面). 走 cell pipeline 同 buffer, 4 quad append
-/// 到末尾即可, 不增 GPU pass.
-fn append_border_vertices(out: &mut Vec<u8>, surface_w: f32, surface_h: f32, is_srgb: bool) {
-    let hidpi = HIDPI_SCALE as f32;
-    let bw = BORDER_PX * hidpi;
-    let color = color_for_vertex_with_srgb(BORDER_COLOR, is_srgb);
-    // 顶边
-    append_quad_px(out, 0.0, 0.0, surface_w, bw, surface_w, surface_h, color);
-    // 底边
-    append_quad_px(
-        out,
-        0.0,
-        surface_h - bw,
-        surface_w,
-        surface_h,
-        surface_w,
-        surface_h,
-        color,
-    );
-    // 左边
-    append_quad_px(out, 0.0, 0.0, bw, surface_h, surface_w, surface_h, color);
-    // 右边
-    append_quad_px(
-        out,
-        surface_w - bw,
-        0.0,
-        surface_w,
-        surface_h,
-        surface_w,
-        surface_h,
-        color,
-    );
-}
+// T-0617: 删 `append_border_vertices` (T-0606 1 px 直边框, 圆角 + 半透明
+// 窗口下被 squircle 角咬出 4 个缺口视觉撕裂; T-0617 Lead 预先 commit 已 unhook
+// 调用, 本 ticket 把 fn / 配套 const 也清). `BORDER_PX` / `BORDER_COLOR` 已删
+// 在常量区.
 
 /// **T-0615 重构**: titlebar bar bg → cell pipeline (rect, no rounding); 三按钮
 /// → rounded pipeline (圆形, hover 时背景圆显出, 非 hover 走 transparent). icon
@@ -2458,8 +2403,11 @@ impl Renderer {
         let baseline_y_px = BASELINE_Y_PX * HIDPI_SCALE as f32;
         // T-0504: titlebar 高度 (physical px = logical × HIDPI_SCALE).
         // T-0608: 改名语义 — 现在是 "cell 区起始 y" = titlebar + tab_bar.
+        // T-0617: 单 tab 时 tab_bar 隐藏 → cell 区起始 y 仅 titlebar (派单 In #B,
+        // 与 ghostty 单 tab 视觉一致). [`tab_bar_h_logical_for`] 单一来源决策.
+        let tab_bar_h_logical = crate::wl::window::tab_bar_h_logical_for(self.tab_count);
         let titlebar_y_offset_px =
-            (TITLEBAR_H_LOGICAL_PX + TAB_BAR_H_LOGICAL_PX) as f32 * HIDPI_SCALE as f32;
+            (TITLEBAR_H_LOGICAL_PX + tab_bar_h_logical) as f32 * HIDPI_SCALE as f32;
 
         // T-0610 part 2: 全 surface bg fill quad (放最前面 — REPLACE blend 让后续
         // cells / titlebar / tab_bar / border quads 在其上覆盖). 走 cell pipeline,
@@ -2526,20 +2474,25 @@ impl Renderer {
         );
         // T-0608/T-0615: tab bar 顶点. bar bg / icon stroke / 底部 border 走 cell
         // pipeline; + box 圆角 + active tab 圆角 + close × hover 红圆 走 rounded
-        // pipeline. tab_count=0 早返 (启动期 race 兜底, 实战 ≥ 1).
-        append_tab_bar_vertices(
-            &mut cell_vertex_bytes,
-            &mut rounded_vertex_bytes,
-            surface_w,
-            surface_h,
-            self.surface_is_srgb,
-            self.tab_count,
-            self.active_tab_idx,
-            hover,
-        );
+        // pipeline.
+        // T-0617: 单 tab 隐藏 tab bar (派单 In #B). tab_count == 1 时不画 tab bar
+        // — 视觉与 ghostty 单 tab 一致, 终端内容直接接 titlebar 下方.
+        if self.tab_count > 1 {
+            append_tab_bar_vertices(
+                &mut cell_vertex_bytes,
+                &mut rounded_vertex_bytes,
+                surface_w,
+                surface_h,
+                self.surface_is_srgb,
+                self.tab_count,
+                self.active_tab_idx,
+                hover,
+            );
+        }
         // T-0617: 去掉 1 px 直线边框 — 圆角 + 半透明窗口下, 直边框被 squircle
-        // 角咬出 4 个缺口视觉撕裂. 圆角 alpha 渐变本身就是窗口边界, 不需边框.
-        let _ = &mut cell_vertex_bytes; // append_border_vertices removed
+        // 角咬出 4 个缺口视觉撕裂. 圆角 alpha 渐变本身就是窗口边界, 不需边框
+        // (Lead 预先 commit 2be7df9 撤调用, T-0617 把 fn 体本身也删 — 见
+        // `append_border_vertices` 注释占位).
         // cell_vertex_count 在下面的 preedit underline append 后再算 (T-0505)。
 
         // Step 4: shape + raster + atlas allocate + build glyph vertex bytes。
@@ -4040,8 +3993,11 @@ pub fn render_headless(
     let cell_h_px = CELL_H_PX * HIDPI_SCALE as f32;
     let baseline_y_px = BASELINE_Y_PX * HIDPI_SCALE as f32;
     // T-0504/T-0608: cells 偏移到 titlebar + tab_bar 之下 (56 logical = 112 physical).
+    // T-0617: 单 tab (HEADLESS_TAB_OVERRIDE 默认 (1, 0)) 时 tab_bar 隐藏 → 仅 titlebar.
+    let (override_tc, _override_ai) = HEADLESS_TAB_OVERRIDE.with(|c| c.get());
+    let tab_bar_h_logical = crate::wl::window::tab_bar_h_logical_for(override_tc);
     let titlebar_y_offset_px =
-        (TITLEBAR_H_LOGICAL_PX + TAB_BAR_H_LOGICAL_PX) as f32 * HIDPI_SCALE as f32;
+        (TITLEBAR_H_LOGICAL_PX + tab_bar_h_logical) as f32 * HIDPI_SCALE as f32;
 
     let mut cell_vertex_bytes: Vec<u8> =
         Vec::with_capacity(cells.len() * VERTS_PER_CELL * VERTEX_BYTES);
@@ -4134,17 +4090,20 @@ pub fn render_headless(
     // T-0608: tab bar (默认 1 tab, active idx 0). 集成测试通过 thread-local
     // [`HEADLESS_TAB_OVERRIDE`] 注入真 tab_count + active_idx — 派单 In #J PNG
     // 三源 verify 路径.
-    let (tc, ai) = HEADLESS_TAB_OVERRIDE.with(|c| c.get());
-    append_tab_bar_vertices(
-        &mut cell_vertex_bytes,
-        &mut rounded_vertex_bytes,
-        surface_w,
-        surface_h,
-        is_srgb,
-        tc,
-        ai,
-        hover_override,
-    );
+    // T-0617: 单 tab (count=1) 时 tab bar 隐藏 — 与 Renderer::draw_frame 同决策.
+    let (tc, ai) = (override_tc, _override_ai);
+    if tc > 1 {
+        append_tab_bar_vertices(
+            &mut cell_vertex_bytes,
+            &mut rounded_vertex_bytes,
+            surface_w,
+            surface_h,
+            is_srgb,
+            tc,
+            ai,
+            hover_override,
+        );
+    }
     // cell_vertex_count 在 preedit underline append 后再算 (T-0505)。
 
     let effective_rows = row_texts.len().min(rows);
@@ -5842,14 +5801,15 @@ mod tests {
 
     // ---------- T-0610 part 2 corner mask 单测 (派单 In #F) ----------
 
-    /// CORNER_RADIUS_PX 锁: 防"顺手改成 4 / 12 / 16". user 实测 sweet spot 是
-    /// 8 logical (= 16 physical 在 HIDPI×2), 与 ghostty Mac 一致. 改前看
-    /// docs/audit/<日期>-T-0610-review.md 三源 PNG verify.
+    /// CORNER_RADIUS_PX 锁: 防"顺手改成 4 / 16". T-0617 Lead 预先 (commit 2be7df9)
+    /// 把外圆角从 8 → 12 logical (= 24 physical 在 HIDPI×2), 与 macOS Big Sur+
+    /// / ghostty 新版圆角更一致 (squircle SDF 视觉效果在 12 logical 更柔和). 改前
+    /// 看 docs/audit/<日期>-T-0617-review.md 三源 PNG verify.
     #[test]
-    fn corner_radius_is_eight_logical_px() {
+    fn corner_radius_is_twelve_logical_px() {
         assert_eq!(
-            CORNER_RADIUS_PX, 8.0,
-            "T-0610 part 2 圆角半径锁 (logical px), 8 logical = 16 physical (HIDPI×2)"
+            CORNER_RADIUS_PX, 12.0,
+            "T-0617 圆角半径锁 (logical px), 12 logical = 24 physical (HIDPI×2)"
         );
     }
 

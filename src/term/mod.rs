@@ -7,9 +7,12 @@
 //! cell)准备数据源。
 //!
 //! 设计:
-//! - `Term<VoidListener>` —— EventListener 是 title / clipboard / bell 等
-//!   外部副作用回调,Phase 3 的目标是"字节 → grid",这些还不接,用 `VoidListener`
-//!   的 no-op 实现兜住
+//! - `Term<TermListener>` —— EventListener 接 OSC 0/1/2 (title) 写入 quill
+//!   per-tab 共享的 `Rc<RefCell<String>>`(T-0617 起;之前 T-0301 用
+//!   `VoidListener` 占位)。其它 event(Bell / ClipboardStore / ColorRequest /
+//!   PtyWrite / TextAreaSizeRequest / CursorBlinkingChange / ResetTitle /
+//!   ChildExit / Wakeup / MouseCursorDirty / Exit)整体 ignore,后续 ticket
+//!   (剪贴板 / bell 等)按需要再开
 //! - 自建 `Dimensions` impl(alacritty_terminal 把它的 `TermSize` 放在
 //!   `#[cfg(test)]` 的 `term::test` 模块里,下游只能自己实现)
 //! - `advance(bytes)` 是入口,单个方法名一致于上游 `Processor::advance`
@@ -20,7 +23,10 @@
 //! [`cursor_visible`]: TermState::cursor_visible
 //! [`cursor_shape`]: TermState::cursor_shape
 
-use alacritty_terminal::event::VoidListener;
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use alacritty_terminal::event::{Event as AlacEvent, EventListener};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::Point as AlacPoint;
 use alacritty_terminal::term::{Config, Term, TermMode};
@@ -459,18 +465,90 @@ impl Dimensions for TermSize {
     }
 }
 
+/// **T-0617**: alacritty `EventListener` 的实装,接 OSC 0/1/2 title 写入
+/// per-tab 共享的 [`Rc<RefCell<String>>`].
+///
+/// **why Rc<RefCell<>>**: alacritty `Term::new(_, _, listener)` 接 owned listener,
+/// 不能借;但 quill 渲染层 / TabInstance 也要读 title 同一份数据 — 单线程
+/// `calloop` (INV-005) 下 `Rc<RefCell<String>>` 是最直接的共享态 (没 Mutex 跨线程
+/// 开销, 也不需 atomic). [`TabInstance`] 持 clone 的 `Rc`, OSC 进来 listener 写
+/// 一份, draw_frame 读同一份 (`borrow().clone()` 短借不长持, 不撞 RefCell 借用
+/// panic).
+///
+/// **接收 event 列表** (alacritty_terminal 0.26 `EventListener::send_event`):
+/// - `Event::Title(s)` — OSC 0/1/2 来时 alacritty 内部走此路径, 写 `*self.title.borrow_mut() = s`
+/// - 其它 ([`AlacEvent::Bell`] / `ClipboardStore` / `ClipboardLoad` / `ColorRequest` /
+///   `PtyWrite` / `TextAreaSizeRequest` / `CursorBlinkingChange` / `ResetTitle` /
+///   `ChildExit` / `Wakeup` / `MouseCursorDirty` / `Exit`) 整体 noop,后续 ticket
+///   按需要再开 (剪贴板 / bell / cursor blink 等都是单独工程)
+///
+/// **为何不直接持 `&mut TabInstance`**: listener 是 owned 字段, 不能借生命周期;
+/// 即使能借, alacritty `Term::send_event` 调用点深, 拿不到上层 (LoopData /
+/// TabList) 的 `&mut` 路径. Rc 共享态绕过这层. ResetTitle 暂忽略 (默认 quill
+/// 不主动 reset, 用户手动改 prompt 自然写新值).
+pub struct TermListener {
+    /// Per-tab title 共享态. listener 写, [`TabInstance::title()`] / draw_frame
+    /// 读同一份. 默认空字符串 — 上层 (window.rs) 在空时 fallback 到 [`crate::wl::render::DEFAULT_TITLE`]
+    /// = "quill".
+    title: Rc<RefCell<String>>,
+}
+
+impl TermListener {
+    /// 构造一个 listener, 持自己的 title `Rc<RefCell<String>>`. [`TermState`] /
+    /// [`TabInstance`] 通过 [`TermState::title_handle`] 拿同一份 Rc clone.
+    pub fn new(title: Rc<RefCell<String>>) -> Self {
+        Self { title }
+    }
+}
+
+impl EventListener for TermListener {
+    fn send_event(&self, event: AlacEvent) {
+        if let AlacEvent::Title(t) = event {
+            // 长 title (>1 KiB) 截断防恶意 / bug 程序 OSC 喷灌. 主流 terminal
+            // 默认无上限, kitty 配置 max_title=2048; quill daily-drive ASCII +
+            // 短 CJK, 1 KiB 足够 (含 unicode 多字节). titlebar 渲染层若需要再
+            // 截 (字符数 / 像素宽), 这里仅防内存灾难.
+            const MAX_TITLE_BYTES: usize = 1024;
+            let truncated = if t.len() > MAX_TITLE_BYTES {
+                // char_indices 找 ≤ MAX_TITLE_BYTES 的最大 char 边界, 防 utf-8
+                // 中点截断生成非法字符串.
+                let cut = t
+                    .char_indices()
+                    .map(|(i, _)| i)
+                    .take_while(|&i| i <= MAX_TITLE_BYTES)
+                    .last()
+                    .unwrap_or(0);
+                t[..cut].to_string()
+            } else {
+                t
+            };
+            *self.title.borrow_mut() = truncated;
+        }
+        // 其它 event noop. AlacEvent 是 enum, 上游加 variant 会 dead_code lint
+        // 提醒 (实操 alacritty_terminal 主分支 variant 列表稳定).
+    }
+}
+
 /// PTY 字节 → alacritty `Term` 状态机的入口。
 ///
 /// 结构:
 /// - `term`:持 grid / cursor / scrollback / modes 等全部终端状态
 /// - `processor`:VT / ANSI escape 解析器,`advance(&mut term, bytes)` 把
 ///   字节推给 `term` 的 `Handler` impl(alacritty_terminal 内部实现)
+/// - `title`:OSC 0/1/2 写入的窗口标题 `Rc<RefCell<String>>`. listener
+///   ([`TermListener`]) 内部持同一份 `Rc` clone, [`Term::new`] 时把
+///   listener 移给 alacritty `Term`. quill 渲染层 / [`crate::tab::TabInstance`]
+///   通过 [`Self::title_handle`] 拿同一份 Rc clone (单线程 INV-005 下无锁安全)
 ///
 /// 字段顺序:`processor` 先 drop 再 `term` 也行,反过来也行——两者解耦,
-/// processor 只在 advance 时持 &mut term。不登 INV。
+/// processor 只在 advance 时持 &mut term。`title` 是 `Rc<RefCell<String>>`
+/// trivial drop, 顺序无关。不登 INV。
 pub struct TermState {
-    term: Term<VoidListener>,
+    term: Term<TermListener>,
     processor: Processor,
+    /// T-0617: OSC title 共享态. listener 持 clone 写入, draw_frame /
+    /// TabInstance 持 clone 读取. 默认空字符串.
+    title: Rc<RefCell<String>>,
     /// T-0302 dirty flag:`advance` 调用一次即置 true,`clear_dirty` 清零。
     /// 给 T-0305 渲染层"数据有新变动,该重画一帧"信号。
     ///
@@ -492,11 +570,32 @@ impl TermState {
     pub fn new(cols: u16, rows: u16) -> Self {
         let size = TermSize::new(cols as usize, rows as usize);
         let config = Config::default();
+        // T-0617: title 起步空字符串. listener / TermState / TabInstance 共享同
+        // 一份 Rc<RefCell<String>>. listener 是 owned (alacritty Term::new 接 owned),
+        // 我们在构造前先建 Rc, 再 clone 给 listener; TermState 自己也 clone 一份
+        // 方便外部 title_handle() 取同一根.
+        let title: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+        let listener = TermListener::new(title.clone());
         Self {
-            term: Term::new(config, &size, VoidListener),
+            term: Term::new(config, &size, listener),
             processor: Processor::new(),
+            title,
             dirty: true,
         }
+    }
+
+    /// T-0617: 取 OSC title 共享态的 `Rc` clone. [`crate::tab::TabInstance::spawn`]
+    /// 在构造期调用, 把同一份 Rc 存入 TabInstance, 让"渲染层 / TabInstance / 内部
+    /// listener" 三方共享同一根 `Rc<RefCell<String>>`.
+    ///
+    /// **why 暴露 Rc 而非 `&str` snapshot**: 渲染路径每帧需读最新值; 若返 `&str`
+    /// 借生命周期捆死 TermState 借用栈, draw_frame 路径同时还要 `&mut TermState`
+    /// (clear_dirty / cells_iter), borrow checker 不放. Rc clone 是 free 计数加 1,
+    /// 渲染层 `borrow().clone()` 短借不长持, 与 listener `borrow_mut()` 仅在 OSC
+    /// 进来一瞬间冲突可能性极低 (OSC 跑在 advance 路径, 与 draw_frame 串行 — calloop
+    /// 单线程 INV-005, 不会真重叠).
+    pub fn title_handle(&self) -> Rc<RefCell<String>> {
+        Rc::clone(&self.title)
     }
 
     /// 改 grid 尺寸为 `cols × rows`。Wayland configure 事件后由
@@ -1848,5 +1947,74 @@ mod tests {
             t.is_dirty(),
             "resize 到相同尺寸也应置 dirty (调用方一致语义)"
         );
+    }
+
+    /// T-0617 #A: TermListener::send_event(Title("foo")) 后 title 共享态 ==
+    /// "foo". 验证 listener trait impl 的 single-method 路径 + Rc<RefCell<>>
+    /// 共享语义 — listener 写 / handle 读看到同一份.
+    #[test]
+    fn term_listener_send_event_title_updates_shared_handle() {
+        let title: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+        let listener = TermListener::new(title.clone());
+        listener.send_event(AlacEvent::Title("foo".to_string()));
+        assert_eq!(&*title.borrow(), "foo");
+        // 再来一次, 验证可覆盖
+        listener.send_event(AlacEvent::Title("bar".to_string()));
+        assert_eq!(&*title.borrow(), "bar");
+    }
+
+    /// T-0617 #A: 其它 AlacEvent (e.g. Bell) 不动 title.
+    #[test]
+    fn term_listener_send_event_non_title_is_noop() {
+        let title: Rc<RefCell<String>> = Rc::new(RefCell::new("orig".to_string()));
+        let listener = TermListener::new(title.clone());
+        listener.send_event(AlacEvent::Bell);
+        listener.send_event(AlacEvent::CursorBlinkingChange);
+        listener.send_event(AlacEvent::ResetTitle);
+        listener.send_event(AlacEvent::Wakeup);
+        assert_eq!(&*title.borrow(), "orig", "非 Title event 不该改 title");
+    }
+
+    /// T-0617 #A: 长 title 截断到 ≤ 1024 byte, 不在 utf-8 char 中点截.
+    #[test]
+    fn term_listener_truncates_huge_title_at_char_boundary() {
+        let title: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+        let listener = TermListener::new(title.clone());
+        // 2000 ASCII chars → 截断到 1024 bytes
+        let huge: String = "a".repeat(2000);
+        listener.send_event(AlacEvent::Title(huge));
+        assert!(
+            title.borrow().len() <= 1024,
+            "长 title 应被截到 ≤ 1024 byte, got {}",
+            title.borrow().len()
+        );
+        // CJK 多字节 (3 byte / char), 600 chars = 1800 byte, 截断后仍 valid utf-8.
+        let cjk: String = "中".repeat(600);
+        listener.send_event(AlacEvent::Title(cjk));
+        let stored = title.borrow().clone();
+        assert!(stored.len() <= 1024);
+        // 截断点应在 char boundary — 重新 parse 不该 panic / lossy.
+        assert!(
+            stored.chars().all(|c| c == '中'),
+            "截断后字符应仍是合法 '中', got {:?}",
+            stored
+        );
+    }
+
+    /// T-0617 #A: TermState 透传 OSC 0 字节流 → title_handle 同步可见.
+    /// 端到端验 alacritty `Processor::advance` → Term Handler → listener.send_event(Title)
+    /// → Rc<RefCell<>> 写入 路径全跑通.
+    #[test]
+    fn term_state_advance_osc_0_updates_title_handle() {
+        let mut t = TermState::new(80, 24);
+        let handle = t.title_handle();
+        assert_eq!(&*handle.borrow(), "", "前置: title 起步空");
+        // OSC 0 ; hello BEL — VT 标准 set window title (兼容 icon name).
+        t.advance(b"\x1b]0;hello\x07");
+        assert_eq!(&*handle.borrow(), "hello", "OSC 0 后 title 应同步");
+        // OSC 2 ; world BEL — set window title (xterm 区分 OSC 1 / 2,
+        // alacritty 把 0/1/2 都翻译成 Event::Title).
+        t.advance(b"\x1b]2;world\x07");
+        assert_eq!(&*handle.borrow(), "world", "OSC 2 后 title 应同步");
     }
 }
