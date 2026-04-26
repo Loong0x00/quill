@@ -580,10 +580,26 @@ impl TermState {
     /// 测试 / 人工调试。
     pub fn line_text(&self, line: usize) -> String {
         use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::cell::Flags;
         let grid = self.term.grid();
         let row = &grid[Line(line as i32)];
         let cols = grid.columns();
-        (0..cols).map(|c| row[Column(c)].c).collect()
+        // 跳过 WIDE_CHAR_SPACER cell: alacritty 协议下 CJK 字符占 2 cells (实字
+        // cell + spacer cell, spacer 的 .c 是空格 ' '), 渲染层走 shape_line
+        // cascade 时若把 spacer 当独立字符, CJK 视觉宽度变 3 cells (T-0801 force
+        // 2× advance + spacer 1 cell), cursor 按 grid col 算反而显得错位。
+        // 跳过 spacer 让 row_text 长度 == grid 实际"语义字符数", shape_line 严
+        // 按 grid cell 宽度 cascade。
+        (0..cols)
+            .filter_map(|c| {
+                let cell = &row[Column(c)];
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    None
+                } else {
+                    Some(cell.c)
+                }
+            })
+            .collect()
     }
 
     // ---------- T-0302 渲染 API ----------
@@ -792,11 +808,22 @@ impl TermState {
     /// 不做 bounds check (与 `line_text` 一致, 调用方应用 dimensions 校验).
     pub fn display_text(&self, line: usize) -> String {
         use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::cell::Flags;
         let grid = self.term.grid();
         let alac_line = Line(line as i32 - grid.display_offset() as i32);
         let row = &grid[alac_line];
         let cols = grid.columns();
-        (0..cols).map(|c| row[Column(c)].c).collect()
+        // 见 line_text 同款 spacer 跳过逻辑 (修 CJK cursor 错位 bug, T-0801 fix-up)。
+        (0..cols)
+            .filter_map(|c| {
+                let cell = &row[Column(c)];
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    None
+                } else {
+                    Some(cell.c)
+                }
+            })
+            .collect()
     }
 
     // ---------- T-0304 scrollback API ----------
