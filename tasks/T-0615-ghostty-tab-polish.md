@@ -2,7 +2,7 @@
 
 **Phase**: 7+ (polish, 跟 ghostty / libadwaita / GNOME 50 视觉对齐)
 **Assigned**: writer-T0615
-**Status**: claimed
+**Status**: in-review
 **Budget**: tokenBudget=300k (跨 wgpu shader per-element corner mask + uniform
 buffer 数组 + hit_test 圆形 button + 渲染层 quad → rounded rect 重构)
 **Dependencies**: T-0608 (multi-tab 现状) / T-0610 part 2 (corner mask shader 现有)
