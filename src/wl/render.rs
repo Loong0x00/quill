@@ -42,6 +42,9 @@ pub const CLEAR_COLOR_SRGB_U8: [u8; 4] = [0x1d, 0x1f, 0x21, 0xff];
 ///
 /// **why 0.85**: ghostty Mac 默认 + user 实测值, "把 quill 放任何窗口上面都能
 /// 看下面内容" 体验 sweet spot. 太透 (< 0.7) 字形难辨, 太实 (> 0.95) 没意义.
+/// **窗口背景半透明** (0.85). 仅作用于 default-bg 的 surface fill quad, 让桌面
+/// 壁纸透出来 15%. SGR-染色 cell bg 走 per-vertex alpha=1.0, 不受影响 — 字色
+/// 块满深度 (ghostty 标准做法).
 const CLEAR_ALPHA_LIVE: f64 = 0.85;
 
 /// sRGB 分量 → 线性分量。LoadOp::Clear 的值在 sRGB 格式 view 上写入前会被当作
@@ -365,7 +368,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         discard;
     }
     let aa = clamp(0.5 - d, 0.0, 1.0);
-    return vec4<f32>(in.color, alpha * mask.alpha_live * aa);
+    // T-0618 follow-up: 字形**不**乘 alpha_live (窗口透明度). 窗口半透 (0.85)
+    // 设计是给 bg 透出桌面壁纸看, 字形该 100% 不透明 — 否则桌面色 bleed 进
+    // 字形, 视觉上"红字看起来粉" (用户实测 ghostty 不透明显的 (255,107,128)
+    // 在 quill 变成 (200,112,144), 用户感知"颜色不对"). alpha_live 仍作用于
+    // bg fill quad / cell bg quads.
+    return vec4<f32>(in.color, alpha * aa);
 }
 "#;
 
@@ -686,9 +694,11 @@ pub enum CursorStyle {
 /// (raster 真翻倍验证)。
 pub const HIDPI_SCALE: u32 = 2;
 
-/// 每顶点字节数:`pos[2 f32] + color[3 f32]` = 20 字节。手算固化,WGSL 端
-/// 与本常量必须一致(见 [`CELL_WGSL`])。
-const VERTEX_BYTES: usize = 5 * std::mem::size_of::<f32>();
+/// 每顶点字节数:`pos[2 f32] + color[3 f32] + alpha[1 f32]` = 24 字节。
+/// alpha 是 per-vertex 不透明度 — bg fill quad 用 alpha_live (0.85, 透明显桌面
+/// 壁纸), SGR 染色 cell quads 用 1.0 (不透明, 字色满深度). 跟 ghostty 处理半
+/// 透明背景同决策. WGSL 端 [`CELL_WGSL`] 必须同步.
+const VERTEX_BYTES: usize = 6 * std::mem::size_of::<f32>();
 
 /// **T-0610 part 2: corner mask uniform 字节数** (4 × f32 = 16 字节, std140 兼容).
 /// `[surface_w, surface_h, corner_radius_phys, alpha_live]` —— wgsl 端 struct
@@ -855,11 +865,13 @@ struct CornerMask {
 struct VsIn {
     @location(0) pos: vec2<f32>,
     @location(1) color: vec3<f32>,
+    @location(2) alpha: f32,
 };
 
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) color: vec3<f32>,
+    @location(1) alpha: f32,
 };
 
 @group(1) @binding(0) var<uniform> mask: CornerMask;
@@ -869,6 +881,7 @@ fn vs_main(v: VsIn) -> VsOut {
     var out: VsOut;
     out.clip = vec4<f32>(v.pos, 0.0, 1.0);
     out.color = v.color;
+    out.alpha = v.alpha;
     return out;
 }
 
@@ -880,16 +893,15 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let cx = clamp(p.x, r, s.x - r);
     let cy = clamp(p.y, r, s.y - r);
     let corner_dist = vec2<f32>(p.x - cx, p.y - cy);
-    // T-0616: squircle (L^n) SDF 取代圆弧 length()-r — 视觉跟 Apple iOS 圆角
-    // continuous-curvature 对齐. d 已 signed: 负 = rounded rect 内, 0 = 边界,
-    // > 1 = AA 带外 (discard). n=SQUIRCLE_EXPONENT (5.0) 由 build_shader_source
-    // 注入, 测试路径切 n=2 退化为圆.
     let d = squircle_sdf(corner_dist, r, SQUIRCLE_EXPONENT);
     if (d > 1.0) {
         discard;
     }
     let aa = clamp(0.5 - d, 0.0, 1.0);
-    let final_a = mask.alpha_live * aa;
+    // T-0618 follow-up: per-vertex alpha. bg fill quad 入参 alpha_live (0.85),
+    // SGR 染色 cell 入参 1.0 — 区分"窗口透明显壁纸" vs "字色满深度". mask
+    // uniform 的 alpha_live 字段保留作 fallback / 未来用, 当前路径不读.
+    let final_a = in.alpha * aa;
     return vec4<f32>(in.color * final_a, final_a);
 }
 "#;
@@ -1021,6 +1033,24 @@ fn append_quad_px(
     surface_h: f32,
     color: [f32; 3],
 ) {
+    append_quad_px_with_alpha(out, x0_px, y0_px, x1_px, y1_px, surface_w, surface_h, color, 1.0)
+}
+
+/// T-0618 follow-up: 同 [`append_quad_px`] 但带 per-vertex alpha. 默认调用方
+/// (selection / preedit underline / cursor / SGR cell bg / titlebar fill) 走
+/// 1.0 (不透明), 仅 [`append_background_fill_quad`] 用 alpha_live 走窗口透明.
+#[allow(clippy::too_many_arguments)]
+fn append_quad_px_with_alpha(
+    out: &mut Vec<u8>,
+    x0_px: f32,
+    y0_px: f32,
+    x1_px: f32,
+    y1_px: f32,
+    surface_w: f32,
+    surface_h: f32,
+    color: [f32; 3],
+    alpha: f32,
+) {
     let left = x0_px / surface_w * 2.0 - 1.0;
     let right = x1_px / surface_w * 2.0 - 1.0;
     let top = 1.0 - y0_px / surface_h * 2.0;
@@ -1039,6 +1069,7 @@ fn append_quad_px(
         out.extend_from_slice(&color[0].to_ne_bytes());
         out.extend_from_slice(&color[1].to_ne_bytes());
         out.extend_from_slice(&color[2].to_ne_bytes());
+        out.extend_from_slice(&alpha.to_ne_bytes());
     }
 }
 
@@ -1639,8 +1670,12 @@ fn create_corner_mask_resources(
 /// cells 与 border 在 bg fill 之上 REPLACE 覆盖 (它们也走 cell shader corner
 /// mask, corner 外 discard 不破透明效果).
 fn append_background_fill_quad(out: &mut Vec<u8>, surface_w: f32, surface_h: f32, color: [f32; 3]) {
-    append_quad_px(
+    // T-0618 follow-up: bg fill 用 alpha_live (CLEAR_ALPHA_LIVE = 0.85) 让壁纸
+    // 透出 15%. 其他 cell quads (SGR 染色 / cursor / selection) 用 alpha=1.0
+    // 满深度. 结果: 默认空区半透明显桌面, 字色 / SGR bg 块满色.
+    append_quad_px_with_alpha(
         out, 0.0, 0.0, surface_w, surface_h, surface_w, surface_h, color,
+        CLEAR_ALPHA_LIVE as f32,
     );
 }
 
@@ -2185,6 +2220,14 @@ impl Renderer {
                 shader_location: 1,
                 format: wgpu::VertexFormat::Float32x3,
             },
+            // T-0618 follow-up: per-vertex alpha (location 2). bg fill quad
+            // 用 alpha_live (0.85), SGR 染色 cell quads 用 1.0 — 区分窗口透明
+            // 显壁纸 vs 字色满深度.
+            wgpu::VertexAttribute {
+                offset: (5 * std::mem::size_of::<f32>()) as u64,
+                shader_location: 2,
+                format: wgpu::VertexFormat::Float32,
+            },
         ];
         let pipeline = self
             .device
@@ -2276,21 +2319,22 @@ impl Renderer {
     ) -> Vec<u8> {
         let mut out: Vec<u8> = Vec::with_capacity(cells.len() * VERTS_PER_CELL * VERTEX_BYTES);
         for cell in cells {
-            // 稀疏渲染:空白 cell 不贡献顶点,深蓝清屏在该位置显露。
-            if cell.c == ' ' {
-                continue;
-            }
-            // T-0604: cell.bg 等于默认 bg (`#000000`, `Color::DEFAULT_BG`) 时跳过
-            // vertex 生成 — alacritty / xterm / foot 标准做法 ("default bg 不画",
-            // 让 clear color #0a1030 透出, 视觉对齐主流终端)。
-            // 仅 [`CellColorSource::Bg`] 路径需此跳过 (Phase 4 主路径); Fg 路径
-            // (Phase 3 fallback) cell.bg 不参与染色, 该跳过分支 no-op 但为语义
-            // 一致仍执行 — 实测 fg 路径下 cell.bg 默认仍是 DEFAULT_BG, "跳过" 不
-            // 区分 source 反而误抹 fg 色块视觉锚点 (T-0305 acceptance), 故 source
-            // 限定 Bg。
-            // WIDE_CHAR_SPACER cell 同走此路径 (alacritty CJK 双宽 spacer cell
-            // bg 默认黑) → spacer 不画 → CJK 字之间无黑色空隙 (派单 Bug 2 自动修)。
-            if matches!(color_source, CellColorSource::Bg) && cell.bg == CELL_BG_DEFAULT {
+            // 跳过条件按 color_source 分:
+            //
+            // - **Bg pass** (Phase 4 主路径): 跳过当 `bg == DEFAULT_BG` —
+            //   alacritty / xterm / foot / ghostty 标准做法 ("default bg 不画",
+            //   让 clear color 透出). **空格非空格不区分** —— claudecode 等 TUI
+            //   用 SGR `\x1b[42m   \x1b[K` 染整行绿色, 后面 trailing spaces 也带
+            //   非默认 bg, 必须画 bg quad (这一条之前漏了, 致 diff add/remove 行
+            //   只染有字符的部分, 后续空格仍黑色).
+            //
+            // - **Fg pass** (Phase 3 fallback / draw_cells 路径): 跳过当 `c == ' '`
+            //   — 视觉是 "字符位置以 fg 色块占位", 空格本无字形不画块.
+            let skip = match color_source {
+                CellColorSource::Bg => cell.bg == CELL_BG_DEFAULT,
+                CellColorSource::Fg => cell.c == ' ',
+            };
+            if skip {
                 continue;
             }
             let x0_px = cell.pos.col as f32 * cell_w_px;
@@ -2334,6 +2378,8 @@ impl Renderer {
                 out.extend_from_slice(&color[0].to_ne_bytes());
                 out.extend_from_slice(&color[1].to_ne_bytes());
                 out.extend_from_slice(&color[2].to_ne_bytes());
+                // SGR 染色 cell bg 满深度 (alpha=1.0). 仅 bg fill quad 走 alpha_live.
+                out.extend_from_slice(&1.0_f32.to_ne_bytes());
             }
         }
         out
@@ -2681,6 +2727,7 @@ impl Renderer {
                     cell_w_px,
                     cell_h_px,
                     baseline_y_px,
+                    titlebar_y_offset_px,
                     surface_w,
                     surface_h,
                     preedit_color,
@@ -2697,6 +2744,7 @@ impl Renderer {
                     p.text.chars().count(),
                     cell_w_px,
                     cell_h_px,
+                    titlebar_y_offset_px,
                     surface_w,
                     surface_h,
                     underline_color,
@@ -3520,6 +3568,7 @@ impl Renderer {
         cell_w_px: f32,
         cell_h_px: f32,
         baseline_y_px: f32,
+        titlebar_y_offset_px: f32,
         surface_w: f32,
         surface_h: f32,
         glyph_color: [f32; 3],
@@ -3527,9 +3576,10 @@ impl Renderer {
         // shape preedit 行 (cosmic-text 走 CJK fallback, T-0405 实测)
         let glyphs = text_system.shape_line(text);
         // preedit 行起绘 x 偏移 (cursor cell 左上角的 surface px). y 同主路径
-        // 用 cursor_line × cell_h_px。
+        // 用 cursor_line × cell_h_px + titlebar_y_offset_px (T-0618 follow-up:
+        // 之前漏加 titlebar offset 致 preedit 画到 cell grid 上方/titlebar 区).
         let base_x_px = cursor_col as f32 * cell_w_px;
-        let base_y_px = cursor_line as f32 * cell_h_px;
+        let base_y_px = cursor_line as f32 * cell_h_px + titlebar_y_offset_px;
         for glyph in &glyphs {
             if !glyph.x_advance.is_finite() || !glyph.x_offset.is_finite() {
                 continue;
@@ -3594,6 +3644,7 @@ fn append_preedit_underline_to_cell_bytes(
     char_count: usize,
     cell_w_px: f32,
     cell_h_px: f32,
+    titlebar_y_offset_px: f32,
     surface_w: f32,
     surface_h: f32,
     underline_color: [f32; 3],
@@ -3604,8 +3655,9 @@ fn append_preedit_underline_to_cell_bytes(
     let underline_thickness_px = PREEDIT_UNDERLINE_PX as f32 * HIDPI_SCALE as f32;
     let x0_px = cursor_col as f32 * cell_w_px;
     let x1_px = x0_px + (char_count as f32) * cell_w_px;
-    // y 在 cell 底部往上 underline_thickness_px
-    let y1_px = (cursor_line + 1) as f32 * cell_h_px;
+    // y 在 cell 底部往上 underline_thickness_px (加 titlebar offset 让 preedit
+    // 跟 cell grid 整体对齐, 不画到 titlebar 区).
+    let y1_px = (cursor_line + 1) as f32 * cell_h_px + titlebar_y_offset_px;
     let y0_px = y1_px - underline_thickness_px;
 
     let left = x0_px / surface_w * 2.0 - 1.0;
@@ -3627,6 +3679,7 @@ fn append_preedit_underline_to_cell_bytes(
         cell_vertex_bytes.extend_from_slice(&underline_color[0].to_ne_bytes());
         cell_vertex_bytes.extend_from_slice(&underline_color[1].to_ne_bytes());
         cell_vertex_bytes.extend_from_slice(&underline_color[2].to_ne_bytes());
+        cell_vertex_bytes.extend_from_slice(&1.0_f32.to_ne_bytes());
     }
 }
 
@@ -3680,6 +3733,7 @@ fn append_selection_bg_to_cell_bytes(
             cell_vertex_bytes.extend_from_slice(&color[0].to_ne_bytes());
             cell_vertex_bytes.extend_from_slice(&color[1].to_ne_bytes());
             cell_vertex_bytes.extend_from_slice(&color[2].to_ne_bytes());
+            cell_vertex_bytes.extend_from_slice(&1.0_f32.to_ne_bytes());
         }
     }
 }
@@ -3753,6 +3807,7 @@ fn append_cursor_quads_to_cell_bytes(
             cell_vertex_bytes.extend_from_slice(&color[0].to_ne_bytes());
             cell_vertex_bytes.extend_from_slice(&color[1].to_ne_bytes());
             cell_vertex_bytes.extend_from_slice(&color[2].to_ne_bytes());
+            cell_vertex_bytes.extend_from_slice(&1.0_f32.to_ne_bytes());
         }
     };
 
@@ -4056,13 +4111,10 @@ pub fn render_headless(
     );
     append_background_fill_quad(&mut cell_vertex_bytes, surface_w, surface_h, bg_fill_color);
     for cell in cells {
-        if cell.c == ' ' {
-            continue;
-        }
-        // T-0604: 与 Renderer::build_vertex_bytes Bg 路径同语义跳过 default bg
-        // — render_headless 走 cell.bg 染色 (上方 line 注释引 T-0407 D fix), 默认
-        // bg cell 跳过让 clear color #0a1030 透出, alacritty / xterm / foot 标准
-        // 做法。WIDE_CHAR_SPACER cell 同走此路径 (派单 Bug 2 自动修)。
+        // 跳过默认 bg cell (alacritty / xterm / foot / ghostty 标准: default bg
+        // 不画, 让 clear color 透出). **空格非空格不分** —— claudecode 等 TUI
+        // 用 SGR + trailing spaces 染整行 bg, 必须画 quad. 跟 Renderer::build_vertex_bytes
+        // Bg 路径同决策 (之前先跳空格致 diff 行只染有字符部分).
         if cell.bg == CELL_BG_DEFAULT {
             continue;
         }
@@ -4094,6 +4146,7 @@ pub fn render_headless(
             cell_vertex_bytes.extend_from_slice(&color[0].to_ne_bytes());
             cell_vertex_bytes.extend_from_slice(&color[1].to_ne_bytes());
             cell_vertex_bytes.extend_from_slice(&color[2].to_ne_bytes());
+            cell_vertex_bytes.extend_from_slice(&1.0_f32.to_ne_bytes());
         }
     }
     // T-0607: selection bg quads (与 draw_frame 同源, append 顺序在 cell 之后
@@ -4427,7 +4480,7 @@ pub fn render_headless(
     if let Some(p) = preedit {
         if !p.text.is_empty() {
             let base_x_px = p.cursor_col as f32 * cell_w_px;
-            let base_y_px = p.cursor_line as f32 * cell_h_px;
+            let base_y_px = p.cursor_line as f32 * cell_h_px + titlebar_y_offset_px;
             let preedit_glyphs = text_system.shape_line(&p.text);
             for glyph in &preedit_glyphs {
                 if !glyph.x_advance.is_finite() || !glyph.x_offset.is_finite() {
@@ -4555,6 +4608,7 @@ pub fn render_headless(
                 p.text.chars().count(),
                 cell_w_px,
                 cell_h_px,
+                titlebar_y_offset_px,
                 surface_w,
                 surface_h,
                 underline_color,
@@ -4807,6 +4861,11 @@ fn create_headless_cell_pipeline(
             offset: (2 * std::mem::size_of::<f32>()) as u64,
             shader_location: 1,
             format: wgpu::VertexFormat::Float32x3,
+        },
+        wgpu::VertexAttribute {
+            offset: (5 * std::mem::size_of::<f32>()) as u64,
+            shader_location: 2,
+            format: wgpu::VertexFormat::Float32,
         },
     ];
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -5800,10 +5859,11 @@ mod tests {
         ) -> Vec<u8> {
             let mut out: Vec<u8> = Vec::with_capacity(cells.len() * VERTS_PER_CELL * VERTEX_BYTES);
             for cell in cells {
-                if cell.c == ' ' {
-                    continue;
-                }
-                if matches!(color_source, CellColorSource::Bg) && cell.bg == CELL_BG_DEFAULT {
+                let skip = match color_source {
+                    CellColorSource::Bg => cell.bg == CELL_BG_DEFAULT,
+                    CellColorSource::Fg => cell.c == ' ',
+                };
+                if skip {
                     continue;
                 }
                 let x0_px = cell.pos.col as f32 * cell_w_px;
@@ -5835,6 +5895,7 @@ mod tests {
                     out.extend_from_slice(&color[0].to_ne_bytes());
                     out.extend_from_slice(&color[1].to_ne_bytes());
                     out.extend_from_slice(&color[2].to_ne_bytes());
+                    out.extend_from_slice(&1.0_f32.to_ne_bytes());
                 }
             }
             out
