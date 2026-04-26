@@ -2,7 +2,7 @@
 
 **Phase**: 8 (polish++, daily-drive feel)
 **Assigned**: writer-T0802
-**Status**: in-review
+**Status**: merged
 **Budget**: tokenBudget=100k (跨 wgpu present_mode + Surface::configure 节流 + window resize event 处理)
 **Dependencies**: T-0102 (Renderer init) / INV-006 (resize_dirty 单消费者)
 **Priority**: P1 (user 实测拖窗口边卡顿明显, "巨大延迟和滑动, 手感不干脆")
