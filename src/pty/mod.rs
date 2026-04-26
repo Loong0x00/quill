@@ -97,6 +97,12 @@ impl PtyHandle {
         // 现代 ncurses / readline 程序都认这个值,比空字符串安全得多。
         let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into());
         cmd.env("TERM", term);
+        // T-0618 follow-up: 声明真彩色支持. ghostty / alacritty / kitty / foot
+        // 都设这个, Node.js supports-color (chalk / ink) 据此输出 truecolor
+        // `\x1b[38;2;R;G;B m`. 没设的话 claude/ink 把 truecolor 降级到最近 xterm-256
+        // 索引 — 跟其他终端真彩色路径不同色 (用户实测 quill 显粉 / ghostty 显真红,
+        // 同 claude 二进制不同环境). 24-bit 真彩色现代终端必备 default.
+        cmd.env("COLORTERM", "truecolor");
 
         // 顺序敏感:`slave.spawn_command(cmd)` **必须** 在 `drop(pair.slave)` 之前。
         // 调换顺序会导致 spawn 时 slave 已无效 / master 永远读不到 EOF(子进程

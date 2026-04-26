@@ -270,65 +270,84 @@ impl Color {
 fn named_color_rgb(name: NamedColor) -> Color {
     use NamedColor as N;
     match name {
-        // ANSI 16 标准色 (xterm-classic palette)
-        N::Black => Color { r: 0, g: 0, b: 0 },
-        N::Red => Color { r: 170, g: 0, b: 0 },
-        N::Green => Color { r: 0, g: 170, b: 0 },
-        N::Yellow => Color {
-            r: 170,
-            g: 85,
-            b: 0,
+        // ANSI 16 — alacritty 默认 (Tango). 跟 BrightX 同源, 视觉一致.
+        N::Black => Color {
+            r: 0x2e,
+            g: 0x34,
+            b: 0x36,
         },
-        N::Blue => Color { r: 0, g: 0, b: 170 },
+        N::Red => Color {
+            r: 0xcc,
+            g: 0x00,
+            b: 0x00,
+        },
+        N::Green => Color {
+            r: 0x4e,
+            g: 0x9a,
+            b: 0x06,
+        },
+        N::Yellow => Color {
+            r: 0xc4,
+            g: 0xa0,
+            b: 0x00,
+        },
+        N::Blue => Color {
+            r: 0x34,
+            g: 0x65,
+            b: 0xa4,
+        },
         N::Magenta => Color {
-            r: 170,
-            g: 0,
-            b: 170,
+            r: 0x75,
+            g: 0x50,
+            b: 0x7b,
         },
         N::Cyan => Color {
-            r: 0,
-            g: 170,
-            b: 170,
+            r: 0x06,
+            g: 0x98,
+            b: 0x9a,
         },
         N::White => Color {
-            r: 170,
-            g: 170,
-            b: 170,
+            r: 0xd3,
+            g: 0xd7,
+            b: 0xcf,
         },
         N::BrightBlack => Color {
-            r: 85,
-            g: 85,
-            b: 85,
+            r: 0x55,
+            g: 0x57,
+            b: 0x53,
         },
+        // alacritty 默认 (Tango) — 工业标准, alacritty / gnome-terminal /
+        // xfce4-terminal 默认都用这套. BrightBlue 是真蓝不是紫, BrightRed 是
+        // 真红不是粉. 之前蒙的 palette 错了 (BrightBlue 蒙成紫色).
         N::BrightRed => Color {
-            r: 255,
-            g: 85,
-            b: 85,
+            r: 0xef,
+            g: 0x29,
+            b: 0x29,
         },
         N::BrightGreen => Color {
-            r: 85,
-            g: 255,
-            b: 85,
+            r: 0x8a,
+            g: 0xe2,
+            b: 0x34,
         },
         N::BrightYellow => Color {
-            r: 255,
-            g: 255,
-            b: 85,
+            r: 0xfc,
+            g: 0xe9,
+            b: 0x4f,
         },
         N::BrightBlue => Color {
-            r: 85,
-            g: 85,
-            b: 255,
+            r: 0x72,
+            g: 0x9f,
+            b: 0xcf,
         },
         N::BrightMagenta => Color {
-            r: 255,
-            g: 85,
-            b: 255,
+            r: 0xad,
+            g: 0x7f,
+            b: 0xa8,
         },
         N::BrightCyan => Color {
-            r: 85,
-            g: 255,
-            b: 255,
+            r: 0x34,
+            g: 0xe2,
+            b: 0xe2,
         },
         N::BrightWhite => Color {
             r: 255,
@@ -822,6 +841,30 @@ impl TermState {
         self.term.mode().contains(TermMode::BRACKETED_PASTE)
     }
 
+    /// alt screen 模式 (DECSET 1049 / 47 / 1047) 是否激活. claudecode / vim /
+    /// less / tmux / htop 等全屏 TUI 切到 alt screen 后, scrollback 不可用 —
+    /// 此时 quill 不该走 scroll_display, 应把滚轮转为 cursor up/down 转发给
+    /// PTY (alacritty / xterm / foot 等标准做法, 由 `ALTERNATE_SCROLL` mode 闸).
+    pub fn is_alt_screen(&self) -> bool {
+        self.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
+    /// `ALTERNATE_SCROLL` (DECSET 1007) 模式是否启用. 默认 on (alacritty
+    /// `enable_default_modes`). 在 alt screen 模式下: on → 滚轮转 cursor 键,
+    /// off → 滚轮无效 (TUI 自己处理 SGR 鼠标). claudecode 用 SGR mouse 自处理
+    /// 时会关此 mode, 但通常 on. 调用方应同时检查 `is_alt_screen() &&
+    /// alternate_scroll_active()` 决定是否走 cursor 键转发.
+    pub fn alternate_scroll_active(&self) -> bool {
+        self.term.mode().contains(TermMode::ALTERNATE_SCROLL)
+    }
+
+    /// app cursor (DECCKM `\x1b[?1h/l`) 模式. **on 用 SS3 序列** (`ESC O A/B/C/D`),
+    /// **off 用 CSI** (`ESC [ A/B/C/D`). vim / readline 默认 on. 滚轮转 cursor
+    /// 键时方向序列要按此 mode 选, 否则 TUI 收到错的转义.
+    pub fn app_cursor_keys(&self) -> bool {
+        self.term.mode().contains(TermMode::APP_CURSOR)
+    }
+
     /// 光标形状,见 [`CursorShape`]。**与 [`cursor_visible`] 正交,两个都得查**:
     /// 渲染层伪代码 `if t.cursor_visible() { draw_cursor(t.cursor_shape()) }`。
     ///
@@ -950,6 +993,32 @@ impl TermState {
             .collect()
     }
 
+    /// 同 [`Self::display_text`] 但 WIDE_CHAR_SPACER cell 用 `'\0'` 占位 (而非
+    /// 跳过). 用于 selection 文本提取 — 让返回字符串的 char 数 == 行 cell 数,
+    /// 调用方按 cell col 索引 substr 不再对 CJK 偏 1. 调用方必须事后 `replace('\0', "")`
+    /// 去掉占位, 得到自然文本 (跟 display_text 同语义).
+    ///
+    /// **why `\0`**: 不会出现在正常终端输出 (TUI 不输出 NUL), 是无歧义 marker.
+    /// 替换比"判断哪个空格是 spacer"简单得多.
+    pub fn display_text_with_spacers(&self, line: usize) -> String {
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::cell::Flags;
+        let grid = self.term.grid();
+        let alac_line = Line(line as i32 - grid.display_offset() as i32);
+        let row = &grid[alac_line];
+        let cols = grid.columns();
+        (0..cols)
+            .map(|c| {
+                let cell = &row[Column(c)];
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    '\0'
+                } else {
+                    cell.c
+                }
+            })
+            .collect()
+    }
+
     // ---------- T-0304 scrollback API ----------
     // alacritty `Grid` 已经实装 ring-buffer 形式的 scrollback storage(`Term::new`
     // 时按 `Config::scrolling_history` 默认 10000 行预留 max_scroll_limit),viewport
@@ -1053,6 +1122,7 @@ impl<'a> Iterator for CellsIter<'a> {
     type Item = CellRef;
 
     fn next(&mut self) -> Option<Self::Item> {
+        use alacritty_terminal::term::cell::Flags;
         self.inner.next().map(|indexed| {
             // T-0602: scrollback 偏移补正 — display_iter 在 display_offset > 0
             // 时产出负 line, 此处加 display_offset 让 line 落回 [0, screen_lines).
@@ -1065,11 +1135,26 @@ impl<'a> Iterator for CellsIter<'a> {
             // 不再分支 Spec/Named/Indexed。
             let mut pos_alac = indexed.point;
             pos_alac.line += self.display_offset;
+            let mut fg = Color::from_alacritty(indexed.cell.fg);
+            let mut bg = Color::from_alacritty(indexed.cell.bg);
+            // T-0618 follow-up: 解析 INVERSE 标志 (SGR 7), 交换 fg/bg.
+            // claudecode (Ink) 用 SGR 7 画 cursor / selection 反相 cell, 实测 55
+            // 处使用. 之前 quill 忽略此 flag 致 cursor 不可见 (cursor cell 看着
+            // 跟普通 cell 一模一样). 在 iterator 处解析让渲染层无感, 且 INVERSE
+            // 后 fg=cell bg, bg=cell fg, 后续路径 (build_vertex_bytes Bg, glyph
+            // pass) 自然走交换后的色, cursor 视觉为反相方块 (主流终端约定).
+            //
+            // **bg DEFAULT 处理**: INVERSE 把 default bg → fg 用. default fg
+            // (#d3d3d3) 当 bg, default bg (#000000) 当 fg → 字色变黑, bg 变浅
+            // 灰, 视觉是 "反白" 突出 cursor 位.
+            if indexed.cell.flags.contains(Flags::INVERSE) {
+                std::mem::swap(&mut fg, &mut bg);
+            }
             CellRef {
                 pos: CellPos::from_alacritty(pos_alac),
                 c: indexed.cell.c,
-                fg: Color::from_alacritty(indexed.cell.fg),
-                bg: Color::from_alacritty(indexed.cell.bg),
+                fg,
+                bg,
             }
         })
     }
