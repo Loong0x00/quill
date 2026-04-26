@@ -34,7 +34,7 @@ use crate::text::{GlyphKey, ShapedGlyph, TextSystem};
 /// (PNG verify 测试断言 RGB 等值, 不影响). live wayland surface 走单独
 /// [`CLEAR_ALPHA_LIVE`] 让 compositor 半透明 blend 桌面 (派单: ghostty 风
 /// 0.85 alpha, 把 quill 放任何窗口上面都能看下面内容).
-pub const CLEAR_COLOR_SRGB_U8: [u8; 4] = [0x0a, 0x10, 0x30, 0xff];
+pub const CLEAR_COLOR_SRGB_U8: [u8; 4] = [0x1d, 0x1f, 0x21, 0xff];
 
 /// **T-0610 hotfix: live wayland surface clear alpha** (0.85 = 217/255).
 /// headless 路径仍 1.0 (PNG 测试不验透明). compositor 必须支持 alpha mode
@@ -477,12 +477,13 @@ const BUTTON_ICON: crate::term::Color = crate::term::Color {
 /// 1 logical = 2 physical 在 HIDPI×2, 跟主流 CSD outline 同款细线.
 const BORDER_PX: f32 = 1.0;
 
-/// **T-0606: 窗口边框颜色** (深灰 #4a4a4a, 比 titlebar #2c2c2c 稍亮一档,
-/// 视觉上让窗口边缘跟桌面背景区分开, 不晃眼).
+/// **T-0606: 窗口边框颜色** (亮灰 #6a6a6a). 之前 #4a4a4a 在新背景 #1d1f21 上
+/// 对比度低 user 实测看不见 (T-0610 part 2 corner mask 还把 corner 区边框
+/// discard, 视觉边框感更弱). 提亮 + 跟新背景对比清晰.
 const BORDER_COLOR: crate::term::Color = crate::term::Color {
-    r: 0x4a,
-    g: 0x4a,
-    b: 0x4a,
+    r: 0x6a,
+    g: 0x6a,
+    b: 0x6a,
 };
 
 /// **CSD titlebar 在 cell vertex buffer 内额外占的"虚拟 cell 行"数** (T-0504).
@@ -4371,8 +4372,8 @@ mod tests {
 
     #[test]
     fn color_matches_spec() {
-        // Ticket acceptance 把 #0a1030 写死;这个测试防止以后"顺手调亮一点"。
-        assert_eq!(CLEAR_COLOR_SRGB_U8, [0x0a, 0x10, 0x30, 0xff]);
+        // Hotfix 后 ghostty 风深灰 #1d1f21 (29/31/33) 替代 #0a1030 深蓝.
+        assert_eq!(CLEAR_COLOR_SRGB_U8, [0x1d, 0x1f, 0x21, 0xff]);
     }
 
     #[test]
@@ -4394,22 +4395,22 @@ mod tests {
 
     #[test]
     fn non_srgb_format_uses_raw_components() {
-        // Unorm (非 sRGB) 格式下不做 gamma,直接取 byte/255。
+        // Unorm (非 sRGB) 格式下不做 gamma,直接取 byte/255. 新色 #1d1f21 (29/31/33).
         let c = clear_color_for(wgpu::TextureFormat::Bgra8Unorm);
-        assert!((c.r - 10.0 / 255.0).abs() < 1e-9);
-        assert!((c.g - 16.0 / 255.0).abs() < 1e-9);
-        assert!((c.b - 48.0 / 255.0).abs() < 1e-9);
+        assert!((c.r - 29.0 / 255.0).abs() < 1e-9);
+        assert!((c.g - 31.0 / 255.0).abs() < 1e-9);
+        assert!((c.b - 33.0 / 255.0).abs() < 1e-9);
         assert!((c.a - 1.0).abs() < 1e-9);
     }
 
     #[test]
     fn srgb_format_applies_gamma() {
         let c = clear_color_for(wgpu::TextureFormat::Bgra8UnormSrgb);
-        // sRGB 输出期望 "GPU 编码回去后" ≈ #0a1030;所以存进 wgpu::Color 的
+        // sRGB 输出期望 "GPU 编码回去后" ≈ #1d1f21;所以存进 wgpu::Color 的
         // 必然是更小(被 decode 过的)值。
-        assert!(c.r < 10.0 / 255.0);
-        assert!(c.g < 16.0 / 255.0);
-        assert!(c.b < 48.0 / 255.0);
+        assert!(c.r < 29.0 / 255.0);
+        assert!(c.g < 31.0 / 255.0);
+        assert!(c.b < 33.0 / 255.0);
     }
 
     // ---------- T-0802 In #A select_present_mode 单测 ----------
