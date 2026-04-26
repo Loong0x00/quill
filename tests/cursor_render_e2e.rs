@@ -38,6 +38,9 @@ const ROWS: usize = 24;
 const CELL_W_LOGICAL: usize = 10;
 const CELL_H_LOGICAL: usize = 25;
 const TITLEBAR_H_LOGICAL: usize = 28;
+// T-0608: cell 区起始 y 现在 = titlebar (28) + tab_bar (28) = 56 logical px.
+const TAB_BAR_H_LOGICAL: usize = 28;
+const TOP_RESERVED_LOGICAL: usize = TITLEBAR_H_LOGICAL + TAB_BAR_H_LOGICAL;
 
 const CURSOR_COL: usize = 5;
 const CURSOR_LINE: usize = 10;
@@ -111,8 +114,9 @@ fn cursor_at(col: usize, line: usize, style: CursorStyle, visible: bool) -> Curs
 fn cursor_cell_phys_bbox() -> (usize, usize, usize, usize) {
     let phys_x0 = CURSOR_COL * CELL_W_LOGICAL * HIDPI_SCALE as usize;
     let phys_x1 = (CURSOR_COL + 1) * CELL_W_LOGICAL * HIDPI_SCALE as usize;
-    let phys_y0 = (CURSOR_LINE * CELL_H_LOGICAL + TITLEBAR_H_LOGICAL) * HIDPI_SCALE as usize;
-    let phys_y1 = ((CURSOR_LINE + 1) * CELL_H_LOGICAL + TITLEBAR_H_LOGICAL) * HIDPI_SCALE as usize;
+    let phys_y0 = (CURSOR_LINE * CELL_H_LOGICAL + TOP_RESERVED_LOGICAL) * HIDPI_SCALE as usize;
+    let phys_y1 =
+        ((CURSOR_LINE + 1) * CELL_H_LOGICAL + TOP_RESERVED_LOGICAL) * HIDPI_SCALE as usize;
     (phys_x0, phys_x1, phys_y0, phys_y1)
 }
 

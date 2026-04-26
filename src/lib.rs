@@ -4,6 +4,7 @@
 pub mod frame_stats;
 pub mod ime;
 pub mod pty;
+pub mod tab;
 pub mod term;
 pub mod text;
 pub mod wl;

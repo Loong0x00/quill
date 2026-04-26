@@ -40,6 +40,7 @@ use calloop::timer::{TimeoutAction, Timer};
 use calloop::{EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction, RegistrationToken};
 
 use crate::pty::PtyHandle;
+use crate::tab::{TabInstance, TabList};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     delegate_compositor, delegate_output, delegate_registry, delegate_seat, delegate_xdg_shell,
@@ -249,6 +250,35 @@ pub(crate) enum AutoScrollOp {
     Start { delta: i32 },
 }
 
+/// T-0608: 待处理 tab 操作. Dispatch 路径 (拿 &mut State) 写, drive_wayland
+/// step 3.8 (拿 &mut LoopData, 含 loop_handle) 真消费 — 与
+/// `apply_selection_op` / `apply_repeat_request` 同套路.
+///
+/// **why 推迟**: 新 tab 需要 spawn PTY + insert calloop source (loop_handle 在
+/// LoopData 不在 State); close tab 需要 remove calloop source (同). Dispatch
+/// 内只能拿到 &mut State, 推迟到 drive_wayland 后单一消费者一次性处理.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TabOp {
+    /// 新建 tab (Ctrl+T / + 按钮 / NewTab PointerAction). drive_wayland 调
+    /// [`apply_tab_op`] spawn 子 shell + register PTY fd + push TabList +
+    /// 切到新 tab.
+    New,
+    /// 关 active tab (Ctrl+W).
+    CloseActive,
+    /// 关指定 idx tab (close × 按钮).
+    Close(usize),
+    /// 下一个 tab (Ctrl+Tab).
+    Next,
+    /// 上一个 tab (Ctrl+Shift+Tab).
+    Prev,
+    /// 切到 idx tab. Ctrl+1..9 / 鼠标 click tab body.
+    Switch(usize),
+    /// 拖拽 reorder. drive_wayland 拿到当前鼠标 x_logical 算 target_idx,
+    /// swap_reorder. (origin_idx 字段无 — drag_active=true 时 tab_press 已记录
+    /// origin, 但本枚举保持无状态化让 drive_wayland 一次性走完所有 PointerState.tab_press.)
+    Reorder { from_idx: usize, target_idx: usize },
+}
+
 /// 把 wayland `EventQueue<State>`、业务 `State`、T-0301 的 `TermState`、
 /// calloop `LoopSignal` 四个运行时对象捆成一个结构,让
 /// `calloop::EventLoop<'_, LoopData>` 一把 own。回调签名得到 `&mut LoopData`,
@@ -268,7 +298,6 @@ pub(crate) enum AutoScrollOp {
 struct LoopData {
     event_queue: EventQueue<State>,
     state: State,
-    term: Option<crate::term::TermState>,
     loop_signal: LoopSignal,
     /// T-0399 P1-1 接入: idle callback 每次成功 draw 后调 `record_and_log`,
     /// 满 [`crate::frame_stats::FRAME_WINDOW`] 帧通过 `tracing::info!`
@@ -327,6 +356,12 @@ struct LoopData {
     /// T-0607: 当前 autoscroll 方向 (`±1` line / 100ms tick). Timer fire 走
     /// [`autoscroll_tick`] 读此值调 scroll_display + 同步 selection_state cursor.
     autoscroll_delta: i32,
+    /// T-0608: 每 tab 一个 PTY fd 注册到 calloop EventLoop (INV-005). 用 tab id
+    /// 索引 RegistrationToken, close tab 时按 id 找 token + remove. 新 tab
+    /// 注册后 push 一对 (id, token).
+    /// 主路径 (active tab 切换) **不**重新注册 — fd 一直挂着, callback 内
+    /// 直接 read 字节; 切 active 仅改 state.tabs.active 索引, 不动 fd 注册.
+    pty_tokens: Vec<(crate::tab::TabId, RegistrationToken)>,
 }
 
 // T-0108 删除:`run_main_loop` / `StepResult` / `install_signal_handlers` /
@@ -415,9 +450,35 @@ pub(crate) fn pty_readable_action(result: &std::io::Result<usize>) -> PtyAction 
 /// EOF / EIO 分支仍是 `pty.try_wait()` 尝试 reap 一下并 `tracing::info!` 一个
 /// exit_code;`Ok(None)` (race) 不 sleep 重试,接受延迟,zombie 由 `PtyHandle::Drop`
 /// / init-adopt 兜底。
+/// T-0608: pty_read_tick 重构 — 接 tab_id 而非裸 pty/term, 内部按 id 索引
+/// state.tabs 的 TabInstance, 拿其 term + pty. 多 tab 模式下每个 PTY fd 注册
+/// 时 closure 携带自己的 tab_id, callback fire 时定位到对应 tab.
+///
+/// **why tab_id 而非 idx**: idx 在 reorder / close 后会变, id 单调全局唯一不变
+/// (派单 In #F anchor 锁定).
 fn pty_read_tick(
+    state: &mut State,
+    tab_id: crate::tab::TabId,
+    loop_signal: &LoopSignal,
+) -> std::io::Result<PostAction> {
+    // 找对应 tab. close race 下可能找不到 (Remove 已发但 calloop fire 队列还有
+    // 一次), 走 PostAction::Remove 让 calloop 自然清理.
+    let Some(tab_idx) = state.tabs_unchecked().idx_of(tab_id) else {
+        tracing::trace!(target: "quill::pty", id=tab_id.raw(), "pty_read_tick: tab gone (race)");
+        return Ok(PostAction::Remove);
+    };
+    let Some(tab) = state.tabs_unchecked_mut().get_mut(tab_idx) else {
+        return Ok(PostAction::Remove);
+    };
+    let (term, pty) = tab.split_term_pty();
+    pty_read_tick_inner(pty, Some(term), loop_signal)
+}
+
+/// T-0608 inner impl: 真 read PTY + advance term. 与原 pty_read_tick 同, 抽出
+/// 让 tab_id 定位逻辑独立 (上一段 fn).
+fn pty_read_tick_inner(
     pty: &mut PtyHandle,
-    term: &mut Option<crate::term::TermState>,
+    mut term: Option<&mut crate::term::TermState>,
     loop_signal: &LoopSignal,
 ) -> std::io::Result<PostAction> {
     // INV-009 sanity check:master fd 必须 O_NONBLOCK。由 T-0201 的 `spawn_program`
@@ -601,7 +662,11 @@ pub(crate) fn decoration_log_decision(mode: DecorationMode) -> DecorationLogDeci
 ///
 /// 测试覆盖见 `tests::cells_from_surface_px_*`。
 pub(crate) fn cells_from_surface_px(width: u32, height: u32) -> (usize, usize) {
-    let usable_h = height.saturating_sub(crate::wl::render::TITLEBAR_H_LOGICAL_PX);
+    // T-0608: 顶部占用 = titlebar + tab_bar (28 + 28 logical = 56 logical px,
+    // 等价 112 physical 在 HIDPI×2). cell 区从 56 logical 起.
+    let top_reserved =
+        crate::wl::render::TITLEBAR_H_LOGICAL_PX + crate::wl::render::TAB_BAR_H_LOGICAL_PX;
+    let usable_h = height.saturating_sub(top_reserved);
     let cols = ((width as f32) / crate::wl::render::CELL_W_PX) as usize;
     let rows = ((usable_h as f32) / crate::wl::render::CELL_H_PX) as usize;
     (cols.max(1), rows.max(1))
@@ -715,7 +780,7 @@ fn propagate_resize_if_dirty(data: &mut LoopData) {
         schedule_resize_followup_timer(data, now);
         return;
     }
-    let LoopData { state, term, .. } = &mut *data;
+    let LoopData { state, .. } = &mut *data;
 
     let width = state.core.width;
     let height = state.core.height;
@@ -725,18 +790,17 @@ fn propagate_resize_if_dirty(data: &mut LoopData) {
         r.resize(width, height);
     }
 
-    if let Some(t) = term.as_mut() {
-        t.resize(cols, rows);
-    }
-
-    if let Some(p) = state.pty.as_ref() {
-        if let Err(err) = p.resize(cols as u16, rows as u16) {
-            // ioctl(TIOCSWINSZ) 极少失败,但 fd 提前关 / EBADF 时不 panic ——
-            // shell 收不到 SIGWINCH 是退化, UI 仍走 (term 已 resize, 渲染正常)。
+    // T-0608: 全 tabs 都 resize. inactive tab 的 term grid + PTY winsize 跟随
+    // viewport 大小, 切回时立即正确 (派单 In #B). 全部 tab 一起 ioctl 是 O(N),
+    // 实战 N ≤ 10 不慢.
+    for tab in state.tabs_unchecked_mut().iter_mut() {
+        tab.term_mut().resize(cols, rows);
+        if let Err(err) = tab.pty().resize(cols as u16, rows as u16) {
             tracing::warn!(
                 ?err,
                 cols,
                 rows,
+                tab_id = tab.id().raw(),
                 "pty.resize ioctl 失败, shell 不会收 SIGWINCH"
             );
         }
@@ -993,9 +1057,10 @@ fn repeat_timer_tick(data: &mut LoopData) -> TimeoutAction {
             return TimeoutAction::Drop;
         }
     };
-    // 写 PTY (复用 Dispatch<WlKeyboard> 的相同策略). pty=None 不应该发生
-    // (repeat 进入路径前 pty 已 spawn) — 防御性 warn 不 panic.
-    if let Some(pty) = data.state.pty.as_ref() {
+    // 写 PTY (复用 Dispatch<WlKeyboard> 的相同策略). T-0608: 写 active tab 的
+    // PTY (repeat 跟 keyboard focus 走 active tab).
+    {
+        let pty = data.state.tabs_unchecked().active().pty();
         match pty.write(&bytes) {
             Ok(n) if n == bytes.len() => {
                 tracing::trace!(
@@ -1027,12 +1092,6 @@ fn repeat_timer_tick(data: &mut LoopData) -> TimeoutAction {
                 );
             }
         }
-    } else {
-        tracing::warn!(
-            target: "quill::keyboard",
-            n = bytes.len(),
-            "repeat tick 但 pty=None, 丢字节"
-        );
     }
     // reschedule 1000/rate ms 后再 fire. rate=0 兜底走 100ms (与 apply 路径
     // 不 schedule 形成多重防御; 实战 rate 由协议给非 0).
@@ -1118,9 +1177,12 @@ fn autoscroll_tick(data: &mut LoopData) -> TimeoutAction {
         // 防御: pending_autoscroll_cancel 路径已清 delta=0, Timer Drop.
         return TimeoutAction::Drop;
     }
-    if let Some(t) = data.term.as_mut() {
-        t.scroll_display(delta);
-    }
+    // T-0608: 走 active tab 的 term.
+    data.state
+        .tabs_unchecked_mut()
+        .active_mut()
+        .term_mut()
+        .scroll_display(delta);
     TimeoutAction::ToDuration(std::time::Duration::from_millis(AUTOSCROLL_INTERVAL_MS))
 }
 
@@ -1141,11 +1203,8 @@ fn apply_selection_op(data: &mut LoopData, qh: &QueueHandle<State>) {
     let Some(op) = data.state.pending_selection_op.take() else {
         return;
     };
-    // 算选区文本. SelectionState / cols / rows 来自 state / term.
-    let Some(t) = data.term.as_ref() else {
-        tracing::warn!(target: "quill::pointer", "apply_selection_op: term=None, 跳过");
-        return;
-    };
+    // 算选区文本. T-0608: 走 active tab 的 term.
+    let t = data.state.tabs_unchecked().active().term();
     let (cols, rows) = t.dimensions();
     // T-0607 已知陷阱 (派单 In #G CJK): display_text 内部跳 WIDE_CHAR_SPACER cell,
     // 与 selected_cells_* 走 grid col/row 索引一致 — 选区跨 CJK 字 substr 不切坏.
@@ -1297,11 +1356,13 @@ fn apply_paste_request(data: &mut LoopData) {
 
     // 注册 calloop Generic source 监听 read_fd readable, 走 paste_read_tick
     // 累积字节, EOF 时包 bracketed paste 写 PTY + remove source.
+    // T-0608: bracketed mode 走 active tab 的 term (paste 跟 keyboard focus 一致).
     let bracketed = data
-        .term
-        .as_ref()
-        .map(|t| t.is_bracketed_paste())
-        .unwrap_or(false);
+        .state
+        .tabs_unchecked()
+        .active()
+        .term()
+        .is_bracketed_paste();
     // PasteReadState 持 OwnedFd 控制 close 时机. Rc<RefCell<>> 让 callback 与
     // 调用方共享同一份 (调用方仅记 token 用 — 不再需要 read_fd_owned).
     let pasta_state = std::rc::Rc::new(std::cell::RefCell::new(PasteReadState {
@@ -1343,6 +1404,194 @@ fn apply_paste_request(data: &mut LoopData) {
             );
         }
     }
+}
+
+/// T-0608: 消费 `state.pending_tab_op`, 真执行 tab 操作 — 新建 spawn + 注册
+/// PTY fd / 关闭 drop + remove fd / 切 active / 拖拽 reorder.
+///
+/// **why drive_wayland step 3.8**: spawn 新 PTY 后必须 insert_source 让新 fd
+/// 进 calloop EventLoop (INV-005); close 必须 remove_source 释放 fd 注册.
+/// LoopHandle 在 LoopData 字段 (Dispatch 路径拿不到), 与 apply_selection_op
+/// 同套路.
+///
+/// **active 切换的副作用**: 切换 active tab 后:
+/// - PointerState.tab_count 同步 (set_tab_count)
+/// - selection_state 清旧选区 (派单"切 tab 时清旧 selection 防 active tab cell.bg
+///   反色错误高亮")
+/// - term.mark_dirty() 触发下一次 idle redraw (新 tab 内容立即上屏)
+/// - PointerState.set_cell_grid 同步新 active 的 cols/rows
+fn apply_tab_op(data: &mut LoopData) {
+    let Some(op) = data.state.pending_tab_op.take() else {
+        return;
+    };
+    match op {
+        TabOp::New => {
+            // spawn 子 shell, 走 propagate_resize 一次让新 tab 同步当前 cols/rows.
+            let (cols, rows) = cells_from_surface_px(data.state.core.width, data.state.core.height);
+            let cols_u16 = cols.min(u16::MAX as usize) as u16;
+            let rows_u16 = rows.min(u16::MAX as usize) as u16;
+            let new_tab = match TabInstance::spawn(cols_u16, rows_u16) {
+                Ok(t) => t,
+                Err(err) => {
+                    tracing::warn!(?err, "新 tab spawn 失败, 跳过");
+                    return;
+                }
+            };
+            let new_id = new_tab.id();
+            let new_pty_fd = new_tab.pty().raw_fd();
+            // 注册 PTY fd 到 calloop. 与 run_window 启动期路径同语义.
+            #[allow(unsafe_code)]
+            let new_pty_borrowed: BorrowedFd<'static> =
+                unsafe { BorrowedFd::borrow_raw(new_pty_fd) };
+            let token_result = data.loop_handle.insert_source(
+                Generic::new(new_pty_borrowed, Interest::READ, Mode::Level),
+                move |_readiness, _fd, data: &mut LoopData| {
+                    let LoopData {
+                        state, loop_signal, ..
+                    } = &mut *data;
+                    pty_read_tick(state, new_id, loop_signal)
+                },
+            );
+            let token = match token_result {
+                Ok(t) => t,
+                Err(err) => {
+                    tracing::warn!(?err, id = new_id.raw(), "新 tab PTY fd insert_source 失败");
+                    // tab spawn 成功但 fd 注册失败 — drop tab 自然 SIGHUP shell.
+                    return;
+                }
+            };
+            data.pty_tokens.push((new_id, token));
+            // push 到 list + 切 active 到新 tab.
+            let tab_list = match data.state.tabs.as_mut() {
+                Some(t) => t,
+                None => return,
+            };
+            let (new_idx, _id) = tab_list.push(new_tab);
+            tab_list.set_active(new_idx);
+            on_active_tab_changed(data);
+            tracing::info!(
+                id = new_id.raw(),
+                idx = new_idx,
+                "new tab spawned + activated"
+            );
+        }
+        TabOp::CloseActive => {
+            let active_idx = match data.state.tabs.as_ref() {
+                Some(t) => t.active_idx(),
+                None => return,
+            };
+            close_tab_idx(data, active_idx);
+        }
+        TabOp::Close(idx) => {
+            close_tab_idx(data, idx);
+        }
+        TabOp::Next => {
+            let tab_list = match data.state.tabs.as_mut() {
+                Some(t) => t,
+                None => return,
+            };
+            if tab_list.len() <= 1 {
+                return;
+            }
+            let next = (tab_list.active_idx() + 1) % tab_list.len();
+            tab_list.set_active(next);
+            on_active_tab_changed(data);
+        }
+        TabOp::Prev => {
+            let tab_list = match data.state.tabs.as_mut() {
+                Some(t) => t,
+                None => return,
+            };
+            if tab_list.len() <= 1 {
+                return;
+            }
+            let len = tab_list.len();
+            let prev = (tab_list.active_idx() + len - 1) % len;
+            tab_list.set_active(prev);
+            on_active_tab_changed(data);
+        }
+        TabOp::Switch(idx) => {
+            let tab_list = match data.state.tabs.as_mut() {
+                Some(t) => t,
+                None => return,
+            };
+            if idx >= tab_list.len() {
+                return;
+            }
+            tab_list.set_active(idx);
+            on_active_tab_changed(data);
+        }
+        TabOp::Reorder {
+            from_idx,
+            target_idx,
+        } => {
+            let tab_list = match data.state.tabs.as_mut() {
+                Some(t) => t,
+                None => return,
+            };
+            let _ = tab_list.swap_reorder(from_idx, target_idx);
+            on_active_tab_changed(data);
+        }
+    }
+}
+
+/// T-0608: 关闭 idx 处 tab — drop TabInstance + remove calloop source + 邻近
+/// active 切换 + 若最后一个 → quit. 抽出来让 CloseActive / Close(idx) 共用.
+fn close_tab_idx(data: &mut LoopData, idx: usize) {
+    // pop tab, 拿到 id 用于 remove token. 即使 tab.idx_of 返 None (race) 仍兜底.
+    let removed_tab_id = {
+        let tab_list = match data.state.tabs.as_mut() {
+            Some(t) => t,
+            None => return,
+        };
+        if idx >= tab_list.len() {
+            return;
+        }
+        let removed = tab_list.remove(idx);
+        removed.map(|t| t.id())
+    };
+    let Some(removed_id) = removed_tab_id else {
+        return;
+    };
+    // remove 对应 calloop source. ptokens 中按 id 找.
+    if let Some(pos) = data.pty_tokens.iter().position(|(id, _)| *id == removed_id) {
+        let (_, token) = data.pty_tokens.swap_remove(pos);
+        data.loop_handle.remove(token);
+    }
+    // tabs 空 → quit (派单 In #I "close 最后一个 tab → quit 整 quill").
+    if data
+        .state
+        .tabs
+        .as_ref()
+        .map(|t| t.is_empty())
+        .unwrap_or(true)
+    {
+        tracing::info!("close last tab → quit quill");
+        data.loop_signal.stop();
+        return;
+    }
+    on_active_tab_changed(data);
+}
+
+/// T-0608: active tab 切换后的副作用 — 同步 PointerState 的 tab_count + cell
+/// grid, 清 selection (派单"切 tab 清旧 selection"), 标记 active term dirty
+/// (触发下一次 idle redraw 让新 tab 内容立即上屏).
+fn on_active_tab_changed(data: &mut LoopData) {
+    let Some(tab_list) = data.state.tabs.as_ref() else {
+        return;
+    };
+    let tab_count = tab_list.len();
+    let (cols, rows) = tab_list.active().term().dimensions();
+    data.state.pointer_state.set_tab_count(tab_count);
+    data.state.pointer_state.set_cell_grid(cols, rows);
+    // 清旧 selection. 派单已知陷阱: 切 tab 时清旧 selection (pointer_state.selection_state.clear())
+    // 防 active tab cell.bg 反色错误高亮.
+    data.state.selection_state.clear();
+    // 标记 active term dirty 触发 redraw.
+    if let Some(t) = data.state.tabs.as_mut() {
+        t.active_mut().term_mut().mark_dirty();
+    }
+    data.state.presentation_dirty = true;
 }
 
 /// T-0607: 异步 paste 读取的中间状态. fd 通过 OwnedFd 持有控制 close 时机
@@ -1392,7 +1641,9 @@ fn paste_read_tick(
             };
             let text_str = String::from_utf8_lossy(&buf).to_string();
             let wrapped = bracketed_paste_wrap(&text_str, bracketed);
-            if let Some(pty) = data.state.pty.as_ref() {
+            // T-0608: 写 active tab 的 PTY (paste 跟 keyboard focus 一致).
+            {
+                let pty = data.state.tabs_unchecked().active().pty();
                 match pty.write(&wrapped) {
                     Ok(n) if n == wrapped.len() => {
                         tracing::debug!(
@@ -1541,6 +1792,11 @@ fn drive_wayland(data: &mut LoopData) -> std::io::Result<PostAction> {
         apply_selection_op(data, &qh);
     }
     apply_paste_request(data);
+
+    // Step 3.8 (T-0608): tab 操作消费 — 新建 / 关闭 / 切换 / 拖拽 reorder.
+    // 与 selection / repeat 同套路 — Dispatch 路径只 set pending_tab_op,
+    // 这里真 spawn 子 shell + insert/remove calloop source + 切 active.
+    apply_tab_op(data);
 
     // Step 4:把 ack_configure / surface commit 这些响应真推给 compositor。
     if let Err(e) = data.state.conn.flush() {
@@ -1813,15 +2069,19 @@ pub fn run_window() -> Result<()> {
         last_selection_text: None,
         last_primary_text: None,
         last_clipboard_text: None,
-        pty: None,
+        // T-0608: tabs 启动后立即被 spawn 真 shell 注入 (下方几行).
+        tabs: None,
+        pending_tab_op: None,
+        last_tab_drag_x: 0.0,
     };
 
-    // T-0202/T-0108:spawn login shell + 把 master fd 注册进 calloop(INV-005)。
-    // 初始尺寸 80x24 按 ticket scope 写死;Phase 3 T-0306 才接 Wayland
-    // configure → cell 尺寸换算。
-    let pty = PtyHandle::spawn_shell(80, 24).context("PtyHandle::spawn_shell(80, 24) 失败")?;
-    let pty_fd = pty.raw_fd();
-    state.pty = Some(pty);
+    // T-0608/T-0202/T-0108: spawn 第一个 tab 的子 shell + 把 master fd 注册进
+    // calloop(INV-005)。初始尺寸 80x24 写死;Wayland configure 后 propagate_resize
+    // 链路同步真实 cols/rows.
+    let initial_tab = TabInstance::spawn(80, 24).context("初始 tab spawn 失败")?;
+    let pty_fd = initial_tab.pty().raw_fd();
+    let initial_tab_id = initial_tab.id();
+    state.tabs = Some(TabList::new(initial_tab));
 
     // 在进 event_loop 之前把 initial request 推给 compositor,否则第一次唤醒等不到
     // configure。registry_queue_init 里已经 flush 过 wl_display.get_registry,但
@@ -1893,27 +2153,17 @@ pub fn run_window() -> Result<()> {
     //   涉所有权转移
     #[allow(unsafe_code)]
     let pty_borrowed: BorrowedFd<'static> = unsafe { BorrowedFd::borrow_raw(pty_fd) };
-    loop_handle
+    // T-0608: PTY callback 通过 closure capture 的 tab_id 定位 state.tabs 的
+    // 对应 TabInstance — 多 tab 时每个 fd 注册都 capture 自己的 id (apply_tab_op
+    // 路径同模式).
+    let initial_token = loop_handle
         .insert_source(
             Generic::new(pty_borrowed, Interest::READ, Mode::Level),
-            |_readiness, _fd, data: &mut LoopData| {
-                // split borrow: pty 藏在 data.state.pty,term 是 data.term 自己,
-                // loop_signal 也是 data 自己的字段 —— 三个字段互相不冲突,
-                // 可同时 &mut 拿出来。`&mut *data` 强制重借用,让编译器看见
-                // 字段级 split。
+            move |_readiness, _fd, data: &mut LoopData| {
                 let LoopData {
-                    state,
-                    term,
-                    loop_signal,
-                    ..
+                    state, loop_signal, ..
                 } = &mut *data;
-                let pty = match state.pty.as_mut() {
-                    Some(p) => p,
-                    // 极罕见:state.pty = None(spawn 后被谁 take 了)。为了不 panic,
-                    // 跳过本轮。正常路径到不了这里。
-                    None => return Ok(PostAction::Continue),
-                };
-                pty_read_tick(pty, term, loop_signal)
+                pty_read_tick(state, initial_tab_id, loop_signal)
             },
         )
         .map_err(|e| anyhow!("calloop insert_source(pty master fd) 失败: {e}"))?;
@@ -1945,9 +2195,9 @@ pub fn run_window() -> Result<()> {
     let mut loop_data = LoopData {
         event_queue,
         state,
-        // T-0301: 初始 80x24,与 `PtyHandle::spawn_shell(80, 24)` 对齐。
-        // Phase 3 T-0306 接窗口 resize 时会重建 Term 或调用 resize method。
-        term: Some(crate::term::TermState::new(80, 24)),
+        // T-0608: term/pty 改为每 tab 各自持 (TabInstance 内). LoopData 不再
+        // 持 term 字段, 主路径走 state.tabs_unchecked().active() / active_mut()
+        // 拿 active tab 的 term + pty.
         loop_signal: loop_signal.clone(),
         // T-0399 P1-1: FrameStats 接采集点。空 stats, idle callback 每次成功
         // draw_cells 后调 record_and_log; Phase 6 soak 通过 `quill::frame`
@@ -1967,6 +2217,9 @@ pub fn run_window() -> Result<()> {
         // T-0607: autoscroll Timer 起步空, AutoScrollStart 时 lazy schedule.
         pending_autoscroll_timer: None,
         autoscroll_delta: 0,
+        // T-0608: 启动后第一个 tab 的 PTY fd 已在上方 insert_source, 把
+        // (tab_id, token) push 进 token 表 — close tab 时按 id 找 token + remove.
+        pty_tokens: vec![(initial_tab_id, initial_token)],
     };
     event_loop
         .run(None, &mut loop_data, |data| {
@@ -1981,19 +2234,31 @@ pub fn run_window() -> Result<()> {
             // 就 draw_frame 一帧 (含 clear + cells + glyphs, T-0403) 或 draw_cells
             // (text_system 未建好时 fallback) + clear_dirty。
             //
-            // borrow split: data.term / data.state.renderer / data.frame_stats /
-            // data.text_system 都是 LoopData 不同字段, 一次解构同时拿四个 &mut
-            // 不冲突。
+            // borrow split: data.state.renderer / data.state.tabs /
+            // data.frame_stats / data.text_system / data.state.pointer_state 等都
+            // 是不同字段, 字段级 split 不冲突 (NLL 支持).
+            // T-0608: term 走 active tab → 通过 tabs.as_mut() 拿 &mut TabList,
+            // 然后 active_mut() 拿 &mut TabInstance, term_mut() 拿 &mut TermState.
+            // state 在 LoopData 字段, 通过 split borrow 与其它 LoopData 字段并存.
             let LoopData {
                 state,
-                term,
                 frame_stats,
                 text_system,
                 ..
             } = &mut *data;
-            let Some(t) = term.as_mut() else {
-                return;
+            // 字段级 split: tabs / renderer / pointer_state / ime_state /
+            // presentation_dirty / pending_scroll_lines / selection_state 都是
+            // State 不同字段, 同 *state 下能拿独立 &mut.
+            // T-0608: 先记 tab_count / active_idx (后续 set_tab_state 用), 避免
+            // 与 active_mut() 的 mut 借用冲突.
+            let (tab_count, active_idx) = match state.tabs.as_ref() {
+                Some(t) => (t.len(), t.active_idx()),
+                None => return,
             };
+            let Some(tab_list) = state.tabs.as_mut() else {
+                return; // tabs 未初始化 (启动期 race) — 跳过本帧
+            };
+            let t = tab_list.active_mut().term_mut();
             // T-0602: 消费 Dispatch<WlPointer> / Dispatch<WlKeyboard> 累积的
             // scrollback line 数. State 拿不到 term (在 LoopData 兄弟字段), 所以
             // 滚动决定推到 idle 回放. scroll_display 内部已置 dirty, 不再单独
@@ -2015,12 +2280,15 @@ pub fn run_window() -> Result<()> {
             if !t.is_dirty() && !state.presentation_dirty {
                 return;
             }
+            // T-0608: tab_count / active_idx 已在上方提前记 (避免与
+            // active_mut() 借用冲突).
             let Some(r) = state.renderer.as_mut() else {
                 // renderer 还没建好(首次 configure 之前的 idle tick)。dirty
                 // 留着,等首次 configure 走 init_renderer_and_draw 完成后下一轮
                 // 再画。
                 return;
             };
+            r.set_tab_state(tab_count, active_idx);
             // T-0305: 全量 cells 收集。1920 cell × CellRef(~32 字节 pos+c+fg+bg)
             // = 60 KiB,Vec 分配开销 << wgpu submit 一次的开销, Phase 6 soak 验
             // bench 再决定是否 reuse Vec(目前简单胜过聪明)。
@@ -2319,13 +2587,37 @@ struct State {
     /// T-0607 hotfix: CLIPBOARD 专用最近选区文本. SetClipboard 路径设, CLIPBOARD
     /// source.Send dispatch 读. 与 PRIMARY 解耦.
     pub(crate) last_clipboard_text: Option<String>,
-    // `pty` **位于 State 最后一位**(Lead + 审码 2026-04-25 拍板,见 T-0202 ticket):
-    // - PTY 持 Linux fd + 子进程句柄,与 wl / wgpu 资源生命周期正交,放最后避免
-    //   跟 INV-001 的 renderer→window→conn 链条耦合,不需要新建 INV。
-    // - 保证 wl / wgpu drop 先跑完,再 drop pty;PtyHandle 自身按 INV-008
-    //   (reader → master → child)正向 drop,master 关闭时 slave 端 SIGHUP 已
-    //   无风险打扰 wl 回调(wl 侧早没了)。
-    pty: Option<PtyHandle>,
+    /// T-0608: 多 tab 集合 + active 索引. 替代原 `pty: Option<PtyHandle>` +
+    /// `LoopData.term: Option<TermState>` 单 tab 字段对. 每个 [`TabInstance`]
+    /// 持自己的 term + pty (派单 In #A).
+    ///
+    /// **why Option**: ctor 路径分两步 (先建 State 给 sctk delegate 用, 后
+    /// spawn 第一个 tab 注入). 启动后**永远 Some** — 进入 event_loop.run 前
+    /// 已注入, drive_wayland 路径全可 unwrap. 用 [`State::tabs_unchecked`] /
+    /// [`State::tabs_unchecked_mut`] 单一访问点封装 unwrap, 保留 INV-010
+    /// "下游不直接读 Option 内部" 类型隔离.
+    ///
+    /// **位于 State 最后一位** (与原 `pty` 同位置, 保留 INV-001 / INV-008 drop
+    /// 序契约): TabInstance 内部 term → pty 顺序 (term drop 释放 alacritty grid,
+    /// 不持 wgpu / wl 资源; pty 按 INV-008 reader → master → child drop).
+    pub(crate) tabs: Option<TabList>,
+    /// T-0608: 待处理 tab 操作. Dispatch 路径写, drive_wayland step 3.8 消费
+    /// (与 pending_selection_op / pending_repeat 同套路).
+    pub(crate) pending_tab_op: Option<TabOp>,
+    /// T-0608: tab drag 期间最后一次 motion 的 logical x. EndTabDrag 时按此 x
+    /// 算 target_idx (派单 In #F).
+    pub(crate) last_tab_drag_x: f64,
+}
+
+impl State {
+    /// T-0608: 拿 active tab 引用. 启动后 tabs 必 Some, 此处 unwrap_or panic
+    /// 兜底 (实际不会触发, 保留 panic message 防 LoopData 改时漏注入).
+    pub(crate) fn tabs_unchecked(&self) -> &TabList {
+        self.tabs.as_ref().expect("tabs not initialized — bug")
+    }
+    pub(crate) fn tabs_unchecked_mut(&mut self) -> &mut TabList {
+        self.tabs.as_mut().expect("tabs not initialized — bug")
+    }
 }
 
 impl State {
@@ -3195,14 +3487,9 @@ fn apply_ime_action(action: ImeAction, text_input: &ZwpTextInputV3, state: &mut 
             // 与 Dispatch<WlKeyboard> 同 PTY 路径; INV-009 master fd O_NONBLOCK,
             // INV-005 calloop 不重试 WouldBlock 直接丢 (派单 In 中文输入背压
             // 罕见, 一帧 done 字节 ≤ 12 (4 中文字符), kernel buffer 必能装下)。
-            let Some(pty) = state.pty.as_ref() else {
-                tracing::warn!(
-                    target: "quill::ime",
-                    n = bytes.len(),
-                    "ImeAction::Commit 时 pty=None, 丢字节"
-                );
-                return;
-            };
+            // T-0608: IME commit 走 active tab 的 PTY (preedit 跟 active tab,
+            // keyboard focus 一致).
+            let pty = state.tabs_unchecked().active().pty();
             match pty.write(&bytes) {
                 Ok(n) if n == bytes.len() => {
                     tracing::debug!(
@@ -3395,6 +3682,24 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                     "Ctrl+Shift+V → Paste(Clipboard) queued"
                 );
             }
+            // T-0608: tab 热键 → 写 pending_tab_op, drive_wayland step 3.8 消费
+            // (与 selection_op / repeat 同套路 — Dispatch 拿不到 LoopHandle, 推迟
+            // 到 drive_wayland 由 apply_tab_op 真 spawn / register / remove fd).
+            KeyboardAction::NewTab => {
+                state.pending_tab_op = Some(TabOp::New);
+            }
+            KeyboardAction::CloseActiveTab => {
+                state.pending_tab_op = Some(TabOp::CloseActive);
+            }
+            KeyboardAction::NextTab => {
+                state.pending_tab_op = Some(TabOp::Next);
+            }
+            KeyboardAction::PrevTab => {
+                state.pending_tab_op = Some(TabOp::Prev);
+            }
+            KeyboardAction::SwitchToTab(idx) => {
+                state.pending_tab_op = Some(TabOp::Switch(idx));
+            }
         }
     }
 }
@@ -3404,14 +3709,8 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
 /// 者都需要 "立即写一次" 语义, 与 INV-009 (master fd O_NONBLOCK) + INV-005
 /// (calloop 不重试 WouldBlock) 一致.
 fn write_keyboard_bytes(state: &State, bytes: &[u8]) {
-    let Some(pty) = state.pty.as_ref() else {
-        tracing::warn!(
-            target: "quill::keyboard",
-            n = bytes.len(),
-            "keyboard write 时 pty=None, 丢字节"
-        );
-        return;
-    };
+    // T-0608: 走 active tab 的 PTY (键盘 focus 跟 active tab 一致).
+    let pty = state.tabs_unchecked().active().pty();
     match pty.write(bytes) {
         Ok(n) if n == bytes.len() => {
             tracing::trace!(
@@ -3668,6 +3967,54 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 state.pending_autoscroll_cancel = true;
                 tracing::trace!(target: "quill::pointer", "AutoScrollStop queued");
             }
+            // T-0608: tab bar 鼠标 actions → pending_tab_op (drive_wayland step
+            // 3.8 真消费, 与键盘 NewTab / CloseActiveTab 同套路).
+            PointerAction::NewTab => {
+                state.pending_tab_op = Some(TabOp::New);
+            }
+            PointerAction::SwitchTab(idx) => {
+                state.pending_tab_op = Some(TabOp::Switch(idx));
+            }
+            PointerAction::CloseTab(idx) => {
+                state.pending_tab_op = Some(TabOp::Close(idx));
+            }
+            PointerAction::StartTabDrag(_idx) => {
+                // 派单 In #F: drag 期间视觉跟随鼠标半透明显示, 当前实装偏离 —
+                // **drag 视觉 ghost overlay 留作后续 ticket** (派单 In #F 半透明
+                // ghost 跟随需要新建 wgpu 顶点 buffer + 第二 pass blend, 工作量
+                // 与本 ticket 主线 reorder 解耦; reorder 逻辑本身已实装).
+                tracing::trace!(target: "quill::pointer", "StartTabDrag (ghost overlay 留作后续)");
+            }
+            PointerAction::TabDragMove { x_logical } => {
+                // drag 期间记 last x, 用于 release 时算 target_idx. State 字段
+                // last_tab_drag_x 暂存.
+                state.last_tab_drag_x = x_logical;
+            }
+            PointerAction::EndTabDrag => {
+                // release 触发 reorder. 派单 In #F: target_idx = (last_x - plus_w)
+                // / tab_body_width. apply_tab_op 路径需要原 idx (来自 PointerState
+                // tab_press, 但 tab_press 已被 take 清空). 改写: PointerAction
+                // 不携带 origin_idx, drive_wayland 路径接到 EndTabDrag 时调
+                // resolve_drag_target 算 (origin_idx 由 idx_of(start tab id) 推
+                // 但已无 anchor — 当前简化: 直接走 last x 落哪个 tab idx 作 target,
+                // 不真 reorder, 派单偏离声明).
+                let last_x = state.last_tab_drag_x;
+                if let Some(tab_list) = state.tabs.as_ref() {
+                    let plus_w = crate::wl::render::TAB_PLUS_W_LOGICAL_PX as f64;
+                    let body_w = super::pointer::tab_body_width(state.core.width, tab_list.len());
+                    if body_w > 0.0 && last_x >= plus_w {
+                        let target_idx = ((last_x - plus_w) / body_w).floor() as usize;
+                        let active_idx = tab_list.active_idx();
+                        let target = target_idx.min(tab_list.len().saturating_sub(1));
+                        if active_idx != target {
+                            state.pending_tab_op = Some(TabOp::Reorder {
+                                from_idx: active_idx,
+                                target_idx: target,
+                            });
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -3790,31 +4137,30 @@ mod tests {
 
     #[test]
     fn cells_from_surface_px_default_800x600_matches_80x22() {
-        // 初始尺寸 800×600 + cell 10×25 + T-0504 titlebar 28 → usable 572 → 22 行.
-        // 之前 (T-0306 时无 titlebar): 80×24. T-0504 起 cell rows 减为 22 给 titlebar
-        // 让出顶部 28 px logical 空间.
+        // T-0608: 顶部占用 = titlebar (28) + tab_bar (28) = 56 logical px.
+        // 800×600 - 56 = 544, 544 / 25 = 21 行.
         assert_eq!(
             cells_from_surface_px(super::INITIAL_WIDTH, super::INITIAL_HEIGHT),
-            (80, 22),
-            "800×600 - titlebar 28 → cell 80×22"
+            (80, 21),
+            "800×600 - titlebar 28 - tab_bar 28 → cell 80×21"
         );
     }
 
     #[test]
     fn cells_from_surface_px_grows_with_surface() {
-        // 拖大窗口能多显示 cells (T-0306 acceptance 核心)
-        // T-0504: usable_h = h - 28, rows = usable_h / 25.
-        // 1200 - 28 = 1172, 1172 / 25 = 46.
+        // 拖大窗口能多显示 cells (T-0306 acceptance 核心).
+        // T-0608: usable_h = h - 56 (titlebar + tab_bar), rows = usable_h / 25.
+        // 1200 - 56 = 1144, 1144 / 25 = 45.
         assert_eq!(
             cells_from_surface_px(1600, 1200),
-            (160, 46),
-            "1600×1200 - titlebar 28 → 160×46"
+            (160, 45),
+            "1600×1200 - 56 → 160×45"
         );
-        // 1080 - 28 = 1052, 1052 / 25 = 42.
+        // 1080 - 56 = 1024, 1024 / 25 = 40.
         assert_eq!(
             cells_from_surface_px(1920, 1080),
-            (192, 42),
-            "1920×1080 - titlebar 28 → 192×42"
+            (192, 40),
+            "1920×1080 - 56 → 192×40"
         );
     }
 
@@ -3843,13 +4189,13 @@ mod tests {
 
     #[test]
     fn cells_from_surface_px_truncates_partial_cells() {
-        // 整数除截断, 余下边距 Phase 4 再细化 (派单允许)。
-        // 805px / 10 = 80 cells (剩 5px 边距), 不向上取 81。
-        // T-0504: usable_h = 612 - 28 = 584, 584 / 25 = 23 行.
+        // 整数除截断, 余下边距 Phase 4 再细化 (派单允许).
+        // 805px / 10 = 80 cells (剩 5px 边距).
+        // T-0608: usable_h = 612 - 56 (titlebar + tab_bar) = 556, 556 / 25 = 22.
         assert_eq!(
             cells_from_surface_px(805, 612),
-            (80, 23),
-            "余数应被截断 + titlebar 28 减让"
+            (80, 22),
+            "余数应被截断 + titlebar 28 + tab_bar 28 减让"
         );
     }
 

@@ -33,6 +33,10 @@ pub use render::CELL_W_PX;
 // 详见 `render.rs::render_headless` 文档头。
 pub use render::render_headless;
 
+// T-0608 multi-tab e2e 测试用: set/reset thread_local tab override 让
+// render_headless 输出含多 tab 标签条.
+pub use render::{reset_headless_tab_state, set_headless_tab_state};
+
 // T-0505: PreeditOverlay 入参 (集成测试 tests/ime_preedit_render.rs 用), quill
 // 自有 struct (INV-010, 不漏 wayland-protocols 类型). PREEDIT_UNDERLINE_PX
 // 常数同步 re-export 给测试 / Phase 6 计算用。
@@ -56,3 +60,7 @@ pub use selection::{
     bracketed_paste_wrap, extract_selection_text, modifier_to_selection_mode, pixel_to_cell,
     selected_cells_block, selected_cells_linear, PasteSource, SelectionMode, SelectionState,
 };
+
+// T-0608: multi-tab e2e 测试 + hit_test_with_tabs 公共 API (HoverRegion 加
+// TabBarPlus / Tab(idx) / TabClose(idx)).
+pub use pointer::{hit_test_with_tabs, HoverRegion, WindowButton};
