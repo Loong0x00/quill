@@ -1656,26 +1656,64 @@ pub fn run_window() -> Result<()> {
     // 每次 attach 新 buffer + commit. 不要每次创建 surface").
     let cursor_surface = compositor.create_surface(&qh);
 
-    // CursorTheme load 失败 (xcursor theme files 不在 /usr/share/icons 等标准
-    // 路径) → None, apply_cursor_shape 路径自动 noop (cursor 维持 compositor
-    // 默认). load_or 内部读 XCURSOR_THEME / XCURSOR_SIZE env, 不存时分别用
-    // "default" / 24 兜底 (Adwaita / Bibata / Yaru 等主流主题都跟 default
-    // inherit 链接).
-    let cursor_theme: Option<CursorTheme> =
-        match CursorTheme::load_or(&conn, shm.clone(), "default", 24) {
-            Ok(theme) => {
-                tracing::info!("wayland_cursor::CursorTheme loaded (xcursor 主题 + size 跟随 env)");
-                Some(theme)
+    // T-0703-fix hotfix: wayland-cursor 0.31 (pure Rust) **不处理 XDG theme
+    // inherit 链** — Arch / Ubuntu 默认 /usr/share/icons/default/index.theme
+    // 写 `Inherits=Adwaita` 但没有自己的 cursors/ 目录, libwayland-cursor (C)
+    // 处理这个 inherit 但 wayland-cursor (Rust) 不处理. load_or("default")
+    // 拿不到任何 cursor 文件, get_cursor 全 None, 4 角 cursor 退化到
+    // compositor 默认小箭头 (user 实测 4 边能用 4 角不能).
+    //
+    // 修: try chain (XCURSOR_THEME env / "Adwaita" / "default"), 第一个能拿到
+    // cursor 的用. cursor_size 走 XCURSOR_SIZE env 默认 24 (派单 Out 不动).
+    let theme_size: u32 = std::env::var("XCURSOR_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(24);
+    let theme_candidates: Vec<String> = std::iter::once(std::env::var("XCURSOR_THEME").ok())
+        .flatten()
+        .chain(["Adwaita".to_string(), "default".to_string()])
+        .collect();
+    let cursor_theme: Option<CursorTheme> = theme_candidates.iter().find_map(|name| {
+        match CursorTheme::load_or(&conn, shm.clone(), name, theme_size) {
+            Ok(mut theme) => {
+                // 探针 verify: try get "left_ptr" 是任何主题必有的 base cursor.
+                // 拿不到说明此 theme 是空 stub (e.g. /usr/share/icons/default/
+                // 只有 index.theme 没 cursors/), 试下一个候选.
+                if theme.get_cursor("left_ptr").is_some()
+                    || theme.get_cursor("default").is_some()
+                {
+                    tracing::info!(
+                        theme = %name,
+                        size = theme_size,
+                        "wayland_cursor::CursorTheme loaded"
+                    );
+                    Some(theme)
+                } else {
+                    tracing::debug!(
+                        target: "quill::cursor",
+                        theme = %name,
+                        "CursorTheme load 成功但 left_ptr/default cursor 都缺 (空 stub theme), 试下一候选"
+                    );
+                    None
+                }
             }
             Err(err) => {
-                tracing::warn!(
+                tracing::debug!(
+                    target: "quill::cursor",
+                    theme = %name,
                     ?err,
-                    "CursorTheme::load_or 失败 — cursor 形状切换退化 (compositor 默认箭头); \
-                     检查 /usr/share/icons/{{default, Adwaita}}/cursors/ 是否存在"
+                    "CursorTheme::load_or 失败, 试下一候选"
                 );
                 None
             }
-        };
+        }
+    });
+    if cursor_theme.is_none() {
+        tracing::warn!(
+            "所有 cursor theme 候选 (XCURSOR_THEME / Adwaita / default) 都 load 失败 — \
+             cursor 形状切换退化 (compositor 默认箭头); 检查 /usr/share/icons/Adwaita/cursors/"
+        );
+    }
 
     // T-0607: bind zwp_primary_selection_device_manager_v1 (PRIMARY 协议).
     // GNOME 45+ / KDE Plasma 6 / wlroots 都支持; 老 compositor 缺 → None,
