@@ -509,6 +509,18 @@ fn key_press_action(
         return action;
     }
 
+    // T-0612 hotfix: Shift+Enter (XK_Return = 0xff0d) → 发 \x1b\r (Esc + CR,
+    // alt-enter 编码) 让 Claude Code TUI / readline 接成 multi-line newline.
+    // 反编译 Claude Code 看到字面: VS Code keybindings.json
+    //   {key:"shift+enter", command:"workbench.action.terminal.sendSequence",
+    //    args:{text:"\x1B\r"}, when:"terminalFocus"}
+    // alacritty 同款: mods="Shift", key="Return", chars="\x1B\r".
+    // 必须**先于** utf8 路径 — xkbcommon 默认 Shift+Return 给 \r 跟 Return 一样
+    // (xterm 历史不区分), 我们劫持发 alt-enter 编码.
+    if shift_active && keysym.raw() == 0xff0d {
+        return KeyboardAction::WriteToPty(vec![0x1b, b'\r']);
+    }
+
     // T-0607: Ctrl+Shift+C / Ctrl+Shift+V → CLIPBOARD 复制 / 粘贴 (alacritty /
     // foot / kitty 同热键). 必须**先于** utf8 路径检测 — Ctrl+C 单独走 utf8
     // 给 \x03 (SIGINT 字节, 派单不动) 但 Ctrl+Shift+C 我们劫持. xkb keysym 在
