@@ -2,7 +2,7 @@
 
 **Phase**: 6+ (架构改动, daily-drive feel)
 **Assigned**: writer-T0608
-**Status**: in-review
+**Status**: merged
 **Budget**: tokenBudget=500k (跨 LoopData 重构 + 多 PTY fd 注册 + 多 Term
 状态 + 标签条 UI + hit_test + 拖拽换序 + 切换键)
 **Dependencies**: T-0504 (PointerState + hit_test) / T-0603 (keyboard
