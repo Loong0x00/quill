@@ -57,6 +57,11 @@
 
 use wayland_client::protocol::wl_pointer;
 use wayland_client::WEnum;
+// T-0703: WpShape 是 wayland-protocols 协议 enum, **仅在本模块内**用于私有
+// 转换 fn `wp_shape_for` (INV-010 类型隔离 + ADR 0008). Dispatch 段直接消费
+// 转换结果, 不出本模块边界. 任何对 cursor 形状的下游消费走 quill 自有
+// [`CursorShape`] enum.
+use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::Shape as WpShape;
 
 use super::render::{BUTTON_H_LOGICAL_PX, BUTTON_W_LOGICAL_PX, TITLEBAR_H_LOGICAL_PX};
 
@@ -99,6 +104,95 @@ pub enum HoverRegion {
     TextArea,
 }
 
+/// T-0703: quill 自有 cursor 形状枚举. 包装 `wp_cursor_shape_v1` 协议 enum
+/// (INV-010 + ADR 0008): WpShape 仅在本模块私有 [`wp_shape_for`] 转换 fn 出现,
+/// 不出现在公共 API.
+///
+/// **覆盖范围**: default / text + 4 边 (n/s/e/w) + 4 角 (ne/nw/se/sw). 与
+/// HoverRegion 加 ResizeEdge 后的全 case 一对一映射 (T-0701 合并后,
+/// [`cursor_shape_for`] 加 ResizeEdge 分支).
+///
+/// **why 不直接用 WpShape**: WpShape 是 wayland-protocols 协议层 enum
+/// (35+ variants 含 dnd_ask / zoom_in 等 quill 不需要的), 暴露到公共 API
+/// 等于让上游协议变 cascade 改 quill (违反 INV-010). 自定义最小 10 变量,
+/// exhaustive match 在调用方编译期 catch — 加新 variant (例 Phase 7+ 加
+/// "正在 grab" cursor) 时所有 match 强制更新.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CursorShape {
+    /// 默认箭头. titlebar / 未识别区域用. 对应 `wp_cursor_shape_v1::Shape::Default`.
+    #[default]
+    Default,
+    /// I-beam (文本编辑光标). text area (cell grid) 用, 暗示用户可选区 / 复制.
+    /// 对应 `wp_cursor_shape_v1::Shape::Text`.
+    Text,
+    /// ↕ 垂直双向箭头 (北/南边 resize). 对应 `wp_cursor_shape_v1::Shape::NsResize`.
+    ///
+    /// `#[allow(dead_code)]`: T-0701 ResizeEdge enum 合并前 [`cursor_shape_for`]
+    /// 无 ResizeEdge 分支 → 不返此 variant. 留作 T-0701 合并后填
+    /// ResizeEdge::Top/Bottom 用. 与 [`PointerState::last_button_serial`]
+    /// (T-0504 forward-compat) 同决策, 移除会破坏 T-0701 接入路径.
+    #[allow(dead_code)]
+    NsResize,
+    /// ↔ 水平双向箭头 (东/西边 resize). 对应 `wp_cursor_shape_v1::Shape::EwResize`.
+    /// `#[allow(dead_code)]`: 同 [`Self::NsResize`], T-0701 合并填 ResizeEdge::Left/Right.
+    #[allow(dead_code)]
+    EwResize,
+    /// ↘↖ 主对角线双向箭头 (西北/东南角 resize). 对应
+    /// `wp_cursor_shape_v1::Shape::NwseResize`.
+    /// `#[allow(dead_code)]`: 同 [`Self::NsResize`], T-0701 合并填 ResizeEdge::TopLeft/BottomRight.
+    #[allow(dead_code)]
+    NwseResize,
+    /// ↙↗ 副对角线双向箭头 (东北/西南角 resize). 对应
+    /// `wp_cursor_shape_v1::Shape::NeswResize`.
+    /// `#[allow(dead_code)]`: 同 [`Self::NsResize`], T-0701 合并填 ResizeEdge::TopRight/BottomLeft.
+    #[allow(dead_code)]
+    NeswResize,
+}
+
+/// T-0703: HoverRegion → CursorShape 翻译表 (派单 In #B 抽决策模式).
+///
+/// 当前 (T-0701 未合并前) ResizeEdge variant 不存在, [`HoverRegion::TitleBar`]
+/// 与 [`HoverRegion::Button`] 都映射到 [`CursorShape::Default`], TextArea →
+/// Text, None → Default. **T-0701 合并后**: [`HoverRegion`] 加
+/// `ResizeEdge(ResizeEdge)` variant, 在此 fn 加分支:
+/// - ResizeEdge::Top / Bottom → NsResize
+/// - ResizeEdge::Left / Right → EwResize
+/// - ResizeEdge::TopLeft / BottomRight → NwseResize
+/// - ResizeEdge::TopRight / BottomLeft → NeswResize
+///
+/// **why pure fn 而非 impl trait**: 单一映射点, 改一处即视觉与行为同步, 与
+/// `verdict_for_scale` / `pty_readable_action` 等 conventions §3 决策抽出
+/// 同套路.
+pub fn cursor_shape_for(hover: HoverRegion) -> CursorShape {
+    match hover {
+        HoverRegion::None => CursorShape::Default,
+        HoverRegion::TitleBar => CursorShape::Default,
+        HoverRegion::Button(_) => CursorShape::Default,
+        HoverRegion::TextArea => CursorShape::Text,
+        // T-0701 合后加: HoverRegion::ResizeEdge(edge) => match edge { ... }
+        // 当前 enum 无此 variant, exhaustive match 编译通过.
+    }
+}
+
+/// T-0703 模块私有: quill [`CursorShape`] → wayland-protocols `WpShape` 协议
+/// enum 转换. **仅供 src/wl/window.rs::Dispatch 段调用** (pub(crate)), 不出
+/// pointer.rs 模块边界 — INV-010 单点路径.
+///
+/// **why 模块私有 inherent fn 而非 `impl From<CursorShape> for WpShape`**:
+/// trait impl 会让下游 `quill_shape.into()` 直接拿到 WpShape (反向偷渡协议
+/// 类型, 与 INV-010 alacritty Point 私有 from_alacritty 同决策, T-0302 4
+/// commits 学费验证).
+pub(crate) fn wp_shape_for(shape: CursorShape) -> WpShape {
+    match shape {
+        CursorShape::Default => WpShape::Default,
+        CursorShape::Text => WpShape::Text,
+        CursorShape::NsResize => WpShape::NsResize,
+        CursorShape::EwResize => WpShape::EwResize,
+        CursorShape::NwseResize => WpShape::NwseResize,
+        CursorShape::NeswResize => WpShape::NeswResize,
+    }
+}
+
 /// `handle_pointer_event` 的副作用描述. 调用方按 variant 分派.
 ///
 /// 抽 enum 而非散落 `if` 是 conventions §3 套路 (类比 [`PtyAction`] /
@@ -120,6 +214,12 @@ pub enum PointerAction {
     ButtonClick(WindowButton),
     /// hover 区域变化 — 调用方走 redraw 路径 (按钮 hover 变深, Close 变红).
     /// 包含**新**区域 (旧区域已存于 [`PointerState`] 内不外漏).
+    ///
+    /// **T-0703 副作用**: HoverChange 也常常意味着 cursor 形状变化 — 但
+    /// cursor set_shape 走独立 [`PointerState::take_pending_cursor_set`] 路径
+    /// (与 pending_scroll_lines / pending_repeat 同 T-0603 套路), 调用方在
+    /// 处理 PointerAction 后**额外**检查并下发, 不复用此 variant 字段
+    /// (避免单 PointerAction 携带多副作用 → match 分支臃肿).
     HoverChange(HoverRegion),
     /// T-0602: 滚轮 / 触摸板纵向滚动 → scrollback 偏移. **正值 = 向上滚 (看
     /// 更老历史), 负值 = 向下滚 (回最新)** — 与 alacritty `Scroll::Delta(i32)`
@@ -174,6 +274,26 @@ pub struct PointerState {
     /// 实测 5090 + Logitech MX 滚轮一格 ≈ 15 px (compositor 翻译), 两格出 1 line;
     /// touchpad 两指滑一指距离约 100-200 px 出 4-8 line. 体感与 foot/kitty 接近.
     scroll_accum_y: f64,
+    /// T-0703: 最近 wl_pointer.Enter event 的 serial. wp_cursor_shape_device_v1.
+    /// set_shape 协议要求传 **enter serial** (不是 button event serial — 那条是
+    /// xdg_toplevel.move 路径). Enter 时记一次, 后续 hover 跨区调 set_shape
+    /// 时传同一 serial — 协议 doc:
+    /// "The serial parameter must match the latest wl_pointer.enter ... serial
+    ///  number sent to the client. Otherwise the request will be ignored."
+    last_enter_serial: u32,
+    /// T-0703: 当前 set_shape 已下发的 cursor 形状. 与 [`hover`] 类似但单独
+    /// 跟踪 — hover 与 cursor 形状是 **n:1 映射** (Default cursor 用于 None /
+    /// TitleBar / Button 三种 hover), 同 cursor 不必重发 set_shape (减压
+    /// compositor + 防 cursor 闪烁).
+    current_cursor_shape: CursorShape,
+    /// T-0703: 待下发的 set_shape (serial, shape). [`apply_enter`] / [`apply_motion`]
+    /// 检测 cursor 形状变化时填入, [`Self::take_pending_cursor_set`] 由
+    /// `Dispatch<wl_pointer>` 在主 PointerAction 处理后取出消费. 单 buffer
+    /// 设计 (与 `State.pending_repeat` / `State.pending_scroll_lines` 同
+    /// T-0603 / T-0602 套路 — 单帧多次填覆盖前次, 取最新).
+    ///
+    /// `None` = 无待发请求, `Some((serial, shape))` = 有待发. take 后置 None.
+    pending_cursor_set: Option<(u32, CursorShape)>,
 }
 
 /// T-0602: 触摸板 / 滚轮累积阈值 (logical px). 累够此值发一次 line 滚动.
@@ -196,6 +316,9 @@ impl PointerState {
             surface_w_logical: initial_w_logical,
             surface_h_logical: initial_h_logical,
             scroll_accum_y: 0.0,
+            last_enter_serial: 0,
+            current_cursor_shape: CursorShape::Default,
+            pending_cursor_set: None,
         }
     }
 
@@ -216,6 +339,27 @@ impl PointerState {
     pub fn hover(&self) -> HoverRegion {
         self.hover
     }
+
+    /// T-0703: 取出并清空待下发的 cursor set_shape 请求. `Dispatch<wl_pointer>`
+    /// 在处理主 [`PointerAction`] 后调一次, 拿到 `Some((serial, shape))` 时调
+    /// `wp_cursor_shape_device_v1.set_shape(serial, wp_shape_for(shape))` (协议
+    /// 调用走 src/wl/window.rs 段).
+    ///
+    /// 返 `None` = 本帧无形状变化, 不下发协议调用 — 防止每帧都发 set_shape
+    /// 加压 compositor (一帧 motion event 可能数十次, hover 同区时 cursor 不变).
+    pub fn take_pending_cursor_set(&mut self) -> Option<(u32, CursorShape)> {
+        self.pending_cursor_set.take()
+    }
+
+    /// T-0703: 当前已下发的 cursor 形状 (供调试 trace / 单测断言).
+    ///
+    /// `#[allow(dead_code)]`: 主路径不用 (Dispatch 直接 take pending), 仅供
+    /// 单测断言 + 未来 trace / debug 入口预留. 与 [`PointerState::last_button_serial`]
+    /// (T-0504 forward-compat) 同决策.
+    #[allow(dead_code)]
+    pub fn current_cursor_shape(&self) -> CursorShape {
+        self.current_cursor_shape
+    }
 }
 
 /// 接 wl_pointer 协议事件 → 算 [`PointerAction`].
@@ -226,12 +370,13 @@ impl PointerState {
 /// 同套路, 决策与副作用分离 (conventions §3).
 ///
 /// 协议事件分派表:
-/// - **Enter(serial, x, y)**: 记 pos + hit_test, 返 HoverChange (从 None →
-///   新区).
+/// - **Enter(serial, x, y)**: 记 pos + enter serial + hit_test, 返 HoverChange
+///   (从 None → 新区) **+ 旁路填 pending_cursor_set** (强制 set 一次, 协议要求).
 /// - **Leave(serial)**: 清 pos, hover → None, 返 HoverChange(None) 让调用方
-///   redraw 清按钮高亮.
+///   redraw 清按钮高亮. 不发 set_cursor (compositor 自己接管).
 /// - **Motion(time, x, y)**: 更新 pos + hit_test; 区域变化才返
-///   HoverChange, 同区返 Nothing (避免 redraw 风暴).
+///   HoverChange, 同区返 Nothing (避免 redraw 风暴). cursor 形状变化时旁路
+///   填 pending_cursor_set.
 /// - **Button(serial, time, btn, state=Pressed)**: 记 serial, 按 hover 分派:
 ///   - TitleBar → StartMove { serial }
 ///   - Button(b) → ButtonClick(b)
@@ -245,8 +390,9 @@ impl PointerState {
 ///   单位是 logical px (与 surface 尺寸 logical 一致).
 /// - Button event 的 button code 是 evdev (BTN_LEFT=0x110), 与 wl_keyboard
 ///   evdev keycode 同源.
-/// - Enter 事件**也带 serial**, 但通常不用作 move 的 serial — 只有 Button
-///   event 的 serial 被 compositor 接受作 grab serial.
+/// - Enter 事件**也带 serial**, button event 的 serial 是另一条 — Enter serial
+///   归 cursor set_shape (T-0703 要求), button serial 归 xdg_toplevel.move
+///   (T-0504, 见 `apply_button`).
 ///
 /// **why 拆 [`apply_enter`] / [`apply_leave`] / [`apply_motion`] /
 /// [`apply_button`] 子 fn**: wl_pointer::Event 含 WlSurface 字段 (Enter /
@@ -256,10 +402,11 @@ impl PointerState {
 pub fn handle_pointer_event(event: wl_pointer::Event, state: &mut PointerState) -> PointerAction {
     match event {
         wl_pointer::Event::Enter {
+            serial,
             surface_x,
             surface_y,
             ..
-        } => apply_enter(state, surface_x, surface_y),
+        } => apply_enter(state, serial, surface_x, surface_y),
         wl_pointer::Event::Leave { .. } => apply_leave(state),
         wl_pointer::Event::Motion {
             surface_x,
@@ -296,9 +443,20 @@ pub fn handle_pointer_event(event: wl_pointer::Event, state: &mut PointerState) 
 
 /// Enter 决策子 fn — 单测入口 (避免构造 WlSurface). 见 [`handle_pointer_event`]
 /// 文档头 "why 拆子 fn".
-pub(crate) fn apply_enter(state: &mut PointerState, x: f64, y: f64) -> PointerAction {
+///
+/// **T-0703**: 同步记 [`PointerState::last_enter_serial`] (cursor set_shape 协议
+/// 用), 并**强制**填一个 pending_cursor_set (即便 cursor 形状未变 — 协议要求
+/// client 在 enter 后必须 set 一次, 否则 cursor 行为 unspecified, 实测 GNOME
+/// mutter 会显示空白).
+pub(crate) fn apply_enter(state: &mut PointerState, serial: u32, x: f64, y: f64) -> PointerAction {
     state.pos = Some((x, y));
+    state.last_enter_serial = serial;
     let new_hover = hit_test(x, y, state.surface_w_logical, state.surface_h_logical);
+    let new_shape = cursor_shape_for(new_hover);
+    // 协议要求: enter 后必须 set 一次 cursor (否则 unspecified). 即便
+    // current_cursor_shape == new_shape (init 都是 Default), 也强制 emit 一次.
+    state.pending_cursor_set = Some((serial, new_shape));
+    state.current_cursor_shape = new_shape;
     if new_hover != state.hover {
         state.hover = new_hover;
         return PointerAction::HoverChange(new_hover);
@@ -307,8 +465,12 @@ pub(crate) fn apply_enter(state: &mut PointerState, x: f64, y: f64) -> PointerAc
 }
 
 /// Leave 决策子 fn. 清 pos + hover, 返 HoverChange(None) 让调用方 redraw 清按钮高亮.
+///
+/// **T-0703**: 不发 set_cursor (鼠标已离开 surface, compositor 自管). 但**清空**
+/// `pending_cursor_set` 兜底防 race (Enter 后立刻 Leave, pending 未消费).
 pub(crate) fn apply_leave(state: &mut PointerState) -> PointerAction {
     state.pos = None;
+    state.pending_cursor_set = None;
     if state.hover != HoverRegion::None {
         state.hover = HoverRegion::None;
         return PointerAction::HoverChange(HoverRegion::None);
@@ -317,10 +479,20 @@ pub(crate) fn apply_leave(state: &mut PointerState) -> PointerAction {
 }
 
 /// Motion 决策子 fn. 区域变化才返 HoverChange, 同区返 Nothing 避免 redraw 风暴.
+///
+/// **T-0703**: hover 跨区且 cursor 形状变 (n:1 映射 → 同 cursor 同 region 内 +
+/// 跨等价 region 不 emit set_shape, 减压 compositor) 时填 pending_cursor_set.
+/// serial 用 [`PointerState::last_enter_serial`] (协议要求 enter serial,
+/// motion event 自身无 serial 字段).
 pub(crate) fn apply_motion(state: &mut PointerState, x: f64, y: f64) -> PointerAction {
     state.pos = Some((x, y));
     let new_hover = hit_test(x, y, state.surface_w_logical, state.surface_h_logical);
     if new_hover != state.hover {
+        let new_shape = cursor_shape_for(new_hover);
+        if new_shape != state.current_cursor_shape {
+            state.pending_cursor_set = Some((state.last_enter_serial, new_shape));
+            state.current_cursor_shape = new_shape;
+        }
         state.hover = new_hover;
         return PointerAction::HoverChange(new_hover);
     }
@@ -561,7 +733,7 @@ mod tests {
     #[test]
     fn enter_records_position_and_hovers_titlebar() {
         let mut state = fresh_state();
-        let action = apply_enter(&mut state, 100.0, 10.0);
+        let action = apply_enter(&mut state, 1, 100.0, 10.0);
         assert_eq!(action, PointerAction::HoverChange(HoverRegion::TitleBar));
         assert_eq!(state.hover(), HoverRegion::TitleBar);
     }
@@ -569,7 +741,7 @@ mod tests {
     #[test]
     fn motion_within_same_region_returns_nothing() {
         let mut state = fresh_state();
-        let _ = apply_enter(&mut state, 100.0, 10.0);
+        let _ = apply_enter(&mut state, 1, 100.0, 10.0);
         // 在 titlebar 内移动
         let action = apply_motion(&mut state, 200.0, 15.0);
         assert_eq!(action, PointerAction::Nothing);
@@ -578,7 +750,7 @@ mod tests {
     #[test]
     fn motion_crosses_to_close_button_emits_hover_change() {
         let mut state = fresh_state();
-        let _ = apply_enter(&mut state, 100.0, 10.0);
+        let _ = apply_enter(&mut state, 1, 100.0, 10.0);
         let action = apply_motion(&mut state, 790.0, 12.0);
         assert_eq!(
             action,
@@ -589,7 +761,7 @@ mod tests {
     #[test]
     fn leave_clears_hover() {
         let mut state = fresh_state();
-        let _ = apply_enter(&mut state, 100.0, 10.0);
+        let _ = apply_enter(&mut state, 1, 100.0, 10.0);
         let action = apply_leave(&mut state);
         assert_eq!(action, PointerAction::HoverChange(HoverRegion::None));
         assert_eq!(state.hover(), HoverRegion::None);
@@ -598,7 +770,7 @@ mod tests {
     #[test]
     fn left_button_press_on_titlebar_starts_move() {
         let mut state = fresh_state();
-        let _ = apply_enter(&mut state, 100.0, 10.0);
+        let _ = apply_enter(&mut state, 1, 100.0, 10.0);
         let action = apply_button(&mut state, 42, 0x110, true);
         assert_eq!(action, PointerAction::StartMove { serial: 42 });
     }
@@ -606,7 +778,7 @@ mod tests {
     #[test]
     fn left_button_press_on_close_emits_button_click() {
         let mut state = fresh_state();
-        let _ = apply_enter(&mut state, 790.0, 12.0);
+        let _ = apply_enter(&mut state, 1, 790.0, 12.0);
         let action = apply_button(&mut state, 42, 0x110, true);
         assert_eq!(action, PointerAction::ButtonClick(WindowButton::Close));
     }
@@ -614,7 +786,7 @@ mod tests {
     #[test]
     fn left_button_press_on_minimize_emits_click() {
         let mut state = fresh_state();
-        let _ = apply_enter(&mut state, 740.0, 12.0);
+        let _ = apply_enter(&mut state, 1, 740.0, 12.0);
         let action = apply_button(&mut state, 42, 0x110, true);
         assert_eq!(action, PointerAction::ButtonClick(WindowButton::Minimize));
     }
@@ -622,7 +794,7 @@ mod tests {
     #[test]
     fn left_button_press_on_maximize_emits_click() {
         let mut state = fresh_state();
-        let _ = apply_enter(&mut state, 760.0, 12.0);
+        let _ = apply_enter(&mut state, 1, 760.0, 12.0);
         let action = apply_button(&mut state, 42, 0x110, true);
         assert_eq!(action, PointerAction::ButtonClick(WindowButton::Maximize));
     }
@@ -630,7 +802,7 @@ mod tests {
     #[test]
     fn right_button_press_does_nothing() {
         let mut state = fresh_state();
-        let _ = apply_enter(&mut state, 790.0, 12.0);
+        let _ = apply_enter(&mut state, 1, 790.0, 12.0);
         let action = apply_button(&mut state, 42, 0x111, true);
         assert_eq!(action, PointerAction::Nothing);
     }
@@ -638,7 +810,7 @@ mod tests {
     #[test]
     fn release_does_not_trigger_action() {
         let mut state = fresh_state();
-        let _ = apply_enter(&mut state, 790.0, 12.0);
+        let _ = apply_enter(&mut state, 1, 790.0, 12.0);
         let action = apply_button(&mut state, 42, 0x110, false);
         assert_eq!(action, PointerAction::Nothing);
     }
@@ -646,7 +818,7 @@ mod tests {
     #[test]
     fn left_button_press_on_text_area_does_nothing() {
         let mut state = fresh_state();
-        let _ = apply_enter(&mut state, 100.0, 200.0);
+        let _ = apply_enter(&mut state, 1, 100.0, 200.0);
         let action = apply_button(&mut state, 42, 0x110, true);
         assert_eq!(action, PointerAction::Nothing);
     }
@@ -786,11 +958,192 @@ mod tests {
     fn set_surface_size_updates_hover_recomputation() {
         let mut state = fresh_state();
         // 鼠标在 800 surface 的 x=790 (Close 按钮内)
-        let _ = apply_enter(&mut state, 790.0, 12.0);
+        let _ = apply_enter(&mut state, 1, 790.0, 12.0);
         assert_eq!(state.hover(), HoverRegion::Button(WindowButton::Close));
         // 拖大 surface 到 1000, 同 x=790 已不在 Close 内 (新 Close x ∈ [976, 1000))
         // → titlebar drag area.
         state.set_surface_size(1000, 600);
         assert_eq!(state.hover(), HoverRegion::TitleBar);
+    }
+
+    // ---- T-0703 cursor shape 测试 ----
+    //
+    // 派单 In #B + #D: HoverRegion → CursorShape 翻译表全覆盖 + apply_enter /
+    // apply_motion 正确填 pending_cursor_set + serial 正确传递 (enter serial
+    // 不是 button serial). cursor 形状对 set_shape 协议是关键, 单测锁住映射
+    // 防漂移 (改 cursor_shape_for body 时本组测试拦回归).
+
+    /// 派单 In #B 翻译表: 全 HoverRegion variant 一一映射.
+    #[test]
+    fn cursor_shape_for_covers_all_hover_regions() {
+        assert_eq!(cursor_shape_for(HoverRegion::None), CursorShape::Default);
+        assert_eq!(
+            cursor_shape_for(HoverRegion::TitleBar),
+            CursorShape::Default
+        );
+        assert_eq!(
+            cursor_shape_for(HoverRegion::Button(WindowButton::Close)),
+            CursorShape::Default
+        );
+        assert_eq!(
+            cursor_shape_for(HoverRegion::Button(WindowButton::Minimize)),
+            CursorShape::Default
+        );
+        assert_eq!(
+            cursor_shape_for(HoverRegion::Button(WindowButton::Maximize)),
+            CursorShape::Default
+        );
+        assert_eq!(
+            cursor_shape_for(HoverRegion::TextArea),
+            CursorShape::Text,
+            "textarea 必须给 I-beam 暗示选区可用"
+        );
+    }
+
+    /// Enter 时强制填 pending_cursor_set (协议要求 enter 后必 set 一次,
+    /// 否则 cursor unspecified — GNOME mutter 显空白).
+    #[test]
+    fn enter_always_emits_pending_cursor_set_with_enter_serial() {
+        let mut state = fresh_state();
+        let _ = apply_enter(&mut state, 99, 100.0, 10.0);
+        let pending = state.take_pending_cursor_set();
+        assert_eq!(
+            pending,
+            Some((99, CursorShape::Default)),
+            "enter→titlebar 必发 set_shape(Default), serial 复用 enter serial"
+        );
+        // take 后置 None
+        assert_eq!(state.take_pending_cursor_set(), None);
+    }
+
+    /// Enter 进 textarea → set_shape(Text).
+    #[test]
+    fn enter_into_textarea_emits_text_cursor() {
+        let mut state = fresh_state();
+        let _ = apply_enter(&mut state, 7, 400.0, 200.0);
+        assert_eq!(
+            state.take_pending_cursor_set(),
+            Some((7, CursorShape::Text))
+        );
+    }
+
+    /// Motion 跨等价 region (titlebar → button) 时 cursor 形状未变 (都 Default),
+    /// **不**重发 set_shape (减压 compositor + 防 cursor 闪烁).
+    #[test]
+    fn motion_across_equivalent_cursor_regions_does_not_reemit() {
+        let mut state = fresh_state();
+        // Enter titlebar → Default + 强制 emit; 消费掉 Enter 的强制 emit.
+        let _ = apply_enter(&mut state, 1, 100.0, 10.0);
+        let _ = state.take_pending_cursor_set();
+        // Motion 到 Close 按钮区 (仍 Default cursor)
+        let _ = apply_motion(&mut state, 790.0, 12.0);
+        assert_eq!(
+            state.take_pending_cursor_set(),
+            None,
+            "titlebar → button 同 cursor (Default), 不重发"
+        );
+    }
+
+    /// Motion 跨 cursor 形状变化的 region (titlebar → textarea) 时填
+    /// pending_cursor_set, serial 是**enter** serial 不是 motion (motion 无 serial).
+    #[test]
+    fn motion_across_cursor_changing_region_emits_with_enter_serial() {
+        let mut state = fresh_state();
+        // Enter titlebar → Default; 消费 Enter 强制 emit.
+        let _ = apply_enter(&mut state, 42, 100.0, 10.0);
+        let _ = state.take_pending_cursor_set();
+        // Motion 到 textarea — Default → Text
+        let _ = apply_motion(&mut state, 100.0, 200.0);
+        assert_eq!(
+            state.take_pending_cursor_set(),
+            Some((42, CursorShape::Text)),
+            "titlebar → textarea 必发 Text, serial 复用 last_enter_serial=42"
+        );
+    }
+
+    /// Leave 不发 set_shape (鼠标已离开, compositor 自管). 同时清 pending
+    /// 防 race (Enter 立刻 Leave, pending 未消费).
+    #[test]
+    fn leave_clears_pending_cursor_set() {
+        let mut state = fresh_state();
+        let _ = apply_enter(&mut state, 1, 100.0, 10.0);
+        // 不 take, 故意留 pending. Leave 应清.
+        let _ = apply_leave(&mut state);
+        assert_eq!(
+            state.take_pending_cursor_set(),
+            None,
+            "Leave 必清 pending_cursor_set 兜底 race"
+        );
+    }
+
+    /// current_cursor_shape() 跟 enter / motion 同步更新, 供 trace / 调试用.
+    #[test]
+    fn current_cursor_shape_tracks_apply_enter_and_motion() {
+        let mut state = fresh_state();
+        assert_eq!(state.current_cursor_shape(), CursorShape::Default);
+        let _ = apply_enter(&mut state, 1, 400.0, 200.0); // textarea
+        assert_eq!(state.current_cursor_shape(), CursorShape::Text);
+        let _ = apply_motion(&mut state, 100.0, 10.0); // titlebar
+        assert_eq!(state.current_cursor_shape(), CursorShape::Default);
+    }
+
+    /// wp_shape_for 全 quill CursorShape variant 映射到 WpShape (INV-010
+    /// 模块私有转换 fn 锁住). 上游 wayland-protocols 改 WpShape 名时本测试
+    /// fail, 提示更新.
+    #[test]
+    fn wp_shape_for_maps_all_quill_variants() {
+        // 仅断言不 panic + 类型对 (WpShape 是 #[non_exhaustive] 通常无 PartialEq,
+        // 用 matches! 锁住具体 variant).
+        assert!(matches!(
+            wp_shape_for(CursorShape::Default),
+            WpShape::Default
+        ));
+        assert!(matches!(wp_shape_for(CursorShape::Text), WpShape::Text));
+        assert!(matches!(
+            wp_shape_for(CursorShape::NsResize),
+            WpShape::NsResize
+        ));
+        assert!(matches!(
+            wp_shape_for(CursorShape::EwResize),
+            WpShape::EwResize
+        ));
+        assert!(matches!(
+            wp_shape_for(CursorShape::NwseResize),
+            WpShape::NwseResize
+        ));
+        assert!(matches!(
+            wp_shape_for(CursorShape::NeswResize),
+            WpShape::NeswResize
+        ));
+    }
+
+    /// handle_pointer_event 整体路径覆盖: Enter event 拆字段 → apply_enter
+    /// → pending_cursor_set 填. 与 axis 同套路 (端到端验证 dispatcher 字段
+    /// 拆解正确).
+    ///
+    /// **why 跳过 Enter event 整体测**: wl_pointer::Event::Enter 含
+    /// surface: WlSurface 字段, 单测无法构造 (需真 Connection). 本组单测
+    /// 走 apply_enter 子 fn, 端到端覆盖等待集成测试 (compositor 真发 Enter).
+    /// 此测仅覆盖 apply_motion 与 apply_leave 通过 handle_pointer_event 的
+    /// 路径 (Motion / Leave 不含 WlSurface 字段, Leave 含但只用 `..` 解构).
+    #[test]
+    fn handle_event_motion_dispatches_to_apply_motion_with_cursor_change() {
+        let mut state = fresh_state();
+        // 准备: 模拟已 Enter (apply_enter 直接调, 跳过 handle_pointer_event).
+        let _ = apply_enter(&mut state, 5, 100.0, 10.0); // titlebar
+        let _ = state.take_pending_cursor_set();
+        // 真走 handle_pointer_event 处理 Motion event.
+        let event = wl_pointer::Event::Motion {
+            time: 0,
+            surface_x: 100.0,
+            surface_y: 200.0, // → textarea
+        };
+        let action = handle_pointer_event(event, &mut state);
+        assert_eq!(action, PointerAction::HoverChange(HoverRegion::TextArea));
+        // cursor 应该填 pending (enter serial 5).
+        assert_eq!(
+            state.take_pending_cursor_set(),
+            Some((5, CursorShape::Text))
+        );
     }
 }
