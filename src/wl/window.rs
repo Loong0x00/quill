@@ -1665,10 +1665,15 @@ pub fn run_window() -> Result<()> {
     //
     // 修: try chain (XCURSOR_THEME env / "Adwaita" / "default"), 第一个能拿到
     // cursor 的用. cursor_size 走 XCURSOR_SIZE env 默认 24 (派单 Out 不动).
-    let theme_size: u32 = std::env::var("XCURSOR_SIZE")
+    // T-0703-fix hotfix v2: cursor 物理像素大小 = logical size × HIDPI_SCALE.
+    // 之前直接用 24 配 set_buffer_scale(2) 让 cursor 实际显示 12 logical px,
+    // 比 GTK4/Qt 应用小一半 (它们走 logical 24 × scale 2 = 48 physical px).
+    // load_or 的 size 参数是 physical pixel size, 必须 × HIDPI_SCALE.
+    let logical_size: u32 = std::env::var("XCURSOR_SIZE")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(24);
+    let theme_size: u32 = logical_size * crate::wl::HIDPI_SCALE;
     let theme_candidates: Vec<String> = std::iter::once(std::env::var("XCURSOR_THEME").ok())
         .flatten()
         .chain(["Adwaita".to_string(), "default".to_string()])
