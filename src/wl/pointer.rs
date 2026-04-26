@@ -392,14 +392,15 @@ pub struct PointerState {
     /// 按钮位置 (按钮在右上角, x = w - n×BUTTON_W; y < TITLEBAR_H).
     surface_w_logical: u32,
     surface_h_logical: u32,
-    /// T-0618: 滚轮累积器废弃. T-0602 用 `Axis` smooth value 累 24 px → 1 line,
-    /// 但 mutter 给 `Axis` 的 value 跟物理速度变 (慢转 8 px / 快转 30 px), 阈值
-    /// 化导致体感"滚一下随机出 0-2 line". 改走 wl_pointer 1.21+ 的 `AxisValue120`
-    /// 离散事件 — 一个 wheel notch 必然 ±120, 直接乘 [`WHEEL_LINES_PER_NOTCH`]
-    /// = 3 (alacritty/foot/gnome-terminal 默认) 出整 line, 跟物理速度无关. 字段
-    /// 保留 0 仅为防 PointerState binary layout 大改 (本字段 unused, 编译器警告
-    /// 可借 `#[allow(dead_code)]`, T-0619+ 真删).
-    #[allow(dead_code)]
+    /// T-0618 follow-up: 全屏 / 最大化时禁用 resize 边. 由 [`Self::set_disable_resize`]
+    /// 同步, 调用方在 WindowConfigure 收到 fullscreen/maximized state 时调.
+    disable_resize: bool,
+    /// T-0618 follow-up: 滚轮 smooth axis 累积器复活. mutter 在 user 这版 (50.x)
+    /// 不发 AxisValue120 (实测全发 Axis smooth value=±10.0), 只走 AxisValue120
+    /// 路径 = 滚轮全死. 走 smooth 路径 + 累积阈值: 累 |value| ≥ ACCUM_THRESHOLD
+    /// 出 1 line, 余量留下次. mutter 一个 wheel notch 发 1-2 个 ±10 event,
+    /// threshold = 10 大概率每 notch 出 1 line (跟用户 "3 行就行" 不同, 但
+    /// smooth 路径下加速感更接近主流终端). 跟方向相同时累, 反向时清.
     scroll_accum_y: f64,
     /// T-0703-fix: 最近 wl_pointer.Enter event 的 serial. `wl_pointer.set_cursor`
     /// 协议要求传 **enter serial** (不是 button event serial — 那条是
@@ -477,8 +478,11 @@ pub(crate) const RESIZE_CORNER_PX: f64 = 8.0;
 /// discrete 用 line 单位 / 触摸板连续 axis 阈值转 line" 的硬约束实操 —
 /// 单一阈值同时覆盖 wheel notch (10 px/格) 与 touchpad (px 累积), 避免分支
 /// 走两套阈值表 (KISS).
-#[allow(dead_code)] // T-0618: deprecated, kept for legacy test referencing
-pub(crate) const SCROLL_ACCUM_LINE_PX: f64 = 24.0;
+/// smooth axis 累积阈值 (logical px). mutter 每 wheel notch 发 1-2 个 ±10 event,
+/// threshold = 10 让 1 notch 出 1 line, 体感"滚一下走一行" 直觉. 用户之前要求
+/// "3 行就行" 是基于 AxisValue120 离散 notch 路径 (一 notch 直接乘 3); 这里
+/// smooth 路径累积慢, 用 10 让累 1 notch 大概 1 line, 用户多滚几下补足.
+pub(crate) const SCROLL_ACCUM_LINE_PX: f64 = 10.0;
 
 /// **T-0618: 滚轮一格 (notch) 滚多少行**. 3 行 = alacritty / foot / gnome-terminal
 /// 默认, daily-drive 标配 (滚 5 次翻一屏 ~24 行). 通过 wl_pointer.AxisValue120
@@ -500,6 +504,7 @@ impl PointerState {
             last_button_serial: 0,
             surface_w_logical: initial_w_logical,
             surface_h_logical: initial_h_logical,
+            disable_resize: false,
             scroll_accum_y: 0.0,
             last_enter_serial: 0,
             current_cursor_shape: CursorShape::Default,
@@ -524,12 +529,13 @@ impl PointerState {
         self.tab_count = count.max(1);
         // tab 数量变化会改 tab body width, 重算 hover.
         if let Some((x, y)) = self.pos {
-            self.hover = hit_test_with_tabs(
+            self.hover = hit_test_with_tabs_ex(
                 x,
                 y,
                 self.surface_w_logical,
                 self.surface_h_logical,
                 self.tab_count,
+                self.disable_resize,
             );
         }
     }
@@ -550,6 +556,22 @@ impl PointerState {
         self.grid_rows = rows.max(1);
     }
 
+    /// T-0618 follow-up: 调用方在 WindowConfigure 收到 fullscreen / maximized
+    /// state 时调, 让 hit_test 路径跳 ResizeEdge.
+    pub fn set_disable_resize(&mut self, disable: bool) {
+        self.disable_resize = disable;
+        if let Some((x, y)) = self.pos {
+            self.hover = hit_test_with_tabs_ex(
+                x,
+                y,
+                self.surface_w_logical,
+                self.surface_h_logical,
+                self.tab_count,
+                self.disable_resize,
+            );
+        }
+    }
+
     /// T-0607: 最近一次 button event 的 serial. set_selection / xdg_toplevel
     /// 等协议路径需 serial (compositor 验证防伪造). 与 `last_enter_serial`
     /// 同性质 (单 source-of-truth, 不外漏).
@@ -565,12 +587,13 @@ impl PointerState {
         // 尺寸变化后重新算一次 hover (按钮挪了位置, 鼠标可能落到不同区).
         // pos 不变, hit_test 用新 surface 尺寸即可.
         if let Some((x, y)) = self.pos {
-            self.hover = hit_test_with_tabs(
+            self.hover = hit_test_with_tabs_ex(
                 x,
                 y,
                 self.surface_w_logical,
                 self.surface_h_logical,
                 self.tab_count,
+                self.disable_resize,
             );
         }
     }
@@ -678,16 +701,29 @@ pub fn handle_pointer_event(
         // 的 value 跟物理速度变, 体感不稳. 触摸板暂不支持 (user 不用).
         // 横向 (HorizontalScroll) 不消费 — quill 终端无横向滚.
         wl_pointer::Event::AxisValue120 { axis, value120 } => {
+            tracing::debug!(
+                target: "quill::pointer",
+                ?axis,
+                value120,
+                "AxisValue120 received"
+            );
             if matches!(axis, WEnum::Value(wl_pointer::Axis::VerticalScroll)) {
                 apply_axis_value120(value120)
             } else {
                 PointerAction::Nothing
             }
         }
-        // T-0618: Axis (smooth) 现在 ignore — discrete notch 走 AxisValue120 已
-        // 覆盖 daily-drive 鼠标. 触摸板要支持时再实装 AxisSource 区分 wheel /
-        // finger, finger 走 px / cell_h 累积. 当前 user 不用触摸板, 简化逻辑.
-        wl_pointer::Event::Axis { .. } => PointerAction::Nothing,
+        // T-0618 follow-up: Axis (smooth) 是 mutter 50.x 实际发的 (AxisValue120
+        // 不发). 累积阈值 SCROLL_ACCUM_LINE_PX = 10 → 1 line, 余量留下次, 反向
+        // 时清累积器. value 协议规约: + = 向下手势 = 看新; quill Scroll(+) = 看老,
+        // 故取负.
+        wl_pointer::Event::Axis { axis, value, .. } => {
+            if matches!(axis, WEnum::Value(wl_pointer::Axis::VerticalScroll)) {
+                apply_axis_smooth(state, value)
+            } else {
+                PointerAction::Nothing
+            }
+        }
         // AxisStop / AxisDiscrete / AxisSource / AxisRelativeDirection / Frame:
         // 不消费 (AxisDiscrete 是 AxisValue120 的老前辈, mutter ≥ 45 已发后者).
         _ => PointerAction::Nothing,
@@ -704,12 +740,13 @@ pub fn handle_pointer_event(
 pub(crate) fn apply_enter(state: &mut PointerState, serial: u32, x: f64, y: f64) -> PointerAction {
     state.pos = Some((x, y));
     state.last_enter_serial = serial;
-    let new_hover = hit_test_with_tabs(
+    let new_hover = hit_test_with_tabs_ex(
         x,
         y,
         state.surface_w_logical,
         state.surface_h_logical,
         state.tab_count,
+        state.disable_resize,
     );
     let new_shape = cursor_shape_for(new_hover);
     // 协议要求: enter 后必须 set 一次 cursor (否则 unspecified). 即便
@@ -747,12 +784,13 @@ pub(crate) fn apply_leave(state: &mut PointerState) -> PointerAction {
 /// 求 enter serial, motion event 自身无 serial 字段).
 pub(crate) fn apply_motion(state: &mut PointerState, x: f64, y: f64) -> PointerAction {
     state.pos = Some((x, y));
-    let new_hover = hit_test_with_tabs(
+    let new_hover = hit_test_with_tabs_ex(
         x,
         y,
         state.surface_w_logical,
         state.surface_h_logical,
         state.tab_count,
+        state.disable_resize,
     );
 
     // T-0608: tab drag 阈值检测 (派单 In #F). press 已记录 tab_press, motion 时
@@ -1006,6 +1044,26 @@ pub(crate) fn apply_axis_value120(value120: i32) -> PointerAction {
     PointerAction::Scroll(-lines)
 }
 
+/// smooth axis 累积器 — mutter 50.x 实测发的是 Axis (value=±10/event), 不发
+/// AxisValue120. 累 |accum| ≥ SCROLL_ACCUM_LINE_PX → 出整 line, 余量留下次,
+/// 反向时清。同 apply_axis_value120 取负让 quill Scroll(+) = 看老历史.
+pub(crate) fn apply_axis_smooth(state: &mut PointerState, value: f64) -> PointerAction {
+    if value == 0.0 {
+        return PointerAction::Nothing;
+    }
+    // 反向时清累积 (用户先滚下再滚上, 不该把下方累积当上方累积消费)
+    if state.scroll_accum_y != 0.0 && state.scroll_accum_y.signum() != value.signum() {
+        state.scroll_accum_y = 0.0;
+    }
+    state.scroll_accum_y += value;
+    let lines = (state.scroll_accum_y / SCROLL_ACCUM_LINE_PX).trunc() as i32;
+    if lines == 0 {
+        return PointerAction::Nothing;
+    }
+    state.scroll_accum_y -= (lines as f64) * SCROLL_ACCUM_LINE_PX;
+    PointerAction::Scroll(-lines)
+}
+
 /// 纯逻辑 hit-test: 给定 surface 内坐标 (logical px) 与 surface 尺寸 (logical),
 /// 算 [`HoverRegion`]. 派单 In #F 抽决策模式硬约束, 单测覆盖 ≥6 case
 /// (titlebar / 3 按钮 / text area / 边界 / T-0701 4 边 + 4 角 resize).
@@ -1078,11 +1136,39 @@ pub fn hit_test_with_tabs(
     surface_h: u32,
     tab_count: usize,
 ) -> HoverRegion {
+    hit_test_with_tabs_ex(x, y, surface_w, surface_h, tab_count, false)
+}
+
+/// T-0618 follow-up: hit_test 扩展版, 加 `disable_resize` 参数. 全屏 / 最大化
+/// 时调用方传 true 跳 ResizeEdge — 视觉上窗口贴边, 拖 resize 没意义且反 UX.
+pub fn hit_test_with_tabs_ex(
+    x: f64,
+    y: f64,
+    surface_w: u32,
+    surface_h: u32,
+    tab_count: usize,
+    disable_resize: bool,
+) -> HoverRegion {
     // 边界外 + 边角 + 边带 走原 hit_test 优先级 (角 / 边 优先按钮 / titlebar /
     // tab bar). 但原 hit_test 把 cell 区起点定在 TITLEBAR_H, 我们要把它推到
     // TITLEBAR_H + TAB_BAR_H. 路径: 先走原 hit_test, 拿到 TitleBar / TextArea
     // 时根据 y 进一步细化为 tab bar 区或真 cell 区.
     let base = hit_test(x, y, surface_w, surface_h);
+    // 全屏 / 最大化下 ResizeEdge 退化到 TitleBar (顶端) 或 TextArea (其他边).
+    let base = if disable_resize {
+        match base {
+            HoverRegion::ResizeEdge(edge) => {
+                use ResizeEdge as E;
+                match edge {
+                    E::Top | E::TopLeft | E::TopRight => HoverRegion::TitleBar,
+                    _ => HoverRegion::TextArea,
+                }
+            }
+            other => other,
+        }
+    } else {
+        base
+    };
     // T-0617: 单 tab (count <= 1) 隐藏 tab bar — 派单 In #B + 红线 "单 tab 时
     // tab area 不存在", click 不应 fall-through 错位.
     if tab_count <= 1 {
