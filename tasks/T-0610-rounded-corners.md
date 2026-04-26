@@ -1,8 +1,8 @@
 # T-0610 part 2 窗口圆角 (shader corner radius mask)
 
 **Phase**: 7+ (polish, daily-drive feel)
-**Assigned**: (open)
-**Status**: open
+**Assigned**: writer-T0610
+**Status**: in-review
 **Budget**: tokenBudget=200k (跨 wgpu shader corner mask + uniform binding +
 vertex layout 兼容 + 4 角圆形 alpha discard + 跟 T-0610 part 1 半透明
 alpha=0.85 兼容)

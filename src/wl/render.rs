@@ -55,6 +55,10 @@ fn srgb_to_linear(v: f64) -> f64 {
     }
 }
 
+/// `#[allow(dead_code)]`: T-0610 part 2 起 live + headless 路径全走
+/// [`clear_color_for_with_alpha`] (clear alpha=0 让 corner 外透明), 本 fn 只剩
+/// 测试 `non_srgb_format_uses_raw_components` / `srgb_format_applies_gamma` 调用.
+#[allow(dead_code)]
 fn clear_color_for(format: wgpu::TextureFormat) -> wgpu::Color {
     clear_color_for_with_alpha(format, 1.0)
 }
@@ -142,6 +146,19 @@ pub struct Renderer {
     /// 当前 glyph vertex buffer 容量 (顶点数计)。Phase 4 单帧字符上限粗估
     /// (24 行 × 80 col × 6 顶点 = 11520 vert), 首次分配后 buffer reuse。
     glyph_buffer_capacity: usize,
+    /// **T-0610 part 2: corner mask uniform buffer** (持 wgpu device 引用).
+    /// `[surface_w, surface_h, corner_radius_phys, alpha_live]` 16 字节 std140.
+    /// `Renderer::new` 建好首帧 + `Renderer::resize` 每次 surface 尺寸变更时
+    /// `queue.write_buffer` 推新尺寸. cell + glyph pipeline 共享 (group=1 binding).
+    /// INV-002 字段顺序: 持 device 引用资源, 必须**在 `device` 之前 drop** —
+    /// reviewer-T0610 否决 hotfix 把字段从 device 之后挪到这里 (与 `glyph_*` 同档).
+    corner_uniform_buffer: wgpu::Buffer,
+    /// **T-0610 part 2: corner mask bind group** (持 device 引用 + uniform buffer
+    /// 内部 Arc). bind_group_layout 内嵌 (group=1 single uniform binding,
+    /// FRAGMENT visibility), pipeline 创建时取自 [`Self::corner_bind_group_layout`]
+    /// 复刻 (无单独字段, 与 GlyphAtlas 内部 layout 同套路 — wgpu Arc 计数兜底).
+    /// INV-002: 同 `corner_uniform_buffer`, 必须在 `device` 之前 drop.
+    corner_bind_group: wgpu::BindGroup,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
@@ -161,6 +178,17 @@ pub struct Renderer {
     /// 通过 [`Self::set_tab_state`] 在每帧 draw_frame 之前同步.
     tab_count: usize,
     active_tab_idx: usize,
+    /// **T-0610 part 2: live alpha** (CLEAR_ALPHA_LIVE = 0.85 / Opaque fallback 1.0).
+    /// `Renderer::new` 据 alpha_mode 决定一次后锁住; `Renderer::resize` 走 update
+    /// uniform 时复用本字段, 不需重查 adapter caps. POD f32 顺序无关, 与
+    /// `surface_is_srgb` 同档.
+    ///
+    /// **派单偏离声明**: 派单"INV-002 字段加 uniform_buffer + bind_group, 17 → 19"
+    /// — 实装加 3 字段 (含 alpha_live), 17 → 20. 理由: alpha_live 必须在 resize
+    /// 路径访问 (`update_corner_uniform` 重写 surface_w/h 时必填), 不存字段需在
+    /// resize 重查 adapter caps (重 GPU query, 60Hz resize 不可接受). Lead follow-up
+    /// sync docs/invariants.md.
+    alpha_live: f32,
     // 持有 Instance 避免提前 drop 掉 Vulkan/GL 实例。
     #[allow(dead_code)]
     instance: wgpu::Instance,
@@ -273,6 +301,12 @@ const BASELINE_Y_PX: f32 = 18.0;
 ///   filterable=false, sampler_type NonFiltering 配 mag/min FilterMode::Nearest)
 /// - `@group(0) @binding(1)`: sampler (NonFiltering)
 const GLYPH_WGSL: &str = r#"
+struct CornerMask {
+    surface_size: vec2<f32>,
+    corner_radius: f32,
+    alpha_live: f32,
+};
+
 struct VsIn {
     @location(0) pos: vec2<f32>,
     @location(1) uv: vec2<f32>,
@@ -287,6 +321,7 @@ struct VsOut {
 
 @group(0) @binding(0) var atlas_tex: texture_2d<f32>;
 @group(0) @binding(1) var atlas_samp: sampler;
+@group(1) @binding(0) var<uniform> mask: CornerMask;
 
 @vertex
 fn vs_main(v: VsIn) -> VsOut {
@@ -300,7 +335,19 @@ fn vs_main(v: VsIn) -> VsOut {
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let alpha = textureSample(atlas_tex, atlas_samp, in.uv).r;
-    return vec4<f32>(in.color, alpha);
+    let p = in.clip.xy;
+    let r = mask.corner_radius;
+    let s = mask.surface_size;
+    let cx = clamp(p.x, r, s.x - r);
+    let cy = clamp(p.y, r, s.y - r);
+    let dx = p.x - cx;
+    let dy = p.y - cy;
+    let d = sqrt(dx * dx + dy * dy);
+    if (d > r + 1.0) {
+        discard;
+    }
+    let aa = clamp(r + 0.5 - d, 0.0, 1.0);
+    return vec4<f32>(in.color, alpha * mask.alpha_live * aa);
 }
 "#;
 
@@ -380,6 +427,23 @@ pub const TAB_MIN_W_LOGICAL_PX: u32 = 80;
 
 /// **T-0608: tab close 按钮 (×) 宽度** (logical px). 16 logical, 占 tab 右侧.
 pub const TAB_CLOSE_W_LOGICAL_PX: u32 = 16;
+
+/// **T-0610 part 2: 窗口圆角半径** (logical px, × HIDPI_SCALE 拿 physical).
+///
+/// 8 logical = 16 physical (HIDPI×2). 与 mutter / GTK4 / ghostty 现代窗口圆角
+/// 视觉一致 (实测 ghostty Mac titlebar 圆角 ~8 px). 不开 user 配置 (派单 Out 段
+/// 硬编码), Phase 7+ config 系统接入时再考虑.
+///
+/// **shader 用法**: `corner_radius_phys = CORNER_RADIUS_PX × HIDPI_SCALE`,
+/// 经 [`Renderer::corner_uniform_buffer`] 上传给 cell + glyph fragment shader,
+/// 走 [`build_corner_mask_uniform`] 算 `vec4<f32>(surface_w, surface_h,
+/// corner_radius_phys, alpha_live)` (16 字节 std140). fragment 内 distance(frag_coord,
+/// nearest_inset_corner_center) > radius+1 → discard, AA band 内 alpha 渐变.
+///
+/// **why 8 logical 而非 12 / 16**: 8 px 是"圆角看得见但不喧宾夺主"的 sweet spot;
+/// 16 px (mutter 系统级 CSD 圆角) 在 800x600 小窗口占比偏大显得"切了块",
+/// ghostty / GTK4 应用主流走 6-10 px 范围。
+pub const CORNER_RADIUS_PX: f32 = 8.0;
 
 /// **CSD titlebar 配色**.
 const TITLEBAR_BG: crate::term::Color = crate::term::Color {
@@ -560,15 +624,83 @@ pub const HIDPI_SCALE: u32 = 2;
 /// 与本常量必须一致(见 [`CELL_WGSL`])。
 const VERTEX_BYTES: usize = 5 * std::mem::size_of::<f32>();
 
+/// **T-0610 part 2: corner mask uniform 字节数** (4 × f32 = 16 字节, std140 兼容).
+/// `[surface_w, surface_h, corner_radius_phys, alpha_live]` —— wgsl 端 struct
+/// `CornerMask { surface_size: vec2<f32>, corner_radius: f32, alpha_live: f32 }`
+/// 自然 16 字节对齐, 不需 padding.
+const CORNER_MASK_UNIFORM_BYTES: u64 = 16;
+
+/// **T-0610 part 2: 把 corner mask 4 个 f32 封成 16 字节 little-endian buffer**.
+/// 调用方 (`Renderer::update_corner_uniform` / `render_headless`) `queue.write_buffer`
+/// 推给 GPU. 抽 free fn 让单测可独立验 (无 wgpu device 依赖).
+///
+/// `surface_w / surface_h`: physical px (与 surface.configure 同单位, NDC 换算同源).
+/// `corner_radius_phys`: physical px (= CORNER_RADIUS_PX × HIDPI_SCALE).
+/// `alpha_live`: 0.0..=1.0 (0.85 live wayland, 1.0 headless / Opaque fallback).
+pub(crate) fn build_corner_mask_uniform(
+    surface_w: f32,
+    surface_h: f32,
+    corner_radius_phys: f32,
+    alpha_live: f32,
+) -> [u8; CORNER_MASK_UNIFORM_BYTES as usize] {
+    let mut out = [0u8; CORNER_MASK_UNIFORM_BYTES as usize];
+    out[0..4].copy_from_slice(&surface_w.to_le_bytes());
+    out[4..8].copy_from_slice(&surface_h.to_le_bytes());
+    out[8..12].copy_from_slice(&corner_radius_phys.to_le_bytes());
+    out[12..16].copy_from_slice(&alpha_live.to_le_bytes());
+    out
+}
+
+/// **T-0610 part 2: 纯 fn corner SDF 距离** (frag_coord 到最近内嵌圆心).
+///
+/// rounded rect filling [0, w] × [0, h] with corner radius `r`: 内嵌圆心位于
+/// `(r, r)` / `(w-r, r)` / `(r, h-r)` / `(w-r, h-r)`. 任意点 `p` 到最近内嵌圆心的
+/// 距离 = `length(p - clamp(p, (r,r), (w-r,h-r)))`.
+///
+/// 距离 ≤ r → 在 rounded rect 内. > r → 在角外 (需 discard / alpha=0).
+/// > r 但 < r+1 → AA 边缘 (alpha 渐变).
+///
+/// 抽 free fn 给单测覆盖 4 角 + 中心 + 边缘 case (派单 In #F 覆盖项).
+/// `#[allow(dead_code)]`: 仅 `#[cfg(test)]` 下 `wl::render::tests` 用 (运行时 wgsl
+/// 端走 inline shader 算同公式), 非 test build 看不到调用方.
+#[allow(dead_code)]
+pub(crate) fn corner_distance(
+    px: f32,
+    py: f32,
+    surface_w: f32,
+    surface_h: f32,
+    corner_radius_phys: f32,
+) -> f32 {
+    let cx = px.clamp(corner_radius_phys, surface_w - corner_radius_phys);
+    let cy = py.clamp(corner_radius_phys, surface_h - corner_radius_phys);
+    let dx = px - cx;
+    let dy = py - cy;
+    (dx * dx + dy * dy).sqrt()
+}
+
 /// WGSL shader 内联(派单 "WGSL 内联在 render.rs,跟现有 clear pass 风格一致,
 /// 别拆文件")。两个 stage:
 /// - vertex: pass-through pos + color
-/// - fragment: 输出 vec4(color, 1.0) 不透明
+/// - fragment: 输出 (color * alpha_live * aa, alpha_live * aa) premultiplied.
+///   alpha_live 来自 `@group(1)` corner mask uniform (派单 In #A) — 0.85 live
+///   wayland 让 compositor 半透明 blend, 1.0 headless / Opaque fallback. aa 是
+///   corner mask AA 因子 (1.0 在 rounded rect 内, 渐变到 0.0 在 corner 边缘).
+///
+/// **T-0610 part 2 corner mask** (派单 In #B): fragment 用 `@builtin(position)`
+/// 拿 frag_coord (physical px), 算到最近内嵌圆心距离 d. d > radius+1 → discard
+/// (corner 外 alpha 保 clear=0); radius..radius+1 → smoothstep AA; ≤ radius
+/// → 完全保留. 与 glyph shader corner mask 同算法 (group=1 共享 uniform).
 ///
 /// 颜色已在 CPU 侧做完 sRGB→linear 预补偿(`color_for_vertex`),WGSL 不再处理
 /// gamma —— sRGB surface 会在 GPU 端把 linear 编码回 sRGB 显示,与
 /// [`clear_color_for`] 的预补偿同套路。
 const CELL_WGSL: &str = r#"
+struct CornerMask {
+    surface_size: vec2<f32>,
+    corner_radius: f32,
+    alpha_live: f32,
+};
+
 struct VsIn {
     @location(0) pos: vec2<f32>,
     @location(1) color: vec3<f32>,
@@ -578,6 +710,8 @@ struct VsOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) color: vec3<f32>,
 };
+
+@group(1) @binding(0) var<uniform> mask: CornerMask;
 
 @vertex
 fn vs_main(v: VsIn) -> VsOut {
@@ -589,7 +723,20 @@ fn vs_main(v: VsIn) -> VsOut {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(in.color, 1.0);
+    let p = in.clip.xy;
+    let r = mask.corner_radius;
+    let s = mask.surface_size;
+    let cx = clamp(p.x, r, s.x - r);
+    let cy = clamp(p.y, r, s.y - r);
+    let dx = p.x - cx;
+    let dy = p.y - cy;
+    let d = sqrt(dx * dx + dy * dy);
+    if (d > r + 1.0) {
+        discard;
+    }
+    let aa = clamp(r + 0.5 - d, 0.0, 1.0);
+    let final_a = mask.alpha_live * aa;
+    return vec4<f32>(in.color * final_a, final_a);
 }
 "#;
 
@@ -1052,6 +1199,79 @@ pub(crate) fn append_tab_bar_vertices(
     );
 }
 
+/// **T-0610 part 2: corner mask bind group layout descriptor**.
+///
+/// 抽 free fn 让 `Renderer::new` + `render_headless` 共享同一 layout 定义 (派单
+/// "shared bind group layout, cell + glyph pipeline 都 bind 同一个"). group=1 binding=0
+/// FRAGMENT 可见 uniform buffer, std140 16 字节 (4 × f32).
+fn create_corner_mask_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("quill-corner-mask-bgl"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: std::num::NonZero::new(CORNER_MASK_UNIFORM_BYTES),
+            },
+            count: None,
+        }],
+    })
+}
+
+/// **T-0610 part 2: 创建 corner mask uniform buffer + bind group + 写入初值**.
+///
+/// `Renderer::new` / `render_headless` 同源 (派单"cell + glyph 共享 group=1 uniform").
+/// 走 `wgpu::BufferUsages::UNIFORM | COPY_DST` 让后续 `queue.write_buffer` 推新尺寸,
+/// 不重建 buffer / bind group (Renderer 字段 set-once 约定, 与 cell/glyph pipeline 同
+/// lazy 套路).
+fn create_corner_mask_resources(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    surface_w: f32,
+    surface_h: f32,
+    alpha_live: f32,
+) -> (wgpu::Buffer, wgpu::BindGroup) {
+    let bgl = create_corner_mask_bgl(device);
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("quill-corner-mask-uniform"),
+        size: CORNER_MASK_UNIFORM_BYTES,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let corner_radius_phys = CORNER_RADIUS_PX * HIDPI_SCALE as f32;
+    let bytes = build_corner_mask_uniform(surface_w, surface_h, corner_radius_phys, alpha_live);
+    queue.write_buffer(&buffer, 0, &bytes);
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("quill-corner-mask-bg"),
+        layout: &bgl,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: buffer.as_entire_binding(),
+        }],
+    });
+    (buffer, bind_group)
+}
+
+/// **T-0610 part 2: append 全 surface bg fill quad** (色 = `clear_rgb_linear`).
+/// 在 cell_vertex_bytes 最前面追加 1 quad (6 顶点, 与 [`append_quad_px`] 同骨架).
+/// cell shader 内 `vec4<f32>(in.color * alpha_live * aa, alpha_live * aa)` 输出,
+/// 让"默认 bg 区"也跟着 alpha_live = 0.85 半透明 + corner 内圆形显示.
+///
+/// **why bg fill quad**: T-0610 part 1 仅 clear alpha=0.85 让默认 bg 区半透明,
+/// 但 corner 外要 alpha=0 — clear 是单一全幅值不能选择性置 0.
+/// 改 clear alpha=0 加上 bg fill quad 在 cell pipeline 走 corner mask,
+/// corner 外被 fragment discard (alpha 保 clear=0 = 透明), corner 内填
+/// alpha=0.85 (uniform translucency 与 ghostty 一致). titlebar 与 tab_bar 与
+/// cells 与 border 在 bg fill 之上 REPLACE 覆盖 (它们也走 cell shader corner
+/// mask, corner 外 discard 不破透明效果).
+fn append_background_fill_quad(out: &mut Vec<u8>, surface_w: f32, surface_h: f32, color: [f32; 3]) {
+    append_quad_px(
+        out, 0.0, 0.0, surface_w, surface_h, surface_w, surface_h, color,
+    );
+}
+
 impl Renderer {
     /// 从 Wayland 裸指针构造 Renderer,配置初始尺寸并返回。
     ///
@@ -1172,22 +1392,40 @@ impl Renderer {
             "wgpu present_mode 选定 (T-0802: Mailbox 偏好减拖窗口 stutter)"
         );
 
-        // T-0610 hotfix: live wayland surface 走 CLEAR_ALPHA_LIVE (0.85) 半透明
-        // (alpha_mode != Opaque 时 compositor blend 桌面). Opaque 退化 alpha=1.0
-        // 跟旧行为等价 (color * 1.0 = color, alpha=1.0 不透明).
-        let clear_alpha = if matches!(alpha_mode, wgpu::CompositeAlphaMode::Opaque) {
+        // T-0610 part 2: clear alpha = 0 (透明) — corner 外 fragment discard
+        // 后让 clear 透明值保留. 非 corner 区域走 [`append_background_fill_quad`]
+        // 在 cell pipeline 内填 alpha_live (0.85 / 1.0). Opaque alpha_mode fallback
+        // 走 alpha_live=1.0 (compositor 不支持半透明), bg fill 仍画 → 视觉等价旧
+        // T-0610 part 1 全不透明.
+        //
+        // why 不复用 T-0610 part 1 clear alpha=0.85: 单一 clear 值不能选择性 0
+        // (corner 外) / 0.85 (内). 改走 clear=0 + bg fill quad 把 alpha_live 决策
+        // 集中到 fragment shader (group=1 uniform), corner mask discard 自然让
+        // 外边透明.
+        let alpha_live = if matches!(alpha_mode, wgpu::CompositeAlphaMode::Opaque) {
             1.0
         } else {
             CLEAR_ALPHA_LIVE
         };
-        let clear = clear_color_for_with_alpha(format, clear_alpha);
+        let clear = clear_color_for_with_alpha(format, 0.0);
         let surface_is_srgb = format.is_srgb();
         tracing::debug!(
             ?format,
             width = config.width,
             height = config.height,
             srgb = surface_is_srgb,
-            "wgpu surface configured"
+            alpha_live,
+            "wgpu surface configured (T-0610 part 2: clear alpha=0, bg fill 走 cell pipeline)"
+        );
+
+        // T-0610 part 2: corner mask uniform + bind group. cell + glyph pipeline
+        // 创建时同 layout, render pass set_bind_group(1, ..) 共享.
+        let (corner_uniform_buffer, corner_bind_group) = create_corner_mask_resources(
+            &device,
+            &queue,
+            physical_w as f32,
+            physical_h as f32,
+            alpha_live as f32,
         );
 
         Ok(Self {
@@ -1209,13 +1447,19 @@ impl Renderer {
             // T-0702: 默认 "quill", 上层 init_renderer_and_draw 后调
             // [`Self::set_title`] 同步 xdg_toplevel.set_title 的值 (实操 window.rs
             // T-0102 起就 set_title("quill"), 与默认一致 — set_title 调用是
-            // future-proof: Phase 7+ 接 cwd / 命令时本字段动态更新).
+            // future-proof: Phase 7+ 接 cwd / 命令 watcher 时本字段动态更新).
             title: DEFAULT_TITLE.to_string(),
             // T-0608: 默认 1 tab, active idx 0 (与 quill 启动期单 tab 对齐).
             // 上层 idle callback 每帧 draw_frame 之前调 [`Self::set_tab_state`]
             // 同步真实 tabs 数量 + active idx.
             tab_count: 1,
             active_tab_idx: 0,
+            // T-0610 part 2: corner mask GPU 资源 (持 device 引用, INV-002
+            // 字段顺序: device 之前 drop). 17 → 20 字段 (含 alpha_live POD),
+            // Lead follow-up sync docs/invariants.md.
+            corner_uniform_buffer,
+            corner_bind_group,
+            alpha_live: alpha_live as f32,
             instance,
         })
     }
@@ -1260,12 +1504,27 @@ impl Renderer {
         self.config.width = physical_w;
         self.config.height = physical_h;
         self.surface.configure(&self.device, &self.config);
+        // T-0610 part 2: corner mask uniform 跟 surface 尺寸同步更新, fragment
+        // shader corner_distance 用 surface_size 算最近内嵌圆心. 不更新会致
+        // resize 后 corner 漂位 (旧尺寸算的圆心在新 surface 内不对齐).
+        // T-0802 节流路径: propagate_resize_if_dirty 节流跳过时本 fn 不调,
+        // dirty 留下次 — uniform 同步推迟到下次 propagate, 接受 < 60ms 不一致
+        // (派单已知陷阱 "resize race < 60ms 不影响 daily drive").
+        let corner_radius_phys = CORNER_RADIUS_PX * HIDPI_SCALE as f32;
+        let bytes = build_corner_mask_uniform(
+            physical_w as f32,
+            physical_h as f32,
+            corner_radius_phys,
+            self.alpha_live,
+        );
+        self.queue
+            .write_buffer(&self.corner_uniform_buffer, 0, &bytes);
         tracing::debug!(
             logical_w = width,
             logical_h = height,
             physical_w,
             physical_h,
-            "wgpu surface reconfigured (HIDPI scaled)"
+            "wgpu surface reconfigured (HIDPI scaled, corner mask uniform synced)"
         );
     }
 
@@ -1496,6 +1755,8 @@ impl Renderer {
                     .as_ref()
                     .ok_or_else(|| anyhow!("cell_vertex_buffer 应已 lazy 初始化"))?;
                 pass.set_pipeline(pipeline);
+                // T-0610 part 2: cell shader group=1 corner mask uniform binding.
+                pass.set_bind_group(1, &self.corner_bind_group, &[]);
                 pass.set_vertex_buffer(0, buf.slice(..));
                 pass.draw(0..vertex_count, 0..1);
             }
@@ -1522,11 +1783,15 @@ impl Renderer {
                 label: Some("quill-cells-shader"),
                 source: wgpu::ShaderSource::Wgsl(CELL_WGSL.into()),
             });
+        // T-0610 part 2: cell pipeline group=1 持 corner mask uniform (group=0 空,
+        // cell shader 无 group=0 binding). 与 glyph pipeline (group=0 atlas +
+        // group=1 corner) 共享 group=1 BGL — 统一 corner mask uniform binding.
+        let corner_bgl = create_corner_mask_bgl(&self.device);
         let layout = self
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("quill-cells-pipeline-layout"),
-                bind_group_layouts: &[],
+                bind_group_layouts: &[None, Some(&corner_bgl)],
                 immediate_size: 0,
             });
         let vertex_attrs = [
@@ -1788,10 +2053,26 @@ impl Renderer {
         let titlebar_y_offset_px =
             (TITLEBAR_H_LOGICAL_PX + TAB_BAR_H_LOGICAL_PX) as f32 * HIDPI_SCALE as f32;
 
+        // T-0610 part 2: 全 surface bg fill quad (放最前面 — REPLACE blend 让后续
+        // cells / titlebar / tab_bar / border quads 在其上覆盖). 走 cell pipeline,
+        // shader 把 alpha_live (0.85 / 1.0) + corner mask AA 应用到 fragment, 让
+        // "默认 bg 区"也跟着半透明 + corner 内圆形 (corner 外 fragment discard
+        // 让 clear=0 透明值显露).
+        //
+        // why 不复用 T-0610 part 1 clear=0.85 路径: 单一 clear 不能选择性 corner
+        // 外 0 / 内 0.85; 走 clear=0 + bg fill 让 corner mask 决策集中在 fragment.
+        let bg_fill_color = self.color_for_vertex(crate::term::Color {
+            r: CLEAR_COLOR_SRGB_U8[0],
+            g: CLEAR_COLOR_SRGB_U8[1],
+            b: CLEAR_COLOR_SRGB_U8[2],
+        });
+        let mut cell_vertex_bytes: Vec<u8> = Vec::new();
+        append_background_fill_quad(&mut cell_vertex_bytes, surface_w, surface_h, bg_fill_color);
+
         // Step 3: cell vertex bytes (T-0407 D fix: 走 bg 色, 让 glyph fg 字形
         // 在 cell bg 块上可见; T-0403 用 fg 致字形被 cell fg 块"涂同色"不可见,
         // 用户实测看到一片连续 fg 色矩形不见字)。
-        let mut cell_vertex_bytes = self.build_vertex_bytes(
+        cell_vertex_bytes.extend(self.build_vertex_bytes(
             cells,
             cell_w_px,
             cell_h_px,
@@ -1804,7 +2085,7 @@ impl Renderer {
             // 同步减 titlebar 高让 cell rows 数对应 cell 区可用高度, 总高 = surface
             // (logical) - titlebar (logical), 视觉无超出.
             titlebar_y_offset_px,
-        );
+        ));
         // T-0607: 追加 selection bg quads (在常规 cell quads 之后, REPLACE blend
         // 让 selection 视觉覆盖 cell 默认 bg). 字形随后走 alpha-blend pass 在
         // selection bg 上仍可见.
@@ -2149,6 +2430,8 @@ impl Renderer {
                     .as_ref()
                     .ok_or_else(|| anyhow!("cell_vertex_buffer 应已 lazy 初始化"))?;
                 pass.set_pipeline(cell_pipeline);
+                // T-0610 part 2: cell shader group=1 corner mask uniform binding.
+                pass.set_bind_group(1, &self.corner_bind_group, &[]);
                 pass.set_vertex_buffer(0, cell_buf.slice(..));
                 pass.draw(0..cell_vertex_count, 0..1);
             }
@@ -2169,6 +2452,8 @@ impl Renderer {
                     .ok_or_else(|| anyhow!("glyph_vertex_buffer 应已 lazy 初始化"))?;
                 pass.set_pipeline(glyph_pipeline);
                 pass.set_bind_group(0, &atlas.bind_group, &[]);
+                // T-0610 part 2: glyph shader group=1 corner mask uniform.
+                pass.set_bind_group(1, &self.corner_bind_group, &[]);
                 pass.set_vertex_buffer(0, glyph_buf.slice(..));
                 pass.draw(0..glyph_vertex_count, 0..1);
             }
@@ -2291,11 +2576,14 @@ impl Renderer {
                 label: Some("quill-glyph-shader"),
                 source: wgpu::ShaderSource::Wgsl(GLYPH_WGSL.into()),
             });
+        // T-0610 part 2: glyph pipeline group=0 atlas + group=1 corner mask. 与
+        // cell pipeline 共享 group=1 BGL — 统一 corner mask uniform binding.
+        let corner_bgl = create_corner_mask_bgl(&self.device);
         let layout = self
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("quill-glyph-pipeline-layout"),
-                bind_group_layouts: &[Some(bgl)],
+                bind_group_layouts: &[Some(bgl), Some(&corner_bgl)],
                 immediate_size: 0,
             });
         let vertex_attrs = [
@@ -3094,8 +3382,27 @@ pub fn render_headless(
     });
     let target_view = target_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-    let clear = clear_color_for(format);
+    // T-0610 part 2: clear alpha=0 让 corner 外 fragment discard 后透明值保留.
+    // 与 Renderer::new 同决策, headless PNG 输出 corner 外 alpha=0 (派单 Acceptance
+    // "PNG verify 角外像素 alpha=0").
+    let clear = clear_color_for_with_alpha(format, 0.0);
     let is_srgb = format.is_srgb();
+    // T-0610 part 2: headless alpha_live 锁 1.0 (保持 PNG center 区域 alpha=255 = opaque,
+    // 与现有 PNG verify 测试 RGB 检查兼容). live wayland 路径走 0.85 (CLEAR_ALPHA_LIVE).
+    let alpha_live: f32 = 1.0;
+    // T-0610 part 2: corner mask uniform + bind group (本地, 函数返回 drop, 不污染
+    // [`Renderer`]). 与 Renderer::new 走 [`create_corner_mask_resources`] 同源.
+    let (corner_uniform_buffer, corner_bind_group) = create_corner_mask_resources(
+        &device,
+        &queue,
+        physical_w as f32,
+        physical_h as f32,
+        alpha_live,
+    );
+    // 持有 corner_uniform_buffer 防 BindGroup 内部 Arc 引用归零 (实测 wgpu 内部
+    // BindGroup 持 Buffer Arc, drop buffer 在 set_bind_group 之前不会真释放, 但
+    // 显式持有让 review 可读).
+    let _corner_uniform_buffer_keepalive = &corner_uniform_buffer;
 
     let cell_pipeline = create_headless_cell_pipeline(&device, format);
 
@@ -3186,6 +3493,19 @@ pub fn render_headless(
 
     let mut cell_vertex_bytes: Vec<u8> =
         Vec::with_capacity(cells.len() * VERTS_PER_CELL * VERTEX_BYTES);
+    // T-0610 part 2: 全 surface bg fill quad (cell pipeline, REPLACE blend 让后续
+    // cells / titlebar / tab_bar / border 在其上覆盖). 与 Renderer::draw_frame 同
+    // 决策, 让"默认 bg 区"也跟着 alpha_live + corner mask. clear=0 透明值在 corner
+    // 外 fragment discard 后保留, PNG 验 corner 外 alpha=0.
+    let bg_fill_color = color_for_vertex_with_srgb(
+        crate::term::Color {
+            r: CLEAR_COLOR_SRGB_U8[0],
+            g: CLEAR_COLOR_SRGB_U8[1],
+            b: CLEAR_COLOR_SRGB_U8[2],
+        },
+        is_srgb,
+    );
+    append_background_fill_quad(&mut cell_vertex_bytes, surface_w, surface_h, bg_fill_color);
     for cell in cells {
         if cell.c == ' ' {
             continue;
@@ -3767,12 +4087,16 @@ pub fn render_headless(
         });
         if let Some(buf) = cell_vbuf.as_ref() {
             pass.set_pipeline(&cell_pipeline);
+            // T-0610 part 2: cell shader group=1 corner mask uniform.
+            pass.set_bind_group(1, &corner_bind_group, &[]);
             pass.set_vertex_buffer(0, buf.slice(..));
             pass.draw(0..cell_vertex_count, 0..1);
         }
         if let Some(buf) = glyph_vbuf.as_ref() {
             pass.set_pipeline(&glyph_pipeline);
             pass.set_bind_group(0, &glyph_bg, &[]);
+            // T-0610 part 2: glyph shader group=1 corner mask uniform.
+            pass.set_bind_group(1, &corner_bind_group, &[]);
             pass.set_vertex_buffer(0, buf.slice(..));
             pass.draw(0..glyph_vertex_count, 0..1);
         }
@@ -3872,6 +4196,9 @@ fn color_for_vertex_with_srgb(c: crate::term::Color, is_srgb: bool) -> [f32; 3] 
 
 /// [`render_headless`] 用的 cell render pipeline (与 [`Renderer::ensure_cell_pipeline`]
 /// 同骨架, 只多 `format` 入参让 headless 路径锁 [`wgpu::TextureFormat::Rgba8UnormSrgb`])。
+///
+/// **T-0610 part 2**: 加 group=1 corner mask BGL (与 Renderer 路径同源 — 走
+/// [`create_corner_mask_bgl`] 共享 layout 定义).
 fn create_headless_cell_pipeline(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
@@ -3880,9 +4207,10 @@ fn create_headless_cell_pipeline(
         label: Some("quill-headless-cells-shader"),
         source: wgpu::ShaderSource::Wgsl(CELL_WGSL.into()),
     });
+    let corner_bgl = create_corner_mask_bgl(device);
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("quill-headless-cells-pipeline-layout"),
-        bind_group_layouts: &[],
+        bind_group_layouts: &[None, Some(&corner_bgl)],
         immediate_size: 0,
     });
     let vertex_attrs = [
@@ -3939,6 +4267,8 @@ fn create_headless_cell_pipeline(
 /// [`render_headless`] 用的 glyph render pipeline (与 [`Renderer::ensure_glyph_pipeline`]
 /// 同骨架, `format` 锁 [`wgpu::TextureFormat::Rgba8UnormSrgb`], `bgl` 由调用方
 /// 传入 — 与 atlas 的 bind_group_layout 匹配)。
+///
+/// **T-0610 part 2**: 加 group=1 corner mask BGL (group=0 atlas, group=1 corner).
 fn create_headless_glyph_pipeline(
     device: &wgpu::Device,
     bgl: &wgpu::BindGroupLayout,
@@ -3948,9 +4278,10 @@ fn create_headless_glyph_pipeline(
         label: Some("quill-headless-glyph-shader"),
         source: wgpu::ShaderSource::Wgsl(GLYPH_WGSL.into()),
     });
+    let corner_bgl = create_corner_mask_bgl(device);
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("quill-headless-glyph-pipeline-layout"),
-        bind_group_layouts: &[Some(bgl)],
+        bind_group_layouts: &[Some(bgl), Some(&corner_bgl)],
         immediate_size: 0,
     });
     let vertex_attrs = [
@@ -4827,5 +5158,168 @@ mod tests {
             }
             out
         }
+    }
+
+    // ---------- T-0610 part 2 corner mask 单测 (派单 In #F) ----------
+
+    /// CORNER_RADIUS_PX 锁: 防"顺手改成 4 / 12 / 16". user 实测 sweet spot 是
+    /// 8 logical (= 16 physical 在 HIDPI×2), 与 ghostty Mac 一致. 改前看
+    /// docs/audit/<日期>-T-0610-review.md 三源 PNG verify.
+    #[test]
+    fn corner_radius_is_eight_logical_px() {
+        assert_eq!(
+            CORNER_RADIUS_PX, 8.0,
+            "T-0610 part 2 圆角半径锁 (logical px), 8 logical = 16 physical (HIDPI×2)"
+        );
+    }
+
+    /// corner_distance 中心点: 距任一内嵌圆心都远, 但 clamp 让中心点落到 (cx, cy)
+    /// 等于 (px, py) — 距离 = 0 (= 完全在 rounded rect 内, 不需 mask).
+    #[test]
+    fn corner_distance_at_center_is_zero() {
+        let r = 16.0;
+        let sw = 1600.0;
+        let sh = 1200.0;
+        let d = corner_distance(800.0, 600.0, sw, sh, r);
+        assert!(d.abs() < 1e-5, "中心点距离应 = 0, got {d}");
+    }
+
+    /// corner_distance 4 角内嵌圆心位置: distance = 0 (clamp 到角内圆心).
+    #[test]
+    fn corner_distance_at_inset_centers_is_zero() {
+        let r = 16.0;
+        let sw = 1600.0;
+        let sh = 1200.0;
+        // top-left 内嵌圆心 (r, r)
+        assert!(corner_distance(r, r, sw, sh, r).abs() < 1e-5);
+        // top-right (sw - r, r)
+        assert!(corner_distance(sw - r, r, sw, sh, r).abs() < 1e-5);
+        // bottom-left (r, sh - r)
+        assert!(corner_distance(r, sh - r, sw, sh, r).abs() < 1e-5);
+        // bottom-right (sw - r, sh - r)
+        assert!(corner_distance(sw - r, sh - r, sw, sh, r).abs() < 1e-5);
+    }
+
+    /// corner_distance 4 角顶点 (0,0) / (sw,0) / (0,sh) / (sw,sh): 距内嵌圆心
+    /// = sqrt(r^2 + r^2) = r * sqrt(2) ≈ 1.414 * r > r → corner 外, fragment
+    /// shader 必 discard.
+    #[test]
+    fn corner_distance_at_corners_exceeds_radius() {
+        let r = 16.0;
+        let sw = 1600.0;
+        let sh = 1200.0;
+        let expected = r * (2.0_f32).sqrt();
+        for (px, py) in [(0.0, 0.0), (sw, 0.0), (0.0, sh), (sw, sh)] {
+            let d = corner_distance(px, py, sw, sh, r);
+            assert!(
+                (d - expected).abs() < 1e-3,
+                "corner ({px}, {py}) distance 应 = r*sqrt(2) = {expected}, got {d}"
+            );
+            assert!(
+                d > r,
+                "corner ({px}, {py}) 距 ({d}) 必 > r ({r}) (discard 路径)"
+            );
+        }
+    }
+
+    /// corner_distance 边缘点: 顶边中点距任一内嵌圆心 (clamp 让 cx=px,cy=r) =
+    /// |py - r| = r → 在 rounded rect 边缘. 不在 corner 区 (clamp 让 cx == px).
+    #[test]
+    fn corner_distance_at_top_edge_middle_equals_radius() {
+        let r = 16.0;
+        let sw = 1600.0;
+        let sh = 1200.0;
+        // 顶边中央 (sw/2, 0)
+        let d = corner_distance(sw / 2.0, 0.0, sw, sh, r);
+        assert!((d - r).abs() < 1e-5, "顶边中央距离应 = r ({r}), got {d}");
+    }
+
+    /// corner_distance 在 rounded rect 内的中间区: distance = 0.
+    #[test]
+    fn corner_distance_at_inset_quad_interior_is_zero() {
+        let r = 16.0;
+        let sw = 1600.0;
+        let sh = 1200.0;
+        // 任意点在 (r, r) 到 (sw-r, sh-r) 矩形内: 距 = 0
+        assert!(corner_distance(100.0, 100.0, sw, sh, r).abs() < 1e-5);
+        assert!(corner_distance(sw - 200.0, sh - 100.0, sw, sh, r).abs() < 1e-5);
+    }
+
+    /// fragment shader discard 决策: corner_dist > r + 1.0 → discard. 单测覆盖
+    /// 决策边界 (派单 已知陷阱 hybrid 走 r+1 阈值).
+    #[test]
+    fn corner_mask_discard_decision_outside_radius_plus_one() {
+        let r = 16.0;
+        let sw = 1600.0;
+        let sh = 1200.0;
+        // 顶角 (0,0): d = r*sqrt(2) ≈ 22.6 > r+1 = 17 → discard
+        let d = corner_distance(0.0, 0.0, sw, sh, r);
+        assert!(
+            d > r + 1.0,
+            "顶角 d ({d}) 应 > r+1 ({}) (discard 路径)",
+            r + 1.0
+        );
+        // (1, 1) 接近顶角但稍内: d = sqrt((r-1)^2 + (r-1)^2) = (r-1)*sqrt(2) ≈ 21.2 > 17
+        let d2 = corner_distance(1.0, 1.0, sw, sh, r);
+        assert!(d2 > r + 1.0, "近顶角 (1,1) d ({d2}) 应 > r+1");
+        // (5, 5) 已脱离顶角圆环: d = (r-5)*sqrt(2) = 11*sqrt(2) ≈ 15.6 < r → keep
+        let d3 = corner_distance(5.0, 5.0, sw, sh, r);
+        assert!(d3 < r, "远离顶角 (5,5) d ({d3}) 应 < r ({r}) (keep 路径)");
+    }
+
+    /// build_corner_mask_uniform 字节布局: std140 [f32; 4] little-endian, 16 字节.
+    /// 派单 In #A "4 × f32 = 16 字节 std140 兼容" 锁.
+    #[test]
+    fn build_corner_mask_uniform_layout_matches_std140() {
+        let bytes = build_corner_mask_uniform(1600.0, 1200.0, 16.0, 0.85);
+        assert_eq!(bytes.len(), 16, "uniform 必 16 字节 std140 兼容");
+        // little-endian f32 解析回去验值
+        let surface_w = f32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let surface_h = f32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        let radius = f32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        let alpha = f32::from_le_bytes(bytes[12..16].try_into().unwrap());
+        assert!((surface_w - 1600.0).abs() < 1e-5);
+        assert!((surface_h - 1200.0).abs() < 1e-5);
+        assert!((radius - 16.0).abs() < 1e-5);
+        assert!((alpha - 0.85).abs() < 1e-5);
+    }
+
+    /// CORNER_MASK_UNIFORM_BYTES 常数锁 (与 build_corner_mask_uniform return 长度一致).
+    #[test]
+    fn corner_mask_uniform_bytes_is_sixteen() {
+        assert_eq!(
+            CORNER_MASK_UNIFORM_BYTES, 16,
+            "T-0610 part 2 std140 [f32; 4] = 16 字节锁"
+        );
+    }
+
+    /// append_background_fill_quad 输出: 1 quad = 6 顶点 = 6 × VERTEX_BYTES.
+    #[test]
+    fn append_background_fill_quad_emits_one_quad() {
+        let mut out = Vec::new();
+        append_background_fill_quad(&mut out, 1600.0, 1200.0, [0.1, 0.2, 0.3]);
+        assert_eq!(
+            out.len(),
+            6 * VERTEX_BYTES,
+            "bg fill quad = 1 quad = 6 顶点 (与 append_quad_px 同骨架)"
+        );
+    }
+
+    /// append_background_fill_quad NDC 范围: 全 surface = NDC 全幅 [-1, +1] × [-1, +1].
+    #[test]
+    fn append_background_fill_quad_covers_full_ndc() {
+        let mut out = Vec::new();
+        append_background_fill_quad(&mut out, 1600.0, 1200.0, [0.1, 0.2, 0.3]);
+        // 第 1 顶点 = TL: NDC (-1, +1). pos[0..4] = x, pos[4..8] = y.
+        let tl_x = f32::from_ne_bytes(out[0..4].try_into().unwrap());
+        let tl_y = f32::from_ne_bytes(out[4..8].try_into().unwrap());
+        assert!((tl_x - (-1.0)).abs() < 1e-5, "TL.x = -1, got {tl_x}");
+        assert!((tl_y - 1.0).abs() < 1e-5, "TL.y = +1, got {tl_y}");
+        // 第 3 顶点 = BR: NDC (+1, -1). offset = 2 × VERTEX_BYTES = 40 字节.
+        let br_off = 2 * VERTEX_BYTES;
+        let br_x = f32::from_ne_bytes(out[br_off..br_off + 4].try_into().unwrap());
+        let br_y = f32::from_ne_bytes(out[br_off + 4..br_off + 8].try_into().unwrap());
+        assert!((br_x - 1.0).abs() < 1e-5, "BR.x = +1, got {br_x}");
+        assert!((br_y - (-1.0)).abs() < 1e-5, "BR.y = -1, got {br_y}");
     }
 }
