@@ -1,8 +1,8 @@
 # T-0611 拖拽文件 → 文件路径插入 (Wayland DnD wl_data_device drop)
 
 **Phase**: 7+ (daily-drive feel, Claude Code workflow 必需)
-**Assigned**: (open)
-**Status**: open
+**Assigned**: writer-T0611
+**Status**: claimed
 **Budget**: tokenBudget=200k (跨 wl_data_device DnD enter/motion/drop/leave + text/uri-list mime + URI 解析 + 多文件路径拼接 + bracketed paste)
 **Dependencies**: T-0607 (wl_data_device 已 bind, paste pipe 路径已通)
 **Priority**: P0 (user 实测 Claude Code daily drive 必需 — 拖文件给 prompt 引用上下文)
