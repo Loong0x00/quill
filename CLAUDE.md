@@ -28,10 +28,15 @@
 
 ## 非目标(暂不做,不纠结)
 
-- 多标签 / 分屏 / 滚动搜索(交给 tmux)
+- 分屏 (Phase 后期再考虑, 不在 daily drive 路径)
+- 滚动搜索 (Phase 后期)
 - ligature(可以以后加)
 - Windows / macOS(Wayland-only)
 - 任何"省显存/省 CPU"的优化技巧 —— 先正确,再性能
+
+**注**: 早期写过"多标签交给 tmux"被 user 否决 (2026-04-26). tmux 是
+tty 时代单 stream 限制的产物, Wayland 窗口能开无数, 在 GUI 终端再叠虚
+拟终端复用器是叠床架屋. 多 tab 走 ghostty 风 native 实现, 见 T-0608。
 
 ---
 
