@@ -2,7 +2,7 @@
 
 **Phase**: 7+ (polish, daily-drive feel)
 **Assigned**: writer-T0703-fix
-**Status**: claimed
+**Status**: in-review
 **Budget**: tokenBudget=200k (sctk wl_cursor + xcursor theme load + cursor surface attach + 4 边 4 角 cursor 文件加载 + fallback 切换)
 **Dependencies**: T-0703 (cursor-shape-v1 现状) / T-0701 (ResizeEdge enum)
 **Priority**: P1 (user 实测 hover resize 边时 cursor 跟拖动接管时不一致, 视觉别扭)
