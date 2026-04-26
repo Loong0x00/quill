@@ -1159,6 +1159,8 @@ fn apply_selection_op(data: &mut LoopData, qh: &QueueHandle<State>) {
     let serial = data.state.pointer_state.last_button_serial();
     match op {
         SelectionOp::SetPrimary => {
+            // T-0607 hotfix: PRIMARY 专用 text 字段, 防被 CLIPBOARD 路径覆盖.
+            data.state.last_primary_text = Some(text.clone());
             let Some(device) = data.state.primary_selection_device.as_ref() else {
                 tracing::trace!(
                     target: "quill::pointer",
@@ -1194,6 +1196,8 @@ fn apply_selection_op(data: &mut LoopData, qh: &QueueHandle<State>) {
             data.state.active_primary_source = Some(source);
         }
         SelectionOp::SetClipboard => {
+            // T-0607 hotfix: CLIPBOARD 专用 text 字段, 防被 PRIMARY 路径覆盖.
+            data.state.last_clipboard_text = Some(text.clone());
             let Some(device) = data.state.data_device.as_ref() else {
                 tracing::trace!(
                     target: "quill::pointer",
@@ -1745,6 +1749,8 @@ pub fn run_window() -> Result<()> {
         data_device: None,
         data_current_offer: None,
         last_selection_text: None,
+        last_primary_text: None,
+        last_clipboard_text: None,
         pty: None,
     };
 
@@ -2224,7 +2230,18 @@ struct State {
     /// T-0607: 最近一次复制的选区文本. 创建 source 后 compositor 在 send event
     /// 中 ask 我们写数据到 fd, 此时读此字段写入. PRIMARY / CLIPBOARD 共享
     /// (语义上同一段选区), 复制时同步更新.
+    ///
+    /// **DEPRECATED 2026-04-26 hotfix**: 保留字段防 schema 破坏既有引用, 但
+    /// PRIMARY / CLIPBOARD 各自走 last_primary_text / last_clipboard_text 防
+    /// 覆盖 race (用户实测 SelectionEnd 自动 SetPrimary 把 CLIPBOARD 内容覆
+    /// 盖成 1 字节空格).
     pub(crate) last_selection_text: Option<String>,
+    /// T-0607 hotfix: PRIMARY 专用最近选区文本. SetPrimary 路径设, PRIMARY
+    /// source.Send dispatch 读. 与 CLIPBOARD 解耦防共享 race.
+    pub(crate) last_primary_text: Option<String>,
+    /// T-0607 hotfix: CLIPBOARD 专用最近选区文本. SetClipboard 路径设, CLIPBOARD
+    /// source.Send dispatch 读. 与 PRIMARY 解耦.
+    pub(crate) last_clipboard_text: Option<String>,
     // `pty` **位于 State 最后一位**(Lead + 审码 2026-04-25 拍板,见 T-0202 ticket):
     // - PTY 持 Linux fd + 子进程句柄,与 wl / wgpu 资源生命周期正交,放最后避免
     //   跟 INV-001 的 renderer→window→conn 链条耦合,不需要新建 INV。
@@ -2809,7 +2826,9 @@ impl Dispatch<ZwpPrimarySelectionSourceV1, ()> for State {
     ) {
         match event {
             zwp_primary_selection_source_v1::Event::Send { mime_type, fd } => {
-                write_selection_to_fd(state.last_selection_text.as_deref(), &mime_type, fd);
+                // T-0607 hotfix: 走 last_primary_text 而非共享 last_selection_text,
+                // 防 SetClipboard 路径覆盖 PRIMARY 内容.
+                write_selection_to_fd(state.last_primary_text.as_deref(), &mime_type, fd);
             }
             zwp_primary_selection_source_v1::Event::Cancelled => {
                 // 其它 client 设了 PRIMARY, quill 失去所有权 — drop 旧 source
@@ -2903,7 +2922,10 @@ impl Dispatch<WlDataSource, ()> for State {
     ) {
         match event {
             wl_data_source::Event::Send { mime_type, fd } => {
-                write_selection_to_fd(state.last_selection_text.as_deref(), &mime_type, fd);
+                // T-0607 hotfix: 走 last_clipboard_text 而非共享 last_selection_text,
+                // 防 SetPrimary 路径 (鼠标松开自动) 覆盖 CLIPBOARD 内容 — 用户实
+                // 测 Ctrl+Shift+C 后误动鼠标导致 paste 出空格的真因.
+                write_selection_to_fd(state.last_clipboard_text.as_deref(), &mime_type, fd);
             }
             wl_data_source::Event::Cancelled => {
                 state.active_data_source = None;
