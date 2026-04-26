@@ -29,7 +29,20 @@ use crate::text::{GlyphKey, ShapedGlyph, TextSystem};
 /// R = 0x0a = 10, G = 0x10 = 16, B = 0x30 = 48
 /// ```
 /// 任何改动都应该同步改这里,同时 `color_matches_spec` 测试会挡回。
+///
+/// **alpha = 0xff** (CLEAR_COLOR_SRGB_U8[3]): headless render 路径强制不透明
+/// (PNG verify 测试断言 RGB 等值, 不影响). live wayland surface 走单独
+/// [`CLEAR_ALPHA_LIVE`] 让 compositor 半透明 blend 桌面 (派单: ghostty 风
+/// 0.85 alpha, 把 quill 放任何窗口上面都能看下面内容).
 pub const CLEAR_COLOR_SRGB_U8: [u8; 4] = [0x0a, 0x10, 0x30, 0xff];
+
+/// **T-0610 hotfix: live wayland surface clear alpha** (0.85 = 217/255).
+/// headless 路径仍 1.0 (PNG 测试不验透明). compositor 必须支持 alpha mode
+/// (PreMultiplied / PostMultiplied), 否则退化 Opaque alpha=1.0.
+///
+/// **why 0.85**: ghostty Mac 默认 + user 实测值, "把 quill 放任何窗口上面都能
+/// 看下面内容" 体验 sweet spot. 太透 (< 0.7) 字形难辨, 太实 (> 0.95) 没意义.
+const CLEAR_ALPHA_LIVE: f64 = 0.85;
 
 /// sRGB 分量 → 线性分量。LoadOp::Clear 的值在 sRGB 格式 view 上写入前会被当作
 /// 线性空间,再做 sRGB 编码。所以如果 surface 是 `*UnormSrgb` 格式,我们要先
@@ -43,19 +56,33 @@ fn srgb_to_linear(v: f64) -> f64 {
 }
 
 fn clear_color_for(format: wgpu::TextureFormat) -> wgpu::Color {
+    clear_color_for_with_alpha(format, 1.0)
+}
+
+/// T-0610 hotfix: 同 [`clear_color_for`] 但 alpha 可自定义. live wayland 路径
+/// 走 [`CLEAR_ALPHA_LIVE`] 让 compositor 半透明 blend; headless 路径仍 alpha=1.0
+/// 走 [`clear_color_for`] 不破 PNG 测试。
+///
+/// **PreMultiplied alpha 协议**: 如果 surface alpha_mode 是 PreMultiplied (mutter
+/// 默认), color 通道必须乘以 alpha 才正确 (e.g. 0.5 alpha 的红 = (0.5, 0, 0, 0.5)).
+/// PostMultiplied 不需要乘 (compositor 自己乘). 我们走 PreMultiplied 主路径,
+/// 所以 RGB 这里乘 alpha (linear space 正确).
+fn clear_color_for_with_alpha(format: wgpu::TextureFormat, alpha: f64) -> wgpu::Color {
     let [r8, g8, b8, _] = CLEAR_COLOR_SRGB_U8;
     let r = f64::from(r8) / 255.0;
     let g = f64::from(g8) / 255.0;
     let b = f64::from(b8) / 255.0;
-    if format.is_srgb() {
-        wgpu::Color {
-            r: srgb_to_linear(r),
-            g: srgb_to_linear(g),
-            b: srgb_to_linear(b),
-            a: 1.0,
-        }
+    let (r_linear, g_linear, b_linear) = if format.is_srgb() {
+        (srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b))
     } else {
-        wgpu::Color { r, g, b, a: 1.0 }
+        (r, g, b)
+    };
+    // PreMultiplied: linear color 乘 alpha. alpha=1.0 时跟原版 clear_color_for 等价.
+    wgpu::Color {
+        r: r_linear * alpha,
+        g: g_linear * alpha,
+        b: b_linear * alpha,
+        a: alpha,
     }
 }
 
@@ -1095,11 +1122,28 @@ impl Renderer {
             .find(|f| f.is_srgb())
             .or_else(|| caps.formats.first().copied())
             .ok_or_else(|| anyhow!("surface 无可用像素格式"))?;
+        // T-0610 hotfix: 优先选半透明 alpha_mode (PreMultiplied / PostMultiplied)
+        // 让 compositor 半透明 blend 桌面. caps.alpha_modes 第一个常是 Opaque
+        // (mutter 默认), Opaque 走 alpha=1.0 完全不透明就退化跟之前一样视觉. 选
+        // PreMultiplied (mutter 真支持) 让 [`CLEAR_ALPHA_LIVE`] 0.85 生效.
         let alpha_mode = caps
             .alpha_modes
-            .first()
+            .iter()
             .copied()
+            .find(|m| matches!(m, wgpu::CompositeAlphaMode::PreMultiplied))
+            .or_else(|| {
+                caps.alpha_modes
+                    .iter()
+                    .copied()
+                    .find(|m| matches!(m, wgpu::CompositeAlphaMode::PostMultiplied))
+            })
+            .or_else(|| caps.alpha_modes.first().copied())
             .ok_or_else(|| anyhow!("surface 无可用 alpha mode"))?;
+        tracing::info!(
+            ?alpha_mode,
+            available = ?caps.alpha_modes,
+            "wgpu surface alpha_mode 选定 (T-0610: PreMultiplied 优先半透明)"
+        );
 
         // T-0404: surface backing 像素 = logical × HIDPI_SCALE。Renderer 内部
         // self.config.width / height 始终是 physical px, NDC 换算 / cell 像素都
@@ -1128,7 +1172,15 @@ impl Renderer {
             "wgpu present_mode 选定 (T-0802: Mailbox 偏好减拖窗口 stutter)"
         );
 
-        let clear = clear_color_for(format);
+        // T-0610 hotfix: live wayland surface 走 CLEAR_ALPHA_LIVE (0.85) 半透明
+        // (alpha_mode != Opaque 时 compositor blend 桌面). Opaque 退化 alpha=1.0
+        // 跟旧行为等价 (color * 1.0 = color, alpha=1.0 不透明).
+        let clear_alpha = if matches!(alpha_mode, wgpu::CompositeAlphaMode::Opaque) {
+            1.0
+        } else {
+            CLEAR_ALPHA_LIVE
+        };
+        let clear = clear_color_for_with_alpha(format, clear_alpha);
         let surface_is_srgb = format.is_srgb();
         tracing::debug!(
             ?format,
