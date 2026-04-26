@@ -2,7 +2,7 @@
 
 **Phase**: 7+ (polish, daily-drive feel 最后一公里)
 **Assigned**: writer-T0617
-**Status**: open
+**Status**: in-review
 **Budget**: tokenBudget=120k
 **Dependencies**: T-0608 (multi-tab) / T-0615 (tab bar polish) / T-0610 part 2 (圆角)
 **Priority**: P2 (daily-drive)

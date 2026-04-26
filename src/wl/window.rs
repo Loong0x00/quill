@@ -662,15 +662,37 @@ pub(crate) fn decoration_log_decision(mode: DecorationMode) -> DecorationLogDeci
 /// `propagate_resize_if_dirty` 的真副作用解耦。
 ///
 /// 测试覆盖见 `tests::cells_from_surface_px_*`。
-pub(crate) fn cells_from_surface_px(width: u32, height: u32) -> (usize, usize) {
-    // T-0608: 顶部占用 = titlebar + tab_bar (28 + 28 logical = 56 logical px,
-    // 等价 112 physical 在 HIDPI×2). cell 区从 56 logical 起.
-    let top_reserved =
-        crate::wl::render::TITLEBAR_H_LOGICAL_PX + crate::wl::render::TAB_BAR_H_LOGICAL_PX;
+///
+/// **T-0617**: `tab_count` 入参决定 tab bar 是否占用顶部空间. 单 tab (count=1)
+/// 时 tab bar 隐藏 (派单 In #B "单 tab 隐藏 tab bar / 终端内容直接接 titlebar
+/// 下方"), top_reserved 仅 titlebar; 多 tab (count >= 2) 仍走 titlebar +
+/// tab_bar. 与 [`tab_bar_h_logical_for`] 同决策, render 与 hit_test 路径
+/// 走同一根 helper 保视觉与逻辑同步.
+pub(crate) fn cells_from_surface_px(width: u32, height: u32, tab_count: usize) -> (usize, usize) {
+    // T-0608/T-0617: 顶部占用 = titlebar + tab_bar (单 tab 时 tab_bar=0).
+    let top_reserved = crate::wl::render::TITLEBAR_H_LOGICAL_PX + tab_bar_h_logical_for(tab_count);
     let usable_h = height.saturating_sub(top_reserved);
     let cols = ((width as f32) / crate::wl::render::CELL_W_PX) as usize;
     let rows = ((usable_h as f32) / crate::wl::render::CELL_H_PX) as usize;
     (cols.max(1), rows.max(1))
+}
+
+/// **T-0617**: 给定 tab 数量, 返 tab bar 占用的 logical px 高度.
+///
+/// 单 tab (count=1) 时 tab bar 隐藏返 0 — 派单 In #B 视觉规则与 ghostty 一致
+/// (单 tab 不画孤零零的 + 按钮 + 空 tab 槽); 多 tab (count >= 2) 返
+/// [`crate::wl::render::TAB_BAR_H_LOGICAL_PX`].
+///
+/// **why pure fn**: render (`Renderer::draw_frame` / `render_headless`) /
+/// hit_test (`hit_test_with_tabs`) / cells_from_surface_px 三处都要这套决策,
+/// 单一来源防回归. 与 `tab_body_width` / `circular_hit` 同 conventions §3
+/// 抽决策状态机套路.
+pub(crate) fn tab_bar_h_logical_for(tab_count: usize) -> u32 {
+    if tab_count >= 2 {
+        crate::wl::render::TAB_BAR_H_LOGICAL_PX
+    } else {
+        0
+    }
 }
 
 /// 纯逻辑决策:看 `core.resize_dirty` 决定 [`propagate_resize_if_dirty`]
@@ -785,7 +807,10 @@ fn propagate_resize_if_dirty(data: &mut LoopData) {
 
     let width = state.core.width;
     let height = state.core.height;
-    let (cols, rows) = cells_from_surface_px(width, height);
+    // T-0617: 单 tab 时 tab bar 隐藏 (高 0), cell 区扩到 titlebar 下方;
+    // 多 tab 仍 titlebar + tab_bar 双层. tab_count 走 state.tabs (启动期保证非空).
+    let tab_count = state.tabs.as_ref().map(|t| t.len()).unwrap_or(1);
+    let (cols, rows) = cells_from_surface_px(width, height, tab_count);
 
     if let Some(r) = state.renderer.as_mut() {
         r.resize(width, height);
@@ -1678,7 +1703,16 @@ fn apply_tab_op(data: &mut LoopData) {
     match op {
         TabOp::New => {
             // spawn 子 shell, 走 propagate_resize 一次让新 tab 同步当前 cols/rows.
-            let (cols, rows) = cells_from_surface_px(data.state.core.width, data.state.core.height);
+            // T-0617: 当前 tab_count 是即将 +1 之前的 (tabs.len()), 但新 tab 加入
+            // 后 count 必 >= 2, tab bar 必显, 所以预先按 max(2) 算 cell 区高度,
+            // 让新 tab grid 起点与 propagate_resize 后续刷新一致 (派单"切 tab 数
+            // 后 grid rows 变化, 触发 PtyHandle::resize 通知 SIGWINCH").
+            let tab_count_after = data.state.tabs.as_ref().map(|t| t.len() + 1).unwrap_or(2);
+            let (cols, rows) = cells_from_surface_px(
+                data.state.core.width,
+                data.state.core.height,
+                tab_count_after,
+            );
             let cols_u16 = cols.min(u16::MAX as usize) as u16;
             let rows_u16 = rows.min(u16::MAX as usize) as u16;
             let new_tab = match TabInstance::spawn(cols_u16, rows_u16) {
@@ -1720,6 +1754,13 @@ fn apply_tab_op(data: &mut LoopData) {
             let (new_idx, _id) = tab_list.push(new_tab);
             tab_list.set_active(new_idx);
             on_active_tab_changed(data);
+            // T-0617: count 变化 (1→2 / N→N+1) → 标 resize_dirty 让下一次
+            // propagate_resize_if_dirty 把所有 tab 的 grid + PTY winsize 同步到
+            // 新的 cell 区高度. 单 tab 时 cell 区含 tab_bar 高度, 多 tab 不含 —
+            // 跨 1↔2 边界必须重 resize, 不然 active tab grid 与新 cell 区错位.
+            // 派单 In #B "切 tab 数后 grid rows 变化, 触发 PtyHandle::resize 通知
+            // SIGWINCH".
+            data.state.core.resize_dirty = true;
             tracing::info!(
                 id = new_id.raw(),
                 idx = new_idx,
@@ -1822,6 +1863,9 @@ fn close_tab_idx(data: &mut LoopData, idx: usize) {
         return;
     }
     on_active_tab_changed(data);
+    // T-0617: count 变化 (N→N-1) → 标 resize_dirty 让下一次 propagate 同步全
+    // tab grid (尤其 2→1 跨边界 tab_bar 隐藏 → cell 区扩高). 与 New 路径同决策.
+    data.state.core.resize_dirty = true;
 }
 
 /// T-0608: active tab 切换后的副作用 — 同步 PointerState 的 tab_count + cell
@@ -2515,8 +2559,16 @@ pub fn run_window() -> Result<()> {
             // State 不同字段, 同 *state 下能拿独立 &mut.
             // T-0608: 先记 tab_count / active_idx (后续 set_tab_state 用), 避免
             // 与 active_mut() 的 mut 借用冲突.
-            let (tab_count, active_idx) = match state.tabs.as_ref() {
-                Some(t) => (t.len(), t.active_idx()),
+            // T-0617: 同步取 active tab 的 title snapshot (Rc<RefCell<String>>
+            // borrow 短持 + clone 出 owned String, 避免长持借用与 listener
+            // borrow_mut() 冲突 panic). 空 string → fallback 到 DEFAULT_TITLE
+            // 让 titlebar 中央仍显 "quill" (与 T-0702 默认行为一致, 派单 In #A
+            // "其它 event 全 ignore" + 启动期 listener 还没收到 OSC).
+            let (tab_count, active_idx, active_title) = match state.tabs.as_ref() {
+                Some(t) => {
+                    let title = t.active().title();
+                    (t.len(), t.active_idx(), title)
+                }
                 None => return,
             };
             let Some(tab_list) = state.tabs.as_mut() else {
@@ -2553,6 +2605,16 @@ pub fn run_window() -> Result<()> {
                 return;
             };
             r.set_tab_state(tab_count, active_idx);
+            // T-0617: 同步 active tab 的 OSC title 到 renderer. listener 写
+            // active_tab.title (Rc<RefCell<String>>), 这里 read snapshot;
+            // active_title 空 → 走 DEFAULT_TITLE = "quill" (与 T-0702 默认 + 启动
+            // 期 fallback 同一来源). 派单 In #A "fallback 显 quill 或 ~".
+            let title_for_render = if active_title.is_empty() {
+                crate::wl::render::DEFAULT_TITLE.to_string()
+            } else {
+                active_title
+            };
+            r.set_title(title_for_render);
             // T-0305: 全量 cells 收集。1920 cell × CellRef(~32 字节 pos+c+fg+bg)
             // = 60 KiB,Vec 分配开销 << wgpu submit 一次的开销, Phase 6 soak 验
             // bench 再决定是否 reuse Vec(目前简单胜过聪明)。
@@ -4045,7 +4107,10 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
         // 整屏量. State 拿不到 term (在 LoopData), 走 cells_from_surface_px
         // 推导 — 与 propagate_resize_if_dirty 同源 fn, 永远跟 surface 当前尺寸
         // 同步; resize 中 race 也只是 ±1 行差, 不影响功能.
-        let (_cols, rows) = cells_from_surface_px(state.core.width, state.core.height);
+        // T-0617: tab_count 入参决定 tab bar 高度 (单 tab 隐藏); 此路径只算 rows
+        // 给 PgUp/PgDn, 单/多 tab 差仅 ~1 行, 用当前 tabs.len() 即可.
+        let tab_count = state.tabs.as_ref().map(|t| t.len()).unwrap_or(1);
+        let (_cols, rows) = cells_from_surface_px(state.core.width, state.core.height, tab_count);
         let rows_u16 = rows.min(u16::MAX as usize) as u16;
         let action = handle_key_event(event, &mut state.keyboard_state, rows_u16);
         match action {
@@ -4548,12 +4613,39 @@ mod tests {
 
     #[test]
     fn cells_from_surface_px_default_800x600_matches_80x22() {
-        // T-0608: 顶部占用 = titlebar (28) + tab_bar (28) = 56 logical px.
+        // T-0608: 顶部占用 = titlebar (28) + tab_bar (28) = 56 logical px (多 tab).
         // 800×600 - 56 = 544, 544 / 25 = 21 行.
         assert_eq!(
-            cells_from_surface_px(super::INITIAL_WIDTH, super::INITIAL_HEIGHT),
+            cells_from_surface_px(super::INITIAL_WIDTH, super::INITIAL_HEIGHT, 2),
             (80, 21),
-            "800×600 - titlebar 28 - tab_bar 28 → cell 80×21"
+            "800×600 - titlebar 28 - tab_bar 28 → cell 80×21 (多 tab)"
+        );
+    }
+
+    /// T-0617: 单 tab 隐藏 tab bar → 顶部仅 titlebar (28 logical), cell 区高度多
+    /// 28 logical 等价多 ~1 行 (HIDPI×2 下).
+    #[test]
+    fn cells_from_surface_px_single_tab_hides_tab_bar() {
+        // 800×600 - 28 (titlebar only) = 572, 572 / 25 = 22 行 (比多 tab 多 1).
+        assert_eq!(
+            cells_from_surface_px(super::INITIAL_WIDTH, super::INITIAL_HEIGHT, 1),
+            (80, 22),
+            "T-0617: 单 tab → tab_bar 隐藏, cell 区高 +28 → 多 1 行"
+        );
+    }
+
+    /// T-0617: tab_bar_h_logical_for 决策表 — 只有 count=1 时返 0, ≥2 返 28.
+    #[test]
+    fn tab_bar_h_logical_for_decision_table() {
+        assert_eq!(tab_bar_h_logical_for(0), 0, "count=0 (兜底) 也隐藏");
+        assert_eq!(tab_bar_h_logical_for(1), 0, "单 tab 隐藏 tab bar");
+        assert_eq!(
+            tab_bar_h_logical_for(2),
+            crate::wl::render::TAB_BAR_H_LOGICAL_PX
+        );
+        assert_eq!(
+            tab_bar_h_logical_for(10),
+            crate::wl::render::TAB_BAR_H_LOGICAL_PX
         );
     }
 
@@ -4563,13 +4655,13 @@ mod tests {
         // T-0608: usable_h = h - 56 (titlebar + tab_bar), rows = usable_h / 25.
         // 1200 - 56 = 1144, 1144 / 25 = 45.
         assert_eq!(
-            cells_from_surface_px(1600, 1200),
+            cells_from_surface_px(1600, 1200, 2),
             (160, 45),
             "1600×1200 - 56 → 160×45"
         );
         // 1080 - 56 = 1024, 1024 / 25 = 40.
         assert_eq!(
-            cells_from_surface_px(1920, 1080),
+            cells_from_surface_px(1920, 1080, 2),
             (192, 40),
             "1920×1080 - 56 → 192×40"
         );
@@ -4578,21 +4670,25 @@ mod tests {
     #[test]
     fn cells_from_surface_px_clamps_zero_to_one() {
         // 极小 surface 整数除给 0, max(1) 兜底。term/pty 都不接受 0 维度。
-        assert_eq!(cells_from_surface_px(0, 0), (1, 1), "0×0 应 clamp 到 1×1");
         assert_eq!(
-            cells_from_surface_px(5, 10),
+            cells_from_surface_px(0, 0, 2),
+            (1, 1),
+            "0×0 应 clamp 到 1×1"
+        );
+        assert_eq!(
+            cells_from_surface_px(5, 10, 2),
             (1, 1),
             "5px (< CELL_W_PX=10) 应 clamp col=1"
         );
         // T-0504: 极小 height 触发 saturating_sub → usable_h = 0, rows clamp 到 1.
         assert_eq!(
-            cells_from_surface_px(20, 5),
+            cells_from_surface_px(20, 5, 2),
             (2, 1),
             "5px (< titlebar 28) 应 clamp row=1"
         );
         // T-0504: height 正好 = titlebar (28) → usable_h = 0, rows clamp 到 1.
         assert_eq!(
-            cells_from_surface_px(20, 28),
+            cells_from_surface_px(20, 28, 2),
             (2, 1),
             "height = titlebar 应 clamp row=1"
         );
@@ -4604,7 +4700,7 @@ mod tests {
         // 805px / 10 = 80 cells (剩 5px 边距).
         // T-0608: usable_h = 612 - 56 (titlebar + tab_bar) = 556, 556 / 25 = 22.
         assert_eq!(
-            cells_from_surface_px(805, 612),
+            cells_from_surface_px(805, 612, 2),
             (80, 22),
             "余数应被截断 + titlebar 28 + tab_bar 28 减让"
         );

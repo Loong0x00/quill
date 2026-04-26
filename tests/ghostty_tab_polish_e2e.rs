@@ -126,9 +126,12 @@ fn count_pixels_in_region(
 /// T-0615 派单 In #B PNG verify: + 按钮包圆角 box (默认 bg #2c2c2c). + box 在
 /// 左上 (0..28×titlebar..titlebar+28) logical, 圆角 6 logical. 圆角处应露 tab bar
 /// bg #1c (圆外像素是 #1c 色, 圆内像素是 #2c box bg).
+///
+/// **T-0617**: + 按钮仅多 tab (count >= 2) 时显示, 单 tab 隐藏整 tab bar — 用
+/// tab_count=2 测试 + box 视觉.
 #[test]
 fn plus_button_box_renders_with_rounded_corners() {
-    let (rgba, physical_w, physical_h) = render_with_state(1, 0, HoverRegion::None);
+    let (rgba, physical_w, physical_h) = render_with_state(2, 0, HoverRegion::None);
     write_png("/tmp/t0615_plus_box.png", &rgba, physical_w, physical_h);
 
     // + box 区: x ∈ [3 logical inset, 28 - 3 logical) phys, y ∈ [titlebar+3, titlebar+25)
@@ -176,10 +179,12 @@ fn plus_button_box_renders_with_rounded_corners() {
 }
 
 /// T-0615 派单 In #B PNG verify: hover + 按钮时 box bg 高亮 (#444 vs default #2c).
+///
+/// **T-0617**: + 按钮仅多 tab (count >= 2) 时显示, 用 tab_count=2.
 #[test]
 fn plus_button_box_hover_highlights() {
-    let (rgba_normal, physical_w, physical_h) = render_with_state(1, 0, HoverRegion::None);
-    let (rgba_hover, _, _) = render_with_state(1, 0, HoverRegion::TabBarPlus);
+    let (rgba_normal, physical_w, physical_h) = render_with_state(2, 0, HoverRegion::None);
+    let (rgba_hover, _, _) = render_with_state(2, 0, HoverRegion::TabBarPlus);
     write_png(
         "/tmp/t0615_plus_hover.png",
         &rgba_hover,

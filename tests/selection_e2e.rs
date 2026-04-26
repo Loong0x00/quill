@@ -28,14 +28,16 @@ use quill::wl::{
 const LOGICAL_W: u32 = 800;
 const LOGICAL_H: u32 = 600;
 const COLS: usize = 80;
-// T-0608: surface 800×600 - (titlebar 28 + tab_bar 28) = 544 logical, 544 / 25 = 21 行.
-const ROWS: usize = 21;
+// T-0608/T-0617: surface 800×600 - titlebar (28). render_headless 默认走单 tab
+// (HEADLESS_TAB_OVERRIDE = (1, 0)), 单 tab 隐藏 tab bar (T-0617 派单 In #B).
+// 572 logical / 25 = 22 行.
+const ROWS: usize = 22;
 
 const CELL_W_LOGICAL: usize = 10;
 const CELL_H_LOGICAL: usize = 25;
 const TITLEBAR_H_LOGICAL: usize = 28;
-const TAB_BAR_H_LOGICAL: usize = 28;
-const TOP_RESERVED_LOGICAL: usize = TITLEBAR_H_LOGICAL + TAB_BAR_H_LOGICAL;
+// T-0617: 单 tab 隐藏 tab bar — top_reserved 仅 titlebar.
+const TOP_RESERVED_LOGICAL: usize = TITLEBAR_H_LOGICAL;
 
 /// 构造空 cell array (全 ' ', bg=#0a1030 深蓝, fg=#d3d3d3 浅灰).
 fn empty_cells(cols: usize, rows: usize) -> Vec<CellRef> {
