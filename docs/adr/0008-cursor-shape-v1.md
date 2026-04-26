@@ -2,7 +2,18 @@
 
 ## Status
 
-Accepted, 2026-04-26
+**Superseded by ADR 0009 (T-0703-fix), 2026-04-26.**
+
+原 Accepted 2026-04-26 (T-0703 合并). 同日上线后用户实测 mutter 在
+wp_cursor_shape_v1 vs xdg_toplevel.resize 内部 cursor name 映射不一致 —
+hover 用 ns-resize, 拖动用 size_ver, 同一交互期视觉两套 svg 切换. 撤回本
+ADR, 改走 wl_cursor + xcursor theme 路径 (与 GTK4 / Qt / Electron / GNOME
+自家 app 一致). 详见 `docs/adr/0009-wl-cursor-fallback.md`. 本 ADR 留作
+历史记录 (CLAUDE.md ADR tombstone 准则), 不删.
+
+---
+
+(以下为原 Accepted 时记录, 仅供历史参考)
 
 ## Context
 

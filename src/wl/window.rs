@@ -65,8 +65,8 @@ use wayland_client::{
 
 use super::keyboard::{handle_key_event, KeyboardAction, KeyboardState};
 use super::pointer::{
-    handle_pointer_event, quill_edge_to_wayland, wp_shape_for, PointerAction, PointerState,
-    WindowButton,
+    handle_pointer_event, quill_edge_to_wayland, xcursor_names_for, CursorShape, PointerAction,
+    PointerState, WindowButton,
 };
 use super::render::Renderer;
 use super::selection::{bracketed_paste_wrap, extract_selection_text, PasteSource, SelectionState};
@@ -77,11 +77,9 @@ use wayland_client::protocol::{
     wl_data_device_manager::{self, WlDataDeviceManager},
     wl_data_offer::{self, WlDataOffer},
     wl_data_source::{self, WlDataSource},
+    wl_shm::{self, WlShm},
 };
-use wayland_protocols::wp::cursor_shape::v1::client::{
-    wp_cursor_shape_device_v1::{self, WpCursorShapeDeviceV1},
-    wp_cursor_shape_manager_v1::{self, WpCursorShapeManagerV1},
-};
+use wayland_cursor::CursorTheme;
 use wayland_protocols::wp::primary_selection::zv1::client::{
     zwp_primary_selection_device_manager_v1::{self, ZwpPrimarySelectionDeviceManagerV1},
     zwp_primary_selection_device_v1::{self, ZwpPrimarySelectionDeviceV1},
@@ -1632,25 +1630,42 @@ pub fn run_window() -> Result<()> {
         }
     };
 
-    // T-0703: 尝试 bind wp_cursor_shape_manager_v1 (cursor-shape-v1) — 老
-    // compositor (wlroots ≤ 0.17 / Plasma 5) 不导出此 global, bind 失败 →
-    // None, cursor 形状切换退化 (compositor 显示默认箭头, quill 功能不影响).
-    // version 锁 1..=1 — 上游 v2 加 dnd_ask + all_resize 两个 cursor 名 quill
-    // 不需要, 锁 v1 兼容 Plasma 6.0 早期. ADR 0008 详释.
-    let cursor_shape_manager: Option<WpCursorShapeManagerV1> = match globals.bind(&qh, 1..=1, ()) {
-        Ok(m) => {
-            tracing::info!("wp_cursor_shape_manager_v1 bound (compositor 支持 cursor-shape-v1)");
-            Some(m)
-        }
-        Err(err) => {
-            tracing::warn!(
-                ?err,
-                "wp_cursor_shape_manager_v1 不可用 — cursor 形状切换退化 (compositor \
-                 显示默认箭头); 升级 GNOME 45+ / KDE Plasma 6 / wlroots 0.18+ 启用"
-            );
-            None
-        }
-    };
+    // T-0703-fix: bind wl_shm + load xcursor theme + 创 cursor wl_surface
+    // (ADR 0009 撤回 ADR 0008 wp_cursor_shape_v1, 走 GTK4 / Qt / Electron / GNOME
+    // 自家 app 同款 wl_pointer.set_cursor + libwayland-cursor 路径, 与 mutter
+    // 拖动接管 cursor 视觉一致).
+    //
+    // wl_shm 是 wayland 核心协议, 任何 compositor 都导出 — bind 失败仅出现在
+    // compositor 重大 bug 时, 那种情况 quill 任何渲染都跑不动, 提早 fail-fast.
+    let shm: WlShm = globals
+        .bind(&qh, 1..=1, ())
+        .map_err(|e| anyhow!("wl_shm 不可用 (compositor bug? bind 失败: {e})"))?;
+
+    // cursor_surface 整个进程一份 (单 wl_pointer 只需一个 cursor surface, 派单
+    // 已知陷阱: "cursor surface 释放 - 多 hover region 切换时复用同一 cursor_surface,
+    // 每次 attach 新 buffer + commit. 不要每次创建 surface").
+    let cursor_surface = compositor.create_surface(&qh);
+
+    // CursorTheme load 失败 (xcursor theme files 不在 /usr/share/icons 等标准
+    // 路径) → None, apply_cursor_shape 路径自动 noop (cursor 维持 compositor
+    // 默认). load_or 内部读 XCURSOR_THEME / XCURSOR_SIZE env, 不存时分别用
+    // "default" / 24 兜底 (Adwaita / Bibata / Yaru 等主流主题都跟 default
+    // inherit 链接).
+    let cursor_theme: Option<CursorTheme> =
+        match CursorTheme::load_or(&conn, shm.clone(), "default", 24) {
+            Ok(theme) => {
+                tracing::info!("wayland_cursor::CursorTheme loaded (xcursor 主题 + size 跟随 env)");
+                Some(theme)
+            }
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    "CursorTheme::load_or 失败 — cursor 形状切换退化 (compositor 默认箭头); \
+                     检查 /usr/share/icons/{{default, Adwaita}}/cursors/ 是否存在"
+                );
+                None
+            }
+        };
 
     // T-0607: bind zwp_primary_selection_device_manager_v1 (PRIMARY 协议).
     // GNOME 45+ / KDE Plasma 6 / wlroots 都支持; 老 compositor 缺 → None,
@@ -1714,8 +1729,12 @@ pub fn run_window() -> Result<()> {
         pointer_state: PointerState::new(INITIAL_WIDTH, INITIAL_HEIGHT),
         pointer: None,
         pointer_seat: None,
-        cursor_shape_manager,
-        cursor_shape_device: None,
+        // T-0703-fix: shm / cursor_theme / cursor_surface 在启动期 bind / load,
+        // 不依赖 Pointer capability — wl_shm 永远存在, theme 加载与 pointer
+        // 无关. cursor_surface 整生命周期复用一份 (派单 In #B 已知陷阱).
+        shm,
+        cursor_theme,
+        cursor_surface,
         is_maximized: false,
         presentation_dirty: false,
         pending_scroll_lines: 0,
@@ -2127,15 +2146,30 @@ struct State {
     /// PointerAction::StartMove 路径需读此字段. drop 顺序: WlSeat 也是
     /// wayland Proxy, 与 keyboard / pointer 同等放尾部安全.
     pointer_seat: Option<wl_seat::WlSeat>,
-    /// T-0703: wp_cursor_shape_manager_v1 (cursor-shape-v1 协议工厂). 启动期
-    /// registry bind 一次, compositor 不导出 (老 wlroots / Plasma 5) 时为
-    /// `None`, cursor 形状切换退化到 compositor 默认 (log warn). ADR 0008.
-    cursor_shape_manager: Option<WpCursorShapeManagerV1>,
-    /// T-0703: wp_cursor_shape_device_v1 (单 wl_pointer 一个). new_capability
-    /// (Pointer) 时若 manager 已绑则 get_pointer 一次, remove 时 destroy.
-    /// `Some(device)` = cursor-shape-v1 路径活, `None` = 退化 (manager 缺失
-    /// 或 pointer capability 暂无). drop 顺序: 与 wl_pointer 同 Proxy 放尾部.
-    cursor_shape_device: Option<WpCursorShapeDeviceV1>,
+    /// T-0703-fix: wl_shm 全局, 给 wayland_cursor::CursorTheme 用 (内部
+    /// create_pool 把 xcursor svg 解码后的 ARGB32 像素铺到 shm pool, attach
+    /// 给 cursor_surface). 一次 bind 整生命周期持有, drop 时自动 destroy
+    /// (wayland-client Proxy Drop). ADR 0009 (撤回 ADR 0008 wp_cursor_shape_v1).
+    ///
+    /// `#[allow(dead_code)]`: 字段不再被显式读 (`CursorTheme` 内部已 clone shm
+    /// 持自己的引用), 但保留**所有权**让 wl_shm 全局在整 State 生命周期内活
+    /// — 防止未来加 cursor 主题热重载 / 二次 CursorTheme 构造时漏 shm 持有.
+    /// 与 `data_device_manager` 同 forward-compat 决策.
+    #[allow(dead_code)]
+    shm: WlShm,
+    /// T-0703-fix: xcursor theme 加载结果 (`wayland_cursor::CursorTheme`). 启动
+    /// 期 `CursorTheme::load_or(conn, shm, "default", 24)` (env XCURSOR_THEME /
+    /// XCURSOR_SIZE 已在 load_or 内部读). 加载失败时 `None`, `apply_cursor_shape`
+    /// 跳过 (cursor 维持上一次状态, 默认箭头). drop 顺序: theme 内部持 WlShmPool,
+    /// 比 cursor_surface 后 drop 安全 (但 wgpu 链 INV-001 不动 — 字段位置在
+    /// pty 之前 / wayland safe wrapper 段).
+    cursor_theme: Option<CursorTheme>,
+    /// T-0703-fix: cursor 形状专用 wl_surface, 整个进程一份, 多 hover region
+    /// 切换时复用 (派单 In #B 已知陷阱: 不每次创建新 surface). attach
+    /// `CursorImageBuffer` (`wayland_cursor` 内部从 shm pool 划块) + commit
+    /// 后通过 `wl_pointer.set_cursor(serial, Some(&cursor_surface), hx, hy)`
+    /// 告诉 compositor 用此 surface 作为 cursor.
+    cursor_surface: wl_surface::WlSurface,
     /// T-0504: 当前是否最大化 (toggle 状态). ButtonClick(Maximize) 时反转 →
     /// 调 set_maximized / unset_maximized. WindowConfigure event (configure
     /// 携带 state 数组含 Maximized) 也可同步, 但 sctk 0.19 WindowConfigure
@@ -2549,14 +2583,10 @@ impl SeatHandler for State {
         if capability == Capability::Pointer && self.pointer.is_none() {
             let ptr = seat.get_pointer(qh, ());
             tracing::info!("wl_seat capability Pointer 出现, wl_pointer 已绑定");
-            // T-0703: cursor_shape_manager bind 成功时, 给本 wl_pointer 拿
-            // 一个 device. manager 缺失 (老 compositor) 时 device 留 None,
-            // set_shape 路径自动跳过 (Dispatch<WlPointer> 段守门).
-            if let Some(manager) = self.cursor_shape_manager.as_ref() {
-                let device = manager.get_pointer(&ptr, qh, ());
-                tracing::info!("wp_cursor_shape_device_v1 已绑定 (cursor 形状切换 active)");
-                self.cursor_shape_device = Some(device);
-            }
+            // T-0703-fix: cursor_surface / cursor_theme 在启动期已就绪 (走
+            // wl_cursor + xcursor theme, ADR 0009). new_capability 不需做额外
+            // 绑定 — apply_cursor_shape 在 Dispatch<WlPointer> 直接读
+            // self.cursor_theme + self.cursor_surface, 走 wl_pointer.set_cursor.
             // T-0607: PRIMARY selection device per seat. manager 缺失 (老 compositor)
             // 时 device 留 None, 选区结束时 SetPrimary 自动跳过 (apply_selection_op
             // 守门).
@@ -2604,14 +2634,9 @@ impl SeatHandler for State {
             }
         }
         if capability == Capability::Pointer {
-            // T-0703: cursor_shape_device 跟 wl_pointer 同生命周期 — pointer
-            // 没了 device 自动 inert (协议明示: "When the pointer capability is
-            // removed from the wl_seat, the wp_cursor_shape_device_v1 object
-            // becomes inert"). take 让 Option 变 None, drop 触发 destroy
-            // request (wayland-protocols 生成的 Drop impl).
-            if self.cursor_shape_device.take().is_some() {
-                tracing::info!("wp_cursor_shape_device_v1 释放 (随 Pointer capability 移除)");
-            }
+            // T-0703-fix: 不再有 wp_cursor_shape_device_v1 需要释放 (ADR 0009
+            // 撤回). cursor_surface / cursor_theme 不绑 pointer 生命周期 — 留
+            // 给整进程, 下一次 Pointer capability 出现时直接复用.
             if let Some(ptr) = self.pointer.take() {
                 ptr.release();
                 tracing::info!("wl_seat capability Pointer 移除, wl_pointer 释放");
@@ -2626,8 +2651,8 @@ impl SeatHandler for State {
         if let Some(kb) = self.keyboard.take() {
             kb.release();
         }
-        // T-0703: cursor_shape_device 与 pointer 同 lifetime, seat 移除即释放.
-        let _ = self.cursor_shape_device.take();
+        // T-0703-fix: cursor_theme / cursor_surface 不绑 seat — 整进程一份,
+        // 下个 seat 重新出现时直接复用.
         if let Some(ptr) = self.pointer.take() {
             ptr.release();
         }
@@ -2665,36 +2690,104 @@ pub(crate) fn cursor_rectangle_for_cell(col: usize, line: usize) -> CursorRectan
     }
 }
 
-/// **T-0703 `Dispatch<WpCursorShapeManagerV1>`**: 与 ZwpTextInputManagerV3 同
-/// 性质 — manager 是工厂对象, 协议零 event (cursor-shape-v1.xml 仅 destroy /
-/// get_pointer / get_tablet_tool_v2 三个 request). 防御性 impl 满足 Dispatch
-/// trait bound, event handler 实际不会被调用. ADR 0008.
-impl Dispatch<WpCursorShapeManagerV1, ()> for State {
+/// **T-0703-fix `Dispatch<WlShm>`**: wl_shm 协议会推 `format` event 列出
+/// compositor 支持的像素格式 (Argb8888 / Xrgb8888 必有). `wayland_cursor` 内部
+/// 走 Argb8888 + alpha, 不依赖此 event 决策, 直接吞.
+impl Dispatch<WlShm, ()> for State {
     fn event(
         _state: &mut Self,
-        _proxy: &WpCursorShapeManagerV1,
-        _event: wp_cursor_shape_manager_v1::Event,
+        _proxy: &WlShm,
+        _event: wl_shm::Event,
         _data: &(),
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
-        // 协议零 event — Event enum 是空 (生成的 `Event {}`). 不会被调用.
+        // wl_shm.format event — 列举支持格式. wayland-cursor 用 ARGB8888
+        // 标准格式 (任何 wayland compositor 必支持), 不需要枚举确认.
     }
 }
 
-/// **T-0703 `Dispatch<WpCursorShapeDeviceV1>`**: device 同 manager 也是零 event
-/// (cursor-shape-v1.xml: destroy / set_shape 两个 request, 0 event). 防御性 impl.
-impl Dispatch<WpCursorShapeDeviceV1, ()> for State {
-    fn event(
-        _state: &mut Self,
-        _proxy: &WpCursorShapeDeviceV1,
-        _event: wp_cursor_shape_device_v1::Event,
-        _data: &(),
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-    ) {
-        // 协议零 event.
+/// T-0703-fix: 应用 cursor 形状变化到 wl_pointer (ADR 0009).
+///
+/// 流程:
+/// 1. 从 [`xcursor_names_for`] 拿 fallback name 列表
+/// 2. 顺序尝试 `theme.get_cursor(name)`, 第一个成功的拿来用
+/// 3. attach `CursorImageBuffer` 到 cursor surface + commit
+/// 4. 调 `wl_pointer.set_cursor(serial, Some(&cursor_surface), hx/scale, hy/scale)`
+///
+/// **why 单点 fn 而非内联**: 调用方 (`Dispatch<WlPointer>`) 已较长, 抽出来
+/// 让 fn body 自描述 cursor pipeline. 不变量也集中: theme miss 走 noop log
+/// (cursor 维持上一次状态), HiDPI scale 跟随 surface (硬编 [`HIDPI_SCALE`]).
+///
+/// **协议 corner case** (派单已知陷阱):
+/// - cursor_surface 复用 (一个 wl_pointer 一个), 多次 attach 新 buffer + commit,
+///   不创新 surface. 协议要求 surface role 一旦设为 cursor 不能再改.
+/// - 全 fallback name 失败 → `cursor_surface` 不动, 上次 attach 的 buffer 仍
+///   是 cursor (compositor 行为). log warn 一次防排障难, 不刷屏.
+/// - HiDPI: cursor surface buffer scale 跟 主 surface scale 一致 ([`HIDPI_SCALE`]
+///   = 2 硬编, T-0502 决策); hotspot / 视觉 size 自动 1:1.
+fn apply_cursor_shape(
+    pointer: &wl_pointer::WlPointer,
+    cursor_surface: &wl_surface::WlSurface,
+    theme: &mut CursorTheme,
+    serial: u32,
+    shape: CursorShape,
+    scale: u32,
+) {
+    let names = xcursor_names_for(shape);
+    for name in names {
+        let cursor = match theme.get_cursor(name) {
+            Some(c) => c,
+            None => continue,
+        };
+        // CursorImageBuffer 实现 Deref<Target = WlBuffer> + dimensions / hotspot.
+        // 单帧 cursor 只用 [0] (静态 cursor 帧动画暂不接, 派单 Out 段无明示但
+        // resize/text 类 cursor 都是单帧, daily-drive 不缺).
+        let buf = &cursor[0];
+        let (w, h) = buf.dimensions();
+        let (hx, hy) = buf.hotspot();
+        // scale 至少 1 防 div-by-zero (实际 HIDPI_SCALE = 2 起步, 防御足).
+        let scale_clamped = scale.max(1) as i32;
+        cursor_surface.set_buffer_scale(scale_clamped);
+        cursor_surface.attach(Some(buf), 0, 0);
+        // damage_buffer 是 wl_surface v4+ 接口 (按 buffer 像素坐标, 非 logical).
+        // sctk 0.19 暴露的 cursor_surface (compositor.create_surface) version 跟
+        // wl_compositor 协商 — 现代 mutter / kwin / sway 都 v6+, damage_buffer
+        // 安全调用. 老 compositor (v < 4) 的 fallback 见 sctk 自己的实现 (走
+        // damage(0,0,w/scale,h/scale)), 这里硬走 damage_buffer 简化, 老用户
+        // 不在 quill daily-drive 范围.
+        if cursor_surface.version() >= 4 {
+            cursor_surface.damage_buffer(0, 0, w as i32, h as i32);
+        } else {
+            cursor_surface.damage(0, 0, (w as i32) / scale_clamped, (h as i32) / scale_clamped);
+        }
+        cursor_surface.commit();
+        let scale_u32 = scale_clamped as u32;
+        pointer.set_cursor(
+            serial,
+            Some(cursor_surface),
+            (hx / scale_u32) as i32,
+            (hy / scale_u32) as i32,
+        );
+        tracing::trace!(
+            target: "quill::cursor",
+            ?shape,
+            name,
+            serial,
+            scale,
+            "wl_pointer.set_cursor (xcursor name resolved)"
+        );
+        return;
     }
+    // 全 fallback 都失败. 派单已知陷阱: log warn 一次, 不刷屏 (调用方 idle
+    // 取 pending 后调本 fn, 一次 hover 跨区只来一次).
+    tracing::warn!(
+        target: "quill::cursor",
+        ?shape,
+        names = ?names,
+        "xcursor theme 缺所有 fallback name; cursor 维持上一次形状 (检查 \
+         /usr/share/icons/{{Adwaita,default}}/cursors/ 资源)"
+    );
 }
 
 // ---------- T-0607 PRIMARY selection 协议 Dispatch impls ----------
@@ -3305,30 +3398,35 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
         // 同一调用避免分支.
         let alt_active = state.keyboard_state.alt_active();
         let action = handle_pointer_event(event, &mut state.pointer_state, alt_active);
-        // T-0703: 主 PointerAction 处理后, 顺手取出 pending_cursor_set 下发
-        // wp_cursor_shape_device_v1.set_shape (单一消费者, 与 take_pending /
-        // pending_scroll_lines 同 T-0602/T-0603 套路). 放最前面以便 Enter
-        // event 也走 set_cursor 路径 (协议要求 enter 后必 set 一次, 否则
-        // unspecified — 实测 mutter 显示空白).
+        // T-0703-fix: 主 PointerAction 处理后, 顺手取出 pending_cursor_set 走
+        // apply_cursor_shape (wl_cursor + xcursor theme + wl_pointer.set_cursor,
+        // ADR 0009 — 单一消费者, 与 take_pending / pending_scroll_lines 同
+        // T-0602/T-0603 套路). 放最前面以便 Enter event 也走 set_cursor 路径
+        // (协议要求 enter 后必 set 一次, 否则 unspecified — 实测 mutter 显示
+        // 空白).
         if let Some((serial, shape)) = state.pointer_state.take_pending_cursor_set() {
-            if let Some(device) = state.cursor_shape_device.as_ref() {
-                let wp_shape = wp_shape_for(shape);
-                tracing::trace!(
-                    target: "quill::pointer",
-                    serial,
-                    ?shape,
-                    "wp_cursor_shape_device_v1.set_shape"
-                );
-                device.set_shape(serial, wp_shape);
-            } else {
-                // 老 compositor 退化路径 — set_shape 无处可调, cursor 维持
-                // compositor 默认箭头. trace 一次便于排障 (是否 manager
-                // 缺失导致体验不一致), 不 warn 防刷屏.
-                tracing::trace!(
-                    target: "quill::pointer",
-                    ?shape,
-                    "cursor shape change requested but cursor_shape_device=None (退化)"
-                );
+            match (state.cursor_theme.as_mut(), state.pointer.as_ref()) {
+                (Some(theme), Some(ptr)) => {
+                    apply_cursor_shape(
+                        ptr,
+                        &state.cursor_surface,
+                        theme,
+                        serial,
+                        shape,
+                        crate::wl::HIDPI_SCALE,
+                    );
+                }
+                _ => {
+                    // theme 加载失败 (启动期 warn 过) 或 pointer 暂未绑定
+                    // (race) — cursor 维持 compositor 默认, trace 不 warn.
+                    tracing::trace!(
+                        target: "quill::cursor",
+                        ?shape,
+                        theme_present = state.cursor_theme.is_some(),
+                        pointer_present = state.pointer.is_some(),
+                        "cursor shape change requested but prerequisite missing (退化)"
+                    );
+                }
             }
         }
         match action {
