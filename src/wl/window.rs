@@ -1444,6 +1444,11 @@ impl State {
         self.renderer = Some(renderer);
 
         if let Some(r) = self.renderer.as_mut() {
+            // T-0702: 同步 xdg_toplevel.set_title 的值给 renderer (titlebar 中央
+            // 显示). 当前 hardcode WINDOW_TITLE = "quill" 与 Renderer DEFAULT_TITLE
+            // 默认值相同, 显式调一遍是 future-proof — Phase 7+ 接 cwd / 命令
+            // watcher 时本调用点改 dynamic title 即可, render 路径无需改.
+            r.set_title(WINDOW_TITLE.to_string());
             r.render().context("首帧渲染失败")?;
         }
         Ok(())
