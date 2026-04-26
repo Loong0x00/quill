@@ -2,7 +2,7 @@
 
 **Phase**: 7+ (polish, 跟 Apple iOS / macOS 圆角视觉对齐)
 **Assigned**: writer-T0616
-**Status**: open
+**Status**: claimed
 **Budget**: tokenBudget=80k (单一 WGSL fn 替换 + 2 处调用 + 1 测试文件)
 **Dependencies**: T-0610 part 2 (surface corner mask shader) / T-0615 (per-element rounded shader)
 **Priority**: P3 (polish, 视觉差异化)
