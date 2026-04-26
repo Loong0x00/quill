@@ -1,8 +1,8 @@
 # T-0701 窗口 4 边 + 4 角 resize 拖动
 
 **Phase**: 7 (CSD 完整化)
-**Assigned**: (open)
-**Status**: open
+**Assigned**: writer-T0701
+**Status**: in-review
 **Budget**: tokenBudget=120k (跨 wl_pointer hit-test + xdg_toplevel.resize 协议)
 **Dependencies**: T-0504 (CSD titlebar + wl_pointer + hit_test)
 **Priority**: P1 (CSD 完整性 — 当前窗口 size hardcode, 拖不动 resize)
