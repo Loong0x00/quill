@@ -1144,6 +1144,13 @@ fn append_titlebar_vertices(
     let titlebar_h = TITLEBAR_H_LOGICAL_PX as f32 * hidpi;
     let btn_w = BUTTON_W_LOGICAL_PX as f32 * hidpi;
     let btn_h = BUTTON_H_LOGICAL_PX as f32 * hidpi;
+    // T-0618 follow-up: 按钮在 titlebar 内**垂直居中**. titlebar_h (28 logical) > btn_h
+    // (24 logical), 差 4 logical = 2 上 + 2 下. 之前 button y=0 (顶到天) 视觉上不
+    // 居中. 算 y_offset 让 button bbox 落 [y_offset, y_offset + btn_h].
+    let btn_y_offset = (titlebar_h - btn_h) / 2.0;
+    let btn_y_top = btn_y_offset;
+    let btn_y_bot = btn_y_offset + btn_h;
+    let btn_cy = btn_y_offset + btn_h / 2.0;
 
     let titlebar_bg = color_for_vertex_with_srgb(TITLEBAR_BG, is_srgb);
     let icon_color = color_for_vertex_with_srgb(BUTTON_ICON, is_srgb);
@@ -1182,9 +1189,9 @@ fn append_titlebar_vertices(
         append_rounded_quad_px(
             rounded_out,
             close_x_min,
-            0.0,
+            btn_y_top,
             close_x_max,
-            btn_h,
+            btn_y_bot,
             surface_w,
             surface_h,
             bg,
@@ -1196,9 +1203,9 @@ fn append_titlebar_vertices(
         append_rounded_quad_px(
             rounded_out,
             max_x_min,
-            0.0,
+            btn_y_top,
             max_x_max,
-            btn_h,
+            btn_y_bot,
             surface_w,
             surface_h,
             bg,
@@ -1211,9 +1218,9 @@ fn append_titlebar_vertices(
             append_rounded_quad_px(
                 rounded_out,
                 min_x_min,
-                0.0,
+                btn_y_top,
                 min_x_max,
-                btn_h,
+                btn_y_bot,
                 surface_w,
                 surface_h,
                 bg,
@@ -1241,8 +1248,8 @@ fn append_titlebar_vertices(
     {
         let mx_min = max_x_min + icon_pad;
         let mx_max = max_x_max - icon_pad;
-        let my_min = icon_pad;
-        let my_max = btn_h - icon_pad;
+        let my_min = btn_y_top + icon_pad;
+        let my_max = btn_y_bot - icon_pad;
         // 上边
         append_rounded_quad_px(
             rounded_out,
@@ -1297,7 +1304,7 @@ fn append_titlebar_vertices(
     if min_x_min >= 0.0 {
         let nx_min = min_x_min + icon_pad;
         let nx_max = min_x_max - icon_pad;
-        let ny = btn_h / 2.0;
+        let ny = btn_cy;
         append_rounded_quad_px(
             rounded_out,
             nx_min,
@@ -1322,19 +1329,19 @@ fn append_titlebar_vertices(
             append_rounded_quad_px(
                 rounded_out,
                 newtab_x_min,
-                0.0,
+                btn_y_top,
                 newtab_x_max,
-                btn_h,
+                btn_y_bot,
                 surface_w,
                 surface_h,
                 bg,
                 btn_radius_phys,
             );
         }
-        // + icon: 横竖两条 stroke quad, 中心点 (inset + btn_w/2, btn_h/2).
+        // + icon: 横竖两条 stroke quad, 中心点 (inset + btn_w/2, btn_cy).
         // 走 rounded_out (radius=0 矩形) 让 icon 在 hover bg 之上.
         let cx = inset + btn_w / 2.0;
-        let cy = btn_h / 2.0;
+        let cy = btn_cy;
         let icon_size = btn_h - 2.0 * icon_pad;
         // 横线
         append_rounded_quad_px(
@@ -3440,15 +3447,18 @@ impl Renderer {
             return;
         }
         // close button 中心 (px). 跟 hit_test / append_titlebar_vertices 同源:
-        // close button 占右上角 BUTTON_W × BUTTON_H, x ∈ [surface_w - btn_w, surface_w].
+        // close button 在 titlebar 内垂直居中, 右内缩 WINDOW_BUTTON_INSET_PX.
         let hidpi = HIDPI_SCALE as f32;
         let btn_w = BUTTON_W_LOGICAL_PX as f32 * hidpi;
         let btn_h = BUTTON_H_LOGICAL_PX as f32 * hidpi;
-        let center_x = surface_w - btn_w / 2.0;
-        let center_y = btn_h / 2.0;
-        // 居中: glyph 起绘 = center - slot.width/2 + bearing_x 偏移. baseline
-        // 风格: glyph 中心 ≈ center_y, 用 (center_y + slot.height/2 - bearing_y)
-        // 算 y_top 让 glyph bbox 中央对 center_y.
+        let titlebar_h = TITLEBAR_H_LOGICAL_PX as f32 * hidpi;
+        let inset = WINDOW_BUTTON_INSET_PX * hidpi;
+        let center_x = surface_w - inset - btn_w / 2.0;
+        let center_y = titlebar_h / 2.0; // T-0618 follow-up: 跟 button bbox 居中
+        let _ = btn_h; // (留 binding 防 cargo warn — center_y 改算 titlebar_h, btn_h 暂未用)
+                       // 居中: glyph 起绘 = center - slot.width/2 + bearing_x 偏移. baseline
+                       // 风格: glyph 中心 ≈ center_y, 用 (center_y + slot.height/2 - bearing_y)
+                       // 算 y_top 让 glyph bbox 中央对 center_y.
         let x_left = center_x - slot.width as f32 / 2.0;
         let y_top = center_y - slot.height as f32 / 2.0;
         let x_right = x_left + slot.width as f32;
