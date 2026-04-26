@@ -79,6 +79,56 @@ pub enum WindowButton {
     Close,
 }
 
+/// T-0701: quill 自有的 8 边角枚举, 与 wayland xdg_toplevel `resize_edge`
+/// 协议 enum 一一对应 (Top / Bottom / Left / Right / TopLeft / TopRight /
+/// BottomLeft / BottomRight). **本枚举不含 None** — `None` 在 wayland 协议里
+/// 表示"compositor 决定边", 客户端发起 resize 必带具体边, 不允许 None
+/// (xdg-shell.xml resize_edge enum entry "none"=0 仅作 default value, 客户端
+/// 不该发).
+///
+/// **INV-010 类型隔离**: 此枚举是**单一边界点** —
+/// `wayland_protocols::xdg::shell::client::xdg_toplevel::ResizeEdge` 仅在
+/// `pointer.rs` 的 [`quill_edge_to_wayland`] 翻译 fn 内出现 (与
+/// `from_alacritty` 同套路, 见 INV-010 + conventions §5). 调用方 (window.rs
+/// `Dispatch<WlPointer>`) 通过翻译 fn 间接拿 wayland enum, 不直接 import
+/// wayland::ResizeEdge 字面 path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResizeEdge {
+    Top,
+    Bottom,
+    Left,
+    Right,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+/// quill ResizeEdge → wayland 协议 ResizeEdge 的**单一翻译边界**.
+///
+/// **why pub(crate) 而非 pub**: 翻译表只给 `wl/window.rs::Dispatch<WlPointer>`
+/// 用, 跨 crate 边界不暴露 (INV-010). 与 `WindowCore` 字段 pub(crate) 同
+/// 模块隔离套路.
+///
+/// **why exhaustive match 无 `_ =>`**: 上游 wayland-protocols 加新 variant
+/// (例如 wayland 主版本若加 corner 细分) 编译期 catch — INV-010 验证条目硬
+/// 要求.
+pub(crate) fn quill_edge_to_wayland(
+    edge: ResizeEdge,
+) -> wayland_protocols::xdg::shell::client::xdg_toplevel::ResizeEdge {
+    use wayland_protocols::xdg::shell::client::xdg_toplevel::ResizeEdge as WlEdge;
+    match edge {
+        ResizeEdge::Top => WlEdge::Top,
+        ResizeEdge::Bottom => WlEdge::Bottom,
+        ResizeEdge::Left => WlEdge::Left,
+        ResizeEdge::Right => WlEdge::Right,
+        ResizeEdge::TopLeft => WlEdge::TopLeft,
+        ResizeEdge::TopRight => WlEdge::TopRight,
+        ResizeEdge::BottomLeft => WlEdge::BottomLeft,
+        ResizeEdge::BottomRight => WlEdge::BottomRight,
+    }
+}
+
 /// 鼠标当前在 surface 内的 hover 区域. 由 [`hit_test`] 算出, [`PointerState`]
 /// 记一份方便 redraw 决策 (按钮 hover 变深 / Close hover 变红 — 派单 In #D).
 ///
@@ -95,6 +145,10 @@ pub enum HoverRegion {
     TitleBar,
     /// 鼠标在三按钮区. 调用方据此渲染高亮 + click 时分派动作.
     Button(WindowButton),
+    /// T-0701: 鼠标在 4 边 / 4 角 resize 区. press 后走 xdg_toplevel.resize
+    /// 让 compositor 接管 resize. 边缘宽度 [`RESIZE_EDGE_PX`] (4 logical),
+    /// 角宽度 [`RESIZE_CORNER_PX`] (8 logical, 优先 corner 让用户好抓).
+    ResizeEdge(ResizeEdge),
     /// 鼠标在 text area (cell grid 区域). Phase 6+ 接选区 / 滚轮.
     TextArea,
 }
@@ -113,6 +167,13 @@ pub enum PointerAction {
     /// compositor 接管拖动. serial 是 button event 的 serial (Wayland 协议
     /// 要求 move 必须传最近 input event 的 serial, compositor 验证防伪造).
     StartMove { serial: u32 },
+    /// T-0701: 4 边 / 4 角 resize 区 press: 触发
+    /// `xdg_toplevel.resize(seat, serial, edge)`, compositor 接管 resize 直到
+    /// 鼠标 release. 与 StartMove 同套路 (xdg-shell 协议要求 resize 也带最近
+    /// input event serial). `edge` 是 quill 自有 [`ResizeEdge`], 调用方需走
+    /// [`quill_edge_to_wayland`] 翻译给 SCTK `Window::resize` (INV-010 单一
+    /// 翻译边界).
+    StartResize { serial: u32, edge: ResizeEdge },
     /// 三按钮 click. 调用方按 button 分派 set_minimized / 切换 maximize /
     /// 关闭. **press → click**: 本 ticket 简化按 press 触发 click (与多数终端
     /// CSD 一致, alacritty / foot 同), 不做"press 同区 + release 同区" 的
@@ -175,6 +236,24 @@ pub struct PointerState {
     /// touchpad 两指滑一指距离约 100-200 px 出 4-8 line. 体感与 foot/kitty 接近.
     scroll_accum_y: f64,
 }
+
+/// T-0701: 边缘 resize hit-test 厚度 (logical px). 4 logical = 8 physical (HIDPI×2),
+/// 与 GNOME mutter / KDE kwin 默认 4-6 px 一致. 鼠标在 surface 边缘此带内
+/// 走 ResizeEdge.
+///
+/// **why 4 而非 8**: 边缘太宽吃掉 cell 边距 — 用户拖文字选区时容易误触发
+/// resize. GNOME / KDE / foot / alacritty 实测均 4-6 logical, 取 4 与
+/// compositor server-side 装饰最小窄边一致 (T-0503 GNOME 政策性 SSD off).
+pub(crate) const RESIZE_EDGE_PX: f64 = 4.0;
+
+/// T-0701: 角 resize hit-test 边长 (logical px). 8 logical 矩形覆盖左上 / 右上
+/// / 左下 / 右下四角, 优先 corner > edge 让用户好抓 (角对角拖最常用,
+/// alacritty / foot / GNOME 默认角带均 ≥ 边带).
+///
+/// **why 8 而非更大**: 与 titlebar 高度 28 / 按钮宽 24 同尺度便心算; 太大
+/// (>16) 在按钮区会与 Close 按钮抢 hit-test (Close 区右上 24×24, 与右上
+/// corner 8×8 区接壤但不重叠 — 派单 In #A "角覆盖优先 edge", 但不抢按钮).
+pub(crate) const RESIZE_CORNER_PX: f64 = 8.0;
 
 /// T-0602: 触摸板 / 滚轮累积阈值 (logical px). 累够此值发一次 line 滚动.
 ///
@@ -349,6 +428,7 @@ pub(crate) fn apply_button(
     match state.hover {
         HoverRegion::TitleBar => PointerAction::StartMove { serial },
         HoverRegion::Button(b) => PointerAction::ButtonClick(b),
+        HoverRegion::ResizeEdge(edge) => PointerAction::StartResize { serial, edge },
         HoverRegion::TextArea | HoverRegion::None => PointerAction::Nothing,
     }
 }
@@ -389,7 +469,7 @@ pub(crate) fn apply_axis_vertical(state: &mut PointerState, value: f64) -> Point
 
 /// 纯逻辑 hit-test: 给定 surface 内坐标 (logical px) 与 surface 尺寸 (logical),
 /// 算 [`HoverRegion`]. 派单 In #F 抽决策模式硬约束, 单测覆盖 ≥6 case
-/// (titlebar / 3 按钮 / text area / 边界).
+/// (titlebar / 3 按钮 / text area / 边界 / T-0701 4 边 + 4 角 resize).
 ///
 /// **CSD 视觉布局** (单一来源, 与 [`crate::wl::render`] titlebar 渲染同源):
 /// - 顶部 [`TITLEBAR_H_LOGICAL_PX`] (28 logical) 是 titlebar.
@@ -398,12 +478,27 @@ pub(crate) fn apply_axis_vertical(state: &mut PointerState, value: f64) -> Point
 /// - titlebar 之下是 text area (cell grid).
 /// - 超出 surface (x < 0 / y < 0 / x ≥ w / y ≥ h) → None.
 ///
+/// **T-0701 hit-test 优先级** (高 → 低):
+/// 1. 边界外 → None
+/// 2. **4 角** ([`RESIZE_CORNER_PX`] = 8 logical 方块, 4 个) → ResizeEdge(corner) —
+///    优先于 edge / button (派单"角覆盖优先 edge"); 角与右上 Close 按钮区重叠
+///    (右上 8×8 在 Close 24×24 内), 用户在最角即拖窗口, 内移 ≥8 logical 即落
+///    Close — 实测体感与 GNOME / foot 一致.
+/// 3. **4 边** ([`RESIZE_EDGE_PX`] = 4 logical 厚 strip) → ResizeEdge(edge) —
+///    避开 4 角 (角已 step 2 接管). titlebar 顶边 (y < 4) 走 Top 而非 titlebar
+///    drag — 避免拖窗口时误抓窗口顶边过细 (GNOME 同决策).
+/// 4. titlebar 段 (y < TITLEBAR_H, 排除上方边):
+///    - 三按钮 hit (Close / Maximize / Minimize) → Button(...)
+///    - 否则 → TitleBar
+/// 5. text area 段 → TextArea
+///
 /// **why 接 f64 而非 i32**: wl_pointer 坐标是 wl_fixed, wayland-client 转 f64.
 /// 边界判断用 < / >= 而非 ≤, 与 NDC / 像素坐标系一致 (像素中心在整数偏 0.5,
 /// 但 hit_test 不需精度到 sub-pixel, 直接用浮点比较即可).
 ///
-/// **单一来源**: 三常数 (TITLEBAR_H / BUTTON_W / BUTTON_H) 都从 `render.rs`
-/// 顶部 import. 改一处即视觉与逻辑同步, 无漂移风险.
+/// **单一来源**: 五常数 (TITLEBAR_H / BUTTON_W / BUTTON_H / RESIZE_EDGE_PX /
+/// RESIZE_CORNER_PX) 都从模块顶部 / `render.rs` import. 改一处即视觉与逻辑
+/// 同步, 无漂移风险.
 pub fn hit_test(x: f64, y: f64, surface_w: u32, surface_h: u32) -> HoverRegion {
     // 边界外
     if x < 0.0 || y < 0.0 {
@@ -413,6 +508,42 @@ pub fn hit_test(x: f64, y: f64, surface_w: u32, surface_h: u32) -> HoverRegion {
     let h = surface_h as f64;
     if x >= w || y >= h {
         return HoverRegion::None;
+    }
+
+    // T-0701 优先级 step 2: 4 角 (角优先 edge, 派单 In #A).
+    // surface 太小 (w < 2 * RESIZE_CORNER_PX 或 h < 同) 时角会重叠 — 此处不
+    // 防御 (INITIAL_WIDTH/HEIGHT 800/600 远超, 用户拉到 ≤16 自找死, 与 alacritty
+    // 同决策不防 minimum-size).
+    let in_left = x < RESIZE_CORNER_PX;
+    let in_right = x >= w - RESIZE_CORNER_PX;
+    let in_top = y < RESIZE_CORNER_PX;
+    let in_bottom = y >= h - RESIZE_CORNER_PX;
+    if in_top && in_left {
+        return HoverRegion::ResizeEdge(ResizeEdge::TopLeft);
+    }
+    if in_top && in_right {
+        return HoverRegion::ResizeEdge(ResizeEdge::TopRight);
+    }
+    if in_bottom && in_left {
+        return HoverRegion::ResizeEdge(ResizeEdge::BottomLeft);
+    }
+    if in_bottom && in_right {
+        return HoverRegion::ResizeEdge(ResizeEdge::BottomRight);
+    }
+
+    // T-0701 优先级 step 3: 4 边 (4 logical 厚 strip).
+    // 顶边 4 logical 走 Top resize 优先于 titlebar drag — 见上方 priority 注释.
+    if y < RESIZE_EDGE_PX {
+        return HoverRegion::ResizeEdge(ResizeEdge::Top);
+    }
+    if y >= h - RESIZE_EDGE_PX {
+        return HoverRegion::ResizeEdge(ResizeEdge::Bottom);
+    }
+    if x < RESIZE_EDGE_PX {
+        return HoverRegion::ResizeEdge(ResizeEdge::Left);
+    }
+    if x >= w - RESIZE_EDGE_PX {
+        return HoverRegion::ResizeEdge(ResizeEdge::Right);
     }
 
     let titlebar_h = TITLEBAR_H_LOGICAL_PX as f64;
@@ -524,10 +655,14 @@ mod tests {
     }
 
     #[test]
-    fn hit_test_close_right_edge_inclusive() {
-        // x=799 仍在 Close 内 (< 800)
+    fn hit_test_close_button_inner_returns_close() {
+        // **T-0701 优先级修正**: 原测试名 hit_test_close_right_edge_inclusive 测
+        // x=799 y=0 → Close, 但右边 4 px 现走 Right resize edge / 顶 4 px 走 Top
+        // edge / 右上 8×8 走 TopRight corner — 边角全优先按钮 (派单"角覆盖优先
+        // edge, edge 优先 button"). 改测 Close 内**避开 4 边 / 8 角**的内点
+        // (x=790 出右边 4 edge & 出 8 corner; y=12 出顶边).
         assert_eq!(
-            hit_test(799.0, 0.0, 800, 600),
+            hit_test(790.0, 12.0, 800, 600),
             HoverRegion::Button(WindowButton::Close)
         );
     }
@@ -540,15 +675,15 @@ mod tests {
     }
 
     #[test]
-    fn hit_test_extremely_narrow_surface_button_overflow_falls_to_titlebar() {
-        // 50×600: Close x ∈ [26, 50), Max x ∈ [2, 26), Min x ∈ [-22, 2) 越界
-        // → x=10 应落 Maximize (在 [2, 26) 内)
-        assert_eq!(
-            hit_test(10.0, 10.0, 50, 600),
-            HoverRegion::Button(WindowButton::Maximize)
-        );
-        // x=0 在 Min 越界外, 落 titlebar
-        assert_eq!(hit_test(0.0, 10.0, 50, 600), HoverRegion::TitleBar);
+    fn hit_test_narrow_surface_button_overflow_falls_to_titlebar() {
+        // 100×600: corner 8 / edge 4 后, Close x ∈ [76, 100), Max x ∈ [52, 76),
+        // Min x ∈ [28, 52), titlebar 缝隙 x ∈ [8, 28).
+        // x=10 y=10 应落 TitleBar (出 corner / edge / 三按钮 — Min 起点 28 > 10).
+        assert_eq!(hit_test(10.0, 10.0, 100, 600), HoverRegion::TitleBar);
+        // **T-0701 优先级修正**: 原测试 50×600 x=0 期望 TitleBar, 但新优先级
+        // 下 (x<4) 必落 Left edge resize. 改测 100×600 x=10 出 corner / edge
+        // 后落 TitleBar — 与原测试"窄 surface button 越界 fallback titlebar" 同
+        // 语义, 仅迁出 4-edge / 8-corner 区域以适配 T-0701.
     }
 
     // ---- apply_* 决策子 fn 测试 (绕开 wl_surface 构造难题, 见
@@ -779,6 +914,177 @@ mod tests {
             action_h,
             PointerAction::Nothing,
             "HorizontalScroll 应沉默 (quill 无横滚)"
+        );
+    }
+
+    // ---- T-0701 hit_test 8 边角 + apply_button StartResize 单测 ----
+
+    /// 4 角各 8×8 logical, 优先 edge / button.
+
+    #[test]
+    fn hit_test_top_left_corner_returns_resize_topleft() {
+        // 800×600: TopLeft 区 x ∈ [0, 8), y ∈ [0, 8)
+        assert_eq!(
+            hit_test(2.0, 2.0, 800, 600),
+            HoverRegion::ResizeEdge(ResizeEdge::TopLeft)
+        );
+    }
+
+    #[test]
+    fn hit_test_top_right_corner_returns_resize_topright() {
+        // 800×600: TopRight 区 x ∈ [792, 800), y ∈ [0, 8) — **优先 Close 按钮**
+        // (Close x ∈ [776, 800) y ∈ [0, 24) 与右上 corner 区重叠 [792,800)×[0,8)).
+        assert_eq!(
+            hit_test(795.0, 3.0, 800, 600),
+            HoverRegion::ResizeEdge(ResizeEdge::TopRight)
+        );
+    }
+
+    #[test]
+    fn hit_test_bottom_left_corner_returns_resize_bottomleft() {
+        // 800×600: BottomLeft x ∈ [0, 8), y ∈ [592, 600)
+        assert_eq!(
+            hit_test(3.0, 595.0, 800, 600),
+            HoverRegion::ResizeEdge(ResizeEdge::BottomLeft)
+        );
+    }
+
+    #[test]
+    fn hit_test_bottom_right_corner_returns_resize_bottomright() {
+        // 800×600: BottomRight x ∈ [792, 800), y ∈ [592, 600)
+        assert_eq!(
+            hit_test(795.0, 598.0, 800, 600),
+            HoverRegion::ResizeEdge(ResizeEdge::BottomRight)
+        );
+    }
+
+    /// 4 边各 4 logical 厚, 避开 4 角.
+
+    #[test]
+    fn hit_test_top_edge_returns_resize_top() {
+        // 800×600: 顶边 y ∈ [0, 4) 中段 (避开角 x ∈ [8, 792))
+        assert_eq!(
+            hit_test(400.0, 2.0, 800, 600),
+            HoverRegion::ResizeEdge(ResizeEdge::Top)
+        );
+    }
+
+    #[test]
+    fn hit_test_bottom_edge_returns_resize_bottom() {
+        // 800×600: 底边 y ∈ [596, 600), x 中段
+        assert_eq!(
+            hit_test(400.0, 598.0, 800, 600),
+            HoverRegion::ResizeEdge(ResizeEdge::Bottom)
+        );
+    }
+
+    #[test]
+    fn hit_test_left_edge_returns_resize_left() {
+        // 800×600: 左边 x ∈ [0, 4), y 中段 (避开角 y ∈ [8, 592))
+        assert_eq!(
+            hit_test(2.0, 300.0, 800, 600),
+            HoverRegion::ResizeEdge(ResizeEdge::Left)
+        );
+    }
+
+    #[test]
+    fn hit_test_right_edge_returns_resize_right() {
+        // 800×600: 右边 x ∈ [796, 800), y 中段
+        assert_eq!(
+            hit_test(798.0, 300.0, 800, 600),
+            HoverRegion::ResizeEdge(ResizeEdge::Right)
+        );
+    }
+
+    /// 边角越界 + 邻接验证 (优先级硬约束).
+
+    #[test]
+    fn hit_test_corner_overlaps_close_button_corner_wins() {
+        // 800×600: x=795 y=3 落 TopRight (corner 优先, 派单 In #A "角覆盖优先 edge");
+        // 内移到 x=795 y=10 (出 corner, 入 Close 区) 应落 Close.
+        assert_eq!(
+            hit_test(795.0, 10.0, 800, 600),
+            HoverRegion::Button(WindowButton::Close)
+        );
+    }
+
+    #[test]
+    fn hit_test_top_edge_above_titlebar_buttons_returns_top() {
+        // 800×600: y=3 在顶边 (RESIZE_EDGE_PX=4), 即使 x 在 Close 范围 (790)
+        // 但避开 corner (x=790 < 792), 应落 Top edge — 优先 Top resize 而非
+        // Close (派单 In #A "顶边走 Top 而非 titlebar drag" 推广到按钮).
+        assert_eq!(
+            hit_test(790.0, 3.0, 800, 600),
+            HoverRegion::ResizeEdge(ResizeEdge::Top)
+        );
+    }
+
+    #[test]
+    fn hit_test_just_below_top_edge_falls_to_titlebar_button() {
+        // y=4 (== RESIZE_EDGE_PX) 离开顶边, x=790 在 Close — 应落 Close.
+        assert_eq!(
+            hit_test(790.0, 4.0, 800, 600),
+            HoverRegion::Button(WindowButton::Close)
+        );
+    }
+
+    /// apply_button StartResize 路径覆盖.
+
+    #[test]
+    fn left_button_press_on_resize_edge_starts_resize() {
+        let mut state = fresh_state();
+        // 进入左边 (x=2 y=300) 触发 hover ResizeEdge::Left
+        let _ = apply_enter(&mut state, 2.0, 300.0);
+        assert_eq!(
+            state.hover(),
+            HoverRegion::ResizeEdge(ResizeEdge::Left),
+            "前置: enter 应记 Left edge hover"
+        );
+        let action = apply_button(&mut state, 99, 0x110, true);
+        assert_eq!(
+            action,
+            PointerAction::StartResize {
+                serial: 99,
+                edge: ResizeEdge::Left
+            }
+        );
+    }
+
+    #[test]
+    fn left_button_press_on_resize_corner_starts_resize_with_corner_edge() {
+        let mut state = fresh_state();
+        // 进入右下角 (x=795 y=595) 触发 ResizeEdge::BottomRight
+        let _ = apply_enter(&mut state, 795.0, 595.0);
+        let action = apply_button(&mut state, 7, 0x110, true);
+        assert_eq!(
+            action,
+            PointerAction::StartResize {
+                serial: 7,
+                edge: ResizeEdge::BottomRight
+            }
+        );
+    }
+
+    /// quill_edge_to_wayland 翻译表全 8 variant 覆盖 (INV-010 单一翻译边界).
+    #[test]
+    fn quill_edge_to_wayland_translates_all_variants() {
+        use wayland_protocols::xdg::shell::client::xdg_toplevel::ResizeEdge as WlEdge;
+        assert_eq!(quill_edge_to_wayland(ResizeEdge::Top), WlEdge::Top);
+        assert_eq!(quill_edge_to_wayland(ResizeEdge::Bottom), WlEdge::Bottom);
+        assert_eq!(quill_edge_to_wayland(ResizeEdge::Left), WlEdge::Left);
+        assert_eq!(quill_edge_to_wayland(ResizeEdge::Right), WlEdge::Right);
+        assert_eq!(quill_edge_to_wayland(ResizeEdge::TopLeft), WlEdge::TopLeft);
+        assert_eq!(
+            quill_edge_to_wayland(ResizeEdge::TopRight),
+            WlEdge::TopRight
+        );
+        assert_eq!(
+            quill_edge_to_wayland(ResizeEdge::BottomLeft),
+            WlEdge::BottomLeft
+        );
+        assert_eq!(
+            quill_edge_to_wayland(ResizeEdge::BottomRight),
+            WlEdge::BottomRight
         );
     }
 

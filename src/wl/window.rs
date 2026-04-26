@@ -63,7 +63,9 @@ use wayland_client::{
 };
 
 use super::keyboard::{handle_key_event, KeyboardAction, KeyboardState};
-use super::pointer::{handle_pointer_event, PointerAction, PointerState, WindowButton};
+use super::pointer::{
+    handle_pointer_event, quill_edge_to_wayland, PointerAction, PointerState, WindowButton,
+};
 use super::render::Renderer;
 use crate::ime::{handle_text_input_event, CursorRectangle, ImeAction, ImeState};
 use wayland_client::protocol::wl_pointer;
@@ -2184,6 +2186,30 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                     "xdg_toplevel.move (titlebar drag)"
                 );
                 state.window.move_(seat, serial);
+            }
+            PointerAction::StartResize { serial, edge } => {
+                // T-0701: xdg_toplevel.resize(seat, serial, edge). 与 StartMove
+                // 同套路, compositor 接管 resize 直到鼠标 release; quill 在此
+                // 期间持续收 configure event (resize 中尺寸 deltas), 走既定
+                // resize_dirty 路径触发 swapchain 重建 + term/pty resize (INV-006).
+                //
+                // edge 走 quill_edge_to_wayland 翻译 (INV-010 单一边界, wayland
+                // 协议 enum 不在本文件出现 — 通过 fn 返回值类型隐式传递).
+                let Some(seat) = state.pointer_seat.as_ref() else {
+                    tracing::warn!(
+                        target: "quill::pointer",
+                        "StartResize 时 pointer_seat=None, 跳过 (race 下罕见)"
+                    );
+                    return;
+                };
+                let wl_edge = quill_edge_to_wayland(edge);
+                tracing::debug!(
+                    target: "quill::pointer",
+                    serial,
+                    ?edge,
+                    "xdg_toplevel.resize (edge/corner drag)"
+                );
+                state.window.resize(seat, serial, wl_edge);
             }
             PointerAction::Scroll(delta) => {
                 // T-0602: 滚轮 / 触摸板累积到 State.pending_scroll_lines, 由
