@@ -451,10 +451,87 @@ impl TextSystem {
                     .collect::<Vec<_>>()
             })
             .collect();
-        raw.into_iter()
+        let emoji_filtered: Vec<ShapedGlyph> = raw
+            .into_iter()
             .map(|g| self.apply_emoji_blacklist(g))
-            .collect()
+            .collect();
+
+        // T-0801: CJK 强制双宽 advance 后处理。详 [`force_cjk_double_advance`] doc。
+        force_cjk_double_advance(emoji_filtered)
     }
+}
+
+/// T-0801: 后处理 shape 出的 glyph 序列, 把 CJK / 双宽字形强制对齐到 monospace
+/// 终端"双 cell"宽度, 修字间空隙 bug。
+///
+/// **真因 (派单 Bug 段引)**: alacritty Term 协议把 CJK 字当 2 cells (实字 cell +
+/// WIDE_CHAR_SPACER cell), quill 渲染按 cosmic-text 自然 advance ~ 1.67 ×
+/// CELL_W_PX_phys (T-0405 实测: Noto CJK 1.0em / DejaVu Sans Mono Latin 0.6em
+/// 跨 face 比例), 字形占第 1 cell + 第 2 cell 一半, 视觉每字一空。主流终端
+/// (alacritty / foot / kitty / xterm) **强制**双宽 cell 居中。
+///
+/// **算法**:
+/// 1. 检测每个 glyph 是否双宽: `natural_advance > 1.5 × CELL_W_PX_phys`
+///    (派单已知陷阱: cosmic-text 不给 wide 标志, advance ratio 是 monospace
+///    终端语境最稳的判断 — codepoint range 检测漏 CJK 扩展块, 且不区分主 face
+///    .notdef tofu 退化路径下"宽 codepoint 但 fallback 给 narrow tofu" 这种 edge)
+/// 2. 重 cascade `x_offset`: 从 0 起累加, narrow → 1 cell (`CELL_W_PX_phys`),
+///    wide → 2 cells (`2 × CELL_W_PX_phys`)
+/// 3. wide glyph 居中: `x_offset += (2 × CELL_W_PX_phys - natural_advance) / 2`
+///    (slot.bearing_x 仍按字形 bbox 左偏, 居中量加在 x_offset 上)
+/// 4. 强制 advance: wide → `2 × CELL_W_PX_phys`, narrow → `CELL_W_PX_phys`
+///    (narrow 也吸到 CELL_W_PX_phys 而非保留 cosmic-text 微差: monospace 终端
+///    grid 严对齐, ASCII 自然 advance 已 ≈ CELL_W_PX_phys 微差忽略, 同时让
+///    "advance 累加 == 期望 grid 宽度" 成为自检不变式)
+///
+/// **不动 single-glyph natural_advance 字段**: ShapedGlyph 公共 API `x_advance`
+/// 是 quill 抽象 (派单 In #A "强制 advance = 2 × CELL_W_PX"), 不暴露 cosmic-text
+/// 自然 advance — 派单 Acceptance "advance = 2 × CELL_W_PX" 是公共契约。下游
+/// 渲染层只看 `x_offset` 决定字形左上角位置 (走 `glyph.x_offset + slot.bearing_x`,
+/// 见 src/wl/render.rs::draw_frame T-0801 注释), `x_advance` 字段保留作元数据
+/// (累加自检 / 测试断言 / 未来 cursor 推进逻辑)。
+///
+/// **HIDPI_SCALE 单一来源** (沿袭 shape_line 注释): 引 [`crate::wl::HIDPI_SCALE`]
+/// 与 [`crate::wl::CELL_W_PX`] 让 cell pixel 宽 一处定义, 不再走 magic number。
+/// 改 CELL_W_PX (Phase 4+ 字体真实 metrics 替换路径) 本 fn 自跟随。
+///
+/// **空切片**: 直接返空, 跳过 cascade (避免 saturating_sub 之类细节)。
+///
+/// 测试覆盖:
+/// - [`tests::shape_line_cjk_glyphs_have_forced_double_advance`]
+/// - [`tests::shape_line_cjk_glyphs_centered_in_double_cell`]
+/// - [`tests::shape_line_ascii_advance_equals_cell_w_phys`]
+/// - [`tests::shape_line_mixed_cjk_returns_glyphs`] (T-0405 ratio range
+///   [1.4, 2.4] 改为严 advance == 2 × CELL_W_PX_phys)
+fn force_cjk_double_advance(glyphs: Vec<ShapedGlyph>) -> Vec<ShapedGlyph> {
+    if glyphs.is_empty() {
+        return glyphs;
+    }
+    let cell_w_phys = crate::wl::CELL_W_PX * (crate::wl::HIDPI_SCALE as f32);
+    let wide_threshold = 1.5 * cell_w_phys;
+    let double_w = 2.0 * cell_w_phys;
+
+    let mut out: Vec<ShapedGlyph> = Vec::with_capacity(glyphs.len());
+    let mut cursor_x: f32 = 0.0;
+    for g in glyphs {
+        let natural = g.x_advance;
+        let is_wide = natural.is_finite() && natural > wide_threshold;
+        let forced_advance = if is_wide { double_w } else { cell_w_phys };
+        // 居中: 仅 wide 应用; narrow 沿 cosmic-text 自然 ASCII 对齐 (差异 < 1 px)
+        let center_pad = if is_wide {
+            (double_w - natural).max(0.0) / 2.0
+        } else {
+            0.0
+        };
+        let new_x_offset = cursor_x + center_pad;
+        out.push(ShapedGlyph {
+            x_advance: forced_advance,
+            x_offset: new_x_offset,
+            ..g
+        });
+        cursor_x += forced_advance;
+    }
+    out
 }
 
 /// 单个字形的光栅化产物 (Phase 4, T-0403)。
@@ -806,13 +883,19 @@ mod tests {
     /// 用户机 noto-fonts-cjk 装齐;CI 无 CJK 字体 cosmic-text 仍走 .notdef
     /// fallback 5 个 glyph 不少 — 关键是 `glyphs.len() == 5` + 不 panic。
     ///
-    /// **T-0405: CJK 双宽 advance 软性断言** (派单 In #B 可选项): T-0407 face
-    /// lock + emoji 排除已锁主 face, 用户机 / CI 走真 CJK fallback face (Noto
-    /// CJK / Source Han Sans), 该 face 设计上 CJK glyph advance ≈ 2 × ASCII
-    /// (东亚 monospace 双宽传统)。**软性 assert**: 若 CJK fallback 真触发
-    /// (`你_face_id != ascii_face_id`) 锁双宽 (±10% 容差); CI 退化到主 face
-    /// tofu 时跳过该 assert (主 face 'a' 与 '你' 同走 .notdef → advance 同源
-    /// 不能区分双宽)。
+    /// **T-0801: 严断言 advance == 2 × CELL_W_PX_phys** (派单 In #C "T-0405
+    /// 测试 ratio range [1.4, 2.4] 改成严 advance == 2 × CELL_W_PX"): T-0405
+    /// 软性 ratio range 是当时未做强制双宽时, 实测 cosmic-text 自然给 1.67;
+    /// T-0801 [`force_cjk_double_advance`] 后处理强制 wide → 2 × CELL_W_PX_phys,
+    /// 现在 CJK glyph advance 必严等 2 × CELL_W_PX × HIDPI_SCALE (浮点 ±0.001
+    /// 容差仅防 IEEE-754 round-trip, 实际 20.0 × 2.0 = 40.0 必精确)。
+    ///
+    /// **CI 退化路径**: 若主 face 'a' 与 '你' 同走 .notdef tofu (无 CJK face),
+    /// '你' 自然 advance 同 ASCII (~CELL_W_PX_phys = 20), 不触发 wide 路径,
+    /// `force_cjk_double_advance` 给 1 cell 而非 2 cells — 严断言会挂。但用户
+    /// 机以 CJK fallback 真触发为准 (派单 Acceptance 段), 退化路径仅 eprintln!
+    /// warning 不挂 CI 的设计 (T-0405) 在 T-0801 改为只在 fallback 真触发时
+    /// 锁严宽 (退化路径仍只 eprintln warn 跳过)。
     #[test]
     fn shape_line_mixed_cjk_returns_glyphs() {
         let mut ts = TextSystem::new().expect("TextSystem::new on user machine");
@@ -834,47 +917,63 @@ mod tests {
             assert_eq!(g.y_advance, 0.0, "horizontal text y_advance is 0");
         }
 
-        // T-0405 软性双宽 assert: 仅当 CJK fallback 真触发 (你_face != primary)
-        // 才锁。否则 (CI 退化到主 face .notdef) 主 face 'a' 与 '你' 走同 face
-        // tofu, advance 同源不能区分 — 跳过 assert 不挂 CI。
+        // T-0801 严断言: CJK fallback 真触发时 (用户机标准路径), '你' / '好'
+        // advance 必严等 2 × CELL_W_PX_phys; ASCII 'a'/'b'/'c' 必严等 CELL_W_PX_phys。
+        // CI 退化路径 (主 face .notdef tofu, 无 CJK face) 只 eprintln warn 跳过 —
+        // 与 T-0405 当时设计一致, 派单 Acceptance "用户机为准, CI 退化作 follow-up"。
         let cjk_face = glyphs[0].face_id();
         let ascii_face = glyphs[2].face_id();
+        let cell_w_phys = crate::wl::CELL_W_PX * (crate::wl::HIDPI_SCALE as f32);
+        let double_w = 2.0 * cell_w_phys;
         if cjk_face != primary && cjk_face != ascii_face {
-            // CJK fallback 真触发, 锁"CJK 显著宽于 ASCII"作 monospace 双宽特征。
+            // 标准路径: 锁"CJK 必严双宽 cell 且 ASCII 必严单宽 cell"。
+            for (i, g) in glyphs.iter().enumerate().take(2) {
+                assert!(
+                    (g.x_advance - double_w).abs() < 0.001,
+                    "T-0801 forced double advance: CJK glyph[{}] x_advance 应严等 \
+                     2 × CELL_W_PX × HIDPI_SCALE = {} (got {})",
+                    i,
+                    double_w,
+                    g.x_advance
+                );
+            }
+            for (i, g) in glyphs.iter().enumerate().take(5).skip(2) {
+                assert!(
+                    (g.x_advance - cell_w_phys).abs() < 0.001,
+                    "T-0801 forced single advance: ASCII glyph[{}] x_advance 应严等 \
+                     CELL_W_PX × HIDPI_SCALE = {} (got {})",
+                    i,
+                    cell_w_phys,
+                    g.x_advance
+                );
+            }
+            // x_offset cascade 锁: '你' 起 0, '好' 起 double_w, 'a' 起 2 × double_w,
+            // 'b' 起 2 × double_w + cell_w_phys, 'c' 起 2 × double_w + 2 × cell_w_phys。
             //
-            // **range [1.4, 2.4] 而非 ±10% [1.8, 2.2]**: 实测用户机
-            // (Noto CJK / Source Han Sans CJK + DejaVu Sans Mono ASCII) 给
-            // ratio ≈ 1.67 — Noto CJK glyph advance = 1.0em (CJK 设计标准),
-            // DejaVu Sans Mono Latin advance ≈ 0.6em (Latin monospace 设计窄于
-            // 1em), 比例落在 1/0.6 ≈ 1.67 而非"严格 2x"。"≈ 2x"是东亚 monospace
-            // 的近似传统说法 (Source Han Sans / Noto Sans Mono CJK + 同 face
-            // 的 Latin 才严格 2:1; 跨 face fallback 比例由两 face 设计决定)。
-            // [1.4, 2.4] 接受 Noto-CJK + DejaVu / Source-Han + Source-Code 等
-            // 真实组合, 锁"CJK 显著宽于 ASCII"信号 (区分 fallback 真触发 vs
-            // 主 face .notdef 同宽退化)。
-            let cjk_adv = glyphs[0].x_advance;
-            let ascii_adv = glyphs[2].x_advance;
-            assert!(
-                ascii_adv > 0.0,
-                "ASCII 'a' advance must be > 0 (got {})",
-                ascii_adv
-            );
-            let ratio = cjk_adv / ascii_adv;
-            assert!(
-                (1.4..=2.4).contains(&ratio),
-                "CJK monospace 双宽特征: '你' advance / 'a' advance 应 ∈ [1.4, 2.4] \
-                 (实测 1.67 用户机, ±0.3 余量给字体组合); \
-                 实测 cjk={}, ascii={}, ratio={} (CJK fallback face_id={}, primary={})",
-                cjk_adv,
-                ascii_adv,
-                ratio,
-                cjk_face,
-                primary
-            );
+            // **不锁 x_offset 严等"cascade 起点", 留 ±cell_w_phys/2 容差**: 居中量
+            // (`(double_w - natural)/2`) 加在 x_offset 上, '你' 居中后实际 offset
+            // 偏几 px (派单 In #A "字形居中双宽 cell" 设计)。锁"严单调递增 +
+            // 大致按 cell 步进"即可。
+            let expected_starts = [
+                0.0,
+                double_w,
+                2.0 * double_w,
+                2.0 * double_w + cell_w_phys,
+                2.0 * double_w + 2.0 * cell_w_phys,
+            ];
+            for (i, g) in glyphs.iter().enumerate() {
+                assert!(
+                    (g.x_offset - expected_starts[i]).abs() <= cell_w_phys / 2.0,
+                    "T-0801 x_offset cascade: glyph[{}] 应在 {} ± cell_w_phys/2 (got {})",
+                    i,
+                    expected_starts[i],
+                    g.x_offset
+                );
+            }
         } else {
             eprintln!(
                 "shape_line_mixed_cjk: CJK fallback 未触发 (cjk_face={} == primary={} or \
-                 == ascii_face={}); 跳过双宽 assert (CI 退化路径)",
+                 == ascii_face={}); 跳过严宽 assert (CI 退化路径)",
                 cjk_face, primary, ascii_face
             );
         }
@@ -926,6 +1025,136 @@ mod tests {
             total,
             expected
         );
+    }
+
+    // ===== T-0801: CJK 强制双宽 advance 后处理测试 =====
+
+    /// T-0801 In #C 测试 #1: CJK 字形必严等 2 × CELL_W_PX_phys。
+    ///
+    /// **why 单独测**: T-0405 `shape_line_mixed_cjk_returns_glyphs` 锁的是
+    /// 用户机 CJK fallback 真触发的标准路径; 本测试聚焦"shape `你好` 后, 每
+    /// 个字形 advance 必严等 forced 双宽"这条不变式, 不被 ASCII glyph 干扰。
+    /// 退化路径 (CI 无 CJK face): 主 face .notdef tofu 自然 advance 也 ≈
+    /// CELL_W_PX_phys 不触发 wide, 测试软性接受 (eprintln warn 跳过)。
+    #[test]
+    fn shape_line_cjk_glyphs_have_forced_double_advance() {
+        let mut ts = TextSystem::new().expect("TextSystem::new on user machine");
+        let primary = ts.primary_face_id();
+        let glyphs = ts.shape_line("你好");
+        assert_eq!(
+            glyphs.len(),
+            2,
+            "shape '你好' must yield 2 glyphs (got {})",
+            glyphs.len()
+        );
+        let cell_w_phys = crate::wl::CELL_W_PX * (crate::wl::HIDPI_SCALE as f32);
+        let double_w = 2.0 * cell_w_phys;
+        let cjk_face = glyphs[0].face_id();
+        if cjk_face != primary {
+            // 标准路径: CJK fallback 真触发, 锁严双宽。
+            for (i, g) in glyphs.iter().enumerate() {
+                assert!(
+                    (g.x_advance - double_w).abs() < 0.001,
+                    "T-0801: CJK glyph[{}] x_advance 应严等 2 × CELL_W_PX_phys = {} \
+                     (got {}); CJK fallback face={}, primary={}",
+                    i,
+                    double_w,
+                    g.x_advance,
+                    cjk_face,
+                    primary
+                );
+            }
+        } else {
+            eprintln!(
+                "shape_line_cjk_glyphs_have_forced_double_advance: CJK fallback 未触发 \
+                 (cjk_face={} == primary={}); 跳过严宽 assert (CI 退化路径)",
+                cjk_face, primary
+            );
+        }
+    }
+
+    /// T-0801 In #C 测试 #2: CJK 字形 x_offset 含居中量 (字形居中双宽 cell)。
+    ///
+    /// 派单 In #A: "x_offset = (2 × CELL_W_PX - actual_glyph_width) / 2 (居中)"。
+    /// 实测自然 CJK advance ≈ 1.67 × CELL_W_PX_phys, 双宽 cell 2.0 × CELL_W_PX_phys,
+    /// 居中量 ≈ (2.0 - 1.67) / 2 × CELL_W_PX_phys ≈ 0.165 × CELL_W_PX_phys。
+    ///
+    /// **锁两件事**:
+    /// 1. 第 1 个 CJK 字形 x_offset > 0 (有正向居中量, 不贴 cell 左缘)
+    /// 2. 第 2 个 CJK 字形 x_offset 在 [double_w, double_w + cell_w_phys) 区间
+    ///    (cascade 起点 = double_w, + 居中量 < cell_w_phys/2)
+    #[test]
+    fn shape_line_cjk_glyphs_centered_in_double_cell() {
+        let mut ts = TextSystem::new().expect("TextSystem::new on user machine");
+        let primary = ts.primary_face_id();
+        let glyphs = ts.shape_line("你好");
+        assert_eq!(glyphs.len(), 2);
+        let cjk_face = glyphs[0].face_id();
+        if cjk_face == primary {
+            eprintln!(
+                "shape_line_cjk_glyphs_centered_in_double_cell: CJK fallback 未触发, \
+                 跳过居中 assert (CI 退化路径)"
+            );
+            return;
+        }
+        let cell_w_phys = crate::wl::CELL_W_PX * (crate::wl::HIDPI_SCALE as f32);
+        let double_w = 2.0 * cell_w_phys;
+        // 第 1 字: x_offset 应是 cascade 起点 0 + 居中量 > 0
+        assert!(
+            glyphs[0].x_offset > 0.0,
+            "T-0801: CJK glyph[0] x_offset 应有正向居中量 > 0 (got {})",
+            glyphs[0].x_offset
+        );
+        assert!(
+            glyphs[0].x_offset < cell_w_phys / 2.0,
+            "T-0801: CJK glyph[0] 居中量应 < cell_w_phys/2 = {} (got {})",
+            cell_w_phys / 2.0,
+            glyphs[0].x_offset
+        );
+        // 第 2 字: cascade 起点 = double_w, + 居中量
+        assert!(
+            glyphs[1].x_offset >= double_w,
+            "T-0801: CJK glyph[1] x_offset 应 >= cascade 起点 {} (got {})",
+            double_w,
+            glyphs[1].x_offset
+        );
+        assert!(
+            glyphs[1].x_offset < double_w + cell_w_phys / 2.0,
+            "T-0801: CJK glyph[1] x_offset 应 < {} + cell_w_phys/2 (got {})",
+            double_w,
+            glyphs[1].x_offset
+        );
+    }
+
+    /// T-0801 In #C 测试 #3: ASCII 字形 advance 必严等 CELL_W_PX_phys (单宽)。
+    ///
+    /// 派单 In #A "单宽字形 (ASCII): advance 仍 cosmic-text 自然值 (跟 CELL_W_PX
+    /// 一致或微差)" — `force_cjk_double_advance` 实装把 ASCII narrow 也吸到严
+    /// CELL_W_PX_phys (而非保留自然微差), monospace 终端 grid 严对齐。
+    #[test]
+    fn shape_line_ascii_advance_equals_cell_w_phys() {
+        let mut ts = TextSystem::new().expect("TextSystem::new on user machine");
+        let glyphs = ts.shape_line("hello");
+        assert_eq!(glyphs.len(), 5);
+        let cell_w_phys = crate::wl::CELL_W_PX * (crate::wl::HIDPI_SCALE as f32);
+        for (i, g) in glyphs.iter().enumerate() {
+            assert!(
+                (g.x_advance - cell_w_phys).abs() < 0.001,
+                "T-0801: ASCII glyph[{}] x_advance 应严等 CELL_W_PX_phys = {} (got {})",
+                i,
+                cell_w_phys,
+                g.x_advance
+            );
+            // x_offset cascade: i × cell_w_phys (ASCII narrow 居中量 = 0)
+            let expected = (i as f32) * cell_w_phys;
+            assert!(
+                (g.x_offset - expected).abs() < 0.001,
+                "T-0801: ASCII glyph[{}] x_offset 应严等 i × cell_w_phys = {} (got {})",
+                i,
+                expected,
+                g.x_offset
+            );
+        }
     }
 
     /// T-0403: ASCII 'a' shape + raster 必须给非空 bitmap。

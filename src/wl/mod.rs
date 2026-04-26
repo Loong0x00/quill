@@ -20,6 +20,12 @@ pub use window::{handle_event, WindowAction, WindowCore, WindowEvent};
 // 此 re-export 以 `crate::wl::HIDPI_SCALE` 路径暴露给 text 模块。
 pub use render::HIDPI_SCALE;
 
+// T-0801: cell 像素宽度常数, text 子系统 (force_cjk_double_advance) 与 render
+// (draw_frame cell px) 共享单一来源 — CJK 字形强制双宽 advance = 2 × CELL_W_PX,
+// 改一处即可。沿袭 HIDPI_SCALE 同款 re-export 路径 (mod render 私有, 仅 const f32
+// 暴露)。INV-010 守: 仅 quill 自有 const, 不漏 wgpu 类型。
+pub use render::CELL_W_PX;
+
 // T-0408 离屏渲染入口 (offscreen render → RGBA8 Vec<u8>)。`src/main.rs`
 // `--headless-screenshot` CLI flag + `tests/headless_screenshot.rs` 集成测试
 // 都走此 fn。入参 / 出参全 quill 自有类型, 不漏 wgpu 内部 (INV-010 类型隔离),
