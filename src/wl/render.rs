@@ -3455,14 +3455,24 @@ impl Renderer {
         let inset = WINDOW_BUTTON_INSET_PX * hidpi;
         let center_x = surface_w - inset - btn_w / 2.0;
         let center_y = titlebar_h / 2.0; // T-0618 follow-up: 跟 button bbox 居中
-        let _ = btn_h; // (留 binding 防 cargo warn — center_y 改算 titlebar_h, btn_h 暂未用)
-                       // 居中: glyph 起绘 = center - slot.width/2 + bearing_x 偏移. baseline
-                       // 风格: glyph 中心 ≈ center_y, 用 (center_y + slot.height/2 - bearing_y)
-                       // 算 y_top 让 glyph bbox 中央对 center_y.
-        let x_left = center_x - slot.width as f32 / 2.0;
-        let y_top = center_y - slot.height as f32 / 2.0;
-        let x_right = x_left + slot.width as f32;
-        let y_bot = y_top + slot.height as f32;
+                                         // T-0618 follow-up part 4: × glyph 视觉跟 Min/Max icon 一档大小. Min/Max
+                                         // 走 icon_pad = 6 logical (12 phys), 实际 icon 区 = btn_h - 2*icon_pad.
+                                         // × 走原生 glyph size (太小, 看着比 Min/Max 小). 等比 scale 到 target_size.
+        let icon_pad_phys = 6.0 * hidpi;
+        let target_size = btn_h - 2.0 * icon_pad_phys;
+        // 等比缩放保 × 不变形. slot 通常近方, 短边为基准.
+        let slot_max = (slot.width.max(slot.height)) as f32;
+        let scale = if slot_max > 0.0 {
+            target_size / slot_max
+        } else {
+            1.0
+        };
+        let render_w = slot.width as f32 * scale;
+        let render_h = slot.height as f32 * scale;
+        let x_left = center_x - render_w / 2.0;
+        let y_top = center_y - render_h / 2.0;
+        let x_right = x_left + render_w;
+        let y_bot = y_top + render_h;
         let ndc_left = x_left / surface_w * 2.0 - 1.0;
         let ndc_right = x_right / surface_w * 2.0 - 1.0;
         let ndc_top = 1.0 - y_top / surface_h * 2.0;
