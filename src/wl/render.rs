@@ -355,6 +355,18 @@ const BUTTON_ICON: crate::term::Color = crate::term::Color {
     b: 0xd3,
 };
 
+/// **T-0606: 窗口边框线宽度** (logical px, × HIDPI_SCALE 拿 physical).
+/// 1 logical = 2 physical 在 HIDPI×2, 跟主流 CSD outline 同款细线.
+const BORDER_PX: f32 = 1.0;
+
+/// **T-0606: 窗口边框颜色** (深灰 #4a4a4a, 比 titlebar #2c2c2c 稍亮一档,
+/// 视觉上让窗口边缘跟桌面背景区分开, 不晃眼).
+const BORDER_COLOR: crate::term::Color = crate::term::Color {
+    r: 0x4a,
+    g: 0x4a,
+    b: 0x4a,
+};
+
 /// **CSD titlebar 在 cell vertex buffer 内额外占的"虚拟 cell 行"数** (T-0504).
 const TITLEBAR_RESERVED_QUAD_ROWS: usize = 64;
 
@@ -601,6 +613,41 @@ fn titlebar_title_baseline_y(titlebar_h_physical: f32) -> f32 {
 /// [`Renderer::draw_frame`] 内 cell px × HIDPI_SCALE 同套路.
 ///
 /// `is_srgb`: surface 是否 sRGB 格式. 同 [`color_for_vertex_with_srgb`].
+/// T-0606: surface 4 边各画一条 1 logical px 边框线, 让窗口跟桌面背景视觉分
+/// 离 (现在裸 surface 边缘融桌面). 走 cell pipeline 同 buffer, 4 quad append
+/// 到末尾即可, 不增 GPU pass.
+fn append_border_vertices(out: &mut Vec<u8>, surface_w: f32, surface_h: f32, is_srgb: bool) {
+    let hidpi = HIDPI_SCALE as f32;
+    let bw = BORDER_PX * hidpi;
+    let color = color_for_vertex_with_srgb(BORDER_COLOR, is_srgb);
+    // 顶边
+    append_quad_px(out, 0.0, 0.0, surface_w, bw, surface_w, surface_h, color);
+    // 底边
+    append_quad_px(
+        out,
+        0.0,
+        surface_h - bw,
+        surface_w,
+        surface_h,
+        surface_w,
+        surface_h,
+        color,
+    );
+    // 左边
+    append_quad_px(out, 0.0, 0.0, bw, surface_h, surface_w, surface_h, color);
+    // 右边
+    append_quad_px(
+        out,
+        surface_w - bw,
+        0.0,
+        surface_w,
+        surface_h,
+        surface_w,
+        surface_h,
+        color,
+    );
+}
+
 fn append_titlebar_vertices(
     out: &mut Vec<u8>,
     surface_w: f32,
@@ -1523,34 +1570,53 @@ impl Renderer {
             self.surface_is_srgb,
             hover,
         );
+        // T-0606: surface 4 边 1 px 边框, 走 cell pipeline 同 buffer.
+        append_border_vertices(
+            &mut cell_vertex_bytes,
+            surface_w,
+            surface_h,
+            self.surface_is_srgb,
+        );
         // cell_vertex_count 在下面的 preedit underline append 后再算 (T-0505)。
 
         // Step 4: shape + raster + atlas allocate + build glyph vertex bytes。
         // 错位检查: row_texts 长度应等于 rows; 若上层传入截短的 row_texts (例
         // term 内部 dimensions() 与 row_texts 临时不同步), 取 min 防越界。
         let effective_rows = row_texts.len().min(rows);
-        // 期望 fg 色: Phase 4 用 quill 默认 fg (#d3d3d3 light gray, term::Color
-        // ::DEFAULT_FG, 但该常数模块私有, 此处内联值)。T-0405 后续会 per-glyph
-        // 用 cell.fg (拿到对应 col / row 的 CellRef.fg), 本单先单一颜色, 视觉
-        // milestone "看见字" 即可。
+        // T-0605: per-glyph fg 走 cell.fg, 接 256 色 / truecolor (alacritty
+        // 解析层早就把 SGR 38;5;N / 38;2;R;G;B 转成 RGB 存 cell.fg, 渲染层之前
+        // hardcode 单一 #d3d3d3 把 256 色废了)。glyph → col 映射用 x_offset /
+        // cell_w_px round (monospace cascade 严对齐, T-0801 force CJK 双宽
+        // 后 advance == n × cell_w_px, round 误差 < 0.5 px 不会跨 cell)。
         let fg_default = crate::term::Color {
             r: 0xd3,
             g: 0xd3,
             b: 0xd3,
         };
-        let glyph_color = self.color_for_vertex(fg_default);
 
         let mut glyph_vertex_bytes: Vec<u8> = Vec::new();
         for (row_idx, row_text) in row_texts.iter().take(effective_rows).enumerate() {
             if row_text.is_empty() {
                 continue;
             }
+            // T-0605: 本行 cell slice (row-major idx = row * cols + col).
+            // cells len 期望 = rows × cols, 防御性 min 截短 (上游 race 时不 panic).
+            let row_start = row_idx * cols;
+            let row_cells: &[CellRef] = if row_start + cols <= cells.len() {
+                &cells[row_start..row_start + cols]
+            } else {
+                &[]
+            };
             let glyphs = text_system.shape_line(row_text);
             for glyph in &glyphs {
                 // 跳过零 advance / 零位置 (异常或 control char)
                 if !glyph.x_advance.is_finite() || !glyph.x_offset.is_finite() {
                     continue;
                 }
+                // T-0605: glyph → col (round nearest, cascade 严对齐时 0 误差).
+                let glyph_col = (glyph.x_offset / cell_w_px).round() as usize;
+                let cell_fg = row_cells.get(glyph_col).map(|c| c.fg).unwrap_or(fg_default);
+                let glyph_color = self.color_for_vertex(cell_fg);
                 // atlas allocate (lazy raster on cache miss)
                 let slot = match self.allocate_glyph_slot(text_system, glyph) {
                     Some(s) => s,
@@ -1642,6 +1708,9 @@ impl Renderer {
         // 划线略亮 #ffffff 让用户区分组词态 vs 已 commit 字。
         if let Some(p) = preedit {
             if !p.text.is_empty() {
+                // T-0605: preedit 文字用 fg_default (跟 IME 中性), 不走 cell.fg
+                // (preedit 是 IME 临时层不绑 alacritty cell SGR).
+                let preedit_color = self.color_for_vertex(fg_default);
                 self.append_preedit_glyphs(
                     text_system,
                     &mut glyph_vertex_bytes,
@@ -1653,7 +1722,7 @@ impl Renderer {
                     baseline_y_px,
                     surface_w,
                     surface_h,
-                    glyph_color,
+                    preedit_color,
                 );
                 let underline_color = self.color_for_vertex(crate::term::Color {
                     r: 0xff,
