@@ -2,6 +2,7 @@
 //! (T-0102)。对外只暴露 [`run_window`] 一个入口,隐藏 SCTK / wayland-client /
 //! wgpu 的全部原始类型。后续 ticket 接 calloop / resize。
 
+mod dnd;
 mod keyboard;
 mod pointer;
 mod render;
@@ -64,3 +65,8 @@ pub use selection::{
 // T-0608: multi-tab e2e 测试 + hit_test_with_tabs 公共 API (HoverRegion 加
 // TabBarPlus / Tab(idx) / TabClose(idx)).
 pub use pointer::{hit_test_with_tabs, HoverRegion, WindowButton};
+
+// T-0611: DnD (drag-and-drop) 文件 → 路径插入纯逻辑层. 集成测试 +
+// `wl/window.rs` 真协议路径都走此公共 API. quill 自有类型 (`PathBuf` /
+// `String` 全 std), 不漏 wayland-client / sctk DnD 协议类型 (INV-010).
+pub use dnd::{build_drop_command, parse_uri_list, shell_escape_path};
