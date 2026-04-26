@@ -1021,20 +1021,22 @@ fn append_titlebar_vertices(
 }
 
 /// **T-0608: tab bar 标签条配色** (active / inactive / hover 三态).
+/// T-0613 hotfix: user 实测原配色 (active 紫调 #404060) 太显眼, 整体灰
+/// 调统一更舒服. 改成中性灰梯度 (跟 titlebar #2c2c2c 同色系阶梯亮度).
 const TAB_BAR_BG: crate::term::Color = crate::term::Color {
     r: 0x1c,
     g: 0x1c,
     b: 0x1c,
 };
 const TAB_ACTIVE_BG: crate::term::Color = crate::term::Color {
-    r: 0x40,
-    g: 0x40,
-    b: 0x60,
+    r: 0x44,
+    g: 0x44,
+    b: 0x44,
 };
 const TAB_HOVER_BG: crate::term::Color = crate::term::Color {
-    r: 0x30,
-    g: 0x30,
-    b: 0x40,
+    r: 0x33,
+    g: 0x33,
+    b: 0x33,
 };
 const TAB_BAR_BORDER: crate::term::Color = crate::term::Color {
     r: 0x0a,

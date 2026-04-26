@@ -125,8 +125,11 @@ fn three_tabs_active_second_renders_with_highlight() {
                 let r = rgba[idx];
                 let g = rgba[idx + 1];
                 let b = rgba[idx + 2];
-                // active bg #404060: B 通道明显高于 R/G (蓝偏紫).
-                let is_active_bg = b > r + 8 && b > g + 8 && (30..=100).contains(&r);
+                // T-0613 hotfix: active bg 改 #444444 中性灰 (之前 #404060 紫调).
+                // 判 R≈G≈B 灰色范围 [55, 75] (sRGB encode 后 #44 ≈ 68).
+                let is_active_bg = (55..=80).contains(&r)
+                    && (r as i32 - g as i32).abs() <= 6
+                    && (r as i32 - b as i32).abs() <= 6;
                 if is_active_bg {
                     active_pixels += 1;
                 }
