@@ -57,11 +57,6 @@
 
 use wayland_client::protocol::wl_pointer;
 use wayland_client::WEnum;
-// T-0703: WpShape 是 wayland-protocols 协议 enum, **仅在本模块内**用于私有
-// 转换 fn `wp_shape_for` (INV-010 类型隔离 + ADR 0008). Dispatch 段直接消费
-// 转换结果, 不出本模块边界. 任何对 cursor 形状的下游消费走 quill 自有
-// [`CursorShape`] enum.
-use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::Shape as WpShape;
 
 use super::render::{BUTTON_H_LOGICAL_PX, BUTTON_W_LOGICAL_PX, TITLEBAR_H_LOGICAL_PX};
 
@@ -158,48 +153,38 @@ pub enum HoverRegion {
     TextArea,
 }
 
-/// T-0703: quill 自有 cursor 形状枚举. 包装 `wp_cursor_shape_v1` 协议 enum
-/// (INV-010 + ADR 0008): WpShape 仅在本模块私有 [`wp_shape_for`] 转换 fn 出现,
-/// 不出现在公共 API.
+/// T-0703-fix: quill 自有 cursor 形状枚举. 经 [`xcursor_names_for`] 翻译为
+/// xcursor name fallback 列表, 由 `src/wl/window.rs` 走 `wayland_cursor::CursorTheme`
+/// 加载真 cursor svg + 自管 wl_pointer.set_cursor (ADR 0009 撤回 ADR 0008
+/// wp_cursor_shape_v1 协议路径).
 ///
 /// **覆盖范围**: default / text + 4 边 (n/s/e/w) + 4 角 (ne/nw/se/sw). 与
-/// HoverRegion 加 ResizeEdge 后的全 case 一对一映射 (T-0701 合并后,
-/// [`cursor_shape_for`] 加 ResizeEdge 分支).
+/// HoverRegion 加 ResizeEdge 后的全 case 一对一映射.
 ///
-/// **why 不直接用 WpShape**: WpShape 是 wayland-protocols 协议层 enum
-/// (35+ variants 含 dnd_ask / zoom_in 等 quill 不需要的), 暴露到公共 API
-/// 等于让上游协议变 cascade 改 quill (违反 INV-010). 自定义最小 10 变量,
-/// exhaustive match 在调用方编译期 catch — 加新 variant (例 Phase 7+ 加
-/// "正在 grab" cursor) 时所有 match 强制更新.
+/// **why 不直接用 wayland-cursor / xcursor crate 的类型**: 它们没有"语义形状
+/// enum", 只接受 cursor name `&str`. 直接让调用方拼字符串 = 失去编译期
+/// exhaustive 检查 + 把"哪些 cursor 是 quill 关心的"的决策散到调用点. 自定义
+/// 6-variant enum 锁住决策面, 改 cursor name fallback 表只改 [`xcursor_names_for`]
+/// body 一处.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CursorShape {
-    /// 默认箭头. titlebar / 未识别区域用. 对应 `wp_cursor_shape_v1::Shape::Default`.
+    /// 默认箭头. titlebar / 未识别区域用. xcursor name `default` / `left_ptr`.
     #[default]
     Default,
     /// I-beam (文本编辑光标). text area (cell grid) 用, 暗示用户可选区 / 复制.
-    /// 对应 `wp_cursor_shape_v1::Shape::Text`.
+    /// xcursor name `text` / `xterm`.
     Text,
-    /// ↕ 垂直双向箭头 (北/南边 resize). 对应 `wp_cursor_shape_v1::Shape::NsResize`.
-    ///
-    /// `#[allow(dead_code)]`: T-0701 ResizeEdge enum 合并前 [`cursor_shape_for`]
-    /// 无 ResizeEdge 分支 → 不返此 variant. 留作 T-0701 合并后填
-    /// ResizeEdge::Top/Bottom 用. 与 [`PointerState::last_button_serial`]
-    /// (T-0504 forward-compat) 同决策, 移除会破坏 T-0701 接入路径.
-    #[allow(dead_code)]
+    /// ↕ 垂直双向箭头 (北/南边 resize). xcursor name `size_ver` / `ns-resize` /
+    /// `n-resize` (mutter 接管 resize 时用 size_ver, 优先它跟 mutter 视觉对齐).
     NsResize,
-    /// ↔ 水平双向箭头 (东/西边 resize). 对应 `wp_cursor_shape_v1::Shape::EwResize`.
-    /// `#[allow(dead_code)]`: 同 [`Self::NsResize`], T-0701 合并填 ResizeEdge::Left/Right.
-    #[allow(dead_code)]
+    /// ↔ 水平双向箭头 (东/西边 resize). xcursor name `size_hor` / `ew-resize` /
+    /// `e-resize`.
     EwResize,
-    /// ↘↖ 主对角线双向箭头 (西北/东南角 resize). 对应
-    /// `wp_cursor_shape_v1::Shape::NwseResize`.
-    /// `#[allow(dead_code)]`: 同 [`Self::NsResize`], T-0701 合并填 ResizeEdge::TopLeft/BottomRight.
-    #[allow(dead_code)]
+    /// ↘↖ 主对角线双向箭头 (西北/东南角 resize). xcursor name `size_fdiag` /
+    /// `nwse-resize` / `nw-resize`.
     NwseResize,
-    /// ↙↗ 副对角线双向箭头 (东北/西南角 resize). 对应
-    /// `wp_cursor_shape_v1::Shape::NeswResize`.
-    /// `#[allow(dead_code)]`: 同 [`Self::NsResize`], T-0701 合并填 ResizeEdge::TopRight/BottomLeft.
-    #[allow(dead_code)]
+    /// ↙↗ 副对角线双向箭头 (东北/西南角 resize). xcursor name `size_bdiag` /
+    /// `nesw-resize` / `ne-resize`.
     NeswResize,
 }
 
@@ -235,22 +220,33 @@ pub fn cursor_shape_for(hover: HoverRegion) -> CursorShape {
     }
 }
 
-/// T-0703 模块私有: quill [`CursorShape`] → wayland-protocols `WpShape` 协议
-/// enum 转换. **仅供 src/wl/window.rs::Dispatch 段调用** (pub(crate)), 不出
-/// pointer.rs 模块边界 — INV-010 单点路径.
+/// T-0703-fix 模块私有: quill [`CursorShape`] → xcursor name fallback 列表.
 ///
-/// **why 模块私有 inherent fn 而非 `impl From<CursorShape> for WpShape`**:
-/// trait impl 会让下游 `quill_shape.into()` 直接拿到 WpShape (反向偷渡协议
-/// 类型, 与 INV-010 alacritty Point 私有 from_alacritty 同决策, T-0302 4
-/// commits 学费验证).
-pub(crate) fn wp_shape_for(shape: CursorShape) -> WpShape {
+/// 调用方 (`src/wl/window.rs::apply_cursor_shape`) 顺序尝试每个 name, 第一个
+/// `wayland_cursor::CursorTheme::get_cursor` 成功的拿来 attach. 全失败时 cursor
+/// 维持上一次状态 (log warn 一次, 不刷屏 — 已知陷阱已在 ADR 0009 写明).
+///
+/// **fallback 顺序原则** (派单 + ADR 0009):
+/// - **mutter 接管 resize 期实测用 `size_ver` 那一套**, 优先 `size_*` (X11
+///   老 cursor name) 跟 mutter 视觉 1:1.
+/// - `ns-resize` 等是 FreeDesktop xcursor 标准新 name, 老主题缺 `size_*` 时
+///   退化到这套.
+/// - `n-resize` 等单方向 name 是 csd-decoration 建议名, 极少见但兜底用.
+/// - `default` / `left_ptr` 一对是新 / 老 alias (Adwaita: left_ptr → default).
+/// - `text` / `xterm` 同理.
+///
+/// **why 模块私有 inherent fn**: xcursor name `&'static str` 是 wayland-cursor
+/// crate 的输入类型 (协议层), INV-010 类型隔离要求 — 不让 xcursor name 字符串
+/// 散落调用点 (拼写错误就 silent fallback 到默认箭头 + 用户找半天). 改 fallback
+/// 顺序只改本 fn body 一处.
+pub(crate) fn xcursor_names_for(shape: CursorShape) -> &'static [&'static str] {
     match shape {
-        CursorShape::Default => WpShape::Default,
-        CursorShape::Text => WpShape::Text,
-        CursorShape::NsResize => WpShape::NsResize,
-        CursorShape::EwResize => WpShape::EwResize,
-        CursorShape::NwseResize => WpShape::NwseResize,
-        CursorShape::NeswResize => WpShape::NeswResize,
+        CursorShape::Default => &["default", "left_ptr"],
+        CursorShape::Text => &["text", "xterm"],
+        CursorShape::NsResize => &["size_ver", "ns-resize", "n-resize"],
+        CursorShape::EwResize => &["size_hor", "ew-resize", "e-resize"],
+        CursorShape::NwseResize => &["size_fdiag", "nwse-resize", "nw-resize"],
+        CursorShape::NeswResize => &["size_bdiag", "nesw-resize", "ne-resize"],
     }
 }
 
@@ -283,8 +279,8 @@ pub enum PointerAction {
     /// hover 区域变化 — 调用方走 redraw 路径 (按钮 hover 变深, Close 变红).
     /// 包含**新**区域 (旧区域已存于 [`PointerState`] 内不外漏).
     ///
-    /// **T-0703 副作用**: HoverChange 也常常意味着 cursor 形状变化 — 但
-    /// cursor set_shape 走独立 [`PointerState::take_pending_cursor_set`] 路径
+    /// **T-0703-fix 副作用**: HoverChange 也常常意味着 cursor 形状变化 —
+    /// 但 cursor set 走独立 [`PointerState::take_pending_cursor_set`] 路径
     /// (与 pending_scroll_lines / pending_repeat 同 T-0603 套路), 调用方在
     /// 处理 PointerAction 后**额外**检查并下发, 不复用此 variant 字段
     /// (避免单 PointerAction 携带多副作用 → match 分支臃肿).
@@ -374,21 +370,20 @@ pub struct PointerState {
     /// 实测 5090 + Logitech MX 滚轮一格 ≈ 15 px (compositor 翻译), 两格出 1 line;
     /// touchpad 两指滑一指距离约 100-200 px 出 4-8 line. 体感与 foot/kitty 接近.
     scroll_accum_y: f64,
-    /// T-0703: 最近 wl_pointer.Enter event 的 serial. wp_cursor_shape_device_v1.
-    /// set_shape 协议要求传 **enter serial** (不是 button event serial — 那条是
-    /// xdg_toplevel.move 路径). Enter 时记一次, 后续 hover 跨区调 set_shape
-    /// 时传同一 serial — 协议 doc:
-    /// "The serial parameter must match the latest wl_pointer.enter ... serial
-    ///  number sent to the client. Otherwise the request will be ignored."
+    /// T-0703-fix: 最近 wl_pointer.Enter event 的 serial. `wl_pointer.set_cursor`
+    /// 协议要求传 **enter serial** (不是 button event serial — 那条是
+    /// xdg_toplevel.move 路径). Enter 时记一次, 后续 hover 跨区调 set_cursor
+    /// 时传同一 serial — 协议 doc (wl_pointer.set_cursor):
+    /// "serial: serial number of the enter event".
     last_enter_serial: u32,
-    /// T-0703: 当前 set_shape 已下发的 cursor 形状. 与 [`hover`] 类似但单独
-    /// 跟踪 — hover 与 cursor 形状是 **n:1 映射** (Default cursor 用于 None /
-    /// TitleBar / Button 三种 hover), 同 cursor 不必重发 set_shape (减压
+    /// T-0703-fix: 当前已下发的 cursor 形状. 与 [`hover`] 类似但单独跟踪 —
+    /// hover 与 cursor 形状是 **n:1 映射** (Default cursor 用于 None /
+    /// TitleBar / Button 三种 hover), 同 cursor 不必重 attach buffer (减压
     /// compositor + 防 cursor 闪烁).
     current_cursor_shape: CursorShape,
-    /// T-0703: 待下发的 set_shape (serial, shape). [`apply_enter`] / [`apply_motion`]
-    /// 检测 cursor 形状变化时填入, [`Self::take_pending_cursor_set`] 由
-    /// `Dispatch<wl_pointer>` 在主 PointerAction 处理后取出消费. 单 buffer
+    /// T-0703-fix: 待下发的 cursor 切换 (serial, shape). [`apply_enter`] /
+    /// [`apply_motion`] 检测 cursor 形状变化时填入, [`Self::take_pending_cursor_set`]
+    /// 由 `Dispatch<wl_pointer>` 在主 PointerAction 处理后取出消费. 单 buffer
     /// 设计 (与 `State.pending_repeat` / `State.pending_scroll_lines` 同
     /// T-0603 / T-0602 套路 — 单帧多次填覆盖前次, 取最新).
     ///
@@ -499,13 +494,14 @@ impl PointerState {
         self.hover
     }
 
-    /// T-0703: 取出并清空待下发的 cursor set_shape 请求. `Dispatch<wl_pointer>`
-    /// 在处理主 [`PointerAction`] 后调一次, 拿到 `Some((serial, shape))` 时调
-    /// `wp_cursor_shape_device_v1.set_shape(serial, wp_shape_for(shape))` (协议
-    /// 调用走 src/wl/window.rs 段).
+    /// T-0703-fix: 取出并清空待下发的 cursor 形状变更请求. `Dispatch<wl_pointer>`
+    /// 在处理主 [`PointerAction`] 后调一次, 拿到 `Some((serial, shape))` 时走
+    /// `apply_cursor_shape` (src/wl/window.rs 段) — 按 [`xcursor_names_for`]
+    /// fallback 列表查 `wayland_cursor::CursorTheme`, attach buffer 到 cursor
+    /// surface, 调 `wl_pointer.set_cursor(serial, ...)` (ADR 0009).
     ///
-    /// 返 `None` = 本帧无形状变化, 不下发协议调用 — 防止每帧都发 set_shape
-    /// 加压 compositor (一帧 motion event 可能数十次, hover 同区时 cursor 不变).
+    /// 返 `None` = 本帧无形状变化, 不下发 wl request — 防止每帧都重 attach
+    /// cursor buffer (一帧 motion event 可能数十次, hover 同区时 cursor 不变).
     pub fn take_pending_cursor_set(&mut self) -> Option<(u32, CursorShape)> {
         self.pending_cursor_set.take()
     }
@@ -550,7 +546,7 @@ impl PointerState {
 /// - Button event 的 button code 是 evdev (BTN_LEFT=0x110), 与 wl_keyboard
 ///   evdev keycode 同源.
 /// - Enter 事件**也带 serial**, button event 的 serial 是另一条 — Enter serial
-///   归 cursor set_shape (T-0703 要求), button serial 归 xdg_toplevel.move
+///   归 wl_pointer.set_cursor (T-0703-fix 要求), button serial 归 xdg_toplevel.move
 ///   (T-0504, 见 `apply_button`).
 ///
 /// **why 拆 [`apply_enter`] / [`apply_leave`] / [`apply_motion`] /
@@ -612,17 +608,18 @@ pub fn handle_pointer_event(
 /// Enter 决策子 fn — 单测入口 (避免构造 WlSurface). 见 [`handle_pointer_event`]
 /// 文档头 "why 拆子 fn".
 ///
-/// **T-0703**: 同步记 [`PointerState::last_enter_serial`] (cursor set_shape 协议
-/// 用), 并**强制**填一个 pending_cursor_set (即便 cursor 形状未变 — 协议要求
-/// client 在 enter 后必须 set 一次, 否则 cursor 行为 unspecified, 实测 GNOME
-/// mutter 会显示空白).
+/// **T-0703-fix**: 同步记 [`PointerState::last_enter_serial`]
+/// (`wl_pointer.set_cursor` 协议必需), 并**强制**填一个 pending_cursor_set
+/// (即便 cursor 形状未变 — 协议要求 client 在 enter 后必须 set 一次, 否则
+/// cursor 行为 unspecified, 实测 GNOME mutter 会显示空白).
 pub(crate) fn apply_enter(state: &mut PointerState, serial: u32, x: f64, y: f64) -> PointerAction {
     state.pos = Some((x, y));
     state.last_enter_serial = serial;
     let new_hover = hit_test(x, y, state.surface_w_logical, state.surface_h_logical);
     let new_shape = cursor_shape_for(new_hover);
     // 协议要求: enter 后必须 set 一次 cursor (否则 unspecified). 即便
-    // current_cursor_shape == new_shape (init 都是 Default), 也强制 emit 一次.
+    // current_cursor_shape == new_shape (init 都是 Default), 也强制 emit 一次
+    // (走 wl_pointer.set_cursor + cursor_surface attach buffer, ADR 0009).
     state.pending_cursor_set = Some((serial, new_shape));
     state.current_cursor_shape = new_shape;
     if new_hover != state.hover {
@@ -634,8 +631,9 @@ pub(crate) fn apply_enter(state: &mut PointerState, serial: u32, x: f64, y: f64)
 
 /// Leave 决策子 fn. 清 pos + hover, 返 HoverChange(None) 让调用方 redraw 清按钮高亮.
 ///
-/// **T-0703**: 不发 set_cursor (鼠标已离开 surface, compositor 自管). 但**清空**
-/// `pending_cursor_set` 兜底防 race (Enter 后立刻 Leave, pending 未消费).
+/// **T-0703-fix**: 不发 wl_pointer.set_cursor (鼠标已离开 surface, compositor
+/// 自管). 但**清空** `pending_cursor_set` 兜底防 race (Enter 后立刻 Leave,
+/// pending 未消费).
 pub(crate) fn apply_leave(state: &mut PointerState) -> PointerAction {
     state.pos = None;
     state.pending_cursor_set = None;
@@ -648,10 +646,10 @@ pub(crate) fn apply_leave(state: &mut PointerState) -> PointerAction {
 
 /// Motion 决策子 fn. 区域变化才返 HoverChange, 同区返 Nothing 避免 redraw 风暴.
 ///
-/// **T-0703**: hover 跨区且 cursor 形状变 (n:1 映射 → 同 cursor 同 region 内 +
-/// 跨等价 region 不 emit set_shape, 减压 compositor) 时填 pending_cursor_set.
-/// serial 用 [`PointerState::last_enter_serial`] (协议要求 enter serial,
-/// motion event 自身无 serial 字段).
+/// **T-0703-fix**: hover 跨区且 cursor 形状变 (n:1 映射 → 同 cursor 同 region
+/// 内 + 跨等价 region 不重发 set_cursor, 减压 compositor) 时填
+/// pending_cursor_set. serial 用 [`PointerState::last_enter_serial`] (协议要
+/// 求 enter serial, motion event 自身无 serial 字段).
 pub(crate) fn apply_motion(state: &mut PointerState, x: f64, y: f64) -> PointerAction {
     state.pos = Some((x, y));
     let new_hover = hit_test(x, y, state.surface_w_logical, state.surface_h_logical);
@@ -1581,12 +1579,14 @@ mod tests {
         assert_eq!(state.hover(), HoverRegion::TitleBar);
     }
 
-    // ---- T-0703 cursor shape 测试 ----
+    // ---- T-0703-fix cursor shape 测试 ----
     //
-    // 派单 In #B + #D: HoverRegion → CursorShape 翻译表全覆盖 + apply_enter /
-    // apply_motion 正确填 pending_cursor_set + serial 正确传递 (enter serial
-    // 不是 button serial). cursor 形状对 set_shape 协议是关键, 单测锁住映射
-    // 防漂移 (改 cursor_shape_for body 时本组测试拦回归).
+    // 派单 In #B + #D + #G: HoverRegion → CursorShape 翻译表全覆盖 +
+    // CursorShape → xcursor name fallback 列表覆盖 (mutter 实测 size_*
+    // 优先) + apply_enter / apply_motion 正确填 pending_cursor_set + serial
+    // 正确传递 (enter serial 不是 button serial). cursor 形状对 wl_pointer.set_cursor
+    // 协议是关键, 单测锁住映射防漂移 (改 cursor_shape_for / xcursor_names_for
+    // body 时本组测试拦回归).
 
     /// 派单 In #B 翻译表: 全 HoverRegion variant 一一映射.
     #[test]
@@ -1625,13 +1625,13 @@ mod tests {
         assert_eq!(
             pending,
             Some((99, CursorShape::Default)),
-            "enter→titlebar 必发 set_shape(Default), serial 复用 enter serial"
+            "enter→titlebar 必发 set_cursor(Default), serial 复用 enter serial"
         );
         // take 后置 None
         assert_eq!(state.take_pending_cursor_set(), None);
     }
 
-    /// Enter 进 textarea → set_shape(Text).
+    /// Enter 进 textarea → set_cursor(Text).
     #[test]
     fn enter_into_textarea_emits_text_cursor() {
         let mut state = fresh_state();
@@ -1643,7 +1643,7 @@ mod tests {
     }
 
     /// Motion 跨等价 region (titlebar → button) 时 cursor 形状未变 (都 Default),
-    /// **不**重发 set_shape (减压 compositor + 防 cursor 闪烁).
+    /// **不**重发 set_cursor (减压 compositor + 防 cursor 闪烁).
     #[test]
     fn motion_across_equivalent_cursor_regions_does_not_reemit() {
         let mut state = fresh_state();
@@ -1702,34 +1702,91 @@ mod tests {
         assert_eq!(state.current_cursor_shape(), CursorShape::Default);
     }
 
-    /// wp_shape_for 全 quill CursorShape variant 映射到 WpShape (INV-010
-    /// 模块私有转换 fn 锁住). 上游 wayland-protocols 改 WpShape 名时本测试
-    /// fail, 提示更新.
+    /// xcursor_names_for 全 quill CursorShape variant 映射 (INV-010 模块
+    /// 私有 fn 锁住). 改 fallback 表 (例: 用户主题升级后增减 cursor name)
+    /// 时本组测试硬挡防漂移.
     #[test]
-    fn wp_shape_for_maps_all_quill_variants() {
-        // 仅断言不 panic + 类型对 (WpShape 是 #[non_exhaustive] 通常无 PartialEq,
-        // 用 matches! 锁住具体 variant).
-        assert!(matches!(
-            wp_shape_for(CursorShape::Default),
-            WpShape::Default
-        ));
-        assert!(matches!(wp_shape_for(CursorShape::Text), WpShape::Text));
-        assert!(matches!(
-            wp_shape_for(CursorShape::NsResize),
-            WpShape::NsResize
-        ));
-        assert!(matches!(
-            wp_shape_for(CursorShape::EwResize),
-            WpShape::EwResize
-        ));
-        assert!(matches!(
-            wp_shape_for(CursorShape::NwseResize),
-            WpShape::NwseResize
-        ));
-        assert!(matches!(
-            wp_shape_for(CursorShape::NeswResize),
-            WpShape::NeswResize
-        ));
+    fn xcursor_names_for_default_falls_back_to_left_ptr() {
+        let names = xcursor_names_for(CursorShape::Default);
+        assert_eq!(
+            names,
+            &["default", "left_ptr"],
+            "Default 走 FreeDesktop 'default' + X11 'left_ptr' 兜底"
+        );
+    }
+
+    #[test]
+    fn xcursor_names_for_text_falls_back_to_xterm() {
+        let names = xcursor_names_for(CursorShape::Text);
+        assert_eq!(
+            names,
+            &["text", "xterm"],
+            "Text 走 FreeDesktop 'text' + X11 'xterm' 兜底 (Adwaita: xterm→text)"
+        );
+    }
+
+    /// **关键**: ns/ew/fdiag/bdiag 必须**优先** size_* (mutter 接管 resize 期
+    /// 用的 X11 老 name), 防视觉与 mutter 拖动 cursor 不一致 — 这正是 T-0703-fix
+    /// bug 修复的核心 (派单 + ADR 0009 重点提醒).
+    #[test]
+    fn xcursor_names_for_ns_resize_prefers_size_ver() {
+        let names = xcursor_names_for(CursorShape::NsResize);
+        assert_eq!(
+            names,
+            &["size_ver", "ns-resize", "n-resize"],
+            "NsResize: size_ver 必须第一 (mutter resize grab 用此 name)"
+        );
+        assert_eq!(
+            names[0], "size_ver",
+            "size_ver 优先级最高 — 跟 mutter 视觉对齐 (派单 Bug 描述硬要求)"
+        );
+    }
+
+    #[test]
+    fn xcursor_names_for_ew_resize_prefers_size_hor() {
+        let names = xcursor_names_for(CursorShape::EwResize);
+        assert_eq!(names, &["size_hor", "ew-resize", "e-resize"]);
+        assert_eq!(names[0], "size_hor");
+    }
+
+    #[test]
+    fn xcursor_names_for_nwse_resize_prefers_size_fdiag() {
+        let names = xcursor_names_for(CursorShape::NwseResize);
+        assert_eq!(names, &["size_fdiag", "nwse-resize", "nw-resize"]);
+        assert_eq!(names[0], "size_fdiag");
+    }
+
+    #[test]
+    fn xcursor_names_for_nesw_resize_prefers_size_bdiag() {
+        let names = xcursor_names_for(CursorShape::NeswResize);
+        assert_eq!(names, &["size_bdiag", "nesw-resize", "ne-resize"]);
+        assert_eq!(names[0], "size_bdiag");
+    }
+
+    /// 全 variant 至少 2 个 fallback name (防"单 name 拼错全失败").
+    #[test]
+    fn xcursor_names_for_each_variant_has_at_least_two_fallbacks() {
+        for shape in [
+            CursorShape::Default,
+            CursorShape::Text,
+            CursorShape::NsResize,
+            CursorShape::EwResize,
+            CursorShape::NwseResize,
+            CursorShape::NeswResize,
+        ] {
+            let names = xcursor_names_for(shape);
+            assert!(
+                names.len() >= 2,
+                "{shape:?} fallback list 至少 2 个 name (防单 name 拼错), 实际 {}",
+                names.len()
+            );
+            for name in names {
+                assert!(
+                    !name.is_empty() && name.is_ascii(),
+                    "{shape:?} 的 cursor name {name:?} 必须 ASCII 非空"
+                );
+            }
+        }
     }
 
     /// handle_pointer_event 整体路径覆盖: Enter event 拆字段 → apply_enter

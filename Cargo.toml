@@ -28,10 +28,18 @@ wayland-client = "0.31"
 # (sctk roadmap 在 0.21+), wayland-protocols = "0.32" 已含 wp/text_input/zv3,
 # unstable feature gate 启用 zwp_text_input_v3 + zwp_text_input_manager_v3。
 # 详见 docs/adr/0007-wayland-protocols-text-input-v3.md。
-# T-0703: 加 staging feature 启 wp_cursor_shape_v1 (cursor-shape-v1, 现代
-# 协议: GNOME 45+ / KDE Plasma 6 / wlroots 0.18+ 全支持). 同 wayland-protocols
-# crate, 仅多一个 feature flag, 无新依赖图节点. 详 docs/adr/0008-cursor-shape-v1.md.
-wayland-protocols = { version = "0.32", features = ["client", "unstable", "staging"] }
+# T-0703-fix: ADR 0008 wp_cursor_shape_v1 路径撤回 — mutter 在 wp_cursor_shape_v1
+# 与 xdg_toplevel.resize 内部 cursor name 映射不一致 (hover 用 ns-resize, 拖动
+# 用 size_ver), 视觉两套 svg 切换. 改走老 wl_cursor + xcursor theme 路径
+# (alacritty/GTK4/Qt/Electron 全部走这条), 与 mutter 自身一致. 详
+# docs/adr/0009-wl-cursor-fallback.md. `staging` feature 不再需要, 删除.
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+# T-0703-fix: wayland-cursor 已是 sctk 0.19.2 的 transitive dep (cursor_theme
+# 用), 此处提为直接 dep 让本 crate 显式绑住 0.31.x — quill 自管 cursor_surface
+# attach + xcursor name fallback chain (sctk ThemedPointer 强耦合 wp_cursor_shape_v1,
+# 在我们撤回该协议后无法复用; 直接用 wayland-cursor::CursorTheme 是 sctk 自身
+# 走的 legacy 路径, 符合 ADR 0009).
+wayland-cursor = "0.31"
 wgpu = "29"
 # T-0501: Wayland wl_keyboard 协议给 client 的是 evdev scan code, 必须经
 # libxkbcommon 翻译 keymap (compositor 推 fd) + modifier mask → keysym + UTF-8。
