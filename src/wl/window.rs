@@ -31,6 +31,7 @@
 
 use std::ffi::c_void;
 use std::os::fd::{AsRawFd, BorrowedFd};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use calloop::generic::Generic;
@@ -261,6 +262,21 @@ struct LoopData {
     /// 文档警告), token 仍留 Some 状态由下次 apply 清理 (race 安全 — 已 Drop
     /// 的 token remove 返 Err 我们吞掉).
     repeat_token: Option<RegistrationToken>,
+    /// T-0802 In #B: 上次 [`propagate_resize_if_dirty`] **真消费** 一轮 (走完
+    /// renderer/term/pty 三方 resize + 清 dirty) 的时刻. None = 还没消费过 (首次
+    /// configure 前). 节流决策 [`should_throttle_propagate`] 用 `now -
+    /// last_propagate_at < RESIZE_THROTTLE_MS` 判跳过; 拖窗口高频 configure 期
+    /// 大部分被本字段挡掉, 单次 propagate 占 GPU/term/pty 不被相邻 cost 撞穿.
+    /// POD (Option<Instant>), drop 顺序无关.
+    last_propagate_at: Option<Instant>,
+    /// T-0802 In #B: 节流期间 dirty 留挂时, schedule 一个 `Timer::from_duration`
+    /// 兜底在 throttle 窗结束后 fire 一次 [`propagate_resize_if_dirty`], 防"拖
+    /// 动停后最后一个 configure 卡在节流窗内不消费, 窗口卡在错尺寸"问题. None
+    /// = 无兜底 Timer pending; Some = 已 insert (后续节流命中不重复 schedule, 单
+    /// 飞行原则). callback fire 后 [`resize_followup_tick`] take 此 token (timer
+    /// 自身 Drop), 真 propagate 走完后 last_propagate_at 更新, 下次 dirty 来时
+    /// 再 schedule. 与 `repeat_token` 同 calloop Timer 单飞行套路 (T-0603 模式).
+    pending_resize_followup: Option<RegistrationToken>,
 }
 
 // T-0108 删除:`run_main_loop` / `StepResult` / `install_signal_handlers` /
@@ -557,6 +573,53 @@ pub(crate) fn should_propagate_resize(resize_dirty: bool) -> bool {
     resize_dirty
 }
 
+/// T-0802 In #B: resize propagate 节流最小间隔 (60ms ≈ 16.7 Hz).
+///
+/// **why 60ms**: 派单 In #B 测算: compositor 拖动期间 60Hz+ configure event
+/// (~16ms 间隔); 单帧 resize cost ≈ wgpu Surface::configure 重建 SwapChain
+/// (10ms) + Term::resize grid 重排 (5ms) + pty TIOCSWINSZ ioctl (1ms) ≈
+/// 15-20ms, 累积 lag 视觉感受明显. 60ms 节流让 propagate ≤ 16.7 Hz, 单次
+/// resize 占帧不超 33% (60ms 内最多一次), 拖动手感跟随 + GPU/term/pty 不被
+/// 撞穿. 30ms 太短 (16ms configure + 20ms resize cost 仍重叠), 100ms 太长
+/// (用户可见延迟).
+///
+/// **dirty 不丢**: 节流期间 `core.resize_dirty` 仍 true (INV-006 单 bool 幂等),
+/// 下次 [`propagate_resize_if_dirty`] 调用 (距上次 ≥ 60ms 时) 必消费. 拖动停
+/// 后最后一个 configure 在节流窗内 → 由 calloop Timer 兜底 fire (见
+/// [`schedule_resize_followup_timer`]) 保证最终 size 不丢.
+const RESIZE_THROTTLE_MS: u64 = 60;
+
+/// T-0802 In #B: 给定当前时刻 + 上次成功 propagate 时刻 + 最小间隔, 算节流是否
+/// 命中 (true = 应跳过本次 propagate, dirty 留给下次).
+///
+/// **why 抽纯 fn**: 副作用 (3 方 resize + 清 dirty + 记 last_propagate_at + 调
+/// LoopHandle.insert_source 排兜底 Timer) 在 [`propagate_resize_if_dirty`] /
+/// [`schedule_resize_followup_timer`], 决策本身是纯 (now / last / interval) →
+/// bool. 与 `should_propagate_resize` / `pty_readable_action` /
+/// `schedule_op_for_request` 同 conventions §3 抽决策状态机套路, 单测可走所有
+/// 分支不需起 wayland.
+///
+/// **first call 路径**: `last == None` → 永不节流 (首次 propagate 立即跑, 不
+/// 等 60ms; 拖动起手即响应).
+///
+/// **monotonic 不抖**: `Instant` 是单调递增 (Rust std 文档保证), 即使系统时间
+/// 跳变也不会 panic / 误判; 极端边界 `now < last` 不可能发生 (would-be panic
+/// 在 `now.duration_since(last)` 文档说会 saturating 至 zero, 我们用 `checked_duration_since`
+/// 双保险).
+pub(crate) fn should_throttle_propagate(
+    now: Instant,
+    last: Option<Instant>,
+    min_interval: Duration,
+) -> bool {
+    match last {
+        None => false,
+        Some(last_t) => {
+            let elapsed = now.checked_duration_since(last_t).unwrap_or(Duration::ZERO);
+            elapsed < min_interval
+        }
+    }
+}
+
 /// 把 `core.resize_dirty` 触发的 resize 同步推给 renderer / term / pty 三方。
 /// `drive_wayland` 在 `dispatch_pending` 之后调一次 —— configure event 在 dispatch
 /// 时跑 `WindowHandler::configure` → `handle_event` 置 dirty,本 fn 紧接消费。
@@ -580,8 +643,26 @@ pub(crate) fn should_propagate_resize(resize_dirty: bool) -> bool {
 /// **split borrow**:`LoopData { state, term, .. } = &mut *data;` 同时拿
 /// `&mut state.pty / &mut state.renderer / &mut state.core / &mut term` 四份;
 /// LoopData 不同字段间 NLL OK,且 state.* 与 term 是独立 LoopData 字段。
+///
+/// **T-0802 In #B 节流**: dispatch_pending 中可能多次 `WindowHandler::configure`
+/// 置 dirty (拖窗口高频 60Hz+ configure), 本 fn 走 [`should_throttle_propagate`]
+/// 判: 距上次成功 propagate < `RESIZE_THROTTLE_MS` (60ms) 跳过, 让 dirty 留给
+/// 下次. 节流跳过时调 [`schedule_resize_followup_timer`] 排兜底 calloop Timer
+/// 在 throttle 窗结束后 fire 一次, 防"拖动停后最后一个 configure 卡节流窗内"卡
+/// 死. INV-006 不破: dirty 仍布尔幂等, 节流仅限 propagate 调用频率, 不修改 dirty
+/// 状态机.
 fn propagate_resize_if_dirty(data: &mut LoopData) {
     if !should_propagate_resize(data.state.core.resize_dirty) {
+        return;
+    }
+    // T-0802 In #B: 节流命中 → 留 dirty, 排兜底 Timer (单飞行, 已有则不重排).
+    let now = Instant::now();
+    if should_throttle_propagate(
+        now,
+        data.last_propagate_at,
+        Duration::from_millis(RESIZE_THROTTLE_MS),
+    ) {
+        schedule_resize_followup_timer(data, now);
         return;
     }
     let LoopData { state, term, .. } = &mut *data;
@@ -616,6 +697,8 @@ fn propagate_resize_if_dirty(data: &mut LoopData) {
     state.pointer_state.set_surface_size(width, height);
 
     state.core.resize_dirty = false;
+    // T-0802 In #B: 记本次 propagate 时刻, 下次 should_throttle_propagate 据此判.
+    data.last_propagate_at = Some(now);
     tracing::debug!(
         width,
         height,
@@ -623,6 +706,82 @@ fn propagate_resize_if_dirty(data: &mut LoopData) {
         rows,
         "propagated resize → renderer + term + pty + pointer"
     );
+}
+
+/// T-0802 In #B: 节流命中时排兜底 calloop Timer — 在 throttle 窗结束后 fire 一
+/// 次 [`resize_followup_tick`], 防"拖动停后最后一个 configure 卡节流窗内不消费,
+/// 窗口卡在错尺寸"问题.
+///
+/// **单飞行**: `data.pending_resize_followup.is_some()` 直接返 (已有 Timer 排了,
+/// 不重复 schedule). callback fire 时 take 此字段 (Drop timer), 走完 propagate
+/// 后 last_propagate_at 更新, 下次 dirty 来时再 schedule.
+///
+/// **delay 算法**: 让 Timer fire 在 `last_propagate_at + RESIZE_THROTTLE_MS` 时
+/// 刻, 即 `now - last_propagate_at` 已耗 `elapsed`, Timer 还需等 `min_interval -
+/// elapsed`. 极端边界 (last=None / elapsed >= min_interval) 在 should_throttle_propagate
+/// 早返 false 不到本 fn, 这里 last 必 Some 且 elapsed < min_interval.
+///
+/// **why calloop Timer**: INV-005 单线程 EventLoop 唯一 IO 调度器, Timer source
+/// 与 wayland fd / pty fd / signalfd 同 EventLoop, 不起 thread. 与 T-0603 keyboard
+/// repeat 同套路.
+fn schedule_resize_followup_timer(data: &mut LoopData, now: Instant) {
+    if data.pending_resize_followup.is_some() {
+        return;
+    }
+    let last = match data.last_propagate_at {
+        Some(t) => t,
+        None => {
+            // Defensive: should_throttle_propagate 在 last=None 早返 false 不到这里.
+            // 真到这里 (上游变化 / race) 走 1ms 兜底立即 fire 一次保证 dirty 不丢.
+            tracing::warn!("schedule_resize_followup_timer: last=None 防御性 1ms 兜底");
+            now
+        }
+    };
+    let elapsed = now.checked_duration_since(last).unwrap_or(Duration::ZERO);
+    let min_interval = Duration::from_millis(RESIZE_THROTTLE_MS);
+    let remaining = min_interval.checked_sub(elapsed).unwrap_or(Duration::ZERO);
+    // remaining=0 极端边界: 直接走 1ms 给 calloop 一帧缓冲 (与 T-0603 delay.max(1)
+    // 同思路, 防 0-duration Timer fire 与本帧 dispatch 重叠).
+    let delay = remaining.max(Duration::from_millis(1));
+    let timer = Timer::from_duration(delay);
+    match data
+        .loop_handle
+        .insert_source(timer, |_deadline, _meta, data: &mut LoopData| {
+            resize_followup_tick(data)
+        }) {
+        Ok(token) => {
+            data.pending_resize_followup = Some(token);
+            tracing::trace!(
+                target: "quill::resize",
+                delay_ms = delay.as_millis() as u64,
+                "resize followup timer scheduled"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                target: "quill::resize",
+                ?err,
+                "calloop insert_source(resize followup) 失败 — 节流可能卡尺寸 \
+                 (用户下次拖动再触发新 configure 解套, quill 继续跑)"
+            );
+        }
+    }
+}
+
+/// T-0802 In #B: 兜底 Timer fire 时跑一次 propagate. take 字段清 single-flight
+/// 标记 (callback 内不能再 remove 自己 — calloop 文档警告, 走 `TimeoutAction::Drop`
+/// 让 calloop 自己释放), 然后调 [`propagate_resize_if_dirty`]; 此时距上次
+/// propagate 必 ≥ `RESIZE_THROTTLE_MS` (Timer fire 时机即此), 走完 last_propagate_at
+/// 更新, 下次 dirty 来时再 schedule.
+///
+/// **dirty 已被消化的 race**: callback fire 之间若主路径 `drive_wayland` 在
+/// 60ms 后已自然跑过 propagate (e.g. 新 configure / pty event 唤醒), dirty 已清,
+/// `propagate_resize_if_dirty` 内 `should_propagate_resize=false` 早返, 本 callback
+/// 等于 noop, 行为安全.
+fn resize_followup_tick(data: &mut LoopData) -> TimeoutAction {
+    data.pending_resize_followup = None;
+    propagate_resize_if_dirty(data);
+    TimeoutAction::Drop
 }
 
 /// T-0603: 一次 keyboard repeat schedule 的最小子集决策 — 给定当前是否有
@@ -1189,6 +1348,10 @@ pub fn run_window() -> Result<()> {
         // 减计数不影响 EventLoop.
         loop_handle: loop_handle.clone(),
         repeat_token: None,
+        // T-0802 In #B: resize 节流状态. last=None → 首次 propagate 立即跑不
+        // 等 60ms; pending_resize_followup=None → 无兜底 Timer pending.
+        last_propagate_at: None,
+        pending_resize_followup: None,
     };
     event_loop
         .run(None, &mut loop_data, |data| {
@@ -2577,6 +2740,67 @@ mod tests {
             !should_propagate_resize(false),
             "dirty=false 时应早返不消费"
         );
+    }
+
+    // ---------- T-0802 In #B should_throttle_propagate 节流决策单测 ----------
+    // propagate_resize_if_dirty 在 dirty=true 时进一步走节流判: 距上次成功
+    // propagate < 60ms → 跳过本次, 留 dirty 给下次 (兜底 Timer 保不丢). 真副
+    // 作用 (LoopHandle.insert_source / Timer fire / 三方 resize) 由集成测试 /
+    // 手测覆盖, 决策本身抽纯 fn (now / last / interval) → bool 单测.
+
+    #[test]
+    fn should_throttle_propagate_returns_false_on_first_call() {
+        // 首次 propagate (last=None) 立即跑不等 60ms, 拖动起手即响应.
+        let now = Instant::now();
+        assert!(
+            !should_throttle_propagate(now, None, Duration::from_millis(60)),
+            "last=None (首次) 必不节流"
+        );
+    }
+
+    #[test]
+    fn should_throttle_propagate_throttles_when_inside_window() {
+        // last=now-30ms, interval=60ms → elapsed=30ms < 60ms 节流命中.
+        // 模拟拖窗口期 16ms 间隔的 configure event 在 60ms 窗内连发.
+        let last = Instant::now();
+        // 用 now > last 但 elapsed < interval. checked_add 避免 overflow.
+        let now = last + Duration::from_millis(30);
+        assert!(
+            should_throttle_propagate(now, Some(last), Duration::from_millis(60)),
+            "elapsed=30ms < interval=60ms 应节流"
+        );
+    }
+
+    #[test]
+    fn should_throttle_propagate_passes_when_outside_window() {
+        // last=now-100ms, interval=60ms → elapsed=100ms ≥ 60ms 不节流, 真消费.
+        let last = Instant::now();
+        let now = last + Duration::from_millis(100);
+        assert!(
+            !should_throttle_propagate(now, Some(last), Duration::from_millis(60)),
+            "elapsed=100ms ≥ interval=60ms 必不节流"
+        );
+    }
+
+    #[test]
+    fn should_throttle_propagate_boundary_at_exact_interval() {
+        // 边界精确等于 interval: elapsed == interval → 不节流 (>= 语义,
+        // strictly less 才节流). 60Hz 拖动 (~16.67ms 间隔) 第 4 次 configure
+        // 距首次约 50ms, 第 5 次约 66.7ms, boundary 行为锁住决策方向.
+        let last = Instant::now();
+        let now = last + Duration::from_millis(60);
+        assert!(
+            !should_throttle_propagate(now, Some(last), Duration::from_millis(60)),
+            "elapsed == interval 必不节流 (strictly less 才节流)"
+        );
+    }
+
+    #[test]
+    fn should_throttle_propagate_throttle_constant_is_60ms() {
+        // 锁住 RESIZE_THROTTLE_MS 常数防"顺手调成 16ms (太频影响) / 100ms (用户
+        // 见明显延迟)". 改时同步 reviewer 看派单 In #B 60ms 论证 (单 resize cost
+        // 15-20ms × 占 33% 帧).
+        assert_eq!(RESIZE_THROTTLE_MS, 60, "T-0802 In #B 派单 60ms 节流硬约束");
     }
 
     // ---------- T-0502 verdict_for_scale 纯逻辑单测 ----------

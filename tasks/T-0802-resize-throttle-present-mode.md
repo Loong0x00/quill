@@ -1,8 +1,8 @@
 # T-0802 resize 节流 + present_mode 优化 (修拖动延迟)
 
 **Phase**: 8 (polish++, daily-drive feel)
-**Assigned**: (open)
-**Status**: open
+**Assigned**: writer-T0802
+**Status**: in-review
 **Budget**: tokenBudget=100k (跨 wgpu present_mode + Surface::configure 节流 + window resize event 处理)
 **Dependencies**: T-0102 (Renderer init) / INV-006 (resize_dirty 单消费者)
 **Priority**: P1 (user 实测拖窗口边卡顿明显, "巨大延迟和滑动, 手感不干脆")
