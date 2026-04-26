@@ -1096,25 +1096,19 @@ pub fn hit_test_with_tabs(
     // 角 / 边 / 三按钮 优先级仍保留 — 它们路径在 base 已落 ResizeEdge / Button /
     // TitleBar.
     if matches!(base, HoverRegion::TextArea) && y < tab_bar_y_end {
-        // tab bar 区: 左侧 TAB_PLUS_W 是 + 按钮.
-        let plus_w = TAB_PLUS_W_LOGICAL_PX as f64;
-        if x < plus_w {
-            return HoverRegion::TabBarPlus;
-        }
-        // tab body 区: x ∈ [plus_w, surface_w), 按 tab_body_width 切片.
-        let body_w = tab_body_width(surface_w, tab_count);
+        // T-0618 follow-up: + 按钮已移到 titlebar (base hit_test 会先返
+        // TabBarPlus), tab bar 不再含 +, x 从 0 开始切 tab body.
+        let body_w = tab_body_width_no_plus(surface_w, tab_count);
         if body_w <= 0.0 {
             return HoverRegion::TitleBar; // 防御 — body 宽 0 退化到 titlebar
         }
-        let local_x = x - plus_w;
-        let idx = (local_x / body_w).floor() as usize;
+        let idx = (x / body_w).floor() as usize;
         if idx >= tab_count {
-            // 超出 tab body 总宽 (e.g. 只有 1 个 tab 但 surface 很宽, body
-            // clamp 到 max_w 后右侧空白) → 落 TitleBar (drag) 兼容预期.
+            // 超出 tab body 总宽 → 落 TitleBar (drag) 兼容预期.
             return HoverRegion::TitleBar;
         }
         // tab idx 内: 右 TAB_CLOSE_W 区是关闭 ×, 左侧 body 是 click 区.
-        let body_left = plus_w + idx as f64 * body_w;
+        let body_left = idx as f64 * body_w;
         let body_right = body_left + body_w;
         let close_left = body_right - TAB_CLOSE_W_LOGICAL_PX as f64;
         if x >= close_left && x < body_right {
@@ -1123,6 +1117,20 @@ pub fn hit_test_with_tabs(
         return HoverRegion::Tab(idx);
     }
     base
+}
+
+/// T-0618 follow-up: tab body 宽度 (no + button prefix), surface_w / tab_count
+/// clamp 到 [TAB_MIN_W, TAB_MAX_W]. 取代 [`tab_body_width`] (它假设左侧有
+/// TAB_PLUS_W_LOGICAL_PX 留给 + button, 现在 + 已移到 titlebar).
+pub fn tab_body_width_no_plus(surface_w: u32, tab_count: usize) -> f64 {
+    if tab_count == 0 {
+        return 0.0;
+    }
+    let raw = surface_w as f64 / tab_count as f64;
+    raw.clamp(
+        crate::wl::render::TAB_MIN_W_LOGICAL_PX as f64,
+        crate::wl::render::TAB_MAX_W_LOGICAL_PX as f64,
+    )
 }
 
 pub fn hit_test(x: f64, y: f64, surface_w: u32, surface_h: u32) -> HoverRegion {
@@ -1190,11 +1198,17 @@ pub fn hit_test(x: f64, y: f64, surface_w: u32, surface_h: u32) -> HoverRegion {
     // 仍走 bbox 快速 reject (y < btn_h), 圆形 SDF 仅在 bbox 内算.
     if y < btn_h {
         let radius = WINDOW_BUTTON_RADIUS_PX as f64;
+        // T-0618 follow-up: + 按钮在 titlebar 左侧 (ghostty 布局), 一直可见.
+        // 单 tab 也显, 多 tab 时 tab bar 仅含 tab 盒子无 +.
+        let newtab_cx = btn_w / 2.0;
         let close_cx = w - btn_w / 2.0;
         let max_cx = w - 1.5 * btn_w;
         let min_cx = w - 2.5 * btn_w;
         let cy = btn_h / 2.0;
 
+        if circular_hit(x, y, newtab_cx, cy, radius) {
+            return HoverRegion::TabBarPlus;
+        }
         if circular_hit(x, y, close_cx, cy, radius) {
             return HoverRegion::Button(WindowButton::Close);
         }
@@ -1321,12 +1335,9 @@ mod tests {
     fn hit_test_narrow_surface_button_overflow_falls_to_titlebar() {
         // 100×600: corner 8 / edge 4 后, Close x ∈ [76, 100), Max x ∈ [52, 76),
         // Min x ∈ [28, 52), titlebar 缝隙 x ∈ [8, 28).
-        // x=10 y=10 应落 TitleBar (出 corner / edge / 三按钮 — Min 起点 28 > 10).
-        assert_eq!(hit_test(10.0, 10.0, 100, 600), HoverRegion::TitleBar);
-        // **T-0701 优先级修正**: 原测试 50×600 x=0 期望 TitleBar, 但新优先级
-        // 下 (x<4) 必落 Left edge resize. 改测 100×600 x=10 出 corner / edge
-        // 后落 TitleBar — 与原测试"窄 surface button 越界 fallback titlebar" 同
-        // 语义, 仅迁出 4-edge / 8-corner 区域以适配 T-0701.
+        // T-0618 follow-up: + 按钮在左侧 (cx=12, radius=12), 占 x ∈ [0, 24] 圆形.
+        // x=26 y=10 落 TitleBar (出 corner / edge / + button / 三按钮 Min 起点 28).
+        assert_eq!(hit_test(26.0, 10.0, 100, 600), HoverRegion::TitleBar);
     }
 
     // ---- apply_* 决策子 fn 测试 (绕开 wl_surface 构造难题, 见

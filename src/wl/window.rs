@@ -688,6 +688,9 @@ pub(crate) fn cells_from_surface_px(width: u32, height: u32, tab_count: usize) -
 /// 单一来源防回归. 与 `tab_body_width` / `circular_hit` 同 conventions §3
 /// 抽决策状态机套路.
 pub(crate) fn tab_bar_h_logical_for(tab_count: usize) -> u32 {
+    // T-0617: 单 tab 隐藏 tab bar (跟 ghostty 一致). + 按钮 T-0618 follow-up 移
+    // 到 titlebar 左侧 (跟 ghostty 布局: titlebar [+ ⌃] center title [- □ ×]),
+    // 单 tab 仍保 + 可见. 多 tab 时 bar 出现仅装 tab 盒子, 不再有 + 按钮.
     if tab_count >= 2 {
         crate::wl::render::TAB_BAR_H_LOGICAL_PX
     } else {
