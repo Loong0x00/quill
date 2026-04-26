@@ -2,7 +2,7 @@
 
 **Phase**: 6+ (daily-drive feel, 选择粘贴)
 **Assigned**: writer-T0607
-**Status**: claimed
+**Status**: in-review
 **Budget**: tokenBudget=300k (跨 wl_data_device + zwp_primary_selection_v1
 + pointer drag + selection state + cell.bg render + bracketed paste +
 auto-scroll Timer)
