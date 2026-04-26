@@ -58,7 +58,10 @@
 use wayland_client::protocol::wl_pointer;
 use wayland_client::WEnum;
 
-use super::render::{BUTTON_H_LOGICAL_PX, BUTTON_W_LOGICAL_PX, TITLEBAR_H_LOGICAL_PX};
+use super::render::{
+    BUTTON_H_LOGICAL_PX, BUTTON_W_LOGICAL_PX, TAB_BAR_H_LOGICAL_PX, TAB_CLOSE_W_LOGICAL_PX,
+    TAB_MAX_W_LOGICAL_PX, TAB_MIN_W_LOGICAL_PX, TAB_PLUS_W_LOGICAL_PX, TITLEBAR_H_LOGICAL_PX,
+};
 
 /// CSD 三按钮枚举. 对应 xdg_toplevel 协议 set_minimized / set_maximized
 /// (toggle) / 关闭 (内部置 exit + loop_signal.stop).
@@ -149,6 +152,13 @@ pub enum HoverRegion {
     /// 让 compositor 接管 resize. 边缘宽度 [`RESIZE_EDGE_PX`] (4 logical),
     /// 角宽度 [`RESIZE_CORNER_PX`] (8 logical, 优先 corner 让用户好抓).
     ResizeEdge(ResizeEdge),
+    /// T-0608: 鼠标在 tab 标签条的 "+" 按钮 (左侧, 新建 tab).
+    TabBarPlus,
+    /// T-0608: 鼠标在 tab 标签条的某个 tab body 上 (idx 是当前 tab 列表索引,
+    /// 拖拽换序后会失效, 调用方处理 click 时立即用 idx 索引 active).
+    Tab(usize),
+    /// T-0608: 鼠标在 tab 标签条的某个 tab 关闭 "x" 按钮上 (idx 同 [`Self::Tab`]).
+    TabClose(usize),
     /// 鼠标在 text area (cell grid 区域). Phase 6+ 接选区 / 滚轮.
     TextArea,
 }
@@ -208,6 +218,11 @@ pub fn cursor_shape_for(hover: HoverRegion) -> CursorShape {
         HoverRegion::TitleBar => CursorShape::Default,
         HoverRegion::Button(_) => CursorShape::Default,
         HoverRegion::TextArea => CursorShape::Text,
+        // T-0608: tab bar 三种区域均走默认箭头 (与 ghostty / kitty 同, +/x/tab body
+        // 区都不变 I-beam / resize, 派单 In #D 字面要求).
+        HoverRegion::TabBarPlus | HoverRegion::Tab(_) | HoverRegion::TabClose(_) => {
+            CursorShape::Default
+        }
         // T-0703 + T-0701 合并后激活 (Lead 手解): ResizeEdge → 4 方向 cursor.
         // Top/Bottom = ↕ (ns), Left/Right = ↔ (ew),
         // TopLeft/BottomRight = ↘ (nwse), TopRight/BottomLeft = ↙ (nesw).
@@ -255,7 +270,9 @@ pub(crate) fn xcursor_names_for(shape: CursorShape) -> &'static [&'static str] {
 /// 抽 enum 而非散落 `if` 是 conventions §3 套路 (类比 [`PtyAction`] /
 /// [`KeyboardAction`] / [`WindowAction`]); 也是 INV-010 类型隔离的实操 —
 /// 调用方拿到的全是 quill 自有类型, 不暴露 wl_pointer::Event 字段.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+// f64 (TabDragMove.x_logical, T-0608) 不实现 Eq (NaN 自反性), 改 PartialEq.
+// 测试 assert_eq! 仅依 PartialEq, 无回归.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum PointerAction {
     /// 没事可做 (motion 不跨区 / Frame / 未识别按键 / 触摸板未达整 line 阈值).
     #[default]
@@ -326,6 +343,21 @@ pub enum PointerAction {
     },
     /// T-0607: 鼠标回到 viewport 内或松开左键 → 取消 autoscroll Timer.
     AutoScrollStop,
+    /// T-0608: 点击 "+" 按钮 (tab bar 左侧) → 新建 tab.
+    NewTab,
+    /// T-0608: 点击 tab body → 切换 active tab.
+    SwitchTab(usize),
+    /// T-0608: 点击 tab close × → 关闭 tab.
+    CloseTab(usize),
+    /// T-0608: 在 tab body 按下并 motion ≥ 5 logical px → 进入 drag 模式.
+    /// idx 是按下时的 tab idx (drag 期间 tabs.swap_reorder 后 idx 可能不再
+    /// 对应同一 tab id, 调用方需先用 idx 抓 tab.id 锁定 anchor).
+    StartTabDrag(usize),
+    /// T-0608: drag 进行中, motion 期间发, 调用方据 x 算 target_idx 重排.
+    TabDragMove { x_logical: f64 },
+    /// T-0608: tab drag 松开 → 调用方提交 reorder (按当前最后一次 TabDragMove
+    /// 的 x 算 target_idx, swap_reorder).
+    EndTabDrag,
 }
 
 /// quill 自有的指针状态封装. 内部跟踪当前 surface 坐标 + hover 区域 + 最近
@@ -408,6 +440,17 @@ pub struct PointerState {
     /// 次, 期间不再重发; 鼠标回 viewport 返 AutoScrollStop. 与 `pending_cursor_set`
     /// 同 set-once 套路防 callback flood.
     autoscroll_active: bool,
+    /// T-0608: 当前 tab 数量. 由 [`PointerState::set_tab_count`] 同步, 让
+    /// hit_test_with_tabs 走 tab bar 解析. 起步 1 (quill 启动期单 tab).
+    tab_count: usize,
+    /// T-0608: tab body 区按下时记按下 tab idx + 起始 x (logical px), 用作
+    /// drag 阈值判定. 鼠标 motion 距离 ≥ 5 logical px 视为 drag, 否则视为 click.
+    /// 派单 In #F "drag 阈值: 拖动 < 5 logical px → 视为 click".
+    /// `Some((idx, start_x))` = press 已记录待判定; `None` = 无 active press.
+    tab_press: Option<(usize, f64)>,
+    /// T-0608: tab drag 进行中标记. 一旦超过 5 px 阈值, 此字段置 true; release
+    /// 时若 true → EndTabDrag 派单 reorder, 若 false → 退化 SwitchTab(idx).
+    tab_drag_active: bool,
 }
 
 /// T-0701: 边缘 resize hit-test 厚度 (logical px). 4 logical = 8 physical (HIDPI×2),
@@ -437,6 +480,10 @@ pub(crate) const RESIZE_CORNER_PX: f64 = 8.0;
 /// 走两套阈值表 (KISS).
 pub(crate) const SCROLL_ACCUM_LINE_PX: f64 = 24.0;
 
+/// T-0608: tab drag 阈值 (logical px). 派单 In #F "拖动 < 5 logical px → 视为
+/// click". 鼠标按下到松开总移动 < 此值视为 click; ≥ 此值视为 drag.
+pub(crate) const TAB_DRAG_THRESHOLD_PX: f64 = 5.0;
+
 impl PointerState {
     /// 启动期建空 PointerState. 初始尺寸由调用方紧接 [`Self::set_surface_size`]
     /// 同步 (与 `WindowCore::new` 拿 INITIAL_WIDTH/HEIGHT 同).
@@ -457,7 +504,35 @@ impl PointerState {
             grid_rows: 24,
             selection_drag: false,
             autoscroll_active: false,
+            // T-0608: 起步 1 个 tab (与 quill 启动期单 tab 对齐).
+            tab_count: 1,
+            tab_press: None,
+            tab_drag_active: false,
         }
+    }
+
+    /// T-0608: 同步当前 tab 数量, 让 hit_test_with_tabs 路径走最新值.
+    /// 调用方 (window.rs Dispatch / new tab path) 在 tabs.push / tabs.remove
+    /// 后调一次.
+    pub fn set_tab_count(&mut self, count: usize) {
+        self.tab_count = count.max(1);
+        // tab 数量变化会改 tab body width, 重算 hover.
+        if let Some((x, y)) = self.pos {
+            self.hover = hit_test_with_tabs(
+                x,
+                y,
+                self.surface_w_logical,
+                self.surface_h_logical,
+                self.tab_count,
+            );
+        }
+    }
+
+    /// T-0608: 当前 tab 数量 (仅供测试 / 调试 — 主路径走 set_tab_count 同步).
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn tab_count(&self) -> usize {
+        self.tab_count
     }
 
     /// T-0607: 同步 viewport cell grid 尺寸 (`cols`, `rows`). 调用方
@@ -484,7 +559,13 @@ impl PointerState {
         // 尺寸变化后重新算一次 hover (按钮挪了位置, 鼠标可能落到不同区).
         // pos 不变, hit_test 用新 surface 尺寸即可.
         if let Some((x, y)) = self.pos {
-            self.hover = hit_test(x, y, self.surface_w_logical, self.surface_h_logical);
+            self.hover = hit_test_with_tabs(
+                x,
+                y,
+                self.surface_w_logical,
+                self.surface_h_logical,
+                self.tab_count,
+            );
         }
     }
 
@@ -615,7 +696,13 @@ pub fn handle_pointer_event(
 pub(crate) fn apply_enter(state: &mut PointerState, serial: u32, x: f64, y: f64) -> PointerAction {
     state.pos = Some((x, y));
     state.last_enter_serial = serial;
-    let new_hover = hit_test(x, y, state.surface_w_logical, state.surface_h_logical);
+    let new_hover = hit_test_with_tabs(
+        x,
+        y,
+        state.surface_w_logical,
+        state.surface_h_logical,
+        state.tab_count,
+    );
     let new_shape = cursor_shape_for(new_hover);
     // 协议要求: enter 后必须 set 一次 cursor (否则 unspecified). 即便
     // current_cursor_shape == new_shape (init 都是 Default), 也强制 emit 一次
@@ -652,7 +739,31 @@ pub(crate) fn apply_leave(state: &mut PointerState) -> PointerAction {
 /// 求 enter serial, motion event 自身无 serial 字段).
 pub(crate) fn apply_motion(state: &mut PointerState, x: f64, y: f64) -> PointerAction {
     state.pos = Some((x, y));
-    let new_hover = hit_test(x, y, state.surface_w_logical, state.surface_h_logical);
+    let new_hover = hit_test_with_tabs(
+        x,
+        y,
+        state.surface_w_logical,
+        state.surface_h_logical,
+        state.tab_count,
+    );
+
+    // T-0608: tab drag 阈值检测 (派单 In #F). press 已记录 tab_press, motion 时
+    // 算与起始 x 的距离 ≥ 5 logical px → tab_drag_active=true. 后续 motion 仅
+    // 更新 drag, release 时按 drag_active 决定 EndTabDrag (reorder) vs SwitchTab.
+    if let Some((origin_idx, start_x)) = state.tab_press {
+        let dx = (x - start_x).abs();
+        if dx >= TAB_DRAG_THRESHOLD_PX && !state.tab_drag_active {
+            state.tab_drag_active = true;
+            return PointerAction::StartTabDrag(origin_idx);
+        }
+        if state.tab_drag_active {
+            // drag 进行中, 发 TabDragMove(x) 让调用方更新拖中视觉 / 算 target_idx.
+            return PointerAction::TabDragMove { x_logical: x };
+        }
+        // < 阈值, 不动.
+        state.hover = new_hover;
+        return PointerAction::Nothing;
+    }
 
     // T-0607: 选区拖动中 — motion 事件应优先发 SelectionUpdate (cursor 跟随);
     // hover change / cursor shape 切换 仍同步更新但不返 HoverChange (调用方
@@ -755,6 +866,18 @@ pub(crate) fn apply_button(
         state.selection_drag = false;
         let was_autoscroll = state.autoscroll_active;
         state.autoscroll_active = false;
+        // T-0608: tab drag release 路径. 若 drag_active=true → EndTabDrag 让
+        // 调用方按当前 x 算 target_idx + swap_reorder. 若 drag_active=false 但
+        // tab_press 仍 Some → 视为 click, SwitchTab(origin_idx) (派单 In #F
+        // 阈值 < 5 px 视 click).
+        if let Some((origin_idx, _start_x)) = state.tab_press.take() {
+            let was_drag = state.tab_drag_active;
+            state.tab_drag_active = false;
+            if was_drag {
+                return PointerAction::EndTabDrag;
+            }
+            return PointerAction::SwitchTab(origin_idx);
+        }
         if was_dragging {
             // 即便 autoscroll 仍 active, SelectionEnd 一并兜底清 (调用方在
             // SelectionEnd 路径走 cancel autoscroll Timer + PRIMARY auto-copy).
@@ -778,6 +901,18 @@ pub(crate) fn apply_button(
         HoverRegion::TitleBar => PointerAction::StartMove { serial },
         HoverRegion::Button(b) => PointerAction::ButtonClick(b),
         HoverRegion::ResizeEdge(edge) => PointerAction::StartResize { serial, edge },
+        // T-0608: tab bar 三区. + 立即 NewTab; close × 立即 CloseTab; tab body
+        // 走 press 记录 (drag 阈值检测), release 时再决定 SwitchTab vs reorder.
+        HoverRegion::TabBarPlus => PointerAction::NewTab,
+        HoverRegion::TabClose(idx) => PointerAction::CloseTab(idx),
+        HoverRegion::Tab(idx) => {
+            // press 记录 origin_idx + start_x, motion 时与 start_x 比距离, release
+            // 时按 drag_active 决定 SwitchTab vs EndTabDrag.
+            let start_x = state.pos.map(|p| p.0).unwrap_or(0.0);
+            state.tab_press = Some((idx, start_x));
+            state.tab_drag_active = false;
+            PointerAction::Nothing
+        }
         HoverRegion::TextArea => {
             // T-0607: text area 左键 press → 开始选区. anchor 走当前 pos →
             // pixel_to_cell. mode 走 alt_active → SelectionMode.
@@ -875,6 +1010,87 @@ pub(crate) fn apply_axis_vertical(state: &mut PointerState, value: f64) -> Point
 /// **单一来源**: 五常数 (TITLEBAR_H / BUTTON_W / BUTTON_H / RESIZE_EDGE_PX /
 /// RESIZE_CORNER_PX) 都从模块顶部 / `render.rs` import. 改一处即视觉与逻辑
 /// 同步, 无漂移风险.
+/// T-0608: 算 tab body width 给定 tab 数量. clamp 到 [TAB_MIN_W, TAB_MAX_W].
+/// surface 上 tab bar 宽度 = surface_w - TAB_PLUS_W (留 + 按钮空间), 每 tab
+/// 平均分. 派单 In #C "标签宽度自适应: 总宽 / tab 数, 上限 ~200, 下限 ~80".
+///
+/// **why 抽 fn**: hit_test + render 都用此公式, 改一处即视觉与逻辑同步
+/// (单一来源, 与 RESIZE_EDGE_PX / cells_from_surface_px 同套路).
+pub fn tab_body_width(surface_w: u32, tab_count: usize) -> f64 {
+    if tab_count == 0 {
+        return 0.0;
+    }
+    let plus_w = TAB_PLUS_W_LOGICAL_PX as f64;
+    let bar_avail = (surface_w as f64 - plus_w).max(0.0);
+    let raw_w = bar_avail / tab_count as f64;
+    let max_w = TAB_MAX_W_LOGICAL_PX as f64;
+    let min_w = TAB_MIN_W_LOGICAL_PX as f64;
+    raw_w.clamp(min_w, max_w)
+}
+
+/// T-0608: 多 tab hit_test 入口. 与 [`hit_test`] 同套路但 tab_count 入参用于
+/// 算 tab bar 区. tab_count == 0 时退化到原 hit_test 行为 (无 tab bar UI,
+/// 用作单 tab 兼容路径; 实战 tab_count >= 1 因为 quill 启动期就有一个 tab).
+///
+/// **优先级** (高 → 低, 派单 In #D):
+/// 1. 4 角 / 4 边 (resize)
+/// 2. titlebar 段 (y < TITLEBAR_H): 三按钮 / TitleBar drag
+/// 3. tab bar 段 (TITLEBAR_H ≤ y < TITLEBAR_H + TAB_BAR_H):
+///    - 左 TAB_PLUS_W 区 → TabBarPlus
+///    - 之后按 tab_body_width 平均分 → Tab(idx) 或 TabClose(idx)
+/// 4. cell 区 (y ≥ TITLEBAR_H + TAB_BAR_H) → TextArea
+pub fn hit_test_with_tabs(
+    x: f64,
+    y: f64,
+    surface_w: u32,
+    surface_h: u32,
+    tab_count: usize,
+) -> HoverRegion {
+    // 边界外 + 边角 + 边带 走原 hit_test 优先级 (角 / 边 优先按钮 / titlebar /
+    // tab bar). 但原 hit_test 把 cell 区起点定在 TITLEBAR_H, 我们要把它推到
+    // TITLEBAR_H + TAB_BAR_H. 路径: 先走原 hit_test, 拿到 TitleBar / TextArea
+    // 时根据 y 进一步细化为 tab bar 区或真 cell 区.
+    let base = hit_test(x, y, surface_w, surface_h);
+    if tab_count == 0 {
+        return base;
+    }
+    let titlebar_h = TITLEBAR_H_LOGICAL_PX as f64;
+    let tab_bar_h = TAB_BAR_H_LOGICAL_PX as f64;
+    let tab_bar_y_end = titlebar_h + tab_bar_h;
+    // y 在 tab bar 段内 → 进 tab bar 解析. 但仅当 base 落 TextArea 或 None
+    // (None 见底边出 surface 时, 不进; 落 TextArea 见 y >= titlebar_h 已通过).
+    // 角 / 边 / 三按钮 优先级仍保留 — 它们路径在 base 已落 ResizeEdge / Button /
+    // TitleBar.
+    if matches!(base, HoverRegion::TextArea) && y < tab_bar_y_end {
+        // tab bar 区: 左侧 TAB_PLUS_W 是 + 按钮.
+        let plus_w = TAB_PLUS_W_LOGICAL_PX as f64;
+        if x < plus_w {
+            return HoverRegion::TabBarPlus;
+        }
+        // tab body 区: x ∈ [plus_w, surface_w), 按 tab_body_width 切片.
+        let body_w = tab_body_width(surface_w, tab_count);
+        if body_w <= 0.0 {
+            return HoverRegion::TitleBar; // 防御 — body 宽 0 退化到 titlebar
+        }
+        let local_x = x - plus_w;
+        let idx = (local_x / body_w).floor() as usize;
+        if idx >= tab_count {
+            // 超出 tab body 总宽 (e.g. 只有 1 个 tab 但 surface 很宽, body
+            // clamp 到 max_w 后右侧空白) → 落 TitleBar (drag) 兼容预期.
+            return HoverRegion::TitleBar;
+        }
+        // tab idx 内: 右 TAB_CLOSE_W 区是关闭 ×, 左侧 body 是 click 区.
+        let body_left = plus_w + idx as f64 * body_w;
+        let body_right = body_left + body_w;
+        let close_left = body_right - TAB_CLOSE_W_LOGICAL_PX as f64;
+        if x >= close_left && x < body_right {
+            return HoverRegion::TabClose(idx);
+        }
+        return HoverRegion::Tab(idx);
+    }
+    base
+}
+
 pub fn hit_test(x: f64, y: f64, surface_w: u32, surface_h: u32) -> HoverRegion {
     // 边界外
     if x < 0.0 || y < 0.0 {

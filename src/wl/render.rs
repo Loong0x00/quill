@@ -129,6 +129,11 @@ pub struct Renderer {
     /// 字符串无 GPU 资源, drop 顺序无关 — 放 `surface_is_srgb` 之后 / `instance`
     /// 之前, 与其它 POD 字段 visual locality 一致 (INV-002 entry 同步更新).
     title: String,
+    /// T-0608: 当前 tab 数量 + active idx, render 走 [`append_tab_bar_vertices`]
+    /// 用. POD usize 无 GPU 资源, 顺序无关. 由调用方 (window.rs idle callback)
+    /// 通过 [`Self::set_tab_state`] 在每帧 draw_frame 之前同步.
+    tab_count: usize,
+    active_tab_idx: usize,
     // 持有 Instance 避免提前 drop 掉 Vulkan/GL 实例。
     #[allow(dead_code)]
     instance: wgpu::Instance,
@@ -326,6 +331,28 @@ pub const BUTTON_W_LOGICAL_PX: u32 = 24;
 /// **CSD 按钮高度** (logical px, T-0504). 24 logical, ≤ TITLEBAR_H (28),
 /// 顶贴 titlebar 顶部 (y ∈ [0, 24)), 底部留 4 px 边距使按钮视觉与 titlebar 分离.
 pub const BUTTON_H_LOGICAL_PX: u32 = 24;
+
+/// **T-0608: 标签条高度** (logical px). 28 logical, 与 titlebar 同高度让视觉
+/// 韵律一致; 总顶部 = titlebar (28) + tab_bar (28) = 56 logical px (= 112 physical
+/// 在 HIDPI×2). cell 区从 56 logical 起.
+///
+/// **why 28 而非更窄**: ghostty / kitty native 标签条均 28-32 logical (容纳
+/// 14-16pt 标题字 + close × icon), 太窄字会糊. 派单 In #C 字面 ~28.
+pub const TAB_BAR_H_LOGICAL_PX: u32 = 28;
+
+/// **T-0608: 标签条 "+" 按钮宽度** (logical px). 28 = 与高度同, 视觉为正方形
+/// 紧贴左上 (titlebar 之下).
+pub const TAB_PLUS_W_LOGICAL_PX: u32 = 28;
+
+/// **T-0608: 单 tab 最大宽度** (logical px). 派单 "上限 ~200 px" 字面.
+/// 多 tab 时 = surface_w / tab 数, clamp 到 [TAB_MIN_W, TAB_MAX_W].
+pub const TAB_MAX_W_LOGICAL_PX: u32 = 200;
+
+/// **T-0608: 单 tab 最小宽度** (logical px). 派单 "下限 ~80 px"; 太挤截短 title.
+pub const TAB_MIN_W_LOGICAL_PX: u32 = 80;
+
+/// **T-0608: tab close 按钮 (×) 宽度** (logical px). 16 logical, 占 tab 右侧.
+pub const TAB_CLOSE_W_LOGICAL_PX: u32 = 16;
 
 /// **CSD titlebar 配色**.
 const TITLEBAR_BG: crate::term::Color = crate::term::Color {
@@ -818,6 +845,186 @@ fn append_titlebar_vertices(
     }
 }
 
+/// **T-0608: tab bar 标签条配色** (active / inactive / hover 三态).
+const TAB_BAR_BG: crate::term::Color = crate::term::Color {
+    r: 0x1c,
+    g: 0x1c,
+    b: 0x1c,
+};
+const TAB_ACTIVE_BG: crate::term::Color = crate::term::Color {
+    r: 0x40,
+    g: 0x40,
+    b: 0x60,
+};
+const TAB_HOVER_BG: crate::term::Color = crate::term::Color {
+    r: 0x30,
+    g: 0x30,
+    b: 0x40,
+};
+const TAB_BAR_BORDER: crate::term::Color = crate::term::Color {
+    r: 0x0a,
+    g: 0x0a,
+    b: 0x0a,
+};
+
+/// **T-0608: tab bar 顶点 append 入口**. 在 `append_titlebar_vertices` 之后调,
+/// 紧贴 titlebar 下方画 [`TAB_BAR_H_LOGICAL_PX`] (28 logical) 高的标签条.
+///
+/// 视觉布局 (派单 In #C):
+/// - 整 tab bar 背景 (深灰 #1c1c1c)
+/// - 左侧 [`TAB_PLUS_W_LOGICAL_PX`] (28 logical 方) "+" 按钮 (白横竖线段)
+/// - 中间 tab 列表: 每 tab 按 [`tab_body_width`] 宽; active 高亮 #404060,
+///   inactive 透明 (即 tab bar bg); hover 时 #303040
+/// - 每 tab 右侧 [`TAB_CLOSE_W_LOGICAL_PX`] (16 logical) "x" close 按钮 (横线段)
+/// - tab 之间 + tab bar 底部细线分隔
+///
+/// **`#[allow(clippy::too_many_arguments)]`**: 与 `append_titlebar_vertices` 同
+/// 决策 — 抽 struct 反而把 NDC 换算主线变间接.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn append_tab_bar_vertices(
+    out: &mut Vec<u8>,
+    surface_w: f32,
+    surface_h: f32,
+    is_srgb: bool,
+    tab_count: usize,
+    active_idx: usize,
+    hover: super::pointer::HoverRegion,
+) {
+    use super::pointer::HoverRegion;
+
+    if tab_count == 0 {
+        return;
+    }
+
+    let hidpi = HIDPI_SCALE as f32;
+    let titlebar_h = TITLEBAR_H_LOGICAL_PX as f32 * hidpi;
+    let bar_h = TAB_BAR_H_LOGICAL_PX as f32 * hidpi;
+    let plus_w = TAB_PLUS_W_LOGICAL_PX as f32 * hidpi;
+    let close_w = TAB_CLOSE_W_LOGICAL_PX as f32 * hidpi;
+    let body_w =
+        (super::pointer::tab_body_width(surface_w as u32 / HIDPI_SCALE, tab_count) as f32) * hidpi;
+
+    let bar_y0 = titlebar_h;
+    let bar_y1 = titlebar_h + bar_h;
+
+    let bar_bg = color_for_vertex_with_srgb(TAB_BAR_BG, is_srgb);
+    let active_bg = color_for_vertex_with_srgb(TAB_ACTIVE_BG, is_srgb);
+    let hover_bg = color_for_vertex_with_srgb(TAB_HOVER_BG, is_srgb);
+    let icon_color = color_for_vertex_with_srgb(BUTTON_ICON, is_srgb);
+    let border_color = color_for_vertex_with_srgb(TAB_BAR_BORDER, is_srgb);
+
+    // 1. tab bar 整 width 背景
+    append_quad_px(
+        out, 0.0, bar_y0, surface_w, bar_y1, surface_w, surface_h, bar_bg,
+    );
+
+    // 2. "+" 按钮 (左侧). hover 时 bg 变深.
+    let plus_bg = match hover {
+        HoverRegion::TabBarPlus => hover_bg,
+        _ => bar_bg,
+    };
+    append_quad_px(
+        out, 0.0, bar_y0, plus_w, bar_y1, surface_w, surface_h, plus_bg,
+    );
+    // + icon: 横竖两条线段, 中心点 (plus_w/2, bar_y0 + bar_h/2)
+    let stroke_w = 2.0 * hidpi;
+    let icon_pad = 8.0 * hidpi;
+    let cx = plus_w / 2.0;
+    let cy = bar_y0 + bar_h / 2.0;
+    let icon_size = bar_h - 2.0 * icon_pad;
+    // 横线
+    append_quad_px(
+        out,
+        cx - icon_size / 2.0,
+        cy - stroke_w / 2.0,
+        cx + icon_size / 2.0,
+        cy + stroke_w / 2.0,
+        surface_w,
+        surface_h,
+        icon_color,
+    );
+    // 竖线
+    append_quad_px(
+        out,
+        cx - stroke_w / 2.0,
+        cy - icon_size / 2.0,
+        cx + stroke_w / 2.0,
+        cy + icon_size / 2.0,
+        surface_w,
+        surface_h,
+        icon_color,
+    );
+
+    // 3. tab 列表: 每 tab body, active 高亮 / hover 高亮.
+    for i in 0..tab_count {
+        let tab_x0 = plus_w + i as f32 * body_w;
+        let tab_x1 = tab_x0 + body_w;
+        if tab_x0 >= surface_w {
+            break;
+        }
+        let bg = if i == active_idx {
+            active_bg
+        } else if matches!(hover, HoverRegion::Tab(idx) | HoverRegion::TabClose(idx) if idx == i) {
+            hover_bg
+        } else {
+            bar_bg
+        };
+        append_quad_px(
+            out, tab_x0, bar_y0, tab_x1, bar_y1, surface_w, surface_h, bg,
+        );
+        // tab 之间分隔细线 (垂直右边)
+        append_quad_px(
+            out,
+            tab_x1 - stroke_w / 2.0,
+            bar_y0,
+            tab_x1 + stroke_w / 2.0,
+            bar_y1,
+            surface_w,
+            surface_h,
+            border_color,
+        );
+
+        // close × icon 在 tab 右侧 close_w 区. 简化画一个 × (两条对角斜线代价高,
+        // 先画"+"风格的横竖一条 — 视觉上是个 + 旋 45° 才像 ×, 当前 cell pipeline
+        // 不支持 rotation. **派单偏离**: close 按钮 icon 在标签条上**仅画底部红
+        // 横线**作 visual cue; 真 × 渲染依赖 glyph pass cosmic-text "×" U+00D7,
+        // 与 titlebar close 按钮同套路 — 后续 ticket 可统一. 当前简化保留交互逻辑
+        // (HoverRegion::TabClose hit_test 仍正确), 视觉上用户能 hover + click).
+        let close_x0 = tab_x1 - close_w;
+        let close_y0 = bar_y0 + bar_h / 2.0 - stroke_w / 2.0;
+        let close_y1 = close_y0 + stroke_w;
+        let close_pad = 4.0 * hidpi;
+        let close_color = match hover {
+            HoverRegion::TabClose(idx) if idx == i => {
+                color_for_vertex_with_srgb(BUTTON_BG_CLOSE_HOVER, is_srgb)
+            }
+            _ => icon_color,
+        };
+        append_quad_px(
+            out,
+            close_x0 + close_pad,
+            close_y0,
+            tab_x1 - close_pad,
+            close_y1,
+            surface_w,
+            surface_h,
+            close_color,
+        );
+    }
+
+    // 4. tab bar 底部细线分隔 (与 cell 区分开)
+    append_quad_px(
+        out,
+        0.0,
+        bar_y1 - stroke_w,
+        surface_w,
+        bar_y1,
+        surface_w,
+        surface_h,
+        border_color,
+    );
+}
+
 impl Renderer {
     /// 从 Wayland 裸指针构造 Renderer,配置初始尺寸并返回。
     ///
@@ -952,8 +1159,20 @@ impl Renderer {
             // T-0102 起就 set_title("quill"), 与默认一致 — set_title 调用是
             // future-proof: Phase 7+ 接 cwd / 命令时本字段动态更新).
             title: DEFAULT_TITLE.to_string(),
+            // T-0608: 默认 1 tab, active idx 0 (与 quill 启动期单 tab 对齐).
+            // 上层 idle callback 每帧 draw_frame 之前调 [`Self::set_tab_state`]
+            // 同步真实 tabs 数量 + active idx.
+            tab_count: 1,
+            active_tab_idx: 0,
             instance,
         })
+    }
+
+    /// T-0608: 同步 tab 状态到 renderer (idle callback 每帧 draw_frame 前调).
+    /// 与 [`Self::set_title`] 同 set-once 套路.
+    pub fn set_tab_state(&mut self, tab_count: usize, active_idx: usize) {
+        self.tab_count = tab_count.max(1);
+        self.active_tab_idx = active_idx.min(self.tab_count - 1);
     }
 
     /// Wayland configure 后把新 surface 像素尺寸推给 wgpu —— 更新 `self.config`
@@ -1513,7 +1732,9 @@ impl Renderer {
         let cell_h_px = CELL_H_PX * HIDPI_SCALE as f32;
         let baseline_y_px = BASELINE_Y_PX * HIDPI_SCALE as f32;
         // T-0504: titlebar 高度 (physical px = logical × HIDPI_SCALE).
-        let titlebar_y_offset_px = TITLEBAR_H_LOGICAL_PX as f32 * HIDPI_SCALE as f32;
+        // T-0608: 改名语义 — 现在是 "cell 区起始 y" = titlebar + tab_bar.
+        let titlebar_y_offset_px =
+            (TITLEBAR_H_LOGICAL_PX + TAB_BAR_H_LOGICAL_PX) as f32 * HIDPI_SCALE as f32;
 
         // Step 3: cell vertex bytes (T-0407 D fix: 走 bg 色, 让 glyph fg 字形
         // 在 cell bg 块上可见; T-0403 用 fg 致字形被 cell fg 块"涂同色"不可见,
@@ -1558,6 +1779,18 @@ impl Renderer {
             surface_w,
             surface_h,
             self.surface_is_srgb,
+            hover,
+        );
+        // T-0608: tab bar 顶点 (titlebar 之下, cell 之上). tab_count / active_idx
+        // 来自调用方 (state.tabs); tab_count=0 时本 fn 早返不画 (启动期 race
+        // 兜底, 实战 ≥ 1).
+        append_tab_bar_vertices(
+            &mut cell_vertex_bytes,
+            surface_w,
+            surface_h,
+            self.surface_is_srgb,
+            self.tab_count,
+            self.active_tab_idx,
             hover,
         );
         // T-0606: surface 4 边 1 px 边框, 走 cell pipeline 同 buffer.
@@ -1681,13 +1914,17 @@ impl Renderer {
         // checker 不放, clone 路径 KISS. Phase 7+ 接 cwd / 命令 watcher 时
         // title 可能更长, 仍 microsecond 级 clone, 不优化.
         let title_for_render = self.title.clone();
+        // T-0608: title baseline 走 titlebar_h_physical (28 logical × HIDPI), 不
+        // 含 tab_bar (titlebar 中央居中独立于 tab bar). titlebar_y_offset_px 现含
+        // tab_bar 是 cell 区起始 offset 用, 这里独立算.
+        let titlebar_h_physical = TITLEBAR_H_LOGICAL_PX as f32 * HIDPI_SCALE as f32;
         self.append_titlebar_title_glyphs(
             text_system,
             &mut glyph_vertex_bytes,
             &title_for_render,
             surface_w,
             surface_h,
-            titlebar_y_offset_px,
+            titlebar_h_physical,
             title_color,
         );
 
@@ -2891,8 +3128,9 @@ pub fn render_headless(
     let cell_w_px = CELL_W_PX * HIDPI_SCALE as f32;
     let cell_h_px = CELL_H_PX * HIDPI_SCALE as f32;
     let baseline_y_px = BASELINE_Y_PX * HIDPI_SCALE as f32;
-    // T-0504: titlebar 高度 (physical px), cells 偏移到 titlebar 之下.
-    let titlebar_y_offset_px = TITLEBAR_H_LOGICAL_PX as f32 * HIDPI_SCALE as f32;
+    // T-0504/T-0608: cells 偏移到 titlebar + tab_bar 之下 (56 logical = 112 physical).
+    let titlebar_y_offset_px =
+        (TITLEBAR_H_LOGICAL_PX + TAB_BAR_H_LOGICAL_PX) as f32 * HIDPI_SCALE as f32;
 
     let mut cell_vertex_bytes: Vec<u8> =
         Vec::with_capacity(cells.len() * VERTS_PER_CELL * VERTEX_BYTES);
@@ -2957,11 +3195,27 @@ pub fn render_headless(
     }
     // T-0504: 追加 titlebar + 3 按钮 + icon 顶点. headless 路径无真鼠标 hover,
     // 走 HoverRegion::None (按钮全无高亮).
+    // T-0608: 紧接追加 tab bar (与 draw_frame 同顺序, headless 默认 1 tab + active=0,
+    // 集成测试 tests/multi_tab_e2e.rs 通过 [`render_headless_with_tabs`] 入口传
+    // 真 tab_count + active_idx).
     append_titlebar_vertices(
         &mut cell_vertex_bytes,
         surface_w,
         surface_h,
         is_srgb,
+        super::pointer::HoverRegion::None,
+    );
+    // T-0608: tab bar (默认 1 tab, active idx 0). 集成测试通过 thread-local
+    // [`HEADLESS_TAB_OVERRIDE`] 注入真 tab_count + active_idx — 派单 In #J PNG
+    // 三源 verify 路径.
+    let (tc, ai) = HEADLESS_TAB_OVERRIDE.with(|c| c.get());
+    append_tab_bar_vertices(
+        &mut cell_vertex_bytes,
+        surface_w,
+        surface_h,
+        is_srgb,
+        tc,
+        ai,
         super::pointer::HoverRegion::None,
     );
     // cell_vertex_count 在 preedit underline append 后再算 (T-0505)。
@@ -3124,7 +3378,9 @@ pub fn render_headless(
         if let Some(last) = title_glyphs.last() {
             let title_advance = last.x_offset + last.x_advance;
             let x_start = titlebar_title_x_start(surface_w, title_advance);
-            let baseline_y = titlebar_title_baseline_y(titlebar_y_offset_px);
+            // T-0608: title baseline 仅依 titlebar height (不含 tab_bar).
+            let titlebar_h_physical_only = TITLEBAR_H_LOGICAL_PX as f32 * HIDPI_SCALE as f32;
+            let baseline_y = titlebar_title_baseline_y(titlebar_h_physical_only);
             for glyph in &title_glyphs {
                 if !glyph.x_advance.is_finite() || !glyph.x_offset.is_finite() {
                     continue;
@@ -3699,6 +3955,31 @@ fn create_headless_glyph_pipeline(
         multiview_mask: None,
         cache: None,
     })
+}
+
+// T-0608: headless 渲染时的 tab 状态注入点. 默认 (1, 0) — 单 tab + active=0.
+// 集成测试 (tests/multi_tab_e2e.rs) 在 render_headless 之前 set 走
+// set_headless_tab_state 注入真 tab_count + active_idx, 让 PNG 输出含多 tab 视觉.
+//
+// why thread_local Cell 而非 render_headless 入参: 不破坏现有 render_headless
+// 8 参签名 — 现有 24 个集成测试已锁此签名 (Smoke / CSD / IME / cursor / selection
+// 等), 加参致全部回归改写工作量 >> 1 个 thread_local 字段. set/get/reset 三 fn
+// 公开给测试.
+thread_local! {
+    pub(crate) static HEADLESS_TAB_OVERRIDE: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((1, 0)) };
+}
+
+/// T-0608: headless 测试调用前 set tab_count / active_idx, render_headless 内
+/// `append_tab_bar_vertices` 用此值. 测试末尾走 [`reset_headless_tab_state`]
+/// 兜底防串测.
+pub fn set_headless_tab_state(tab_count: usize, active_idx: usize) {
+    HEADLESS_TAB_OVERRIDE.with(|c| c.set((tab_count.max(1), active_idx)));
+}
+
+/// T-0608: 重置 tab override 到默认 (1, 0). 测试末尾或 setUp 调.
+pub fn reset_headless_tab_state() {
+    HEADLESS_TAB_OVERRIDE.with(|c| c.set((1, 0)));
 }
 
 #[cfg(test)]

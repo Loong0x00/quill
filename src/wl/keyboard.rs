@@ -275,6 +275,17 @@ pub enum KeyboardAction {
     /// T-0607: Ctrl+Shift+V → 粘贴 CLIPBOARD. 调用方走
     /// `state.pending_paste_request = Some(PasteSource::Clipboard)`.
     PasteFromClipboard,
+    /// T-0608: Ctrl+T → 新 tab.
+    NewTab,
+    /// T-0608: Ctrl+W → 关 active tab.
+    CloseActiveTab,
+    /// T-0608: Ctrl+Tab → 下一个 tab (循环).
+    NextTab,
+    /// T-0608: Ctrl+Shift+Tab → 上一个 tab.
+    PrevTab,
+    /// T-0608: Ctrl+1..=9 → 跳到第 N 个 tab (alacritty / kitty 同款热键).
+    /// `idx` 是 0-based (Ctrl+1 → 0, Ctrl+9 → 8).
+    SwitchToTab(usize),
 }
 
 /// 接 wl_keyboard 协议事件 → 算 [`KeyboardAction`]。
@@ -513,6 +524,36 @@ fn key_press_action(
         // XK_V = 0x56, XK_v = 0x76
         if raw == 0x56 || raw == 0x76 {
             return KeyboardAction::PasteFromClipboard;
+        }
+        // T-0608: Ctrl+Shift+Tab → PrevTab (Ctrl+Tab 单独 Ctrl, 见下方).
+        // XK_ISO_Left_Tab = 0xfe20, 但 Tab 在 Shift 下 keysym 也可能是
+        // XK_Tab (0xff09); 双接.
+        if raw == 0xfe20 || raw == 0xff09 {
+            return KeyboardAction::PrevTab;
+        }
+    }
+    // T-0608: 单 Ctrl (无 Shift) 热键 — Ctrl+T / Ctrl+W / Ctrl+Tab / Ctrl+1..9.
+    // 必须**先于** utf8 路径 — Ctrl+T xkbcommon 给 \x14 (DC4) bash readline 用,
+    // 但 quill 拦截作 NewTab (与 ghostty / kitty 一致, 用户 vim Ctrl+T 失能是
+    // trade-off, 派单接受).
+    if ctrl_active && !shift_active {
+        let raw = keysym.raw();
+        // XK_T = 0x54, XK_t = 0x74
+        if raw == 0x54 || raw == 0x74 {
+            return KeyboardAction::NewTab;
+        }
+        // XK_W = 0x57, XK_w = 0x77
+        if raw == 0x57 || raw == 0x77 {
+            return KeyboardAction::CloseActiveTab;
+        }
+        // XK_Tab = 0xff09 (无 Shift Ctrl+Tab)
+        if raw == 0xff09 {
+            return KeyboardAction::NextTab;
+        }
+        // XK_1..XK_9 = 0x31..0x39 → SwitchToTab(0..8)
+        if (0x31..=0x39).contains(&raw) {
+            let idx = (raw - 0x31) as usize;
+            return KeyboardAction::SwitchToTab(idx);
         }
     }
 

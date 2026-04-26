@@ -28,11 +28,14 @@ use quill::wl::{
 const LOGICAL_W: u32 = 800;
 const LOGICAL_H: u32 = 600;
 const COLS: usize = 80;
-const ROWS: usize = 22;
+// T-0608: surface 800×600 - (titlebar 28 + tab_bar 28) = 544 logical, 544 / 25 = 21 行.
+const ROWS: usize = 21;
 
 const CELL_W_LOGICAL: usize = 10;
 const CELL_H_LOGICAL: usize = 25;
 const TITLEBAR_H_LOGICAL: usize = 28;
+const TAB_BAR_H_LOGICAL: usize = 28;
+const TOP_RESERVED_LOGICAL: usize = TITLEBAR_H_LOGICAL + TAB_BAR_H_LOGICAL;
 
 /// 构造空 cell array (全 ' ', bg=#0a1030 深蓝, fg=#d3d3d3 浅灰).
 fn empty_cells(cols: usize, rows: usize) -> Vec<CellRef> {
@@ -109,8 +112,8 @@ fn cell_phys_bbox(col: usize, line: usize) -> (usize, usize, usize, usize) {
     let scale = HIDPI_SCALE as usize;
     let x0 = col * CELL_W_LOGICAL * scale;
     let x1 = (col + 1) * CELL_W_LOGICAL * scale;
-    let y0 = (line * CELL_H_LOGICAL + TITLEBAR_H_LOGICAL) * scale;
-    let y1 = ((line + 1) * CELL_H_LOGICAL + TITLEBAR_H_LOGICAL) * scale;
+    let y0 = (line * CELL_H_LOGICAL + TOP_RESERVED_LOGICAL) * scale;
+    let y1 = ((line + 1) * CELL_H_LOGICAL + TOP_RESERVED_LOGICAL) * scale;
     (x0, x1, y0, y1)
 }
 
