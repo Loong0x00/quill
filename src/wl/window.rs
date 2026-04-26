@@ -1611,6 +1611,12 @@ fn drop_read_tick(
             };
             if !cmdline.is_empty() {
                 let wrapped = bracketed_paste_wrap(&cmdline, bracketed);
+                // T-0618: DnD drop 是用户主动操作 → 跳底.
+                data.state
+                    .tabs_unchecked_mut()
+                    .active_mut()
+                    .term_mut()
+                    .reset_display();
                 let pty = data.state.tabs_unchecked().active().pty();
                 match pty.write(&wrapped) {
                     Ok(n) if n == wrapped.len() => {
@@ -1936,6 +1942,12 @@ fn paste_read_tick(
             };
             let text_str = String::from_utf8_lossy(&buf).to_string();
             let wrapped = bracketed_paste_wrap(&text_str, bracketed);
+            // T-0618: paste 是用户主动操作 → 跳底 (跟 write_keyboard_bytes 一致).
+            data.state
+                .tabs_unchecked_mut()
+                .active_mut()
+                .term_mut()
+                .reset_display();
             // T-0608: 写 active tab 的 PTY (paste 跟 keyboard focus 一致).
             {
                 let pty = data.state.tabs_unchecked().active().pty();
