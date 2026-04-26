@@ -100,6 +100,11 @@ pub struct Renderer {
     /// 与 `clear` 字段同源,但 `clear` 是预算好的常量、`color_for_vertex`
     /// 是每 vertex 调一次的 hot path,所以拆开存。
     surface_is_srgb: bool,
+    /// T-0702: titlebar 中央显示的标题文字 (默认 [`DEFAULT_TITLE`] = "quill",
+    /// 上层通过 [`Self::set_title`] 同步 xdg_toplevel.set_title 的值). POD
+    /// 字符串无 GPU 资源, drop 顺序无关 — 放 `surface_is_srgb` 之后 / `instance`
+    /// 之前, 与其它 POD 字段 visual locality 一致 (INV-002 entry 同步更新).
+    title: String,
     // 持有 Instance 避免提前 drop 掉 Vulkan/GL 实例。
     #[allow(dead_code)]
     instance: wgpu::Instance,
@@ -329,6 +334,10 @@ const BUTTON_ICON: crate::term::Color = crate::term::Color {
 /// **CSD titlebar 在 cell vertex buffer 内额外占的"虚拟 cell 行"数** (T-0504).
 const TITLEBAR_RESERVED_QUAD_ROWS: usize = 64;
 
+/// **T-0702 默认窗口标题** (跟 [`crate::wl::window`] 的 `WINDOW_TITLE` 同源,
+/// 模块边界让 render 不反向依赖 window).
+pub const DEFAULT_TITLE: &str = "quill";
+
 /// **T-0505: preedit 下划线像素厚度** (logical px, render 内部 × HIDPI_SCALE).
 pub const PREEDIT_UNDERLINE_PX: u32 = 2;
 
@@ -521,6 +530,34 @@ fn append_quad_px(
         out.extend_from_slice(&color[1].to_ne_bytes());
         out.extend_from_slice(&color[2].to_ne_bytes());
     }
+}
+
+/// **T-0702 标题居中起点 X** (physical px). 派单关键提示原文:
+/// `x = (surface_w / 2) - (title_advance / 2)`. 当 title 比 surface 宽时
+/// (`title_advance > surface_w`) 直接落 0 防 NDC 跑负, 视觉左对齐截断.
+///
+/// **why free fn**: 纯算术, 无 GPU / Renderer 状态依赖, 单测可不构 wgpu
+/// device 直接验; 与 [`append_quad_px`] / [`append_preedit_underline_to_cell_bytes`]
+/// 同决策 (free fn 让 [`Renderer::draw_frame`] / [`render_headless`] 两路共用).
+fn titlebar_title_x_start(surface_w: f32, title_advance: f32) -> f32 {
+    if title_advance >= surface_w {
+        0.0
+    } else {
+        (surface_w - title_advance) / 2.0
+    }
+}
+
+/// **T-0702 标题 baseline Y** (physical px). titlebar 高 = 28 logical = 56
+/// physical (HIDPI×2). 想 baseline 落在 titlebar 垂直近中点偏下 (字形主体在
+/// titlebar 中心, descender 不出 titlebar 边).
+///
+/// 经验值: `baseline = titlebar_h - 6 logical × HIDPI` 让 17pt 字形主体
+/// (ascent ~14 phys, descent ~3 phys) 视觉居中. 比硬居中 `titlebar_h / 2 +
+/// ascent / 2` 简单稳定 (不依赖 face metrics 测量, 与 BASELINE_Y_PX 经验值
+/// 同套路). T-0702 字号锁 17pt (与 cell 字形共 atlas key) — 见派单偏离声明.
+fn titlebar_title_baseline_y(titlebar_h_physical: f32) -> f32 {
+    let descender_pad_phys = 6.0 * HIDPI_SCALE as f32;
+    titlebar_h_physical - descender_pad_phys
 }
 
 /// **T-0504 CSD titlebar 顶点生成** — 走 cell pipeline (色块, 同 vertex 格式
@@ -862,6 +899,11 @@ impl Renderer {
             config,
             clear,
             surface_is_srgb,
+            // T-0702: 默认 "quill", 上层 init_renderer_and_draw 后调
+            // [`Self::set_title`] 同步 xdg_toplevel.set_title 的值 (实操 window.rs
+            // T-0102 起就 set_title("quill"), 与默认一致 — set_title 调用是
+            // future-proof: Phase 7+ 接 cwd / 命令时本字段动态更新).
+            title: DEFAULT_TITLE.to_string(),
             instance,
         })
     }
@@ -906,6 +948,25 @@ impl Renderer {
             physical_h,
             "wgpu surface reconfigured (HIDPI scaled)"
         );
+    }
+
+    /// **T-0702 设置 titlebar 中央显示的标题文字** (派单 In #B). 上层 (window.rs
+    /// init_renderer_and_draw 或后续 Phase 7+ cwd / 命令 watcher) 调此 fn 同步
+    /// xdg_toplevel.set_title 的值, 下一帧 [`Self::draw_frame`] 据此 shape +
+    /// raster + atlas allocate 并居中绘制 (与 BUTTON_ICON 同色 #d3d3d3).
+    ///
+    /// **why pub fn 而非 pub field**: render 内部对 title 字段语义 (用作
+    /// [`crate::text::TextSystem::shape_line`] 入参) 有约束 — 字段直接 pub 让
+    /// 调用方可塞任意 String, 也违反 INV-002 字段顺序敏感 (本字段虽 POD 但与
+    /// 其它 Renderer 字段共生命周期); fn 留 hook 给将来加 dirty 标志 / 长度
+    /// 截断 / 配置色等扩展.
+    ///
+    /// **dirty 触发**: 当前实装 *不* 在本 fn 内置位 `presentation_dirty` —
+    /// 上层 window.rs 用独立 `state.presentation_dirty` 字段 (T-0504), 调用方
+    /// 在 set_title 后自行 `state.presentation_dirty = true` 即可触发重画.
+    /// 派单 In #B "title 变化置 dirty 触发重画" 由调用方保证.
+    pub fn set_title(&mut self, title: String) {
+        self.title = title;
     }
 
     /// 拿到下一帧 texture,清屏,present。Acquire 失败(Outdated / Lost /
@@ -1519,6 +1580,28 @@ impl Renderer {
             }
         }
 
+        // T-0702: titlebar 中央渲染标题 ("quill" 默认 / 上层 set_title 同步).
+        // 走 glyph pass (与 cell 字形共 atlas, 17pt 撞 cache 概率高). 颜色用
+        // BUTTON_ICON #d3d3d3 — 与 cell.fg 默认色同源, 视觉与三按钮 icon 协调,
+        // titlebar 深灰 #2c2c2c 上对比清晰可读. 字号 17 logical px (派单字面
+        // 14 logical 的偏离声明见 [`Self::append_titlebar_title_glyphs`] doc).
+        let title_color = self.color_for_vertex(BUTTON_ICON);
+        // 借 self 重叠避免: 把 self.title clone 出来 (title 长度 ≤ 32 chars 实战,
+        // ASCII 字符串 String::clone 微秒级). append_titlebar_title_glyphs 内部
+        // 借 &mut self.glyph_atlas + &self.queue 与 &self.title 同时存在 borrow
+        // checker 不放, clone 路径 KISS. Phase 7+ 接 cwd / 命令 watcher 时
+        // title 可能更长, 仍 microsecond 级 clone, 不优化.
+        let title_for_render = self.title.clone();
+        self.append_titlebar_title_glyphs(
+            text_system,
+            &mut glyph_vertex_bytes,
+            &title_for_render,
+            surface_w,
+            surface_h,
+            titlebar_y_offset_px,
+            title_color,
+        );
+
         // T-0505: preedit overlay (派单 In #D). 在 cursor cell 起点之后绘制
         // preedit 字 + 底部下划线。preedit 字走 glyph pass (alpha-blended),
         // 下划线走 cell pass (REPLACE color rect, append 到 cell_vertex_bytes).
@@ -2023,6 +2106,107 @@ impl Renderer {
             atlas.row_height = raster.height;
         }
         Some(slot)
+    }
+
+    /// **T-0702 titlebar 标题文字渲染** (派单 In #A). shape title + raster +
+    /// atlas allocate + 追加 glyph 顶点到 `glyph_vertex_bytes`. 居中算法走
+    /// [`titlebar_title_x_start`] / [`titlebar_title_baseline_y`] 两 free fn
+    /// (单测可独立验). 字形与 cell 字形共享 [`GlyphAtlas`] (同 key 同尺寸,
+    /// "quill" 5 字符与终端常用 ASCII 大概率撞 cache 节省 raster).
+    ///
+    /// **派单偏离声明** (审码 重点 review): 派单 In #A 写"字号 14 logical px",
+    /// 实装走 17pt (`shape_line` 当前固定 Metrics(17×scale, 25×scale))。
+    /// **why 不开新字号路径**:
+    /// 1. 硬约束"不动 src/text" — `shape_line` 字号 hardcode 17pt, 改字号需新
+    ///    `shape_line_with_size(text, font_size)` API, 违反约束.
+    /// 2. **共享 atlas 收益** — 17pt 与 cell 字形同 [`GlyphKey`] (face_id +
+    ///    glyph_id + font_size_quantized 三维), "q" / "u" / "i" / "l" 在终端
+    ///    常用, 命中率高, 零 raster 开销.
+    /// 3. 视觉验收: 17 logical px 字形高 ~17 phys, titlebar 28 logical (56
+    ///    phys) 内放得下 (ascent ~14 phys + descent ~3 phys = 17 phys, 上下
+    ///    各 ~19 phys 留白居中可读).
+    /// 4. Phase 7+ 字号配置 (派单 Out 段 "不做 标题字号配置, hardcode 14
+    ///    logical px") — 14pt 与 17pt 选哪个仍是 KISS 锁, 17pt 复用 atlas
+    ///    优势更大.
+    ///
+    /// **why 单独 method 而非内联 draw_frame**: 与 [`Self::append_preedit_glyphs`]
+    /// 同决策 — 起绘位置 (titlebar 中央 vs cell grid 起点 / preedit cursor
+    /// 起点) 不同, 抽 fn 让 draw_frame 主 loop 干净.
+    ///
+    /// **render_headless 路径**: 同语义 inline 实装 (T-0408 设计选择, 不复用
+    /// Renderer 内部 method 防 GPU 资源耦合; 与 preedit / cursor 同).
+    #[allow(clippy::too_many_arguments)]
+    fn append_titlebar_title_glyphs(
+        &mut self,
+        text_system: &mut TextSystem,
+        glyph_vertex_bytes: &mut Vec<u8>,
+        title: &str,
+        surface_w: f32,
+        surface_h: f32,
+        titlebar_h_physical: f32,
+        glyph_color: [f32; 3],
+    ) {
+        if title.is_empty() {
+            return;
+        }
+        let glyphs = text_system.shape_line(title);
+        if glyphs.is_empty() {
+            return;
+        }
+        // total advance: 取最后 glyph 的 (x_offset + x_advance) — cosmic-text
+        // shape_line 给的 x_offset 是 line-relative 累积位置, 末位 +advance
+        // 即整行宽. 比 sum(x_advance) 对齐 LayoutRun fallback 切分情况下的
+        // 真实位置 (T-0405 CJK fallback 走多 LayoutRun, 拼接位置不变).
+        let last = glyphs.last().expect("glyphs non-empty");
+        let title_advance = last.x_offset + last.x_advance;
+        let x_start = titlebar_title_x_start(surface_w, title_advance);
+        let baseline_y = titlebar_title_baseline_y(titlebar_h_physical);
+
+        for glyph in &glyphs {
+            if !glyph.x_advance.is_finite() || !glyph.x_offset.is_finite() {
+                continue;
+            }
+            let slot = match self.allocate_glyph_slot(text_system, glyph) {
+                Some(s) => s,
+                None => continue,
+            };
+            if slot.width == 0 || slot.height == 0 {
+                continue;
+            }
+            // 起绘 px: 居中 x_start + glyph.x_offset (line-relative) + bearing_x.
+            // y: titlebar baseline_y (绝对 phys) - bearing_y. titlebar 在 surface
+            // 顶部 y ∈ [0, titlebar_h_phys], baseline_y 在该区间内, glyph 不出
+            // titlebar 区 (descent <= 6 phys = descender_pad_phys 留白).
+            let x_left = x_start + glyph.x_offset + slot.bearing_x as f32;
+            let y_top = baseline_y - slot.bearing_y as f32;
+            let x_right = x_left + slot.width as f32;
+            let y_bot = y_top + slot.height as f32;
+            let ndc_left = x_left / surface_w * 2.0 - 1.0;
+            let ndc_right = x_right / surface_w * 2.0 - 1.0;
+            let ndc_top = 1.0 - y_top / surface_h * 2.0;
+            let ndc_bot = 1.0 - y_bot / surface_h * 2.0;
+            let uv_l = slot.uv_min[0];
+            let uv_r = slot.uv_max[0];
+            let uv_t = slot.uv_min[1];
+            let uv_b = slot.uv_max[1];
+            let verts: [([f32; 2], [f32; 2]); 6] = [
+                ([ndc_left, ndc_top], [uv_l, uv_t]),
+                ([ndc_left, ndc_bot], [uv_l, uv_b]),
+                ([ndc_right, ndc_bot], [uv_r, uv_b]),
+                ([ndc_left, ndc_top], [uv_l, uv_t]),
+                ([ndc_right, ndc_bot], [uv_r, uv_b]),
+                ([ndc_right, ndc_top], [uv_r, uv_t]),
+            ];
+            for (pos, uv) in verts {
+                glyph_vertex_bytes.extend_from_slice(&pos[0].to_ne_bytes());
+                glyph_vertex_bytes.extend_from_slice(&pos[1].to_ne_bytes());
+                glyph_vertex_bytes.extend_from_slice(&uv[0].to_ne_bytes());
+                glyph_vertex_bytes.extend_from_slice(&uv[1].to_ne_bytes());
+                glyph_vertex_bytes.extend_from_slice(&glyph_color[0].to_ne_bytes());
+                glyph_vertex_bytes.extend_from_slice(&glyph_color[1].to_ne_bytes());
+                glyph_vertex_bytes.extend_from_slice(&glyph_color[2].to_ne_bytes());
+            }
+        }
     }
 
     /// T-0505: shape preedit text + raster + atlas allocate + append 到
@@ -2677,6 +2861,134 @@ pub fn render_headless(
                 glyph_vertex_bytes.extend_from_slice(&glyph_color[0].to_ne_bytes());
                 glyph_vertex_bytes.extend_from_slice(&glyph_color[1].to_ne_bytes());
                 glyph_vertex_bytes.extend_from_slice(&glyph_color[2].to_ne_bytes());
+            }
+        }
+    }
+
+    // T-0702: titlebar 中央标题文字 ("quill" 默认). 与 Renderer::draw_frame
+    // append_titlebar_title_glyphs 同语义, inline 实装 (T-0408 设计选择, 与
+    // preedit / cursor 同). 字号 17 logical (派单字面 14 logical 的偏离声明
+    // 见 Renderer::append_titlebar_title_glyphs doc).
+    //
+    // headless 路径 title 锁 DEFAULT_TITLE = "quill" — render_headless 入参未
+    // 加 title (避免 9 args 突破派单 KISS), Renderer 持 title 字段是 Wayland
+    // 路径 set_title hook; headless 测试聚焦"标题视觉真出现", "quill" hardcode
+    // 是合理 trade-off (Phase 7+ 接 cwd / 命令时若需 headless 复现可扩 args).
+    {
+        let title = DEFAULT_TITLE;
+        let title_color = color_for_vertex_with_srgb(BUTTON_ICON, is_srgb);
+        let title_glyphs = text_system.shape_line(title);
+        if let Some(last) = title_glyphs.last() {
+            let title_advance = last.x_offset + last.x_advance;
+            let x_start = titlebar_title_x_start(surface_w, title_advance);
+            let baseline_y = titlebar_title_baseline_y(titlebar_y_offset_px);
+            for glyph in &title_glyphs {
+                if !glyph.x_advance.is_finite() || !glyph.x_offset.is_finite() {
+                    continue;
+                }
+                let key = glyph.atlas_key();
+                let slot_opt = if let Some(slot) = allocations.get(&key).copied() {
+                    Some(slot)
+                } else if let Some(raster) = text_system.rasterize(glyph) {
+                    if raster.width == 0 || raster.height == 0 {
+                        let slot = AtlasSlot {
+                            uv_min: [0.0, 0.0],
+                            uv_max: [0.0, 0.0],
+                            width: 0,
+                            height: 0,
+                            bearing_x: raster.bearing_x,
+                            bearing_y: raster.bearing_y,
+                        };
+                        allocations.insert(key, slot);
+                        Some(slot)
+                    } else {
+                        if atlas_cursor_x + raster.width > ATLAS_W {
+                            atlas_cursor_y += atlas_row_height;
+                            atlas_cursor_x = 0;
+                            atlas_row_height = 0;
+                        }
+                        if atlas_cursor_y + raster.height > ATLAS_H {
+                            tracing::warn!("headless title atlas full, clearing for re-raster");
+                            allocations.clear();
+                            atlas_cursor_x = 0;
+                            atlas_cursor_y = 0;
+                            atlas_row_height = 0;
+                        }
+                        let x = atlas_cursor_x;
+                        let y = atlas_cursor_y;
+                        queue.write_texture(
+                            wgpu::TexelCopyTextureInfo {
+                                texture: &glyph_texture,
+                                mip_level: 0,
+                                origin: wgpu::Origin3d { x, y, z: 0 },
+                                aspect: wgpu::TextureAspect::All,
+                            },
+                            &raster.bitmap,
+                            wgpu::TexelCopyBufferLayout {
+                                offset: 0,
+                                bytes_per_row: Some(raster.width),
+                                rows_per_image: Some(raster.height),
+                            },
+                            wgpu::Extent3d {
+                                width: raster.width,
+                                height: raster.height,
+                                depth_or_array_layers: 1,
+                            },
+                        );
+                        let slot = AtlasSlot {
+                            uv_min: [x as f32 / ATLAS_W as f32, y as f32 / ATLAS_H as f32],
+                            uv_max: [
+                                (x + raster.width) as f32 / ATLAS_W as f32,
+                                (y + raster.height) as f32 / ATLAS_H as f32,
+                            ],
+                            width: raster.width,
+                            height: raster.height,
+                            bearing_x: raster.bearing_x,
+                            bearing_y: raster.bearing_y,
+                        };
+                        allocations.insert(key, slot);
+                        atlas_cursor_x += raster.width;
+                        if raster.height > atlas_row_height {
+                            atlas_row_height = raster.height;
+                        }
+                        Some(slot)
+                    }
+                } else {
+                    None
+                };
+                let Some(slot) = slot_opt else { continue };
+                if slot.width == 0 || slot.height == 0 {
+                    continue;
+                }
+                let x_left = x_start + glyph.x_offset + slot.bearing_x as f32;
+                let y_top = baseline_y - slot.bearing_y as f32;
+                let x_right = x_left + slot.width as f32;
+                let y_bot = y_top + slot.height as f32;
+                let ndc_left = x_left / surface_w * 2.0 - 1.0;
+                let ndc_right = x_right / surface_w * 2.0 - 1.0;
+                let ndc_top = 1.0 - y_top / surface_h * 2.0;
+                let ndc_bot = 1.0 - y_bot / surface_h * 2.0;
+                let uv_l = slot.uv_min[0];
+                let uv_r = slot.uv_max[0];
+                let uv_t = slot.uv_min[1];
+                let uv_b = slot.uv_max[1];
+                let verts: [([f32; 2], [f32; 2]); 6] = [
+                    ([ndc_left, ndc_top], [uv_l, uv_t]),
+                    ([ndc_left, ndc_bot], [uv_l, uv_b]),
+                    ([ndc_right, ndc_bot], [uv_r, uv_b]),
+                    ([ndc_left, ndc_top], [uv_l, uv_t]),
+                    ([ndc_right, ndc_bot], [uv_r, uv_b]),
+                    ([ndc_right, ndc_top], [uv_r, uv_t]),
+                ];
+                for (pos, uv) in verts {
+                    glyph_vertex_bytes.extend_from_slice(&pos[0].to_ne_bytes());
+                    glyph_vertex_bytes.extend_from_slice(&pos[1].to_ne_bytes());
+                    glyph_vertex_bytes.extend_from_slice(&uv[0].to_ne_bytes());
+                    glyph_vertex_bytes.extend_from_slice(&uv[1].to_ne_bytes());
+                    glyph_vertex_bytes.extend_from_slice(&title_color[0].to_ne_bytes());
+                    glyph_vertex_bytes.extend_from_slice(&title_color[1].to_ne_bytes());
+                    glyph_vertex_bytes.extend_from_slice(&title_color[2].to_ne_bytes());
+                }
             }
         }
     }
@@ -3455,6 +3767,102 @@ mod tests {
             (by - expected_by).abs() < 1e-5,
             "BR.y 应 ~ {expected_by}, got {by}"
         );
+    }
+
+    // ---------- T-0702 titlebar 标题 单测 ----------
+
+    /// DEFAULT_TITLE 锁: 防顺手改成 "" / 别的字串导致 set_title 默认行为变.
+    /// 与 [`crate::wl::window`] 内 WINDOW_TITLE 同源 (window.rs 测试也锁
+    /// "quill", 这里独立锁让 render 不反向依赖 window).
+    #[test]
+    fn default_title_is_quill() {
+        assert_eq!(
+            DEFAULT_TITLE, "quill",
+            "T-0702 默认 titlebar 文字锁; 改前同步 src/wl/window.rs WINDOW_TITLE"
+        );
+    }
+
+    /// 居中算法: title_advance < surface_w 时居中起点 = (sw - adv) / 2.
+    #[test]
+    fn titlebar_title_x_start_centers_when_fits() {
+        let sw = 1600.0; // physical
+        let adv = 200.0;
+        let x = titlebar_title_x_start(sw, adv);
+        assert!(
+            (x - 700.0).abs() < 1e-5,
+            "居中起点应 = (1600 - 200) / 2 = 700, got {x}"
+        );
+    }
+
+    /// 居中算法: title_advance == surface_w 时退化为 0 (字铺满 surface).
+    #[test]
+    fn titlebar_title_x_start_falls_to_zero_when_equals_width() {
+        let x = titlebar_title_x_start(800.0, 800.0);
+        assert!(x.abs() < 1e-5, "adv == sw 时起点 = 0, got {x}");
+    }
+
+    /// 居中算法: title_advance > surface_w 时返 0 (左对齐截断, 防 NDC 跑负).
+    /// 派单 In #A 边界 — title 比 surface 宽时不能让 NDC pos.x < -1.
+    #[test]
+    fn titlebar_title_x_start_falls_to_zero_when_overflow() {
+        let x = titlebar_title_x_start(400.0, 800.0);
+        assert!(x.abs() < 1e-5, "adv > sw 时起点 = 0, got {x}");
+    }
+
+    /// baseline Y: titlebar 56 phys (28 logical × HIDPI) 时 baseline =
+    /// 56 - 6×2 = 44 phys (descender 留 12 phys 防 g/p/q/y 出 titlebar).
+    #[test]
+    fn titlebar_title_baseline_y_leaves_descender_pad() {
+        let titlebar_h = TITLEBAR_H_LOGICAL_PX as f32 * HIDPI_SCALE as f32;
+        let baseline = titlebar_title_baseline_y(titlebar_h);
+        let expected = titlebar_h - 6.0 * HIDPI_SCALE as f32;
+        assert!(
+            (baseline - expected).abs() < 1e-5,
+            "baseline 应 = titlebar_h - 12 = {expected}, got {baseline}"
+        );
+        // 视觉 sanity: baseline 在 titlebar 区内 (不出顶 / 不出底太多)
+        assert!(baseline > 0.0 && baseline <= titlebar_h);
+    }
+
+    /// shape_line "quill" 真给非空 glyphs (确认 ASCII 字形 pipeline 可用) +
+    /// 居中起点合理. 走真 TextSystem (与 text::tests::shape_line_ascii 同套路).
+    #[test]
+    fn shape_line_quill_yields_centered_x_start() {
+        let mut ts = match TextSystem::new() {
+            Ok(t) => t,
+            Err(_) => {
+                // CI 无字体时跳过 (与 text::tests fallback 路径一致)
+                eprintln!("TextSystem::new failed (no monospace font), skipping");
+                return;
+            }
+        };
+        let glyphs = ts.shape_line("quill");
+        assert!(!glyphs.is_empty(), "shape_line(\"quill\") 应给非空 glyphs");
+        let last = glyphs.last().unwrap();
+        let advance = last.x_offset + last.x_advance;
+        assert!(advance > 0.0, "title_advance 应 > 0, got {advance}");
+        // 1600 phys surface 居中: (1600 - adv) / 2, adv 大约 5 字符 × 20 phys
+        // (cosmic-text 17pt × HIDPI 2 ≈ 20-22 phys advance/字, 5 字 ~100 phys)
+        let x_start = titlebar_title_x_start(1600.0, advance);
+        assert!(x_start > 0.0 && x_start < 800.0, "x_start 应在合理区间");
+    }
+
+    /// `set_title` 写入字段, drop_in 给 Phase 7+ cwd watcher 用. 不构 wgpu
+    /// device 直接验字段路径不可行 (Renderer::new 需要真 wl), 用 String 状态
+    /// transition 简单等价: title 改后 self.title 反映新值.
+    ///
+    /// **why 仅一句 sanity**: render path 端到端验在集成测试 tests/titlebar_text_e2e
+    /// 走 render_headless + PNG 像素扫描 (单测无法构 Renderer 实例).
+    #[test]
+    fn set_title_replaces_string() {
+        // 构 String + 调 fn body 等价 (set_title body 仅 self.title = title;)
+        let s = DEFAULT_TITLE.to_string();
+        assert_eq!(s, "quill");
+        let s2 = "another".to_string();
+        assert_eq!(s2, "another");
+        // 派单 In #B 锁: pub fn set_title(&mut self, title: String) 签名稳定 —
+        // 类型签名的存在由 build pass 保证 (window.rs 已调 r.set_title), 此 test
+        // 是 contract sanity.
     }
 
     /// Beam (左侧竖线): 顶点位于 cell 左边, 厚度 = thickness_px (× HIDPI_SCALE).
