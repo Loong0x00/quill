@@ -2,7 +2,7 @@
 
 **Phase**: 7
 **Assigned**: writer-T0702
-**Status**: in-review
+**Status**: merged
 **Budget**: tokenBudget=80k (单文件 src/wl/render.rs titlebar pipeline 加字形)
 **Dependencies**: T-0504 (titlebar 渲染) / T-0405 (字形 atlas / shape_line)
 **Priority**: P1 (CSD 完整性 — 正常窗口 titlebar 显示标题, quill 当前空白灰条)
