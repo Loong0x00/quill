@@ -128,24 +128,42 @@ Lead 决定:**T-0104 + Phase 2 PTY 并行推进**。理由:
 
 ---
 
-## Phase 6 — 打磨 + daily drive ✅ 三并行合 + polish 进行中 (2026-04-26)
+## Phase 6 — 打磨 + daily drive ✅ 4/4 全合 (2026-04-26)
 
 **已合**:
 - T-0601 cursor render (block / underline / beam / hollow 4 形, P0) ✅
 - T-0602 scrollback (滚轮 + PageUp/PageDown + Term::scroll_display, P1) ✅
 - T-0603 keyboard repeat (calloop Timer + 长按重发, P1) ✅
-- auditor-codebase 整体审码 A 级 pass (INV-001..010 跨 ticket 真守 + 0 unwrap/expect + 0 TODO/FIXME) ✅
+- T-0604 cell.bg default skip + CJK spacer + cursor inset (修每字黑底 / CJK 黑空隙 / cursor 盖字) ✅
+- auditor-codebase 整体审码 A 级 pass ✅
 
-**polish 中**:
-- T-0604 cell.bg default skip + CJK spacer + cursor inset (修视觉 bug: 每字黑底 / CJK 黑空隙 / cursor 盖字) 派单中
-
-**待派**:
+**待派 (Phase 6+ 后续)**:
 - T-0605 内存泄漏 soak 1h (RSS 漂移 < 10%)
 - T-0606 配置文件 (TOML, font-size / color / scrollback 上限)
 - T-0607 复制粘贴 (wl_data_device, Ctrl+Shift+C/V)
 - T-0608 键位绑定基础
 
-**里程碑**:`exec quill` 进 login shell, Claude Code 8h 不闪退。
+---
+
+## Phase 7 — CSD 完整化 ✅ 3/3 全合 (2026-04-26)
+
+User 实测 T-0504 CSD 最小 (titlebar + 3 按钮 + drag move), 缺 resize / 标题 / cursor 形状. Phase 7 三并行修齐:
+
+- T-0701 窗口 4 边 + 4 角 resize (xdg_toplevel.resize + ResizeEdge enum + INV-010 模范实施) ✅
+- T-0702 titlebar 中央 "quill" 标题文字渲染 (INV-002 字段 14 → 15) ✅
+- T-0703 mouse cursor 形状 wp_cursor_shape_v1 (titlebar default / textarea I-beam / 4 方向 resize 箭头, ADR 0008) ✅
+
+**里程碑达成**: quill 跟主流 GNOME / KDE / VS Code 窗口体验对齐.
+
+---
+
+## Phase 8 — polish++ (terminal correctness + daily-drive feel, 2026-04-26)
+
+**polish 中** (双并行):
+- T-0801 CJK 字形 forced 双宽 advance (修字间空隙, cosmic-text 自然 1.67× → 严 2× 居中)
+- T-0802 resize 节流 + wgpu present_mode Mailbox (修拖窗口卡顿延迟)
+
+**里程碑**:`exec quill` 进 login shell, Claude Code 8h 不闪退.
 
 ---
 
@@ -202,5 +220,7 @@ Lead 决定:**T-0104 + Phase 2 PTY 并行推进**。理由:
 - 2026-04-25 **T-0406 merged → 🎉 Phase 4 8/8 收尾完成**: glyph atlas clear-on-full (KISS, 替代 T-0403 panic 遗留路径). 改 src/wl/render.rs::allocate_glyph_slot + render_headless 双源同改 (writer 主动告知偏离 #1 跨函数同改, reviewer accept), atlas 满 → tracing::warn! + 清 allocations + reset shelf cursor (cursor_x/cursor_y/row_height) → fall through shelf packing 当帧重 raster (1 帧 hiccup, 用户基本看不见). **不真 LRU**: ROADMAP "T-0406 LRU" 命名沿用历史, 真 LRU 需 slab + 单槽位驱逐 + free-list 跟当前 shelf packing 不兼容; clear-on-full KISS 等价 (终端字符集稳定). 零 GPU resource churn (texture/bind_group/view/sampler 全保留). 3 文件 +259/-24 (含集成测试 atlas_clear_on_full.rs 2 测试: full → clear no panic + clear 后视觉像素 ≥300). 124 tests (+2). 三源 PNG verify atlas baseline /tmp/T-0406-baseline.png 一致 (cell 90 / glyph 90 / atlas 12 与 T-0405/0407/0408 同源). INV-010 第 12 次零真违规. **Phase 4 全收尾**: T-0401-0408 (8/8) 全合, ASCII prompt 真显示 + HiDPI 2x + headless screenshot + CJK fallback verify + atlas full-safe 全到位. 下阶段 Phase 5 fcitx5 输入法
 - 2026-04-25 **Phase 5 全收尾 (T-0501/0502/0503/0410/0504/0505)**: 5 ticket + 1 hotfix 跨 wl_keyboard / set_buffer_scale / xdg-decoration / PtyHandle::write libc::write fix / CSD 自画 titlebar+wl_pointer / fcitx5 text-input-v3. 跨 ticket 三并行 + 二并行 (T-0501/0502/0503 同时跑 + T-0504/0505 同时跑) git auto merge 多次冲突 Lead 手解 (window.rs imports / WindowCore 字段 / draw_frame 签名 / impl Dispatch trait 多源加 variant). T-0410 hotfix v2 真因深挖: portable-pty take_writer 每次 dup+drop fd 跟 calloop epoll 注册 fd 冲突 (假说), 改 libc::write to raw_fd 直修 — 避开抽象. user 实测 sudo pacman -Syu 全完成. fcitx5-rime 中文输入路径打通 (preedit 下划线 + commit + cursor_rectangle 上报). GNOME mutter 政策性不支持 SSD → CSD 自画 (T-0504, ~600 行 pointer.rs + render titlebar pipeline + hit-test). 199 tests (+50 from Phase 4 124 baseline)
 - 2026-04-26 **Phase 6 三并行合 (T-0601/0602/0603) + auditor-codebase A 级 pass**: T-0601 cursor render (block/underline/beam/hollow 4 形, P0) + T-0602 scrollback (滚轮 24px 阈值 + PageUp/Down 半屏 + Term::scroll_display + display_text 替代 line_text + advance auto-reset, P1) + T-0603 keyboard repeat (calloop Timer + KeyboardState 状态机 + modifier 变化 cancel + apply_repeat_request 单一消费者跟 propagate_resize_if_dirty INV-006 同套路, P1). 三并行真 git merge 冲突 (src/wl/window.rs WindowCore 字段 + src/wl/keyboard.rs KeyboardAction 多 variant + src/wl/render.rs draw_frame 签名), Lead 手解保留所有 variant. 257 tests (+58 from Phase 5 199). auditor-codebase 落 docs/audit/2026-04-26-codebase-overview-review.md (496 行) **A 级 pass**: INV-001..010 跨 ticket grep 真验全守 / 0 unwrap/expect 生产代码 / 0 TODO/FIXME / 13 unsafe 全 SAFETY: / ADR 0001-0007 一致 / 17 直接 dep 211 transitive 全锁 — agent 评 "代码质量在项目范围内优于行业平均, 主要功劳是 conventions §3 抽决策状态机模式 (4 模块) + INV-010 类型隔离 12+ 次 + per-ticket fresh agent + 结构化 docs handoff orchestration 物理化"
-- 2026-04-26 **T-0604 派单中 (cell.bg default skip + CJK spacer + cursor inset)**: User 实测三视觉 bug 同源 (每字黑底 / CJK 字间黑空隙 / cursor 盖最后字), 真因不是协议问题 — alacritty default cell.bg=黑 #000000, T-0407 D fix 让 draw_frame 走 cell.bg 默认 cell 都画黑覆盖 #0a1030 清屏色. cursor.col 数据正确 (Lead 加 trace 验证 'a' 后 col=18 = prompt 17 + 1, vt100 标准), 但字形 advance > CELL_W_PX 像素溢出, cursor 在下一 cell 的左边缘覆盖溢出像素 → 视觉像盖字. 修 build_vertex_bytes 对 DEFAULT_BG 跳过 vertex (alacritty/xterm/foot 标准做法) + cursor cell inset 1 logical px
+- 2026-04-26 **T-0604 merged (cell.bg default skip + CJK spacer + cursor inset)**: 三视觉 bug 同源修. cursor.col 数据正确 (Lead trace 验证), 真因 cell 几何不是协议. build_vertex_bytes 对 DEFAULT_BG 跳过 vertex (alacritty/xterm/foot 标准) + cursor cell inset 1 logical px. 4 文件 +431, 265 tests (+8). INV-010 第 13 次. 三源 PNG verify 整片深蓝清屏, prompt 字形直接画在清屏色上无每字黑底
+- 2026-04-26 **🎉 Phase 7 CSD 完整化 3/3 (T-0701/0702/0703)**: User 实测 T-0504 CSD 缺 resize / 标题 / cursor 形状. 三并行修齐. T-0701 4 边 + 4 角 resize (xdg_toplevel.resize + ResizeEdge enum + INV-010 模范实施 wayland enum 单一翻译边界 quill_edge_to_wayland) + T-0702 titlebar 中央 "quill" 字形 (INV-002 字段 14→15, Renderer 加 title: String) + T-0703 wp_cursor_shape_v1 (CursorShape enum + cursor_shape_for + 4 方向 resize cursor + apply_enter serial, ADR 0008 wayland-protocols staging feature 不引新 crate). 三并行 git merge 冲突 (window.rs imports + pointer.rs cursor_shape_for ResizeEdge 分支 + apply_enter signature), Lead 手解 + Lead 合并时手加 cursor_shape_for ResizeEdge mapping (T-0703 派单选项 B). 298 tests (+33 from T-0604). quill 跟主流 GNOME / KDE / VS Code 窗口体验对齐
+- 2026-04-26 **T-0801/0802 派单中 (Phase 8 polish++ 双并行)**: T-0801 CJK 字形 forced 双宽 advance 修字间空隙 (cosmic-text 自然 1.67× → 严 2 × CELL_W_PX 居中, 跟 alacritty / kitty 主流终端 monospace 协议) + T-0802 resize 节流 + wgpu present_mode Mailbox 修拖窗口卡顿 (compositor 高频 configure → wgpu Surface::configure 重建 SwapChain ~10ms 累积 lag, 加 60ms 节流 + Mailbox 减 vsync 阻塞 + 同尺寸跳过). 双并行不同模块 (T-0801 src/text + render glyph, T-0802 src/wl/render present_mode + window resize)
 - (后续每个阶段起止在这追加)
