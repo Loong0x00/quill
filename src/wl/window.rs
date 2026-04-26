@@ -3670,13 +3670,21 @@ impl Dispatch<WlDataDevice, ()> for State {
                 );
             }
             wl_data_device::Event::Leave => {
-                // 协议: 拖出 surface (未 drop). 清 offer + 已 accept 的 mime.
-                if let Some(offer) = state.dnd_current_offer.take() {
-                    offer.destroy();
+                // 协议: Leave 通知拖出 surface. **但 Drop event 之后也立即跟一个
+                // Leave** (drag session 结束), 此时 pending_drop=true, 我们仍要
+                // 异步 receive 走 apply_drop_request, 不能清 offer / accepted_mime.
+                // T-0611 hotfix v2: 检 pending_drop, 正在 drop 时跳过清理, 留给
+                // drop_read_tick EOF 路径 take + finish + destroy.
+                if state.pending_drop {
+                    tracing::debug!(target: "quill::pointer", "DnD leave (during drop, 不清状态留给 apply_drop_request)");
+                } else {
+                    if let Some(offer) = state.dnd_current_offer.take() {
+                        offer.destroy();
+                    }
+                    state.dnd_current_offer_mimes.clear();
+                    state.dnd_accepted_mime = None;
+                    tracing::debug!(target: "quill::pointer", "DnD leave (cancel, 拖出未 drop)");
                 }
-                state.dnd_current_offer_mimes.clear();
-                state.dnd_accepted_mime = None;
-                tracing::debug!(target: "quill::pointer", "DnD leave");
             }
             _ => {}
         }

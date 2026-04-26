@@ -653,11 +653,24 @@ fn scroll_keysym_override(
 /// 时再扩此表 (派单 Out: 鼠标 / 复杂 modifier 留 T-0506+)。
 fn terminal_keysym_override(keysym: xkb::Keysym) -> Option<Vec<u8>> {
     // xkbcommon::xkb::Keysym 是 newtype wrapper around u32; 直接比较 raw 值。
-    // 常量值见 xkeysym keysymdef.h: BackSpace=0xff08, Delete=0xffff
+    // 常量值见 xkeysym keysymdef.h.
     let raw = keysym.raw();
     match raw {
         0xff08 => Some(vec![0x7f]),          // BackSpace → DEL
         0xffff => Some(b"\x1b[3~".to_vec()), // Delete → CSI 3 ~
+        // T-0614 hotfix: 方向键 / Home / End / PageUp / PageDown 的 xterm escape
+        // sequences. xkbcommon 默认给 raw keysym 不发字节, 必须 quill 自己翻译.
+        // user 实测 bash readline 上方向键调历史不工作就是缺这个. PageUp/Down
+        // 已被 scroll_keysym_override 拦走 (T-0602 scrollback), 不重复.
+        // CSI 序列跟 xterm/foot/alacritty 同. modifier-aware (Shift/Ctrl+Arrow)
+        // 留 Phase 7+ kitty keyboard protocol 实装.
+        0xff52 => Some(b"\x1b[A".to_vec()), // Up    → CSI A
+        0xff54 => Some(b"\x1b[B".to_vec()), // Down  → CSI B
+        0xff53 => Some(b"\x1b[C".to_vec()), // Right → CSI C
+        0xff51 => Some(b"\x1b[D".to_vec()), // Left  → CSI D
+        0xff50 => Some(b"\x1b[H".to_vec()), // Home  → CSI H
+        0xff57 => Some(b"\x1b[F".to_vec()), // End   → CSI F
+        0xff09 => Some(b"\t".to_vec()),     // Tab → \t (xkbcommon 默认已对, 显式锁)
         _ => None,
     }
 }
