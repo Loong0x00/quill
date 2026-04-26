@@ -3634,13 +3634,23 @@ impl Dispatch<WlDataDevice, ()> for State {
                 if let Some(offer) = state.dnd_current_offer.as_ref() {
                     // accept(serial, Option<String>) — None 拒绝, Some 接受.
                     offer.accept(serial, chosen.clone());
+                    // T-0611 hotfix: 必须调 set_actions(Copy, Copy) 否则 mutter
+                    // 默认 client 不接受 drop, cursor 显示禁止, 用户释放鼠标
+                    // 直接发 Leave 不发 Drop. user 实测 log 见过 enter/leave
+                    // 反复但从无 Drop event 即此 bug. wl_data_device v3+ 协议
+                    // 要求 client 显式 set_actions, copy/move/ask 三选一,
+                    // quill 走 copy (拖文件入终端是复制路径不是移动).
+                    if chosen.is_some() {
+                        use wayland_client::protocol::wl_data_device_manager::DndAction;
+                        offer.set_actions(DndAction::Copy, DndAction::Copy);
+                    }
                 }
                 state.dnd_accepted_mime = chosen.clone();
                 tracing::debug!(
                     target: "quill::pointer",
                     x, y, mimes = ?state.dnd_current_offer_mimes,
                     accepted = ?chosen,
-                    "DnD enter"
+                    "DnD enter (set_actions=Copy if accepted)"
                 );
             }
             wl_data_device::Event::Motion { time, x, y } => {
