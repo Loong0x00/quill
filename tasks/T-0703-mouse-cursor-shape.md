@@ -1,8 +1,8 @@
 # T-0703 mouse cursor 形状切换 (resize 边箭头 / titlebar 默认 / textarea I-beam)
 
 **Phase**: 7
-**Assigned**: (open)
-**Status**: open
+**Assigned**: writer-T0703
+**Status**: claimed
 **Budget**: tokenBudget=180k (跨 wl_pointer.set_cursor + cursor theme 加载 + cursor-shape-v1 协议)
 **Dependencies**: T-0504 (wl_pointer + hit_test) / T-0701 (resize hit-test)
 **Priority**: P1 (CSD 完整性 — 鼠标 hover resize 边时应该变 ↔, hover textarea 时应该变 I-beam)
