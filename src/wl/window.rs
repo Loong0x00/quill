@@ -1185,11 +1185,13 @@ fn apply_selection_op(data: &mut LoopData, qh: &QueueHandle<State>) {
             tracing::debug!(
                 target: "quill::pointer",
                 n = text.len(),
-                "PRIMARY set_selection (compositor 之后会问 Send event 拿数据)"
+                "PRIMARY set_selection"
             );
-            // source 现在归 compositor (selection owner), 我们不再持引用 — 但
-            // source 是 wayland Proxy, drop 不发 destroy (协议 source 自然 lifecycle:
-            // 直到 cancelled / 新 selection 替换). wayland-client 内部 ref 跟踪.
+            // T-0607 hotfix: store source 防 drop. wayland-client Proxy drop
+            // 实测会触发 destroy → compositor cancel selection → 内容清空. 旧
+            // active_primary_source 此处替换 (旧 source drop 时 compositor 已
+            // cache 之前 send 出去的数据, 不影响其它 client 已粘贴的内容)。
+            data.state.active_primary_source = Some(source);
         }
         SelectionOp::SetClipboard => {
             let Some(device) = data.state.data_device.as_ref() else {
@@ -1217,6 +1219,10 @@ fn apply_selection_op(data: &mut LoopData, qh: &QueueHandle<State>) {
                 n = text.len(),
                 "CLIPBOARD set_selection"
             );
+            // T-0607 hotfix: 同 PRIMARY 路径, store source 防 drop. CLIPBOARD
+            // 在 mutter 上 lazy fetch 严重 (粘贴方真要时才 send), source 不存
+            // 立刻 drop 是 user 实测 Ctrl+Shift+V 粘贴出空格的真因。
+            data.state.active_data_source = Some(source);
         }
     }
 }
@@ -1733,6 +1739,8 @@ pub fn run_window() -> Result<()> {
         primary_selection_manager,
         primary_selection_device: None,
         primary_current_offer: None,
+        active_primary_source: None,
+        active_data_source: None,
         data_device_manager,
         data_device: None,
         data_current_offer: None,
@@ -2204,6 +2212,15 @@ struct State {
     data_device: Option<WlDataDevice>,
     /// T-0607 CLIPBOARD 协议: 当前最新的 wl_data_offer.
     data_current_offer: Option<WlDataOffer>,
+    /// T-0607 hotfix: 当前持有的 PRIMARY source. set_selection 后必须 store
+    /// 防 wayland-client Proxy drop 时发 destroy → compositor cancel selection
+    /// → 内容立刻清空. 新 set_selection 替换时旧 source 自然 drop (compositor
+    /// 已 cache send 过的数据); cancelled event 来时显式 take 清理。
+    active_primary_source: Option<ZwpPrimarySelectionSourceV1>,
+    /// T-0607 hotfix: 当前持有的 CLIPBOARD source. 同 active_primary_source
+    /// 路径 (CLIPBOARD compositor 多 lazy fetch, 不 store 直接 drop 后粘贴方
+    /// 拿到空, 用户实测 Ctrl+Shift+V 粘贴出空格的真因)。
+    active_data_source: Option<WlDataSource>,
     /// T-0607: 最近一次复制的选区文本. 创建 source 后 compositor 在 send event
     /// 中 ask 我们写数据到 fd, 此时读此字段写入. PRIMARY / CLIPBOARD 共享
     /// (语义上同一段选区), 复制时同步更新.
@@ -2795,9 +2812,10 @@ impl Dispatch<ZwpPrimarySelectionSourceV1, ()> for State {
                 write_selection_to_fd(state.last_selection_text.as_deref(), &mime_type, fd);
             }
             zwp_primary_selection_source_v1::Event::Cancelled => {
-                // 其它 client 设了 PRIMARY, quill 失去所有权 — 仅 trace, 用户视
-                // 觉无变化 (仍能看自己的选区高亮, 但 PRIMARY pasta 拿到的是
-                // 其它 client 内容).
+                // 其它 client 设了 PRIMARY, quill 失去所有权 — drop 旧 source
+                // 释放内存. 用户视觉无变化 (仍能看自己的选区高亮, 但 PRIMARY
+                // paste 拿到的是其它 client 内容).
+                state.active_primary_source = None;
                 tracing::trace!(target: "quill::pointer", "PRIMARY source cancelled");
             }
             _ => {}
@@ -2888,6 +2906,7 @@ impl Dispatch<WlDataSource, ()> for State {
                 write_selection_to_fd(state.last_selection_text.as_deref(), &mime_type, fd);
             }
             wl_data_source::Event::Cancelled => {
+                state.active_data_source = None;
                 tracing::trace!(target: "quill::pointer", "CLIPBOARD source cancelled");
             }
             _ => {}
