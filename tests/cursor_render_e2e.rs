@@ -22,7 +22,9 @@ use std::path::PathBuf;
 
 use quill::term::{CellPos, CellRef, Color};
 use quill::text::TextSystem;
-use quill::wl::{render_headless, CursorInfo, CursorStyle, CURSOR_THICKNESS_PX, HIDPI_SCALE};
+use quill::wl::{
+    render_headless, CursorInfo, CursorStyle, CURSOR_INSET_PX, CURSOR_THICKNESS_PX, HIDPI_SCALE,
+};
 
 const LOGICAL_W: u32 = 800;
 const LOGICAL_H: u32 = 600;
@@ -249,7 +251,11 @@ fn cursor_beam_renders_left_strip() {
 
     let (x0, _x1, y0, y1) = cursor_cell_phys_bbox();
     let thickness_phys = CURSOR_THICKNESS_PX as usize * HIDPI_SCALE as usize; // 4
-    let left_strip_x = (x0, x0 + thickness_phys);
+                                                                              // T-0604: cursor cell x 内缩 inset_phys (= CURSOR_INSET_PX × HIDPI_SCALE)
+                                                                              // 让字形溢出像素不被覆盖 — Beam 左侧竖线起点跟着内缩, strip 范围从
+                                                                              // (x0+inset, x0+inset+thickness).
+    let inset_phys = CURSOR_INSET_PX as usize * HIDPI_SCALE as usize; // 2
+    let left_strip_x = (x0 + inset_phys, x0 + inset_phys + thickness_phys);
     let left_bright = count_bright_pixels(&rgba, physical_w, left_strip_x, (y0, y1), 200);
     let strip_pixels = thickness_phys * (y1 - y0); // 4 × 50 = 200
     eprintln!("Beam left strip bright: {}/{}", left_bright, strip_pixels);
@@ -316,18 +322,46 @@ fn cursor_hollow_block_renders_4_borders() {
 
     let (x0, x1, y0, y1) = cursor_cell_phys_bbox();
     let thickness_phys = CURSOR_THICKNESS_PX as usize * HIDPI_SCALE as usize; // 4
+                                                                              // T-0604: cursor cell x 方向内缩 inset_phys, HollowBlock 4 边框 left / right
+                                                                              // strip 起点 / 终点跟内缩走 (top / bottom 仍跨整个 cell 宽减 inset, 但因内
+                                                                              // 缩量 inset_phys = 2 phys vs cell width 20 phys ≈ 10% 损失, top/bottom 视
+                                                                              // strip 还是从 x0..x1 但 strip 宽内可能边缘 inset 区缺像素 — 阈值放宽 70%).
+    let inset_phys = CURSOR_INSET_PX as usize * HIDPI_SCALE as usize; // 2
+    let inner_x0 = x0 + inset_phys;
+    let inner_x1 = x1 - inset_phys;
 
     // 4 边各自应 >= 80% 亮像素 (top / bottom / left / right strip).
-    let top_bright =
-        count_bright_pixels(&rgba, physical_w, (x0, x1), (y0, y0 + thickness_phys), 200);
-    let bottom_bright =
-        count_bright_pixels(&rgba, physical_w, (x0, x1), (y1 - thickness_phys, y1), 200);
-    let left_bright =
-        count_bright_pixels(&rgba, physical_w, (x0, x0 + thickness_phys), (y0, y1), 200);
-    let right_bright =
-        count_bright_pixels(&rgba, physical_w, (x1 - thickness_phys, x1), (y0, y1), 200);
+    // top / bottom strip 取内缩后的 x 范围 (inner_x0..inner_x1, T-0604 inset).
+    let top_bright = count_bright_pixels(
+        &rgba,
+        physical_w,
+        (inner_x0, inner_x1),
+        (y0, y0 + thickness_phys),
+        200,
+    );
+    let bottom_bright = count_bright_pixels(
+        &rgba,
+        physical_w,
+        (inner_x0, inner_x1),
+        (y1 - thickness_phys, y1),
+        200,
+    );
+    let left_bright = count_bright_pixels(
+        &rgba,
+        physical_w,
+        (inner_x0, inner_x0 + thickness_phys),
+        (y0, y1),
+        200,
+    );
+    let right_bright = count_bright_pixels(
+        &rgba,
+        physical_w,
+        (inner_x1 - thickness_phys, inner_x1),
+        (y0, y1),
+        200,
+    );
 
-    let edge_top_bottom = ((x1 - x0) * thickness_phys) as u32; // 80
+    let edge_top_bottom = ((inner_x1 - inner_x0) * thickness_phys) as u32;
     let edge_left_right = (thickness_phys * (y1 - y0)) as u32; // 200
 
     eprintln!(
@@ -345,8 +379,9 @@ fn cursor_hollow_block_renders_4_borders() {
         "right edge sparse"
     );
 
-    // 中心 inset (cell 内部去掉 thickness 边框) 应几乎无亮像素 — 验"hollow"
-    let inner_x = (x0 + thickness_phys, x1 - thickness_phys);
+    // 中心 inset (cell 内部去掉 inset + thickness 边框) 应几乎无亮像素 — 验
+    // "hollow". T-0604: x 方向加 inset_phys 偏移与 cursor cell 内缩同步。
+    let inner_x = (inner_x0 + thickness_phys, inner_x1 - thickness_phys);
     let inner_y = (y0 + thickness_phys, y1 - thickness_phys);
     let inner_bright = count_bright_pixels(&rgba, physical_w, inner_x, inner_y, 200);
     eprintln!("HollowBlock inner region bright: {}", inner_bright);

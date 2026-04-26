@@ -34,7 +34,9 @@ pub use render::{PreeditOverlay, PREEDIT_UNDERLINE_PX};
 // T-0601: 光标 quad 入参 (集成测试 tests/cursor_render_e2e.rs + window.rs
 // idle callback 用). quill 自有 struct + enum (INV-010, 不漏 alacritty
 // CursorShape).
-pub use render::{CursorInfo, CursorStyle, CURSOR_THICKNESS_PX};
+// T-0604: 加 CURSOR_INSET_PX 给集成测试同步算 cell 内缩 strip 范围 (派单
+// In #C 让 cursor 不接触相邻 cell 边缘, 字形溢出像素不被覆盖).
+pub use render::{CursorInfo, CursorStyle, CURSOR_INSET_PX, CURSOR_THICKNESS_PX};
 
 // T-0603: 集成测试 tests/keyboard_repeat_e2e.rs 用 KeyboardState +
 // wl_keyboard::Event + KeyboardAction. quill 自有类型 (INV-010).
