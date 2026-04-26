@@ -394,6 +394,16 @@ pub const CURSOR_THICKNESS_PX: u32 = 2;
 /// 几何契约。
 pub const CURSOR_INSET_PX: u32 = 1;
 
+/// **T-0607: 选区背景色**. 蓝色 (#3e6e9e) 让默认 fg #d3d3d3 light gray 字形
+/// 在其上 alpha-blend 仍可读. 与 alacritty / foot / xterm 选区色精神一致 (
+/// 它们走 fg/bg 反转 让选中字符明显; quill 简化为单色 bg 覆盖, 派单 In #D
+/// 接受 — 视觉上"选中区域可见"即达 acceptance, 派单未要求字形反色).
+pub const SELECTION_BG: crate::term::Color = crate::term::Color {
+    r: 0x3e,
+    g: 0x6e,
+    b: 0x9e,
+};
+
 /// **T-0604: cell.bg default skip 比较常数**, 与 [`crate::term::Color::DEFAULT_BG`]
 /// 同源 (`#000000`). render 模块复制 inline literal 而非引用 src/term 私有
 /// const, 沿袭本模块 [`TITLEBAR_BG`] / [`BUTTON_BG_HOVER`] / render_headless
@@ -1469,6 +1479,10 @@ impl Renderer {
         // 调用方在 IME preedit 显示时把 visible=false (光标位置与 preedit 起点
         // 视觉冲突). 见 [`CursorInfo`] doc.
         cursor: Option<&CursorInfo>,
+        // T-0607: 选中 cell 列表 (Linear / Block 模式由调用方计算后传 Vec<CellPos>).
+        // 空 vec / None 时不画 selection bg. quill 自有类型 (CellPos), INV-010
+        // 安全 (与 hover / preedit / cursor 同).
+        selection: Option<&[crate::term::CellPos]>,
     ) -> Result<()> {
         if cols == 0 || rows == 0 {
             return self.render();
@@ -1513,6 +1527,24 @@ impl Renderer {
             // (logical) - titlebar (logical), 视觉无超出.
             titlebar_y_offset_px,
         );
+        // T-0607: 追加 selection bg quads (在常规 cell quads 之后, REPLACE blend
+        // 让 selection 视觉覆盖 cell 默认 bg). 字形随后走 alpha-blend pass 在
+        // selection bg 上仍可见.
+        if let Some(sel) = selection {
+            let sel_color = self.color_for_vertex(SELECTION_BG);
+            append_selection_bg_to_cell_bytes(
+                &mut cell_vertex_bytes,
+                sel,
+                cols,
+                rows,
+                cell_w_px,
+                cell_h_px,
+                surface_w,
+                surface_h,
+                titlebar_y_offset_px,
+                sel_color,
+            );
+        }
         // T-0504: 追加 titlebar + 3 按钮 + icon 顶点到 cell pipeline 同 buffer.
         // titlebar 与 cell 共用 cell pipeline (同 vertex 格式 pos+color), 一次
         // draw 同时画完, 视觉无延迟. hover 来自调用方维护的 PointerState.hover().
@@ -2372,6 +2404,60 @@ fn append_preedit_underline_to_cell_bytes(
     }
 }
 
+/// **T-0607: 在 cell_vertex_bytes 上追加选区背景 quads** (cell pass REPLACE
+/// 路径). 每个选中的 [`crate::term::CellPos`] 在视觉上覆盖一个 [`SELECTION_BG`]
+/// 矩形. cell pass 内 vertex 顺序: 先常规 cell quads → 后 selection bg quads,
+/// REPLACE blend 让 selection 视觉覆盖 cell 默认 bg. 主 grid 字形随后走 alpha-
+/// blend pass, 在 selection bg 上仍可见 (派单 In #D 接受单色 selection bg).
+///
+/// **why y_offset_px**: 与 cell quads 同源, cells 区起绘 y 已偏移 titlebar 高度.
+/// 选区在 viewport 内, 必须同步加 offset.
+///
+/// **越界防御**: cell.col >= cols / cell.line >= rows 跳过 (resize race 下
+/// selection 持的旧 row 可能越界). 与 cursor / preedit 同决策.
+#[allow(clippy::too_many_arguments)]
+fn append_selection_bg_to_cell_bytes(
+    cell_vertex_bytes: &mut Vec<u8>,
+    cells_iter: &[crate::term::CellPos],
+    cols: usize,
+    rows: usize,
+    cell_w_px: f32,
+    cell_h_px: f32,
+    surface_w: f32,
+    surface_h: f32,
+    y_offset_px: f32,
+    color: [f32; 3],
+) {
+    for pos in cells_iter {
+        if pos.col >= cols || pos.line >= rows {
+            continue;
+        }
+        let x0_px = pos.col as f32 * cell_w_px;
+        let y0_px = pos.line as f32 * cell_h_px + y_offset_px;
+        let x1_px = x0_px + cell_w_px;
+        let y1_px = y0_px + cell_h_px;
+        let left = x0_px / surface_w * 2.0 - 1.0;
+        let right = x1_px / surface_w * 2.0 - 1.0;
+        let top = 1.0 - y0_px / surface_h * 2.0;
+        let bottom = 1.0 - y1_px / surface_h * 2.0;
+        let verts: [[f32; 2]; 6] = [
+            [left, top],
+            [left, bottom],
+            [right, bottom],
+            [left, top],
+            [right, bottom],
+            [right, top],
+        ];
+        for v in verts {
+            cell_vertex_bytes.extend_from_slice(&v[0].to_ne_bytes());
+            cell_vertex_bytes.extend_from_slice(&v[1].to_ne_bytes());
+            cell_vertex_bytes.extend_from_slice(&color[0].to_ne_bytes());
+            cell_vertex_bytes.extend_from_slice(&color[1].to_ne_bytes());
+            cell_vertex_bytes.extend_from_slice(&color[2].to_ne_bytes());
+        }
+    }
+}
+
 /// **T-0601: 在 cell_vertex_bytes 上追加光标 quad(s)** (cell pass REPLACE
 /// 路径). 按 `cursor.style` 派生 1 (Block / Underline / Beam) 或 4 (HollowBlock)
 /// 个矩形. `cursor.visible == false` / 越界 (col >= cols / line >= rows) 时
@@ -2550,6 +2636,9 @@ pub fn render_headless(
     // T-0601: 光标 quad(s) (None = headless 测试 / CLI screenshot 不需光标).
     // 与 [`Renderer::draw_frame`] 同语义, 见 [`CursorInfo`] doc.
     cursor: Option<&CursorInfo>,
+    // T-0607: 选中 cell 列表 (Linear / Block 由调用方算后传).
+    // 空 / None 时不画 selection bg.
+    selection: Option<&[crate::term::CellPos]>,
 ) -> Result<(Vec<u8>, u32, u32)> {
     if width == 0 || height == 0 {
         return Err(anyhow!(
@@ -2744,6 +2833,24 @@ pub fn render_headless(
             cell_vertex_bytes.extend_from_slice(&color[1].to_ne_bytes());
             cell_vertex_bytes.extend_from_slice(&color[2].to_ne_bytes());
         }
+    }
+    // T-0607: selection bg quads (与 draw_frame 同源, append 顺序在 cell 之后
+    // 让 REPLACE blend 视觉覆盖). headless 路径写入 PNG 后扫像素 verify (派单
+    // Acceptance "三源 PNG verify").
+    if let Some(sel) = selection {
+        let sel_color = color_for_vertex_with_srgb(SELECTION_BG, is_srgb);
+        append_selection_bg_to_cell_bytes(
+            &mut cell_vertex_bytes,
+            sel,
+            cols,
+            rows,
+            cell_w_px,
+            cell_h_px,
+            surface_w,
+            surface_h,
+            titlebar_y_offset_px,
+            sel_color,
+        );
     }
     // T-0504: 追加 titlebar + 3 按钮 + icon 顶点. headless 路径无真鼠标 hover,
     // 走 HoverRegion::None (按钮全无高亮).

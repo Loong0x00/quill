@@ -144,8 +144,9 @@ fn run_headless_screenshot(path: &std::path::Path) -> Result<()> {
         HEIGHT,
         None, // T-0505: --headless-screenshot CLI 路径无 IME 上下文, 不画 preedit
         None, // T-0601: CLI 路径不强制画光标 (静态截图 daily-drive 视觉验证
-              // 不依赖光标; 集成测试 tests/cursor_render_e2e.rs 走 Some(_)
-              // 验证 cursor quad 渲染. 派单 Out 段同决策).
+        // 不依赖光标; 集成测试 tests/cursor_render_e2e.rs 走 Some(_)
+        // 验证 cursor quad 渲染. 派单 Out 段同决策).
+        None, // T-0607: CLI 截图路径无选区
     )
     .context("render_headless 失败")?;
 

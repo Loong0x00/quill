@@ -76,7 +76,8 @@ fn render_headless_with_cjk_printf() -> (Vec<u8>, u32, u32) {
         LOGICAL_W,
         LOGICAL_H,
         None,
-        None, // T-0601: CJK fallback 测试聚焦字形 fallback, 不画 cursor
+        None, // T-0601: CJK fallback 测试聚焦字形 fallback, 不画 cursor,
+        None, // T-0607 selection
     )
     .expect("render_headless failed")
 }

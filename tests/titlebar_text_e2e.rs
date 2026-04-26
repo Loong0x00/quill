@@ -63,6 +63,7 @@ fn render_with_titlebar() -> (Vec<u8>, u32, u32) {
         LOGICAL_H,
         None,
         None,
+        None, // T-0607 selection
     )
     .expect("render_headless failed")
 }

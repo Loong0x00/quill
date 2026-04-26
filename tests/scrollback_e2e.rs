@@ -54,6 +54,7 @@ fn render_term_to_rgba(term: &TermState, ts: &mut TextSystem) -> (Vec<u8>, u32, 
     let row_texts: Vec<String> = (0..rows).map(|r| term.display_text(r)).collect();
     render_headless(
         ts, &cells, cols, rows, &row_texts, LOGICAL_W, LOGICAL_H, None, None,
+        None, // T-0607 selection
     )
     .expect("render_headless failed")
 }

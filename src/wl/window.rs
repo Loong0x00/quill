@@ -30,7 +30,7 @@
 //! - INV-009 master fd O_NONBLOCK
 
 use std::ffi::c_void;
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -69,11 +69,24 @@ use super::pointer::{
     WindowButton,
 };
 use super::render::Renderer;
+use super::selection::{bracketed_paste_wrap, extract_selection_text, PasteSource, SelectionState};
 use crate::ime::{handle_text_input_event, CursorRectangle, ImeAction, ImeState};
 use wayland_client::protocol::wl_pointer;
+use wayland_client::protocol::{
+    wl_data_device::{self, WlDataDevice},
+    wl_data_device_manager::{self, WlDataDeviceManager},
+    wl_data_offer::{self, WlDataOffer},
+    wl_data_source::{self, WlDataSource},
+};
 use wayland_protocols::wp::cursor_shape::v1::client::{
     wp_cursor_shape_device_v1::{self, WpCursorShapeDeviceV1},
     wp_cursor_shape_manager_v1::{self, WpCursorShapeManagerV1},
+};
+use wayland_protocols::wp::primary_selection::zv1::client::{
+    zwp_primary_selection_device_manager_v1::{self, ZwpPrimarySelectionDeviceManagerV1},
+    zwp_primary_selection_device_v1::{self, ZwpPrimarySelectionDeviceV1},
+    zwp_primary_selection_offer_v1::{self, ZwpPrimarySelectionOfferV1},
+    zwp_primary_selection_source_v1::{self, ZwpPrimarySelectionSourceV1},
 };
 use wayland_protocols::wp::text_input::zv3::client::{
     zwp_text_input_manager_v3::{self, ZwpTextInputManagerV3},
@@ -207,6 +220,37 @@ pub(crate) enum RepeatScheduleRequest {
     Stop,
 }
 
+/// T-0607: 选区操作请求. `Dispatch<WlPointer>` / `Dispatch<WlKeyboard>` 在
+/// 收到 SelectionEnd / Ctrl+Shift+C 时写到 `state.pending_selection_op`,
+/// drive_wayland step 3.7 真消费 (那里能拿 LoopData 字段 + wayland 协议
+/// handle).
+///
+/// 与 `core.resize_dirty` (INV-006) / `pending_repeat` (T-0603) 同套路 — 协议事
+/// 件路径只 set 单次延迟请求, 单一上游消费者推副作用 (协议 set_selection
+/// request).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SelectionOp {
+    /// SelectionEnd → 算选区文本, 创建 wp_primary_selection_source_v1 + offer
+    /// text/plain mime, set_selection on primary device.
+    SetPrimary,
+    /// Ctrl+Shift+C → 算选区文本, 创建 wl_data_source + offer text/plain mime,
+    /// set_selection on data_device.
+    SetClipboard,
+}
+
+/// T-0607: autoscroll 请求. `Dispatch<WlPointer>` 在 AutoScrollStart 时写到
+/// `state.pending_autoscroll_op`, drive_wayland step 3.7 真 insert calloop
+/// Timer source.
+///
+/// 与 `pending_resize_followup` (T-0802) / `repeat_token` (T-0603) 同 calloop
+/// Timer 单飞行套路.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AutoScrollOp {
+    /// 启动 Timer, 100ms 一次 fire 调用 [`autoscroll_tick`] → scroll_display(delta)
+    /// + cursor 跟 (selection_state.update). delta = ±1 (来自 PointerAction).
+    Start { delta: i32 },
+}
+
 /// 把 wayland `EventQueue<State>`、业务 `State`、T-0301 的 `TermState`、
 /// calloop `LoopSignal` 四个运行时对象捆成一个结构,让
 /// `calloop::EventLoop<'_, LoopData>` 一把 own。回调签名得到 `&mut LoopData`,
@@ -277,6 +321,14 @@ struct LoopData {
     /// 自身 Drop), 真 propagate 走完后 last_propagate_at 更新, 下次 dirty 来时
     /// 再 schedule. 与 `repeat_token` 同 calloop Timer 单飞行套路 (T-0603 模式).
     pending_resize_followup: Option<RegistrationToken>,
+    /// T-0607: autoscroll Timer 句柄. None = 无 autoscroll, Some = 已 insert
+    /// 一个 100ms 重复 Timer source. Start 路径先 take 旧 + remove, 再 insert
+    /// 新; Stop / SelectionEnd 路径仅 take + remove. 与 `repeat_token` /
+    /// `pending_resize_followup` 同 calloop Timer 单飞行套路 (派单 In #E).
+    pending_autoscroll_timer: Option<RegistrationToken>,
+    /// T-0607: 当前 autoscroll 方向 (`±1` line / 100ms tick). Timer fire 走
+    /// [`autoscroll_tick`] 读此值调 scroll_display + 同步 selection_state cursor.
+    autoscroll_delta: i32,
 }
 
 // T-0108 删除:`run_main_loop` / `StepResult` / `install_signal_handlers` /
@@ -695,6 +747,10 @@ fn propagate_resize_if_dirty(data: &mut LoopData) {
     // T-0504: 同步 PointerState 的 surface 尺寸 (logical px), 让 hit_test 用
     // 最新尺寸算按钮位置 (按钮在右上角, 拖窗口时按钮跟着移).
     state.pointer_state.set_surface_size(width, height);
+    // T-0607: 同步 cell grid 尺寸 (cols, rows), 让 pixel_to_cell clamp 边界
+    // 用最新值. cells_from_surface_px 已减 titlebar, 与 PointerState 内部
+    // px → cell 的 titlebar 偏移一致.
+    state.pointer_state.set_cell_grid(cols, rows);
 
     state.core.resize_dirty = false;
     // T-0802 In #B: 记本次 propagate 时刻, 下次 should_throttle_propagate 据此判.
@@ -991,6 +1047,420 @@ fn repeat_timer_tick(data: &mut LoopData) -> TimeoutAction {
     TimeoutAction::ToDuration(std::time::Duration::from_millis(interval_ms))
 }
 
+/// T-0607 autoscroll Timer interval. 100ms 一次 fire 调 `term.scroll_display(±1)`.
+/// 派单 In #E "Timer fire 100ms 一次".
+const AUTOSCROLL_INTERVAL_MS: u64 = 100;
+
+/// T-0607: 消费 `state.pending_autoscroll_op` / `state.pending_autoscroll_cancel`,
+/// 真 schedule / cancel calloop Timer. 与 `apply_repeat_request` 同套路 —
+/// 协议事件路径只 set 单次延迟请求, 单一上游消费者 (drive_wayland step 3.7)
+/// 推副作用.
+fn apply_autoscroll_op(data: &mut LoopData) {
+    // Cancel 优先于 Start (SelectionEnd 路径同时 set cancel 与 op=None,
+    // 防 race 多发 Start).
+    if data.state.pending_autoscroll_cancel {
+        data.state.pending_autoscroll_cancel = false;
+        if let Some(tok) = data.pending_autoscroll_timer.take() {
+            data.loop_handle.remove(tok);
+            tracing::debug!(target: "quill::pointer", "autoscroll Timer cancelled");
+        }
+        data.autoscroll_delta = 0;
+    }
+    let Some(op) = data.state.pending_autoscroll_op.take() else {
+        return;
+    };
+    match op {
+        AutoScrollOp::Start { delta } => {
+            // 已有 timer (start 重发 — pointer 已守 autoscroll_active 一次, 不
+            // 该重 schedule, 但防 race 仍清旧). delta 更新到最新 (用户从下越
+            // 切到上越也走此路径).
+            if let Some(tok) = data.pending_autoscroll_timer.take() {
+                data.loop_handle.remove(tok);
+            }
+            data.autoscroll_delta = delta;
+            let timer =
+                Timer::from_duration(std::time::Duration::from_millis(AUTOSCROLL_INTERVAL_MS));
+            match data
+                .loop_handle
+                .insert_source(timer, |_deadline, _meta, data: &mut LoopData| {
+                    autoscroll_tick(data)
+                }) {
+                Ok(token) => {
+                    data.pending_autoscroll_timer = Some(token);
+                    tracing::debug!(
+                        target: "quill::pointer",
+                        delta,
+                        "autoscroll Timer scheduled (100ms 重复)"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        target: "quill::pointer",
+                        ?err,
+                        "calloop insert_source(autoscroll) 失败 — 边缘自动滚 不工作但 quill 继续跑"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// T-0607: autoscroll Timer fire 一次 — `term.scroll_display(delta)` + cursor
+/// 跟随 (selection_state.cursor 不变, 但渲染重画, 用户视觉上看到选区延伸).
+///
+/// **why 不更新 selection_state cursor 行号**: scroll_display 改 display_offset,
+/// alacritty 内部 grid 不变 — cursor 位置仍以"viewport row" 表示, scroll 后视
+/// 觉上 cursor 标的是新进入 viewport 的 row. selection_state 本身没动 (anchor
+/// / cursor 保持原 row), 但渲染层 selected_cells_linear 走 viewport row 索引
+/// 时, scroll 后 anchor 行号若超出 viewport 就部分剪裁 (派单 Out: 跨 scrollback
+/// 选择跟随历史 P2). KISS.
+fn autoscroll_tick(data: &mut LoopData) -> TimeoutAction {
+    let delta = data.autoscroll_delta;
+    if delta == 0 {
+        // 防御: pending_autoscroll_cancel 路径已清 delta=0, Timer Drop.
+        return TimeoutAction::Drop;
+    }
+    if let Some(t) = data.term.as_mut() {
+        t.scroll_display(delta);
+    }
+    TimeoutAction::ToDuration(std::time::Duration::from_millis(AUTOSCROLL_INTERVAL_MS))
+}
+
+/// T-0607: 消费 `state.pending_selection_op`, 真创建 source + set_selection.
+///
+/// **PRIMARY** (`SetPrimary`): 仅当 `primary_selection_device` 已绑.
+/// **CLIPBOARD** (`SetClipboard`): 仅当 `data_device` 已绑.
+///
+/// 两路径都先算选区文本 (走 SelectionState + extract_selection_text + display_text),
+/// 存到 `state.last_selection_text`, 然后创建 source + offer 4 mime + set_selection.
+/// compositor 之后通过 source 的 Send event 反向问我们 (走 Dispatch<...Source>
+/// → write_selection_to_fd 真写 fd).
+///
+/// **selection 文本为空** (用户 click 但没拖, anchor==cursor 单 cell 但 display_text
+/// 该 cell 是空格): 仍 set_selection (空字符串), 主流终端同行为 (alacritty / foot
+/// click 立即 set 空 PRIMARY).
+fn apply_selection_op(data: &mut LoopData, qh: &QueueHandle<State>) {
+    let Some(op) = data.state.pending_selection_op.take() else {
+        return;
+    };
+    // 算选区文本. SelectionState / cols / rows 来自 state / term.
+    let Some(t) = data.term.as_ref() else {
+        tracing::warn!(target: "quill::pointer", "apply_selection_op: term=None, 跳过");
+        return;
+    };
+    let (cols, rows) = t.dimensions();
+    // T-0607 已知陷阱 (派单 In #G CJK): display_text 内部跳 WIDE_CHAR_SPACER cell,
+    // 与 selected_cells_* 走 grid col/row 索引一致 — 选区跨 CJK 字 substr 不切坏.
+    let text = extract_selection_text(&data.state.selection_state, cols, rows, |line| {
+        t.display_text(line)
+    });
+    data.state.last_selection_text = Some(text.clone());
+
+    let serial = data.state.pointer_state.last_button_serial();
+    match op {
+        SelectionOp::SetPrimary => {
+            let Some(device) = data.state.primary_selection_device.as_ref() else {
+                tracing::trace!(
+                    target: "quill::pointer",
+                    "SetPrimary 但 device=None (compositor 不导出), 退化跳过"
+                );
+                return;
+            };
+            let Some(manager) = data.state.primary_selection_manager.as_ref() else {
+                return;
+            };
+            let source = manager.create_source(qh, ());
+            // text/plain;charset=utf-8 (主), text/plain (老 client 兼容),
+            // UTF8_STRING (X11 PRIMARY 标准), TEXT (X11 fallback). 与 alacritty
+            // / foot / wl-clipboard 兼容.
+            for mime in [
+                "text/plain;charset=utf-8",
+                "text/plain",
+                "UTF8_STRING",
+                "TEXT",
+            ] {
+                source.offer(mime.to_string());
+            }
+            device.set_selection(Some(&source), serial);
+            tracing::debug!(
+                target: "quill::pointer",
+                n = text.len(),
+                "PRIMARY set_selection (compositor 之后会问 Send event 拿数据)"
+            );
+            // source 现在归 compositor (selection owner), 我们不再持引用 — 但
+            // source 是 wayland Proxy, drop 不发 destroy (协议 source 自然 lifecycle:
+            // 直到 cancelled / 新 selection 替换). wayland-client 内部 ref 跟踪.
+        }
+        SelectionOp::SetClipboard => {
+            let Some(device) = data.state.data_device.as_ref() else {
+                tracing::trace!(
+                    target: "quill::pointer",
+                    "SetClipboard 但 data_device=None, 退化跳过"
+                );
+                return;
+            };
+            let Some(manager) = data.state.data_device_manager.as_ref() else {
+                return;
+            };
+            let source = manager.create_data_source(qh, ());
+            for mime in [
+                "text/plain;charset=utf-8",
+                "text/plain",
+                "UTF8_STRING",
+                "TEXT",
+            ] {
+                source.offer(mime.to_string());
+            }
+            device.set_selection(Some(&source), serial);
+            tracing::debug!(
+                target: "quill::pointer",
+                n = text.len(),
+                "CLIPBOARD set_selection"
+            );
+        }
+    }
+}
+
+/// T-0607: 消费 `state.pending_paste_request`, 真 trigger offer.receive +
+/// 异步读 pipe → bracketed paste 包装 → pty.write.
+///
+/// **why pipe2 + calloop Generic source 而非 thread**: INV-005 单 EventLoop —
+/// 不起 thread 做 IO. compositor 通过 receive request 把数据写到我们给的 fd
+/// (write 端我们传过去), 我们读 read 端. read 端走 calloop Generic source 注册
+/// 到 EventLoop, callback 在 read EOF 后 unregister + bracketed wrap + pty write.
+///
+/// **fd 协议**: `offer.receive(mime, write_fd)` — write_fd 由我们创建, compositor
+/// dup 它写完关. 我们持 read_fd 走非阻塞读. 读完 (read returns 0 EOF) 关 read fd.
+fn apply_paste_request(data: &mut LoopData) {
+    let Some(source) = data.state.pending_paste_request.take() else {
+        return;
+    };
+
+    // 取出对应 offer (Primary / Clipboard).
+    enum OfferRef<'a> {
+        Primary(&'a ZwpPrimarySelectionOfferV1),
+        Clipboard(&'a WlDataOffer),
+    }
+    let offer_ref = match source {
+        PasteSource::Primary => match data.state.primary_current_offer.as_ref() {
+            Some(o) => OfferRef::Primary(o),
+            None => {
+                tracing::debug!(
+                    target: "quill::pointer",
+                    "Paste(Primary) 但 current_offer=None (没人复制过 PRIMARY?), 跳过"
+                );
+                return;
+            }
+        },
+        PasteSource::Clipboard => match data.state.data_current_offer.as_ref() {
+            Some(o) => OfferRef::Clipboard(o),
+            None => {
+                tracing::debug!(
+                    target: "quill::pointer",
+                    "Paste(Clipboard) 但 current_offer=None, 跳过"
+                );
+                return;
+            }
+        },
+    };
+
+    // 创建 pipe (read_fd, write_fd). 走 libc::pipe2(O_CLOEXEC | O_NONBLOCK)
+    // 让 read 非阻塞 + 进程 fork 不漏 fd.
+    let (read_fd, write_fd) = match make_paste_pipe() {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::warn!(
+                target: "quill::pointer",
+                error = %e,
+                "Paste: 创建 pipe 失败, 跳过"
+            );
+            return;
+        }
+    };
+
+    // 走 receive request, compositor 将开始往 write_fd 写.
+    let mime = "text/plain;charset=utf-8".to_string();
+    match offer_ref {
+        OfferRef::Primary(o) => o.receive(mime, write_fd.as_fd()),
+        OfferRef::Clipboard(o) => o.receive(mime, write_fd.as_fd()),
+    }
+    drop(write_fd); // 关我们这端 write fd, 让 compositor 写完后 reader 拿 EOF
+                    // (compositor 持 dup 副本, 它写完关).
+
+    // 注册 calloop Generic source 监听 read_fd readable, 走 paste_read_tick
+    // 累积字节, EOF 时包 bracketed paste 写 PTY + remove source.
+    let bracketed = data
+        .term
+        .as_ref()
+        .map(|t| t.is_bracketed_paste())
+        .unwrap_or(false);
+    // PasteReadState 持 OwnedFd 控制 close 时机. Rc<RefCell<>> 让 callback 与
+    // 调用方共享同一份 (调用方仅记 token 用 — 不再需要 read_fd_owned).
+    let pasta_state = std::rc::Rc::new(std::cell::RefCell::new(PasteReadState {
+        buf: Vec::new(),
+        fd: Some(read_fd),
+        bracketed,
+    }));
+    let pasta_state_for_callback = pasta_state.clone();
+    let raw_fd = pasta_state
+        .borrow()
+        .fd
+        .as_ref()
+        .expect("just set Some")
+        .as_raw_fd();
+    // SAFETY: raw_fd 来自 pasta_state.fd (OwnedFd), 该 OwnedFd 持续活到 callback
+    // 返 PostAction::Remove 后 fd 被 take 并 drop (close). BorrowedFd 'static
+    // 是语法 marker, 真生命周期靠 pasta_state.fd 的 OwnedFd. calloop Generic
+    // 在 PostAction::Remove 时走 epoll_ctl(EPOLL_CTL_DEL); 后续 fd close, EBADF
+    // 由 calloop 0.14 内部容忍 (与 wayland fd / pty fd 注册同 pattern, INV-001
+    // 同源).
+    #[allow(unsafe_code)]
+    let borrowed_fd: BorrowedFd<'static> = unsafe { BorrowedFd::borrow_raw(raw_fd) };
+
+    let result = data.loop_handle.insert_source(
+        Generic::new(borrowed_fd, Interest::READ, Mode::Level),
+        move |_readiness, _fd, data: &mut LoopData| {
+            paste_read_tick(data, &pasta_state_for_callback)
+        },
+    );
+    match result {
+        Ok(_token) => {
+            tracing::debug!(target: "quill::pointer", ?source, "Paste: started async read pipe");
+        }
+        Err(err) => {
+            tracing::warn!(
+                target: "quill::pointer",
+                ?err,
+                "calloop insert_source(paste pipe) 失败 — 跳过本次 paste"
+            );
+        }
+    }
+}
+
+/// T-0607: 异步 paste 读取的中间状态. fd 通过 OwnedFd 持有控制 close 时机
+/// (PostAction::Remove 时 take + drop 即 close; calloop epoll_ctl(EPOLL_CTL_DEL)
+/// 在 source remove 路径走, EBADF 容忍).
+struct PasteReadState {
+    /// 累积读到的字节. EOF 时一次性 bracketed wrap + write_to_pty.
+    buf: Vec<u8>,
+    /// 读端 OwnedFd. PostAction::Remove 时 take + drop 关闭.
+    fd: Option<std::os::fd::OwnedFd>,
+    /// 是否包 bracketed paste (拷贝 term mode 在 schedule 时刻, 防 race).
+    bracketed: bool,
+}
+
+/// T-0607: paste pipe readable callback. 读字节累积, EOF 时:
+/// - 包 bracketed paste (若启用 — 走 term.is_bracketed_paste)
+/// - pty.write
+/// - 返 PostAction::Remove 让 calloop 释放 source + close read_fd
+fn paste_read_tick(
+    data: &mut LoopData,
+    pasta_state: &std::rc::Rc<std::cell::RefCell<PasteReadState>>,
+) -> std::io::Result<PostAction> {
+    let raw_fd = match pasta_state.borrow().fd.as_ref() {
+        Some(fd) => fd.as_raw_fd(),
+        None => {
+            return Ok(PostAction::Remove);
+        }
+    };
+    let mut chunk = [0u8; 4096];
+    loop {
+        // SAFETY: raw_fd 来自 pasta_state.fd (OwnedFd), 上面 borrow 已校验 Some;
+        // libc::read 不转移所有权, 仅读字节. errno 通过 last_os_error 拿.
+        #[allow(unsafe_code)]
+        let n = unsafe { libc::read(raw_fd, chunk.as_mut_ptr() as *mut _, chunk.len()) };
+        if n > 0 {
+            pasta_state
+                .borrow_mut()
+                .buf
+                .extend_from_slice(&chunk[..n as usize]);
+            continue;
+        }
+        if n == 0 {
+            // EOF — compositor 写完关 fd. 走 bracketed wrap + pty.write.
+            let (buf, bracketed) = {
+                let mut state_mut = pasta_state.borrow_mut();
+                (std::mem::take(&mut state_mut.buf), state_mut.bracketed)
+            };
+            let text_str = String::from_utf8_lossy(&buf).to_string();
+            let wrapped = bracketed_paste_wrap(&text_str, bracketed);
+            if let Some(pty) = data.state.pty.as_ref() {
+                match pty.write(&wrapped) {
+                    Ok(n) if n == wrapped.len() => {
+                        tracing::debug!(
+                            target: "quill::pointer",
+                            n,
+                            bracketed,
+                            "paste: wrote bytes to pty"
+                        );
+                    }
+                    Ok(n) => {
+                        tracing::warn!(
+                            target: "quill::pointer",
+                            wrote = n,
+                            total = wrapped.len(),
+                            "paste: pty.write 部分写入, 剩余字节丢弃 (背压)"
+                        );
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        tracing::warn!(
+                            target: "quill::pointer",
+                            n = wrapped.len(),
+                            "paste: pty.write WouldBlock, 字节丢弃 (背压, INV-005 不重试)"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "quill::pointer",
+                            error = %e,
+                            "paste: pty.write 失败"
+                        );
+                    }
+                }
+            }
+            // 释放 fd (close), source 一并 remove.
+            pasta_state.borrow_mut().fd = None;
+            return Ok(PostAction::Remove);
+        }
+        // n < 0: errno
+        let err = std::io::Error::last_os_error();
+        match err.kind() {
+            std::io::ErrorKind::WouldBlock => return Ok(PostAction::Continue),
+            std::io::ErrorKind::Interrupted => continue,
+            _ => {
+                tracing::warn!(
+                    target: "quill::pointer",
+                    error = %err,
+                    "paste: read failed"
+                );
+                pasta_state.borrow_mut().fd = None;
+                return Ok(PostAction::Remove);
+            }
+        }
+    }
+}
+
+/// T-0607: 创建 pipe2(O_CLOEXEC | O_NONBLOCK) 用于 selection paste.
+fn make_paste_pipe() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    use std::os::fd::FromRawFd;
+    let mut fds = [-1i32; 2];
+    // SAFETY: pipe2 标准 syscall, fds 是栈数组 ≥ 2 元. flags O_CLOEXEC 让 fd
+    // 不漏给 fork 子进程; O_NONBLOCK 让 read EOF 路径不阻塞 (与 INV-005 一致).
+    #[allow(unsafe_code)]
+    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: pipe2 返 ≥0 时 fds[0] / fds[1] 是有效 fd, 我们获得所有权.
+    #[allow(unsafe_code)]
+    unsafe {
+        Ok((
+            std::os::fd::OwnedFd::from_raw_fd(fds[0]),
+            std::os::fd::OwnedFd::from_raw_fd(fds[1]),
+        ))
+    }
+}
+
 /// calloop wayland source 的回调:**prepare_read → read → dispatch_pending →
 /// flush** 四步拆清楚,之间有若干退出 / 错误分支要处理。
 ///
@@ -1050,6 +1520,19 @@ fn drive_wayland(data: &mut LoopData) -> std::io::Result<PostAction> {
     // 已置 `state.pending_repeat` (按键 Pressed → Start 或 Released / modifier
     // 变化 → Stop). 在 flush 之前把 calloop Timer source 真 insert / remove.
     apply_repeat_request(data);
+
+    // Step 3.7 (T-0607): selection / paste / autoscroll 副作用 — 与 repeat
+    // 同套路, dispatch 期间 Dispatch<WlPointer> / Dispatch<WlKeyboard> 写
+    // pending_*, 这里真消费 (那里 &mut LoopData 字段全可访问 + 协议 handle
+    // 全可调).
+    apply_autoscroll_op(data);
+    {
+        // qh 从 event_queue 拿. 借: data.event_queue 与 data.state 是不同字段,
+        // 直接 split borrow.
+        let qh = data.event_queue.handle();
+        apply_selection_op(data, &qh);
+    }
+    apply_paste_request(data);
 
     // Step 4:把 ack_configure / surface commit 这些响应真推给 compositor。
     if let Err(e) = data.state.conn.flush() {
@@ -1169,6 +1652,45 @@ pub fn run_window() -> Result<()> {
         }
     };
 
+    // T-0607: bind zwp_primary_selection_device_manager_v1 (PRIMARY 协议).
+    // GNOME 45+ / KDE Plasma 6 / wlroots 都支持; 老 compositor 缺 → None,
+    // PRIMARY 路径退化, 仅 CLIPBOARD 工作. 派单 In #F 已知陷阱.
+    let primary_selection_manager: Option<ZwpPrimarySelectionDeviceManagerV1> =
+        match globals.bind(&qh, 1..=1, ()) {
+            Ok(m) => {
+                tracing::info!(
+                    "zwp_primary_selection_device_manager_v1 bound (PRIMARY 中键复制粘贴可用)"
+                );
+                Some(m)
+            }
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    "zwp_primary_selection_device_manager_v1 不可用 — PRIMARY 中键复制 \
+                     退化; 仅 CLIPBOARD 工作. 升级 compositor 启用 (GNOME 45+ / Plasma 6)."
+                );
+                None
+            }
+        };
+
+    // T-0607: bind wl_data_device_manager (CLIPBOARD 核心协议, 现代 compositor
+    // 全支持). version 1..=3 — quill 仅用 v1 子集 (set_selection / set / receive),
+    // 锁 1..=3 兼容老新.
+    let data_device_manager: Option<WlDataDeviceManager> = match globals.bind(&qh, 1..=3, ()) {
+        Ok(m) => {
+            tracing::info!("wl_data_device_manager bound (CLIPBOARD Ctrl+Shift+C/V 可用)");
+            Some(m)
+        }
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "wl_data_device_manager 不可用 — CLIPBOARD 退化 (极罕见, 现代 \
+                 compositor 都导出); Ctrl+Shift+C/V 不工作"
+            );
+            None
+        }
+    };
+
     // State 字段顺序固化 INV-001(renderer→window→conn)+ pty 放最后(T-0202 Lead + 审码)。
     // T-0501 加: seat_state / keyboard_state / keyboard 三字段位于 core 与 pty 之间,
     // 不破坏 INV-001 链条 (它们都不持 wgpu/wayland 裸指针, 仅 SCTK/wayland-client
@@ -1201,6 +1723,20 @@ pub fn run_window() -> Result<()> {
         text_input: None,
         ime_state: ImeState::new(),
         pending_repeat: None,
+        // T-0607 selection / clipboard 起步全空, 协议 device 在 SeatHandler::
+        // new_capability(Pointer) 时 lazy 创建.
+        selection_state: SelectionState::new(),
+        pending_selection_op: None,
+        pending_paste_request: None,
+        pending_autoscroll_op: None,
+        pending_autoscroll_cancel: false,
+        primary_selection_manager,
+        primary_selection_device: None,
+        primary_current_offer: None,
+        data_device_manager,
+        data_device: None,
+        data_current_offer: None,
+        last_selection_text: None,
         pty: None,
     };
 
@@ -1352,6 +1888,9 @@ pub fn run_window() -> Result<()> {
         // 等 60ms; pending_resize_followup=None → 无兜底 Timer pending.
         last_propagate_at: None,
         pending_resize_followup: None,
+        // T-0607: autoscroll Timer 起步空, AutoScrollStart 时 lazy schedule.
+        pending_autoscroll_timer: None,
+        autoscroll_delta: 0,
     };
     event_loop
         .run(None, &mut loop_data, |data| {
@@ -1477,6 +2016,29 @@ pub fn run_window() -> Result<()> {
                     // 用户滚到顶却看到 active 内容是派单 In #D 真因.
                     // `rows` 行 × ~80 字符每行 = ~7 KiB Vec, 与 cells Vec 同数量级。
                     let row_texts: Vec<String> = (0..rows).map(|row| t.display_text(row)).collect();
+                    // T-0607: 算选中 cells 列表给 draw_frame 渲染 selection bg.
+                    // 选区为空 (无 active selection / 已 clear) → 空 vec 入参,
+                    // append_selection_bg_to_cell_bytes 内 loop noop.
+                    let selection_cells: Vec<crate::term::CellPos> = {
+                        let sel = &state.selection_state;
+                        if sel.has_selection() {
+                            match sel.mode() {
+                                crate::wl::selection::SelectionMode::Linear => {
+                                    crate::wl::selection::selected_cells_linear(sel, cols)
+                                }
+                                crate::wl::selection::SelectionMode::Block => {
+                                    crate::wl::selection::selected_cells_block(sel, cols, rows)
+                                }
+                            }
+                        } else {
+                            Vec::new()
+                        }
+                    };
+                    let selection_slice = if selection_cells.is_empty() {
+                        None
+                    } else {
+                        Some(selection_cells.as_slice())
+                    };
                     r.draw_frame(
                         ts,
                         &cells,
@@ -1486,6 +2048,7 @@ pub fn run_window() -> Result<()> {
                         hover,
                         preedit_overlay.as_ref(),
                         cursor_info.as_ref(),
+                        selection_slice,
                     )
                 }
                 None => r.draw_cells(&cells, cols, rows),
@@ -1604,6 +2167,47 @@ struct State {
     /// 单一上游消费者推副作用. drop 顺序: `RepeatScheduleRequest` 是 POD enum,
     /// 无 GPU / wayland 引用, 顺序无关.
     pending_repeat: Option<RepeatScheduleRequest>,
+    /// T-0607: 鼠标选区状态. anchor / cursor / mode / active / has_selection
+    /// 全藏在 SelectionState 内, 字段私有 (INV-010 类型隔离). 渲染 / 复制路径
+    /// 走公共 method (selected_cells_linear / extract_selection_text).
+    pub(crate) selection_state: SelectionState,
+    /// T-0607: 待发的 selection 操作 (SetPrimary / SetClipboard). 由
+    /// [`apply_selection_op`] 在 dispatch_pending 后真 trigger 协议 request.
+    pub(crate) pending_selection_op: Option<SelectionOp>,
+    /// T-0607: 待发的粘贴请求. 中键 → Primary, Ctrl+Shift+V → Clipboard.
+    /// 由 [`apply_paste_request`] 在 dispatch_pending 后调 offer.receive +
+    /// 启动 calloop Generic source 异步读 pipe.
+    pub(crate) pending_paste_request: Option<PasteSource>,
+    /// T-0607: 待发的 autoscroll 操作. 由 [`apply_autoscroll_op`] 在
+    /// dispatch_pending 后真 schedule / cancel calloop Timer.
+    pub(crate) pending_autoscroll_op: Option<AutoScrollOp>,
+    /// T-0607: 待发的 autoscroll cancel 标志. SelectionEnd / AutoScrollStop
+    /// 走此置 true.
+    pub(crate) pending_autoscroll_cancel: bool,
+    /// T-0607 PRIMARY 协议: device_manager 工厂 (`zwp_primary_selection_device_manager_v1`).
+    /// compositor 不导出 (老 wlroots / 极少 case) → None, PRIMARY 路径退化 (仅
+    /// CLIPBOARD 工作 + warn log, 派单 In #F 已知陷阱).
+    primary_selection_manager: Option<ZwpPrimarySelectionDeviceManagerV1>,
+    /// T-0607 PRIMARY 协议: device per seat. SeatHandler::new_capability
+    /// (Pointer) 时, manager 已 bind 则 get_device 一次, remove 时 destroy.
+    primary_selection_device: Option<ZwpPrimarySelectionDeviceV1>,
+    /// T-0607 PRIMARY 协议: 当前最新的 incoming offer (compositor 推送某 client
+    /// 设的 selection 给我们). `Dispatch<ZwpPrimarySelectionDeviceV1>` 收到
+    /// data_offer event 时 take 旧 + 存新, selection event 时 mark 当前 offer
+    /// 为"selection owner". 中键粘贴 (Paste(Primary)) 走此 offer 的 receive.
+    primary_current_offer: Option<ZwpPrimarySelectionOfferV1>,
+    /// T-0607 CLIPBOARD 协议: data_device_manager 工厂. 现代 compositor 都导出
+    /// (核心协议, 非 unstable), 极罕见 None.
+    data_device_manager: Option<WlDataDeviceManager>,
+    /// T-0607 CLIPBOARD 协议: data_device per seat. 与 primary_selection_device
+    /// 同生命周期 (跟 Pointer capability).
+    data_device: Option<WlDataDevice>,
+    /// T-0607 CLIPBOARD 协议: 当前最新的 wl_data_offer.
+    data_current_offer: Option<WlDataOffer>,
+    /// T-0607: 最近一次复制的选区文本. 创建 source 后 compositor 在 send event
+    /// 中 ask 我们写数据到 fd, 此时读此字段写入. PRIMARY / CLIPBOARD 共享
+    /// (语义上同一段选区), 复制时同步更新.
+    pub(crate) last_selection_text: Option<String>,
     // `pty` **位于 State 最后一位**(Lead + 审码 2026-04-25 拍板,见 T-0202 ticket):
     // - PTY 持 Linux fd + 子进程句柄,与 wl / wgpu 资源生命周期正交,放最后避免
     //   跟 INV-001 的 renderer→window→conn 链条耦合,不需要新建 INV。
@@ -1953,6 +2557,24 @@ impl SeatHandler for State {
                 tracing::info!("wp_cursor_shape_device_v1 已绑定 (cursor 形状切换 active)");
                 self.cursor_shape_device = Some(device);
             }
+            // T-0607: PRIMARY selection device per seat. manager 缺失 (老 compositor)
+            // 时 device 留 None, 选区结束时 SetPrimary 自动跳过 (apply_selection_op
+            // 守门).
+            if self.primary_selection_device.is_none() {
+                if let Some(manager) = self.primary_selection_manager.as_ref() {
+                    let device = manager.get_device(&seat, qh, ());
+                    tracing::info!("zwp_primary_selection_device_v1 已绑定 (PRIMARY 选区 active)");
+                    self.primary_selection_device = Some(device);
+                }
+            }
+            // T-0607: CLIPBOARD data_device per seat.
+            if self.data_device.is_none() {
+                if let Some(manager) = self.data_device_manager.as_ref() {
+                    let device = manager.get_data_device(&seat, qh, ());
+                    tracing::info!("wl_data_device 已绑定 (CLIPBOARD 选区 active)");
+                    self.data_device = Some(device);
+                }
+            }
             self.pointer = Some(ptr);
             self.pointer_seat = Some(seat);
         }
@@ -2073,6 +2695,255 @@ impl Dispatch<WpCursorShapeDeviceV1, ()> for State {
     ) {
         // 协议零 event.
     }
+}
+
+// ---------- T-0607 PRIMARY selection 协议 Dispatch impls ----------
+
+/// `Dispatch<ZwpPrimarySelectionDeviceManagerV1>`: 工厂对象, 协议零 event.
+impl Dispatch<ZwpPrimarySelectionDeviceManagerV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwpPrimarySelectionDeviceManagerV1,
+        _event: zwp_primary_selection_device_manager_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+/// `Dispatch<ZwpPrimarySelectionDeviceV1>`: 接受 compositor 推 data_offer +
+/// selection events. selection event 标记当前 incoming offer 为 owner (中键
+/// 粘贴时读此).
+impl Dispatch<ZwpPrimarySelectionDeviceV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &ZwpPrimarySelectionDeviceV1,
+        event: zwp_primary_selection_device_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_primary_selection_device_v1::Event::DataOffer { offer } => {
+                // 协议: data_offer event 是 selection event 的 prefix (compositor
+                // 先发 data_offer 创建 offer 对象, 再发 selection 把它声明为当前
+                // selection). 我们这里仅记录, selection event 才真把它作为
+                // current_offer.
+                tracing::trace!(
+                    target: "quill::pointer",
+                    "PRIMARY data_offer received (待 selection 事件确认)"
+                );
+                // 防御性 destroy 旧 (compositor 一般会发 selection(None) 替换,
+                // 这里如果重复 data_offer 而 selection 未到, 旧 offer 没被引用 —
+                // wayland-client 自管 drop).
+                let _ = offer;
+            }
+            zwp_primary_selection_device_v1::Event::Selection { id } => {
+                // selection event 给当前 selection owner (id=Some) 或清 (None).
+                if let Some(prev) = state.primary_current_offer.take() {
+                    prev.destroy();
+                }
+                state.primary_current_offer = id;
+                tracing::debug!(
+                    target: "quill::pointer",
+                    has_offer = state.primary_current_offer.is_some(),
+                    "PRIMARY selection event"
+                );
+            }
+            _ => {}
+        }
+    }
+
+    // 协议要求: data_offer event 携带 NewId<ZwpPrimarySelectionOfferV1>, 调用方
+    // 必须实现 event_created_child 路由让新对象 Dispatch 到自己. 这里走 self.
+    wayland_client::event_created_child!(State, ZwpPrimarySelectionDeviceV1, [
+        zwp_primary_selection_device_v1::EVT_DATA_OFFER_OPCODE => (ZwpPrimarySelectionOfferV1, ()),
+    ]);
+}
+
+/// `Dispatch<ZwpPrimarySelectionOfferV1>`: 收到 compositor 推 offer 提供的
+/// MIME 类型. 我们仅关心 text/plain (UTF-8); 其它无视.
+impl Dispatch<ZwpPrimarySelectionOfferV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwpPrimarySelectionOfferV1,
+        event: zwp_primary_selection_offer_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let zwp_primary_selection_offer_v1::Event::Offer { mime_type } = event {
+            tracing::trace!(target: "quill::pointer", mime = %mime_type, "PRIMARY offer mime");
+        }
+    }
+}
+
+/// `Dispatch<ZwpPrimarySelectionSourceV1>`: 我们创建的 source 收到 compositor
+/// 反向 event — Send (要写数据到 fd) / Cancelled (其它 client 设了 selection).
+impl Dispatch<ZwpPrimarySelectionSourceV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &ZwpPrimarySelectionSourceV1,
+        event: zwp_primary_selection_source_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_primary_selection_source_v1::Event::Send { mime_type, fd } => {
+                write_selection_to_fd(state.last_selection_text.as_deref(), &mime_type, fd);
+            }
+            zwp_primary_selection_source_v1::Event::Cancelled => {
+                // 其它 client 设了 PRIMARY, quill 失去所有权 — 仅 trace, 用户视
+                // 觉无变化 (仍能看自己的选区高亮, 但 PRIMARY pasta 拿到的是
+                // 其它 client 内容).
+                tracing::trace!(target: "quill::pointer", "PRIMARY source cancelled");
+            }
+            _ => {}
+        }
+    }
+}
+
+// ---------- T-0607 CLIPBOARD (wl_data_device) 协议 Dispatch impls ----------
+
+/// `Dispatch<WlDataDeviceManager>`: 工厂对象, 协议零 event.
+impl Dispatch<WlDataDeviceManager, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WlDataDeviceManager,
+        _event: wl_data_device_manager::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+/// `Dispatch<WlDataDevice>`: 接 data_offer + selection events (与 PRIMARY device
+/// 同套路, 仅协议 path 不同).
+impl Dispatch<WlDataDevice, ()> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &WlDataDevice,
+        event: wl_data_device::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_data_device::Event::DataOffer { id } => {
+                tracing::trace!(target: "quill::pointer", "CLIPBOARD data_offer received");
+                let _ = id;
+            }
+            wl_data_device::Event::Selection { id } => {
+                if let Some(prev) = state.data_current_offer.take() {
+                    prev.destroy();
+                }
+                state.data_current_offer = id;
+                tracing::debug!(
+                    target: "quill::pointer",
+                    has_offer = state.data_current_offer.is_some(),
+                    "CLIPBOARD selection event"
+                );
+            }
+            _ => {}
+        }
+    }
+
+    wayland_client::event_created_child!(State, WlDataDevice, [
+        wl_data_device::EVT_DATA_OFFER_OPCODE => (WlDataOffer, ()),
+    ]);
+}
+
+/// `Dispatch<WlDataOffer>`: 收到 offer mime types (类似 PRIMARY offer). drag-and-drop
+/// 路径 (派单 Out P3) 还有 source_actions / action 等 event, 这里不消费.
+impl Dispatch<WlDataOffer, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WlDataOffer,
+        event: wl_data_offer::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let wl_data_offer::Event::Offer { mime_type } = event {
+            tracing::trace!(target: "quill::pointer", mime = %mime_type, "CLIPBOARD offer mime");
+        }
+    }
+}
+
+/// `Dispatch<WlDataSource>`: 我们创建的 CLIPBOARD source 反向 event.
+impl Dispatch<WlDataSource, ()> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &WlDataSource,
+        event: wl_data_source::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_data_source::Event::Send { mime_type, fd } => {
+                write_selection_to_fd(state.last_selection_text.as_deref(), &mime_type, fd);
+            }
+            wl_data_source::Event::Cancelled => {
+                tracing::trace!(target: "quill::pointer", "CLIPBOARD source cancelled");
+            }
+            _ => {}
+        }
+    }
+}
+
+/// T-0607: compositor 通过 source 的 Send event ask 我们把 selection 数据写到
+/// 它给的 fd. 我们走非阻塞 write (一次性写完, kernel pipe buffer 通常 ≥ 64 KiB
+/// 远超选区文本长度, 不会卡). 写完关 fd 让 reader (compositor / 接收 client)
+/// 拿到 EOF.
+///
+/// **why 一行 write 而非 calloop async**: 选区文本典型 < 4 KiB, kernel pipe
+/// buffer 默认 64 KiB 远超, 一次 write 必成. 真大 paste (>1 MiB 命令输出复制)
+/// 罕见, Phase 6 加非阻塞 + chunked write. KISS.
+///
+/// **mime_type 校验**: quill 仅 offer text/plain;charset=utf-8 + UTF8_STRING +
+/// TEXT 三个 (派单 In #F + #G), 接到 compositor send 任何这三个之一都返同样
+/// UTF-8 字节. 其它 mime (e.g. image/png) 不该来 (compositor 不会发 client 没
+/// offer 过的 mime), 防御性吞掉 + warn.
+fn write_selection_to_fd(text: Option<&str>, mime_type: &str, fd: std::os::fd::OwnedFd) {
+    let bytes = text.unwrap_or("").as_bytes();
+    let recognized = matches!(
+        mime_type,
+        "text/plain;charset=utf-8" | "text/plain" | "UTF8_STRING" | "TEXT"
+    );
+    if !recognized {
+        tracing::warn!(
+            target: "quill::pointer",
+            mime = %mime_type,
+            "selection source send: 未知 mime 类型, 拒绝写入 (fd 直接关)"
+        );
+        // OwnedFd drop 自动 close, reader 收 EOF (空数据).
+        return;
+    }
+    // SAFETY: fd 是 OwnedFd, 我们获得所有权 (从 wayland-client). std::fs::File
+    // ::from(fd) 接管 fd (同样所有权), drop 关 fd. write_all 走非阻塞但 kernel
+    // pipe buffer ≥ 64 KiB 一次必成.
+    use std::io::Write;
+    let mut file = std::fs::File::from(fd);
+    if let Err(e) = file.write_all(bytes) {
+        tracing::warn!(
+            target: "quill::pointer",
+            error = %e,
+            n = bytes.len(),
+            "selection source send: write 失败 (compositor 已掉?)"
+        );
+    } else {
+        tracing::debug!(
+            target: "quill::pointer",
+            n = bytes.len(),
+            mime = %mime_type,
+            "selection source: wrote bytes to compositor"
+        );
+    }
+    // file drop 自动 close fd, reader 收 EOF.
 }
 
 /// **`Dispatch<ZwpTextInputManagerV3>`**: manager 是工厂对象, 自身无事件
@@ -2329,6 +3200,24 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
             KeyboardAction::StopRepeat => {
                 state.pending_repeat = Some(RepeatScheduleRequest::Stop);
             }
+            // T-0607 CLIPBOARD 热键. SetClipboard 走 selection_state 当前选区
+            // (与 SelectionEnd 同 path 但 device 走 wl_data_device 而非 PRIMARY).
+            // 选区为空 (用户没拖过 / 已 clear) 时仍 set_selection (空字符串),
+            // 与 alacritty / foot 一致.
+            KeyboardAction::CopyToClipboard => {
+                state.pending_selection_op = Some(SelectionOp::SetClipboard);
+                tracing::debug!(
+                    target: "quill::keyboard",
+                    "Ctrl+Shift+C → SetClipboard queued"
+                );
+            }
+            KeyboardAction::PasteFromClipboard => {
+                state.pending_paste_request = Some(PasteSource::Clipboard);
+                tracing::debug!(
+                    target: "quill::keyboard",
+                    "Ctrl+Shift+V → Paste(Clipboard) queued"
+                );
+            }
         }
     }
 }
@@ -2409,7 +3298,13 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
-        let action = handle_pointer_event(event, &mut state.pointer_state);
+        // T-0607: 鼠标按下时 alt_active 影响 SelectionMode (Linear vs Block).
+        // 走 keyboard_state.alt_active() 读"语义 Alt active" (effective mods,
+        // 含 latched / locked, 兼容用户改 keymap 把 Alt 重映射). 非 button
+        // event (motion / enter / axis) 不读此值, 但本路径单点入口 全部走
+        // 同一调用避免分支.
+        let alt_active = state.keyboard_state.alt_active();
+        let action = handle_pointer_event(event, &mut state.pointer_state, alt_active);
         // T-0703: 主 PointerAction 处理后, 顺手取出 pending_cursor_set 下发
         // wp_cursor_shape_device_v1.set_shape (单一消费者, 与 take_pending /
         // pending_scroll_lines 同 T-0602/T-0603 套路). 放最前面以便 Enter
@@ -2532,6 +3427,65 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                     let _ = handle_event(&mut state.core, WindowEvent::Close);
                 }
             },
+            // T-0607 选区操作: SelectionStart/Update/End 走 selection_state 状态
+            // 转移 + presentation_dirty 触发重画 (cell 反色). 真 PRIMARY auto-copy
+            // (SelectionEnd 路径) 走 state.pending_selection_op = Some(SetPrimary)
+            // 让 drive_wayland step 3.7 真消费 (那里能拿 LoopData 字段).
+            PointerAction::SelectionStart { anchor, mode } => {
+                state.selection_state.start(anchor, mode);
+                state.presentation_dirty = true;
+                tracing::trace!(
+                    target: "quill::pointer",
+                    ?anchor,
+                    ?mode,
+                    "SelectionStart"
+                );
+            }
+            PointerAction::SelectionUpdate { cursor } => {
+                state.selection_state.update(cursor);
+                state.presentation_dirty = true;
+            }
+            PointerAction::SelectionEnd => {
+                state.selection_state.end();
+                // 选区结束 → cancel autoscroll Timer + 触发 PRIMARY auto-copy.
+                // pending_autoscroll_cancel 让 drive_wayland step 3.7 真 remove
+                // calloop Timer source (这里只能拿 &mut State 拿不到 LoopHandle).
+                state.pending_autoscroll_cancel = true;
+                state.pending_selection_op = Some(SelectionOp::SetPrimary);
+                state.presentation_dirty = true;
+                tracing::debug!(
+                    target: "quill::pointer",
+                    "SelectionEnd → schedule PRIMARY auto-copy + cancel autoscroll"
+                );
+            }
+            PointerAction::Paste(source) => {
+                // 中键 → Primary 单点入口. Ctrl+Shift+V → Clipboard 走 keyboard
+                // 路径推 pending_paste_request (那里直接置). 调用方
+                // (drive_wayland step 3.7) 走 dispatch_pending 之后真 trigger
+                // offer.receive + read pipe. 这里只 set 单次延迟请求.
+                state.pending_paste_request = Some(source);
+                tracing::debug!(
+                    target: "quill::pointer",
+                    ?source,
+                    "Paste request queued"
+                );
+            }
+            PointerAction::AutoScrollStart { delta } => {
+                // 拖到 viewport 边缘 → schedule autoscroll Timer (100ms 一次
+                // scroll_display(±1) + cursor 跟随). 走 pending_autoscroll_op
+                // 让 drive_wayland step 3.7 真 insert source (LoopHandle 在
+                // LoopData, Dispatch 拿不到).
+                state.pending_autoscroll_op = Some(AutoScrollOp::Start { delta });
+                tracing::debug!(
+                    target: "quill::pointer",
+                    delta,
+                    "AutoScrollStart queued"
+                );
+            }
+            PointerAction::AutoScrollStop => {
+                state.pending_autoscroll_cancel = true;
+                tracing::trace!(target: "quill::pointer", "AutoScrollStop queued");
+            }
         }
     }
 }
