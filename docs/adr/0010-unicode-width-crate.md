@@ -1,6 +1,6 @@
 # ADR 0010 — 引入 unicode-width crate (grid 占位与字形渲染解耦)
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-05-02
 **Phase**: 8 (terminal correctness)
 **Related**: T-0801 (CJK forced double advance), T-0803 (本次落地)
