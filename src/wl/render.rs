@@ -3634,9 +3634,8 @@ impl Renderer {
 /// 偏短, Phase 6 待办兑现).
 ///
 /// **why free fn 不是 method on Renderer**: 不需要 self.device / self.atlas,
-/// 纯 vertex generation 数学; render_headless 也能复用 (但 headless 内联了类
-/// 似 loop, 此 fn 仅 draw_frame 路径用 — render_headless preedit 走自己的
-/// inline 实现, 与 T-0408 设计一致)。
+/// 纯 vertex generation 数学; draw_frame + render_headless 两路径 (T-0807 起)
+/// 都调本 fn 统一 underline 宽度计算 (cell 数 via unicode-width).
 #[allow(clippy::too_many_arguments)]
 fn append_preedit_underline_to_cell_bytes(
     cell_vertex_bytes: &mut Vec<u8>,
