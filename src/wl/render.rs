@@ -2741,7 +2741,7 @@ impl Renderer {
                     &mut cell_vertex_bytes,
                     p.cursor_col,
                     p.cursor_line,
-                    p.text.chars().count(),
+                    unicode_width::UnicodeWidthStr::width(p.text.as_str()),
                     cell_w_px,
                     cell_h_px,
                     titlebar_y_offset_px,
@@ -3628,9 +3628,10 @@ impl Renderer {
 
 /// T-0505: 在 cell_vertex_bytes 上追加 preedit 下划线矩形 (cell pass REPLACE
 /// 路径). 横跨 (cursor_col, cursor_line) 起 N 个 cell 宽度, 高 PREEDIT_UNDERLINE_PX
-/// × HIDPI_SCALE 在 cell 底部。N = preedit char 数; ASCII 1 字符 = 1 cell, CJK
-/// 1 字符 = 2 cell (但 char_count 取 chars().count() 偏小, Phase 6 接 east-asian
-/// width 表精确算 cell 数, 当前 KISS 用 char count, 视觉上差不多)。
+/// × HIDPI_SCALE 在 cell 底部。N = preedit 占用 cell 数 (T-0807 m1 收口:
+/// 调用方传 `unicode_width::UnicodeWidthStr::width(text)`, ASCII 1 char = 1 cell,
+/// CJK 1 char = 2 cell, 与 grid 对齐. 此前用 chars().count() CJK preedit 下划线
+/// 偏短, Phase 6 待办兑现).
 ///
 /// **why free fn 不是 method on Renderer**: 不需要 self.device / self.atlas,
 /// 纯 vertex generation 数学; render_headless 也能复用 (但 headless 内联了类
@@ -3641,7 +3642,7 @@ fn append_preedit_underline_to_cell_bytes(
     cell_vertex_bytes: &mut Vec<u8>,
     cursor_col: usize,
     cursor_line: usize,
-    char_count: usize,
+    cell_count: usize,
     cell_w_px: f32,
     cell_h_px: f32,
     titlebar_y_offset_px: f32,
@@ -3649,12 +3650,12 @@ fn append_preedit_underline_to_cell_bytes(
     surface_h: f32,
     underline_color: [f32; 3],
 ) {
-    if char_count == 0 {
+    if cell_count == 0 {
         return;
     }
     let underline_thickness_px = PREEDIT_UNDERLINE_PX as f32 * HIDPI_SCALE as f32;
     let x0_px = cursor_col as f32 * cell_w_px;
-    let x1_px = x0_px + (char_count as f32) * cell_w_px;
+    let x1_px = x0_px + (cell_count as f32) * cell_w_px;
     // y 在 cell 底部往上 underline_thickness_px (加 titlebar offset 让 preedit
     // 跟 cell grid 整体对齐, 不画到 titlebar 区).
     let y1_px = (cursor_line + 1) as f32 * cell_h_px + titlebar_y_offset_px;
@@ -4605,7 +4606,7 @@ pub fn render_headless(
                 &mut cell_vertex_bytes,
                 p.cursor_col,
                 p.cursor_line,
-                p.text.chars().count(),
+                unicode_width::UnicodeWidthStr::width(p.text.as_str()),
                 cell_w_px,
                 cell_h_px,
                 titlebar_y_offset_px,
@@ -5150,6 +5151,34 @@ mod tests {
         assert!(c.r < 29.0 / 255.0);
         assert!(c.g < 31.0 / 255.0);
         assert!(c.b < 33.0 / 255.0);
+    }
+
+    /// T-0807 m1: preedit 下划线宽度 sanity. `append_preedit_underline_to_cell_bytes`
+    /// 接的是 cell 数 (T-0807 改名 char_count → cell_count), 调用方传
+    /// `unicode_width::UnicodeWidthStr::width(text)` 而非 `chars().count()`.
+    /// CJK preedit "今天" 应占 4 cell (每字 2), 不是 2 cell.
+    ///
+    /// 此处不直接 mock GPU 跑下划线渲染 (render_headless 复杂度), 只锁
+    /// "调用方表达式语义正确" — width("今天") == 4 与 chars().count() == 2 的
+    /// 差异是本 ticket 的核心修复点. 防 Phase 6 后续 ticket 误回退到 char count.
+    #[test]
+    fn preedit_underline_cell_count_uses_unicode_width_for_cjk() {
+        let cjk = "今天";
+        let cells = unicode_width::UnicodeWidthStr::width(cjk);
+        assert_eq!(
+            cells, 4,
+            "CJK preedit '今天' 应占 4 cell (每字 wide=2), got {}",
+            cells
+        );
+        let chars = cjk.chars().count();
+        assert_eq!(
+            chars, 2,
+            "CJK preedit '今天' chars().count() = 2, 验旧路径偏小"
+        );
+        // ASCII 兜底: 单宽路径下 width == chars().count().
+        let ascii = "abc";
+        assert_eq!(unicode_width::UnicodeWidthStr::width(ascii), 3);
+        assert_eq!(ascii.chars().count(), 3);
     }
 
     // ---------- T-0802 In #A select_present_mode 单测 ----------
