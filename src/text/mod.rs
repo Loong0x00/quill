@@ -456,40 +456,51 @@ impl TextSystem {
             .map(|g| self.apply_emoji_blacklist(g))
             .collect();
 
-        // T-0801: CJK 强制双宽 advance 后处理。详 [`force_cjk_double_advance`] doc。
-        force_cjk_double_advance(emoji_filtered)
+        // T-0801: CJK / wide 字形强制双宽 advance 后处理。详 [`force_cjk_double_advance`] doc。
+        // T-0803: 透传原文 &str — wide 判定走 unicode-width 表 (POSIX wcwidth +
+        // East Asian Width), 需按 ShapedGlyph.cluster 回查原文 char。
+        force_cjk_double_advance(emoji_filtered, text)
     }
 }
 
-/// T-0801: 后处理 shape 出的 glyph 序列, 把 CJK / 双宽字形强制对齐到 monospace
-/// 终端"双 cell"宽度, 修字间空隙 bug。
+/// T-0801 + T-0803: 后处理 shape 出的 glyph 序列, 按 grid 占位标准把字形对齐到
+/// monospace 终端 1 / 2 cell 宽度。
 ///
-/// **真因 (派单 Bug 段引)**: alacritty Term 协议把 CJK 字当 2 cells (实字 cell +
+/// **真因 (T-0801 引)**: alacritty Term 协议把 CJK 字当 2 cells (实字 cell +
 /// WIDE_CHAR_SPACER cell), quill 渲染按 cosmic-text 自然 advance ~ 1.67 ×
 /// CELL_W_PX_phys (T-0405 实测: Noto CJK 1.0em / DejaVu Sans Mono Latin 0.6em
 /// 跨 face 比例), 字形占第 1 cell + 第 2 cell 一半, 视觉每字一空。主流终端
 /// (alacritty / foot / kitty / xterm) **强制**双宽 cell 居中。
 ///
+/// **T-0803 修判定来源 (ADR 0010)**: T-0801 用 `natural_advance > 1.5 × CELL_W_PX_phys`
+/// 判 wide, 把 nerd font 图标 (PUA U+E000..F8FF) 字形 ~1.67 cell 误判 wide,
+/// 但 lsd / fzf / starship / ghostty 全用 unicode-width crate 算 PUA = 1 cell,
+/// grid 视图错位。T-0803 改判 wide 走 `unicode_width::UnicodeWidthChar::width(ch)`
+/// (POSIX wcwidth + Unicode East Asian Width 表), 与工业标准对齐:
+///   - CJK W → 2 cell, ASCII Na → 1 cell, PUA N → 1 cell, emoji → 2 cell
+///
 /// **算法**:
-/// 1. 检测每个 glyph 是否双宽: `natural_advance > 1.5 × CELL_W_PX_phys`
-///    (派单已知陷阱: cosmic-text 不给 wide 标志, advance ratio 是 monospace
-///    终端语境最稳的判断 — codepoint range 检测漏 CJK 扩展块, 且不区分主 face
-///    .notdef tofu 退化路径下"宽 codepoint 但 fallback 给 narrow tofu" 这种 edge)
+/// 1. 按 `g.cluster` 从 `original` 取 char, `UnicodeWidthChar::width(ch).unwrap_or(1) >= 2`
+///    判 wide (`unwrap_or(1)` fallback: control char width 返 None, 渲染按 1 cell;
+///    `unwrap_or(' ')` 兜底 cluster 越界 — 越界几乎不可能, 但 quill 原则 panic-free)
 /// 2. 重 cascade `x_offset`: 从 0 起累加, narrow → 1 cell (`CELL_W_PX_phys`),
 ///    wide → 2 cells (`2 × CELL_W_PX_phys`)
 /// 3. wide glyph 居中: `x_offset += (2 × CELL_W_PX_phys - natural_advance) / 2`
-///    (slot.bearing_x 仍按字形 bbox 左偏, 居中量加在 x_offset 上)
+///    (字形居中双宽 cell, slot.bearing_x 仍按字形 bbox 左偏, 居中量加在 x_offset 上)
 /// 4. 强制 advance: wide → `2 × CELL_W_PX_phys`, narrow → `CELL_W_PX_phys`
-///    (narrow 也吸到 CELL_W_PX_phys 而非保留 cosmic-text 微差: monospace 终端
-///    grid 严对齐, ASCII 自然 advance 已 ≈ CELL_W_PX_phys 微差忽略, 同时让
-///    "advance 累加 == 期望 grid 宽度" 成为自检不变式)
+///    (monospace 终端 grid 严对齐, ASCII / PUA 自然 advance 与 CELL_W_PX_phys
+///    微差直接吸齐, 让 "advance 累加 == 期望 grid 宽度" 成为自检不变式)
+///
+/// **已知 trade-off (ADR 0010 Out 段)**: PUA / nerd font 图标自然字形 ~1.67 cell
+/// 现在被压在 1 cell, 字形可能与下一字符像素级重叠几像素 — ghostty / kitty 走
+/// 字形 squeeze 渲染 (`scale_x = cell_w / natural_advance`) 解决, 走另开 ticket
+/// Phase 后期落地。本 fn 仅修 grid 判定。
 ///
 /// **不动 single-glyph natural_advance 字段**: ShapedGlyph 公共 API `x_advance`
 /// 是 quill 抽象 (派单 In #A "强制 advance = 2 × CELL_W_PX"), 不暴露 cosmic-text
-/// 自然 advance — 派单 Acceptance "advance = 2 × CELL_W_PX" 是公共契约。下游
-/// 渲染层只看 `x_offset` 决定字形左上角位置 (走 `glyph.x_offset + slot.bearing_x`,
-/// 见 src/wl/render.rs::draw_frame T-0801 注释), `x_advance` 字段保留作元数据
-/// (累加自检 / 测试断言 / 未来 cursor 推进逻辑)。
+/// 自然 advance。下游渲染层只看 `x_offset` 决定字形左上角位置 (走
+/// `glyph.x_offset + slot.bearing_x`, 见 src/wl/render.rs::draw_frame T-0801 注释),
+/// `x_advance` 字段保留作元数据 (累加自检 / 测试断言 / 未来 cursor 推进逻辑)。
 ///
 /// **HIDPI_SCALE 单一来源** (沿袭 shape_line 注释): 引 [`crate::wl::HIDPI_SCALE`]
 /// 与 [`crate::wl::CELL_W_PX`] 让 cell pixel 宽 一处定义, 不再走 magic number。
@@ -501,21 +512,26 @@ impl TextSystem {
 /// - [`tests::shape_line_cjk_glyphs_have_forced_double_advance`]
 /// - [`tests::shape_line_cjk_glyphs_centered_in_double_cell`]
 /// - [`tests::shape_line_ascii_advance_equals_cell_w_phys`]
+/// - [`tests::shape_line_pua_nerd_font_icon_advance_eq_one_cell`] (T-0803)
+/// - [`tests::shape_line_emoji_advance_eq_double_cell`] (T-0803)
 /// - [`tests::shape_line_mixed_cjk_returns_glyphs`] (T-0405 ratio range
 ///   [1.4, 2.4] 改为严 advance == 2 × CELL_W_PX_phys)
-fn force_cjk_double_advance(glyphs: Vec<ShapedGlyph>) -> Vec<ShapedGlyph> {
+fn force_cjk_double_advance(glyphs: Vec<ShapedGlyph>, original: &str) -> Vec<ShapedGlyph> {
     if glyphs.is_empty() {
         return glyphs;
     }
     let cell_w_phys = crate::wl::CELL_W_PX * (crate::wl::HIDPI_SCALE as f32);
-    let wide_threshold = 1.5 * cell_w_phys;
     let double_w = 2.0 * cell_w_phys;
 
     let mut out: Vec<ShapedGlyph> = Vec::with_capacity(glyphs.len());
     let mut cursor_x: f32 = 0.0;
     for g in glyphs {
+        let ch = original
+            .get(g.cluster..)
+            .and_then(|s| s.chars().next())
+            .unwrap_or(' ');
+        let is_wide = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1) >= 2;
         let natural = g.x_advance;
-        let is_wide = natural.is_finite() && natural > wide_threshold;
         let forced_advance = if is_wide { double_w } else { cell_w_phys };
         // 居中: 仅 wide 应用; narrow 沿 cosmic-text 自然 ASCII 对齐 (差异 < 1 px)
         let center_pad = if is_wide {
@@ -621,6 +637,19 @@ pub struct ShapedGlyph {
     pub y_advance: f32,
     pub x_offset: f32,
     pub y_offset: f32,
+    /// **T-0803 加**: 原文 byte cluster 起点 (取 cosmic-text [`cosmic_text::LayoutGlyph::start`],
+    /// 0.12 已稳)。[`force_cjk_double_advance`] 用此回查原文 char, 走
+    /// `unicode_width::UnicodeWidthChar::width(ch)` 决定 grid 占位 1 vs 2 cell
+    /// (替代 T-0801 的字形 natural advance ratio 判定 — PUA / nerd font 图标
+    /// 字形宽 ~1.67 cell 但 unicode-width 算 1 cell, 字形比例靠不住, 见 ADR 0010)。
+    ///
+    /// **why 不存 char**: 一字符可能 shape 出多 glyph (例 ZWJ 表情 / 复合字 / 连字),
+    /// cluster 是 cosmic-text/HarfBuzz 协议层标准 — 多 glyph 共享同 cluster
+    /// 等价 "同一原文 char start"; cluster + 原文 &str 配合可重建任意 char,
+    /// 语义比 "凭 glyph 自身回猜字符" 稳, 也省掉 char 字段 4 字节。
+    ///
+    /// INV-010 守: usize 是 quill 基础类型, 不暴露 cosmic-text [`cosmic_text::LayoutGlyph`]。
+    pub cluster: usize,
     /// **T-0403 加 (私有)**: cosmic-text 自带 cache_key, 给 [`TextSystem::rasterize`]
     /// 用 — `cache_key.font_id` 是 LayoutGlyph 实际选中的 face (含 CJK fallback
     /// 切到 Noto CJK 时的 face_id), 单纯 (gid, font_size) 不够, 必须有 font_id。
@@ -681,6 +710,9 @@ impl ShapedGlyph {
             y_advance: 0.0,
             x_offset: g.x,
             y_offset: g.y,
+            // T-0803: cluster = LayoutGlyph.start (原文 byte 起点)。cosmic-text 0.12
+            // 字段稳定, 0.19+ 仍 `start: usize` 同名同类型, 升级路径同其他字段。
+            cluster: g.start,
             cache_key: physical.cache_key,
         }
     }
@@ -1155,6 +1187,70 @@ mod tests {
                 g.x_offset
             );
         }
+    }
+
+    // ===== T-0803: unicode-width grid 占位判定测试 =====
+
+    /// T-0803: PUA / nerd font 图标 (U+E0B0 powerline triangle) 必算 1 cell,
+    /// 与 lsd / fzf / starship / ghostty 对齐 (ADR 0010 核心目标)。
+    ///
+    /// **why U+E0B0**: powerline 三角是最常见的 nerd font 图标 (oh-my-zsh /
+    /// starship / lsd 默认 prompt 都有), 字形宽 ~1.67 cell — T-0801 自然
+    /// advance ratio 误判 wide → 2 cell, 与 lsd 内部 unicode-width 算 1 cell
+    /// 错位 1 cell per icon (派单 Bug 段截图证据)。
+    ///
+    /// **CI 退化路径**: nerd font 通常未装, cosmic-text 给主 face .notdef tofu
+    /// (gid=0, 自然 advance ≈ CELL_W_PX_phys); unicode-width 算 PUA = 1, 强制
+    /// advance 仍 = CELL_W_PX_phys, 测试通过 (退化路径 advance 与正常路径同)。
+    #[test]
+    fn shape_line_pua_nerd_font_icon_advance_eq_one_cell() {
+        let mut ts = TextSystem::new().expect("TextSystem::new on user machine");
+        let glyphs = ts.shape_line("\u{E0B0}");
+        assert_eq!(
+            glyphs.len(),
+            1,
+            "shape U+E0B0 must yield 1 glyph (got {})",
+            glyphs.len()
+        );
+        let cell_w_phys = crate::wl::CELL_W_PX * (crate::wl::HIDPI_SCALE as f32);
+        assert!(
+            (glyphs[0].x_advance - cell_w_phys).abs() < 0.001,
+            "T-0803: PUA U+E0B0 advance 应严等 CELL_W_PX_phys = {} (unicode-width \
+             算 PUA = 1 cell, 与 lsd / ghostty 对齐); got {}",
+            cell_w_phys,
+            glyphs[0].x_advance
+        );
+    }
+
+    /// T-0803: emoji (U+1F600 grinning face) 必算 2 cell (unicode-width 表
+    /// 把 emoji 标 W = wide)。
+    ///
+    /// **CI / 用户机均测**: 用户机有 NotoColorEmoji → cosmic-text fallback,
+    /// `apply_emoji_blacklist` 把 glyph_id 改 0 但保留 cluster + advance →
+    /// `force_cjk_double_advance` 仍按 cluster 回查 char 走 unicode-width 判 wide
+    /// → 强制 advance = 2 × CELL_W_PX_phys。CI 无 emoji face 时 cosmic-text 给
+    /// 主 face .notdef tofu, cluster 仍指向 emoji char, unicode-width 仍判 wide,
+    /// advance 同 — 退化路径行为与正常路径一致 (派单 Acceptance "用户机为准, CI
+    /// 退化作 follow-up", 此处刚好两路径同行为)。
+    #[test]
+    fn shape_line_emoji_advance_eq_double_cell() {
+        let mut ts = TextSystem::new().expect("TextSystem::new on user machine");
+        let glyphs = ts.shape_line("\u{1F600}");
+        assert_eq!(
+            glyphs.len(),
+            1,
+            "shape U+1F600 must yield 1 glyph (got {})",
+            glyphs.len()
+        );
+        let cell_w_phys = crate::wl::CELL_W_PX * (crate::wl::HIDPI_SCALE as f32);
+        let double_w = 2.0 * cell_w_phys;
+        assert!(
+            (glyphs[0].x_advance - double_w).abs() < 0.001,
+            "T-0803: emoji U+1F600 advance 应严等 2 × CELL_W_PX_phys = {} \
+             (unicode-width 表 emoji = W); got {}",
+            double_w,
+            glyphs[0].x_advance
+        );
     }
 
     /// T-0403: ASCII 'a' shape + raster 必须给非空 bitmap。

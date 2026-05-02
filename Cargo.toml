@@ -20,6 +20,11 @@ raw-window-handle = "0.6"
 smithay-client-toolkit = "0.19"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# T-0803 / ADR 0010: grid 占位判定单一权威 (POSIX wcwidth + Unicode East Asian
+# Width 表)。把 ShapedGlyph 双宽判定从字形 natural advance ratio 解耦, 让 PUA /
+# nerd font 图标 = 1 cell 与 lsd / fzf / starship / ghostty 对齐 (cosmic-text
+# 已 transitive 依赖此 crate, 无新二进制开销)。
+unicode-width = "0.1"
 # client_system 切换到 libwayland C 后端 —— wgpu/Vulkan 需要真实 wl_display / wl_surface
 # 指针,纯 Rust 后端产出的协议对象不是 ABI 兼容 libwayland。
 wayland-backend = { version = "0.3", features = ["client_system"] }
