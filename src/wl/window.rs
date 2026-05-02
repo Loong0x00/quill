@@ -4402,6 +4402,20 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
         let tab_count = state.tabs.as_ref().map(|t| t.len()).unwrap_or(1);
         let (_cols, rows) = cells_from_surface_px(state.core.width, state.core.height, tab_count);
         let rows_u16 = rows.min(u16::MAX as usize) as u16;
+        // T-0806: preedit 非空时吞所有 Key (press/release) event 不送 PTY.
+        // text-input-v3 协议规定 client 自负责防御 — fcitx5 在 inline_ascii /
+        // Caps_Lock 切英文等模式下不消费 backspace 但仍发出 wl_keyboard.key,
+        // 不防御会 destructive 删 PTY 已 commit 字符 (实测拼音 preedit 时按
+        // backspace 删了之前的 "你好"). Ctrl+C 等紧急 control 暂不豁免 (倾向
+        // 严格, 后续 user 反馈再调). Keymap / Enter / Leave / Modifiers /
+        // RepeatInfo 仍正常 dispatch 让 keyboard_state 跟 compositor 同步.
+        if key_event_swallowed_for_preedit(&event, state.ime_state.is_preedit_active()) {
+            tracing::trace!(
+                target: "quill::keyboard",
+                "key swallowed (preedit active)"
+            );
+            return;
+        }
         let action = handle_key_event(event, &mut state.keyboard_state, rows_u16);
         match action {
             KeyboardAction::Nothing => {}
@@ -4468,6 +4482,17 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
             }
         }
     }
+}
+
+/// T-0806: 判断一个 wl_keyboard event 是否该被 preedit guard 吞掉.
+///
+/// **纯函数**: 不读 State / IME state, 由调用方传 `preedit_active` bool. 抽
+/// 出来主要为了 unit test (Dispatch impl 太大, 构造完整 State 测 guard 不现
+/// 实). 仅 `Event::Key` (press 或 release) 在 preedit 非空时返 true; Keymap /
+/// Enter / Leave / Modifiers / RepeatInfo 都不吞 (协议层 state 必须跟 compositor
+/// 同步, 否则 modifier mask / keymap 会错位).
+fn key_event_swallowed_for_preedit(event: &wl_keyboard::Event, preedit_active: bool) -> bool {
+    preedit_active && matches!(event, wl_keyboard::Event::Key { .. })
 }
 
 /// T-0603 + T-0501: 写 keyboard 字节到 PTY (Pressed 即时回显路径). 抽出来
@@ -5249,6 +5274,77 @@ mod tests {
             schedule_op_for_request(&RepeatScheduleRequest::Start, true, 25),
             RepeatScheduleOp::CancelAndStart,
             "Start + rate>0 + 有旧 token 应 CancelAndStart (清旧 + schedule 新)"
+        );
+    }
+
+    // ---------- T-0806 preedit guard ----------
+    // text-input-v3 协议 client 自负责 preedit 非空时拦 key event. fcitx5 在
+    // inline_ascii / Caps_Lock 切英文等模式下不消费 backspace / delete / arrow
+    // 但 compositor 仍发 wl_keyboard.key, quill 不防御会 destructive 删 PTY 已
+    // commit 字符. 这组测试覆盖 key_event_swallowed_for_preedit 纯函数 (Dispatch
+    // impl 太大不好测全 State, 抽 helper 单测套路与 schedule_op_for_request 同).
+
+    use wayland_client::protocol::wl_keyboard::KeyState;
+    use wayland_client::WEnum;
+
+    fn key_event(evdev_key: u32, key_state: KeyState) -> wl_keyboard::Event {
+        wl_keyboard::Event::Key {
+            serial: 0,
+            time: 0,
+            key: evdev_key,
+            state: WEnum::Value(key_state),
+        }
+    }
+
+    #[test]
+    fn key_swallowed_when_preedit_active() {
+        // KEY_BACKSPACE = 14 — 触发 bug 的真实场景: 拼音 preedit 非空时按
+        // backspace, 必须吞掉不送 PTY 防误删 commit 历史.
+        let event = key_event(14, KeyState::Pressed);
+        assert!(
+            key_event_swallowed_for_preedit(&event, true),
+            "preedit 非空时 KeyPress 必须被吞"
+        );
+    }
+
+    #[test]
+    fn key_passed_through_when_preedit_empty() {
+        // 维持原行为: 无 preedit 时 'a' (KEY_A=30) 不被吞, Dispatch impl 后续走
+        // handle_key_event → WriteToPty 路径正常打字.
+        let event = key_event(30, KeyState::Pressed);
+        assert!(
+            !key_event_swallowed_for_preedit(&event, false),
+            "preedit 空时 KeyPress 必须透传"
+        );
+    }
+
+    #[test]
+    fn key_release_swallowed_when_preedit_active() {
+        // release 也吞: 防 release 路径触发 StopRepeat / 其它副作用引发 race
+        // (例 press 在 preedit 前送了 PTY, preedit 期间 release 若不吞会去
+        // cancel timer, 状态机错位). 派单 In #B "key release event 同样吞".
+        let event = key_event(14, KeyState::Released);
+        assert!(
+            key_event_swallowed_for_preedit(&event, true),
+            "preedit 非空时 KeyRelease 必须被吞"
+        );
+    }
+
+    #[test]
+    fn modifiers_event_not_swallowed_even_with_preedit_active() {
+        // 边界: Modifiers / Keymap / Enter / Leave / RepeatInfo 不该被吞 —
+        // 协议层 state (modifier mask / keymap / focus) 必须跟 compositor 同步,
+        // 否则 preedit 结束后用户按 Ctrl+C 会因 Ctrl mask 没记到而退化成普通 'c'.
+        let event = wl_keyboard::Event::Modifiers {
+            serial: 0,
+            mods_depressed: 4,
+            mods_latched: 0,
+            mods_locked: 0,
+            group: 0,
+        };
+        assert!(
+            !key_event_swallowed_for_preedit(&event, true),
+            "Modifiers event 即使 preedit 非空也必须透传 (state 同步)"
         );
     }
 }

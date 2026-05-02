@@ -178,6 +178,15 @@ impl ImeState {
         self.enabled
     }
 
+    /// preedit 非空 = IME 候选词正在编辑, 物理 key event (wl_keyboard.key) 不该
+    /// 直接送 PTY (text-input-v3 协议: client 自负责防御). T-0806: fcitx5 在
+    /// inline_ascii / Caps_Lock 切英文等模式下不消费 backspace / arrow / delete
+    /// 但 compositor 仍发 wl_keyboard.key 给 client, quill 不防御会 destructive
+    /// 删 PTY 已 commit 字符 (实测拼音 preedit 时按 backspace 删了之前的 "你好").
+    pub fn is_preedit_active(&self) -> bool {
+        !self.current_preedit.is_empty()
+    }
+
     /// 更新 cursor_rectangle 暂存值。返 `Some(new)` 表示 "值变化, 调用方应
     /// 调 text_input.set_cursor_rectangle(x,y,w,h) + commit()"; 返 `None`
     /// 表示 "无变化, 跳过协议 round-trip"。
@@ -601,6 +610,32 @@ mod tests {
         assert!(!state.is_enabled());
         assert_eq!(state.current_preedit(), "");
         assert_eq!(state.current_preedit_cursor(), (0, 0));
+        assert!(
+            !state.is_preedit_active(),
+            "default 无 preedit, is_preedit_active 应 false"
+        );
+    }
+
+    /// T-0806: is_preedit_active 跟踪 current_preedit 非空. 拼音 "ni" preedit
+    /// 后应返 true, 后续 commit + 清 preedit 后回 false.
+    #[test]
+    fn is_preedit_active_tracks_current_preedit() {
+        let mut state = ImeState::new();
+        // 帧 1: preedit "ni" → done → is_preedit_active=true
+        handle_text_input_event(preedit_event(Some("ni"), 2, 2), &mut state);
+        let _ = handle_text_input_event(done_event(1), &mut state);
+        assert!(
+            state.is_preedit_active(),
+            "preedit 'ni' apply 后 is_preedit_active 应 true"
+        );
+        // 帧 2: commit "你" + 清 preedit → done → is_preedit_active=false
+        handle_text_input_event(commit_event(Some("你")), &mut state);
+        handle_text_input_event(preedit_event(Some(""), 0, 0), &mut state);
+        let _ = handle_text_input_event(done_event(2), &mut state);
+        assert!(
+            !state.is_preedit_active(),
+            "commit 后 preedit 清空, is_preedit_active 应 false"
+        );
     }
 
     // ---------- cursor_rectangle 上报 ----------
