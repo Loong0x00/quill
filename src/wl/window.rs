@@ -1256,7 +1256,15 @@ fn apply_selection_op(data: &mut LoopData, qh: &QueueHandle<State>) {
         |line: i32| -> String {
             if line >= 0 {
                 if (line as usize) < rows {
-                    t.display_text_with_spacers(line as usize)
+                    // T-0805 hotfix: SelectionPos.line 是 absolute (origin =
+                    // display_offset=0 时 viewport 顶). display_text_with_spacers
+                    // 接 viewport_line, 内部 alac_line = viewport_line -
+                    // display_offset. 想要 alac_line == selection.line, 必须
+                    // 传 viewport_line = line + display_offset. 否则 user 滚屏
+                    // (display_offset>0) 时复制拿到的是 history 内容 (display
+                    // 当前显示的字), 不是 selection 真实端点的内容.
+                    let viewport_line = (line as usize) + display_offset;
+                    t.display_text_with_spacers(viewport_line)
                 } else {
                     String::new()
                 }
