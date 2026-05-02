@@ -402,9 +402,15 @@ fn viewport_line_of(sel_line: i32, rows: usize, display_offset: usize) -> Option
 /// **完整选区文本** (跨 history + viewport 同源).
 ///
 /// `row_text(sel_line)` 接 [`SelectionPos`] 同款 viewport-relative `i32` 行号:
-/// - `>= 0` 表 viewport 内行, 调用方应返 [`crate::term::TermState::display_text_with_spacers`]
+/// - `>= 0` 表 viewport-absolute 行 (origin = display_offset=0 时 viewport 顶),
+///   调用方应:
+///   1. 算 `viewport_line = line + display_offset` (T-0805 hotfix e12f276 必需,
+///      否则 user 滚屏时复制拿到的是当前显示内容而非 selection 端点真实内容)
+///   2. 返 [`crate::term::TermState::display_text_with_spacers`]`(viewport_line)`
 /// - `< 0` 表 history 行 (越小越旧, `-1` 是 viewport 上方第 1 行), 调用方应转
-///   `ScrollbackPos` 后返 [`crate::term::TermState::scrollback_line_text`]
+///   `ScrollbackPos` 后返 [`crate::term::TermState::scrollback_line_text_with_spacers`]
+///   (T-0807: 镜像 viewport 路径的 `\0` spacer 协议, 让外层 `replace('\0', "")`
+///   行为对 viewport 与 history 路径一致, 复制 CJK 行不再夹空格)
 /// - 越界 (滚出 history 顶 / viewport 底) 返 `String::new()`, 本模块按空行处理
 ///
 /// **why 不接 ScrollbackPos**: INV-010 类型隔离 — selection 模块永不接触
