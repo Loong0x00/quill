@@ -521,7 +521,6 @@ fn force_cjk_double_advance(glyphs: Vec<ShapedGlyph>, original: &str) -> Vec<Sha
         return glyphs;
     }
     let cell_w_phys = crate::wl::CELL_W_PX * (crate::wl::HIDPI_SCALE as f32);
-    let double_w = 2.0 * cell_w_phys;
 
     // T-0807 M1: 按 cluster 聚合推 cursor (而非按 glyph 独立推).
     // cosmic-text/HarfBuzz 协议: 同 cluster 多 glyph 来自同一原文段
@@ -538,26 +537,24 @@ fn force_cjk_double_advance(glyphs: Vec<ShapedGlyph>, original: &str) -> Vec<Sha
     //    存 0 — sum 仍等 cluster_advance, 渲染层只看 x_offset 决定字形位置.
 
     // 预扫: 每 glyph 对应的下一个不同 cluster 起点 (= cluster substring 终点).
+    //
+    // T-0807 A 段 hotfix: 旧 reverse 扫只更新"看到不同 cluster"的 glyph 的
+    // next_cluster_start, 段第一 glyph 漏更新 → 保持 default = original.len(),
+    // 主循环 cluster_str 取过头, width 多算后续 cluster 的 cell.
+    // 改正向 single-pass: 段切换时把整段 [seg_start..i) 所有 glyph 的 next 一起
+    // 写为 glyphs[i].cluster (新段起点); 末段保持 default = original.len() ✓.
     let n = glyphs.len();
     let mut next_cluster_start: Vec<usize> = vec![original.len(); n];
     {
-        let mut last_seen: Option<(usize, usize)> = None; // (idx, cluster)
-        for (i, g) in glyphs.iter().enumerate().rev() {
-            if let Some((_, last_c)) = last_seen {
-                if last_c != g.cluster {
-                    // i 之后第一个 cluster 不同的 glyph cluster 即 substr 终点
-                    next_cluster_start[i] = last_c;
+        let mut seg_start = 0;
+        for i in 1..n {
+            if glyphs[i].cluster != glyphs[seg_start].cluster {
+                for slot in next_cluster_start.iter_mut().take(i).skip(seg_start) {
+                    *slot = glyphs[i].cluster;
                 }
+                seg_start = i;
             }
-            // 更新 last_seen 到 "本 glyph 之后看见的最近一个 cluster".
-            // 同 cluster 多 glyph 共享 next_cluster_start (走相同 last_c).
-            last_seen = Some((i, g.cluster));
         }
-        // 从前往后再校正: 同 cluster 段共享 next 边界 = 段后第一个不同 cluster.
-        // 反向扫已经给出每个 glyph 看到的"下一个不同 cluster", 同 cluster 内
-        // 各 glyph 的 next_cluster_start 取其中"最大那个" (= 段后真正的下一
-        // cluster 起点). 反向扫法实际已自然给出 — 同 cluster 内每个 glyph 看到
-        // 的下一个不同 cluster 都是同一个 (因为段后所有 glyph 都属下一段开头).
     }
 
     let mut out: Vec<ShapedGlyph> = Vec::with_capacity(n);
@@ -607,8 +604,6 @@ fn force_cjk_double_advance(glyphs: Vec<ShapedGlyph>, original: &str) -> Vec<Sha
             ..*g
         });
     }
-    // double_w 仅供注释保留语义对照, 防意外死代码 warning.
-    let _ = double_w;
     out
 }
 
@@ -1495,6 +1490,80 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// T-0807 A 段 hotfix: ZWJ emoji cluster 段长 > 1 后接 ASCII cluster, 不该
+    /// 多算 cell.
+    ///
+    /// **bug 实证**: `"👨\u{200D}b"` shape 出 cluster=[0, 0, 7] 3 glyph (👨 + ZWJ
+    /// 同 cluster=0, 'b' cluster=7). 预扫的 reverse 扫法只更新"看到不同 cluster
+    /// 的 glyph"的 next_cluster_start, 同 cluster 段第一 glyph (i=0) 的
+    /// next_cluster_start 保持 default = original.len() = 8. 主循环 i=0 时
+    /// `cluster_str = original[0..8]` = 全文 "👨\u{200D}b", width=3 cell,
+    /// cluster_advance = 3 cell. 然后 i=2 'b' 进新 cluster 又算 1 cell → total
+    /// = 4 cell. 期望: width("👨\u{200D}b") = 3 cell.
+    ///
+    /// 修法: reverse 扫改正向 single-pass — 段第一 glyph 的 next 也更新为段后
+    /// 第一不同 cluster 的起点 (见 force_cjk_double_advance 实装).
+    ///
+    /// 锁: 跑 hotfix 前此测试 fail (4 ≠ 3); 跑后 pass.
+    #[test]
+    fn force_cjk_double_advance_zwj_emoji_followed_by_ascii_no_extra_cell() {
+        use unicode_width::UnicodeWidthStr;
+        let mut ts = TextSystem::new().expect("TextSystem::new on user machine");
+        let text = "\u{1F468}\u{200D}b";
+        let glyphs = ts.shape_line(text);
+        assert!(
+            !glyphs.is_empty(),
+            "'man + ZWJ + b' should yield at least 1 glyph"
+        );
+        let cell_w_phys = crate::wl::CELL_W_PX * (crate::wl::HIDPI_SCALE as f32);
+        let expected_cells = UnicodeWidthStr::width(text).max(1);
+        let expected_total = (expected_cells as f32) * cell_w_phys;
+        let total_advance: f32 = glyphs.iter().map(|g| g.x_advance).sum();
+        assert!(
+            (total_advance - expected_total).abs() < 0.001,
+            "T-0807 A 段 hotfix: cluster 段长>1 + ASCII 后接 总 advance 应严等 \
+             width(text)*cell = {} ({} cells); got {}; glyphs = {:?}",
+            expected_total,
+            expected_cells,
+            total_advance,
+            glyphs
+        );
+    }
+
+    /// T-0807 A 段 hotfix: 三 cluster (中段段长 > 1) 总 advance 不漏算.
+    ///
+    /// `"a👨\u{200D}👩c"` 期望 5 cluster 边界 — 'a' (cluster=0) → ZWJ 序列
+    /// (cluster=1) → 'c' (cluster=10). 中段 ZWJ 多 glyph 共享 cluster, 段第一
+    /// glyph 的 next_cluster_start 必须正确指向 'c' 的起点 (10), 才能取到
+    /// substring "👨\u{200D}👩" 算 width = 4 cell. 旧 reverse 扫给段第一 glyph
+    /// next = original.len() = 11, substring = "👨\u{200D}👩c", width = 5,
+    /// cluster_advance = 5 cell, 然后 'c' 又算 1 cell → total = 7 cell.
+    /// 期望: width("a👨\u{200D}👩c") = 6 cell.
+    #[test]
+    fn force_cjk_double_advance_three_clusters_no_misaligned_advance() {
+        use unicode_width::UnicodeWidthStr;
+        let mut ts = TextSystem::new().expect("TextSystem::new on user machine");
+        let text = "a\u{1F468}\u{200D}\u{1F469}c";
+        let glyphs = ts.shape_line(text);
+        assert!(
+            !glyphs.is_empty(),
+            "'a + ZWJ couple + c' should yield at least 1 glyph"
+        );
+        let cell_w_phys = crate::wl::CELL_W_PX * (crate::wl::HIDPI_SCALE as f32);
+        let expected_cells = UnicodeWidthStr::width(text).max(1);
+        let expected_total = (expected_cells as f32) * cell_w_phys;
+        let total_advance: f32 = glyphs.iter().map(|g| g.x_advance).sum();
+        assert!(
+            (total_advance - expected_total).abs() < 0.001,
+            "T-0807 A 段 hotfix: 三 cluster (中段长>1) 总 advance 应严等 \
+             width(text)*cell = {} ({} cells); got {}; glyphs = {:?}",
+            expected_total,
+            expected_cells,
+            total_advance,
+            glyphs
+        );
     }
 
     /// T-0403: ASCII 'a' shape + raster 必须给非空 bitmap。
