@@ -1213,7 +1213,11 @@ mod tests {
         s.update(sp(10, 3));
         s.rebase_for_grid_scroll(5, 100_000);
         assert_eq!(s.anchor(), sp(2, -7), "history 端 -2 - 5 = -7");
-        assert_eq!(s.cursor(), sp(10, -2), "viewport 端 3 - 5 = -2 (进 history)");
+        assert_eq!(
+            s.cursor(),
+            sp(10, -2),
+            "viewport 端 3 - 5 = -2 (进 history)"
+        );
     }
 
     /// **bug 3 真因回归锁**: user 在 history (display_offset=D) 选了一段, CC
@@ -1232,8 +1236,7 @@ mod tests {
         s.start(sp(2, -3), SelectionMode::Linear);
         s.update(sp(2, -3));
         let display_offset_before: usize = 10;
-        let viewport_line_before =
-            s.anchor().line + display_offset_before as i32;
+        let viewport_line_before = s.anchor().line + display_offset_before as i32;
         assert_eq!(viewport_line_before, 7, "anchor 渲染落 viewport row 7");
 
         // CC 输出 5 行: alacritty `display_offset += 5`, quill `selection.line -= 5`.
