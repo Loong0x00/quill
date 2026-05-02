@@ -1243,12 +1243,33 @@ fn apply_selection_op(data: &mut LoopData, qh: &QueueHandle<State>) {
     // 每个 CJK 在选区里多 1 char 在尾巴 (旧实现的 doc 注释错: 假设两者对齐,
     // 实际 CJK 占 2 cells / 1 char). 走 display_text_with_spacers 让 char 数 ==
     // cell 数, 提取后 strip '\0'.
+    // T-0805: row_text closure 接 SelectionPos.line (i32, viewport-relative).
+    // line>=0 走 viewport (display_text_with_spacers); line<0 走 history
+    // (scrollback_line_text). ScrollbackPos 转换 inline 守 INV-010 — selection
+    // 模块永不接触该类型. 边界: 滚出 viewport 底外或 history 顶外返空.
+    let history_size = t.scrollback_size();
     let text = extract_selection_text(
         &data.state.selection_state,
         cols,
         rows,
         display_offset,
-        |line| t.display_text_with_spacers(line),
+        |line: i32| -> String {
+            if line >= 0 {
+                if (line as usize) < rows {
+                    t.display_text_with_spacers(line as usize)
+                } else {
+                    String::new()
+                }
+            } else {
+                let k = (-line) as usize;
+                if k > history_size {
+                    String::new()
+                } else {
+                    let row = history_size - k;
+                    t.scrollback_line_text(crate::term::ScrollbackPos { row })
+                }
+            }
+        },
     );
     let text = text.replace('\0', "");
     data.state.last_selection_text = Some(text.clone());

@@ -398,29 +398,30 @@ fn viewport_line_of(sel_line: i32, rows: usize, display_offset: usize) -> Option
     Some(viewport_line)
 }
 
-/// T-0607 + T-0804: 给定 SelectionState + display_offset + row_text 取行函数,
-/// 拼出**当前 viewport 内可见**部分的选区文本.
+/// T-0607 + T-0804 + T-0805: 给定 SelectionState + row_text 取行函数, 拼出
+/// **完整选区文本** (跨 history + viewport 同源).
 ///
-/// `row_text(viewport_line)` 接 viewport-relative `0..rows` 行号, 应返 `String`
-/// (与 [`crate::term::TermState::display_text`] 同款 spacer 跳过).
+/// `row_text(sel_line)` 接 [`SelectionPos`] 同款 viewport-relative `i32` 行号:
+/// - `>= 0` 表 viewport 内行, 调用方应返 [`crate::term::TermState::display_text_with_spacers`]
+/// - `< 0` 表 history 行 (越小越旧, `-1` 是 viewport 上方第 1 行), 调用方应转
+///   `ScrollbackPos` 后返 [`crate::term::TermState::scrollback_line_text`]
+/// - 越界 (滚出 history 顶 / viewport 底) 返 `String::new()`, 本模块按空行处理
 ///
-/// **T-0804 viewport 反查**: 选区 SelectionPos.line 走 `viewport_line =
-/// sel_line + display_offset` 反查, 仅 `0..rows` 内的行 emit 文本; 滚出 viewport
-/// 的部分 (history) 当前 skip — 跨 history 复制走另开 ticket T-0805. 跟
-/// T-0607 旧行为兼容: display_offset=0 + 选区在 viewport 内时, 文本与旧路径
-/// 输出完全一致.
+/// **why 不接 ScrollbackPos**: INV-010 类型隔离 — selection 模块永不接触
+/// alacritty 坐标 / quill term 类型. 转换在调用方 (`wl/window.rs`) inline.
 ///
-/// **Linear** (仅看 viewport 内可见部分):
-/// - 单可见行: `row_text[起.col..=终.col]`
-/// - 多可见行: 首可见行从 `start.col` (若 start 在 viewport 内) 或 `0` (若 start
-///   滚出顶) 起; 末可见行到 `end.col` (若 end 在 viewport 内) 或 `cols-1` (若
-///   end 滚出底); 中间整行 `[0..cols)`. 行间 `\n`.
+/// `display_offset` 仅用于 history 部分整体滚出底外 (`end.line + off < 0`)
+/// 的早退优化 — 顶外 (`start.line + off >= rows`) 不可能 (用户没法选 viewport
+/// 下方还没渲染的内容). 删 clamp 路径后, 这里基本是空运行, 留参数防 caller
+/// 接口抖动.
+///
+/// **Linear**: 首行 `[start.col..]` + 中间整行 + 末行 `[..=end.col]`. anchor /
+/// cursor 真实 col 完整保留 (T-0805 修 T-0804 fallback "首可见行 col=0" 误导).
 ///
 /// **Block** (派单 In #G "末尾空格 trim — 用户期望剪表格列"):
-/// - 每行 `[min_col..=max_col]` substr, **trim_end** (空格/tab 都剪) + `\n`
-///   join. 末行后**不加** `\n` (与 alacritty 同).
+/// - 每行 `[min_col..=max_col]` substr, **trim_end** (空格/tab 都剪) + `\n` join.
 ///
-/// `row_text` 调用次数 ≤ 可见选区行数 (典型 < 50 行); String 分配开销 << 复制/粘贴
+/// `row_text` 调用次数 ≤ 选区行数 (典型 < 50 行); String 分配开销 << 复制/粘贴
 /// I/O. 派单 KISS 接受.
 ///
 /// **char vs byte index**: 走 `chars()` 截断 — 终端 grid 一格 = 一 char (CJK
@@ -434,7 +435,7 @@ pub fn extract_selection_text<F>(
     mut row_text: F,
 ) -> String
 where
-    F: FnMut(usize) -> String,
+    F: FnMut(i32) -> String,
 {
     if !state.has_selection || cols == 0 || rows == 0 {
         return String::new();
@@ -453,52 +454,36 @@ fn extract_linear<F>(
     row_text: &mut F,
 ) -> String
 where
-    F: FnMut(usize) -> String,
+    F: FnMut(i32) -> String,
 {
-    let _ = cols; // cols 在行内 substr 时不需要 (chars().count() 是真实字符数 ≤ cols)
+    let _ = (cols, rows, display_offset);
     let (start, end) =
         if (state.anchor.line, state.anchor.col) <= (state.cursor.line, state.cursor.col) {
             (state.anchor, state.cursor)
         } else {
             (state.cursor, state.anchor)
         };
-    // T-0804: 选区端点 sel_line → viewport_line. start/end 整体滚出 viewport
-    // (start>底 或 end<顶) 时返空; 部分滚出时把端点 clamp 到可见边界.
-    let rows_i32 = rows as i32;
-    let off = display_offset as i32;
-    let start_v = start.line + off; // 可负 (history) 或 >= rows (滚到底外)
-    let end_v = end.line + off;
-    if end_v < 0 || start_v >= rows_i32 {
-        return String::new();
-    }
-    let visible_start_line = start_v.max(0) as usize;
-    let visible_end_line = end_v.min(rows_i32 - 1) as usize;
-    // 端点 col: start 滚出顶时首可见行从 col 0 起; end 滚出底时末可见行到末列.
-    let start_col = if start_v < 0 { 0 } else { start.col };
-    let end_col = if end_v >= rows_i32 {
-        cols.saturating_sub(1)
-    } else {
-        end.col
-    };
 
     let mut out = String::new();
-    if visible_start_line == visible_end_line {
-        let txt = row_text(visible_start_line);
-        out.push_str(&substr_chars(&txt, start_col, end_col + 1));
+    if start.line == end.line {
+        let txt = row_text(start.line);
+        out.push_str(&substr_chars(&txt, start.col, end.col + 1));
         return out;
     }
-    // 首可见行: [start_col..]
-    let first = row_text(visible_start_line);
-    out.push_str(&substr_chars(&first, start_col, usize::MAX));
+    // 首行: [start.col..]
+    let first = row_text(start.line);
+    out.push_str(&substr_chars(&first, start.col, usize::MAX));
     out.push('\n');
-    // 中间整可见行
-    for line in (visible_start_line + 1)..visible_end_line {
+    // 中间整行
+    let mut line = start.line + 1;
+    while line < end.line {
         out.push_str(&row_text(line));
         out.push('\n');
+        line += 1;
     }
-    // 末可见行: [..=end_col]
-    let last = row_text(visible_end_line);
-    out.push_str(&substr_chars(&last, 0, end_col + 1));
+    // 末行: [..=end.col]
+    let last = row_text(end.line);
+    out.push_str(&substr_chars(&last, 0, end.col + 1));
     out
 }
 
@@ -510,23 +495,22 @@ fn extract_block<F>(
     row_text: &mut F,
 ) -> String
 where
-    F: FnMut(usize) -> String,
+    F: FnMut(i32) -> String,
 {
-    let _ = cols;
+    let _ = (cols, rows, display_offset);
     let min_col = state.anchor.col.min(state.cursor.col);
     let max_col = state.anchor.col.max(state.cursor.col);
     let min_row = state.anchor.line.min(state.cursor.line);
     let max_row = state.anchor.line.max(state.cursor.line);
     let mut lines: Vec<String> = Vec::new();
-    for line in min_row..=max_row {
-        let Some(viewport_line) = viewport_line_of(line, rows, display_offset) else {
-            continue;
-        };
-        let txt = row_text(viewport_line);
+    let mut line = min_row;
+    while line <= max_row {
+        let txt = row_text(line);
         let seg = substr_chars(&txt, min_col, max_col + 1);
         // 派单 In #G "Block 末尾空格 trim — 用户期望剪表格列".
         let trimmed = seg.trim_end_matches([' ', '\t']).to_string();
         lines.push(trimmed);
+        line += 1;
     }
     lines.join("\n")
 }
@@ -892,7 +876,7 @@ mod tests {
         let mut s = SelectionState::new();
         s.start(sp(0, 0), SelectionMode::Linear);
         s.update(sp(4, 0));
-        let row_text = |line: usize| -> String {
+        let row_text = |line: i32| -> String {
             match line {
                 0 => "hello world".into(),
                 _ => String::new(),
@@ -906,7 +890,7 @@ mod tests {
         let mut s = SelectionState::new();
         s.start(sp(6, 0), SelectionMode::Linear);
         s.update(sp(4, 2));
-        let row_text = |line: usize| -> String {
+        let row_text = |line: i32| -> String {
             match line {
                 0 => "hello world".into(),
                 1 => "second line".into(),
@@ -926,7 +910,7 @@ mod tests {
         let mut s = SelectionState::new();
         s.start(sp(0, 0), SelectionMode::Block);
         s.update(sp(9, 1));
-        let row_text = |line: usize| -> String {
+        let row_text = |line: i32| -> String {
             match line {
                 0 => "abc       ".into(), // 行 0: "abc" + 7 空格
                 1 => "xyz123    ".into(), // 行 1: "xyz123" + 4 空格
@@ -946,7 +930,7 @@ mod tests {
         let mut s = SelectionState::new();
         s.start(sp(0, 0), SelectionMode::Linear);
         s.update(sp(2, 0));
-        let row_text = |line: usize| -> String {
+        let row_text = |line: i32| -> String {
             match line {
                 0 => "中文测试".into(),
                 _ => String::new(),
@@ -959,7 +943,7 @@ mod tests {
     #[test]
     fn extract_no_selection_returns_empty() {
         let s = SelectionState::new();
-        let row_text = |_: usize| String::new();
+        let row_text = |_: i32| String::new();
         assert!(extract_selection_text(&s, 80, 24, 0, row_text).is_empty());
     }
 
@@ -1035,5 +1019,87 @@ mod tests {
         // 验数据保留 — anchor/cursor 仍是原值 (跨 history 复制走 T-0805).
         assert_eq!(s.anchor(), sp(0, -2));
         assert_eq!(s.cursor(), sp(7, 10));
+    }
+
+    // ---- T-0805 新增: extract_selection_text 跨 history + viewport ----
+
+    /// T-0805 核心场景: 选区跨 history + viewport, 复制结果应是
+    /// "anchor.col 起 history 部分末行 → 中间整行 → viewport 末行 end.col 止"
+    /// 完整文本, 不再被 T-0804 fallback clamp 成 "viewport 整段从 col 0".
+    ///
+    /// scenario: anchor.line=-3 col=2, cursor.line=2 col=10, display_offset=5.
+    /// 6 行: -3, -2, -1, 0, 1, 2. 首行 "h-3 line"[2..]="3 line", 中间 4 行整行,
+    /// 末行 "v2 line"[..=10]="v2 line" (短于 11 char, 全取).
+    #[test]
+    fn extract_linear_crosses_history_to_viewport() {
+        let mut s = SelectionState::new();
+        s.start(sp(2, -3), SelectionMode::Linear);
+        s.update(sp(10, 2));
+
+        let row_text = |line: i32| -> String {
+            match line {
+                -3 => "h-3 line".into(),
+                -2 => "h-2 line".into(),
+                -1 => "h-1 line".into(),
+                0 => "v0 line".into(),
+                1 => "v1 line".into(),
+                2 => "v2 line".into(),
+                _ => String::new(),
+            }
+        };
+        let out = extract_selection_text(&s, 80, 24, 5, row_text);
+        // 首行 [2..] = "3 line", 中间 4 行整行, 末行 [..=10] (短行全取) = "v2 line"
+        assert_eq!(out, "3 line\nh-2 line\nh-1 line\nv0 line\nv1 line\nv2 line");
+    }
+
+    /// T-0805 边界: anchor 远超 history_size, 调用方 closure 该行返空 (压根没那
+    /// 么多 history). extract_linear 不该 panic 也不该 skip 后续行 — 首行空但
+    /// 后续行内容正常拼回去.
+    #[test]
+    fn extract_linear_anchor_in_history_far_past_history_size() {
+        let mut s = SelectionState::new();
+        s.start(sp(0, -100), SelectionMode::Linear);
+        s.update(sp(5, 0));
+
+        let row_text = |line: i32| -> String {
+            // 假设 history_size=2: line=-1, -2 有内容; line<=-3 返空 (越界).
+            match line {
+                -2 => "h-2 line".into(),
+                -1 => "h-1 line".into(),
+                0 => "v0 line".into(),
+                _ => String::new(),
+            }
+        };
+        let out = extract_selection_text(&s, 80, 24, 5, row_text);
+        // 行 -100..=-3 全空, 行 -2/-1 有内容, 行 0 末行截 [..=5] = "v0 lin"
+        // 首行 (line=-100, [0..]) = "", 之后每行 push '\n', 末行 [..=5]
+        // → 99 个换行 + 中间 -2/-1 行 + 末行截. 直接验关键不变式:
+        // 1) 不 panic; 2) 含 "h-2 line"; 3) 末尾是 "v0 lin"
+        assert!(!out.is_empty(), "应有输出 (起码换行)");
+        assert!(out.contains("h-2 line\n"), "history 中段应有内容");
+        assert!(out.contains("h-1 line\n"), "history 中段应有内容");
+        assert!(out.ends_with("v0 lin"), "末行应截到 [..=5]");
+    }
+
+    /// T-0805: Block 模式跨 history + viewport, 各行 [min_col..=max_col] 截.
+    /// scenario: anchor (3, -2), cursor (7, 1) Block. 4 行 (-2,-1,0,1) 各取
+    /// col 3..=7 (5 char). 末尾空格 trim.
+    #[test]
+    fn extract_block_crosses_history() {
+        let mut s = SelectionState::new();
+        s.start(sp(3, -2), SelectionMode::Block);
+        s.update(sp(7, 1));
+
+        let row_text = |line: i32| -> String {
+            match line {
+                -2 => "ABCDEFGHIJ".into(), // [3..=7] = "DEFGH"
+                -1 => "abcdef    ".into(), // [3..=7] = "def  " → trim → "def"
+                0 => "0123456789".into(),  // [3..=7] = "34567"
+                1 => "xy        ".into(),  // [3..=7] = "     " → trim → ""
+                _ => String::new(),
+            }
+        };
+        let out = extract_selection_text(&s, 80, 24, 0, row_text);
+        assert_eq!(out, "DEFGH\ndef\n34567\n");
     }
 }
