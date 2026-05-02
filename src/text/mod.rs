@@ -523,30 +523,92 @@ fn force_cjk_double_advance(glyphs: Vec<ShapedGlyph>, original: &str) -> Vec<Sha
     let cell_w_phys = crate::wl::CELL_W_PX * (crate::wl::HIDPI_SCALE as f32);
     let double_w = 2.0 * cell_w_phys;
 
-    let mut out: Vec<ShapedGlyph> = Vec::with_capacity(glyphs.len());
+    // T-0807 M1: 按 cluster 聚合推 cursor (而非按 glyph 独立推).
+    // cosmic-text/HarfBuzz 协议: 同 cluster 多 glyph 来自同一原文段
+    // (ZWJ emoji / VS16 / 复合连字 / combining mark), cluster 单调非递减.
+    //
+    // 步骤:
+    // 1. 预扫一遍 cluster 边界 — 每 cluster 的"原文 substring"起点 = g.cluster,
+    //    终点 = 下一个不同 cluster 的 g.cluster (或 original.len()).
+    // 2. cluster 的 grid cell 宽 = sum unicode_width(每 char) of substring,
+    //    至少 1 cell (防 width=0 退化, 例 '\r' / 全 zero-width cluster).
+    // 3. 同 cluster 多 glyph 共享 cursor_x 起点 (x_offset 一致),
+    //    cursor_x 仅在进入新 cluster 时推一次 cluster_advance.
+    // 4. x_advance 字段语义: cluster 第一 glyph 存 cluster_advance, 后续 glyph
+    //    存 0 — sum 仍等 cluster_advance, 渲染层只看 x_offset 决定字形位置.
+
+    // 预扫: 每 glyph 对应的下一个不同 cluster 起点 (= cluster substring 终点).
+    let n = glyphs.len();
+    let mut next_cluster_start: Vec<usize> = vec![original.len(); n];
+    {
+        let mut last_seen: Option<(usize, usize)> = None; // (idx, cluster)
+        for (i, g) in glyphs.iter().enumerate().rev() {
+            if let Some((_, last_c)) = last_seen {
+                if last_c != g.cluster {
+                    // i 之后第一个 cluster 不同的 glyph cluster 即 substr 终点
+                    next_cluster_start[i] = last_c;
+                }
+            }
+            // 更新 last_seen 到 "本 glyph 之后看见的最近一个 cluster".
+            // 同 cluster 多 glyph 共享 next_cluster_start (走相同 last_c).
+            last_seen = Some((i, g.cluster));
+        }
+        // 从前往后再校正: 同 cluster 段共享 next 边界 = 段后第一个不同 cluster.
+        // 反向扫已经给出每个 glyph 看到的"下一个不同 cluster", 同 cluster 内
+        // 各 glyph 的 next_cluster_start 取其中"最大那个" (= 段后真正的下一
+        // cluster 起点). 反向扫法实际已自然给出 — 同 cluster 内每个 glyph 看到
+        // 的下一个不同 cluster 都是同一个 (因为段后所有 glyph 都属下一段开头).
+    }
+
+    let mut out: Vec<ShapedGlyph> = Vec::with_capacity(n);
     let mut cursor_x: f32 = 0.0;
-    for g in glyphs {
-        let ch = original
-            .get(g.cluster..)
-            .and_then(|s| s.chars().next())
-            .unwrap_or(' ');
-        let is_wide = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1) >= 2;
+    let mut last_cluster: Option<usize> = None;
+    let mut cluster_start_x: f32 = 0.0;
+    let mut cluster_advance: f32 = 0.0;
+    let mut cluster_is_wide: bool = false;
+
+    for (i, g) in glyphs.iter().enumerate() {
+        // 进入新 cluster: 把上一 cluster advance 推到 cursor_x, 算新 cluster_advance.
+        if Some(g.cluster) != last_cluster {
+            if last_cluster.is_some() {
+                cursor_x += cluster_advance;
+            }
+            // 新 cluster substring [g.cluster .. next_cluster_start[i]).
+            let end = next_cluster_start[i].max(g.cluster).min(original.len());
+            let cluster_str = original.get(g.cluster..end).unwrap_or("");
+            let cells = unicode_width::UnicodeWidthStr::width(cluster_str).max(1);
+            cluster_advance = (cells as f32) * cell_w_phys;
+            cluster_is_wide = cells >= 2;
+            cluster_start_x = cursor_x;
+            last_cluster = Some(g.cluster);
+        }
+
+        // 居中: 仅 wide cluster 第一 glyph 算居中量, 后续 glyph (零宽 mark /
+        // VS16 / ZWJ 子序列 glyph) 沿同 cursor 起点不再加 pad.
+        // 第一 glyph 判别: out 中最近 push 的 glyph cluster 是否同此 g.cluster.
+        let is_first_in_cluster = out.last().is_none_or(|prev| prev.cluster != g.cluster);
         let natural = g.x_advance;
-        let forced_advance = if is_wide { double_w } else { cell_w_phys };
-        // 居中: 仅 wide 应用; narrow 沿 cosmic-text 自然 ASCII 对齐 (差异 < 1 px)
-        let center_pad = if is_wide {
-            (double_w - natural).max(0.0) / 2.0
+        let center_pad = if cluster_is_wide && is_first_in_cluster {
+            (cluster_advance - natural).max(0.0) / 2.0
         } else {
             0.0
         };
-        let new_x_offset = cursor_x + center_pad;
+        let new_x_offset = cluster_start_x + center_pad;
+        // x_advance 字段: 仅 cluster 第一 glyph 存 cluster_advance, 后续 0
+        // — sum 仍等 cluster_advance, 渲染层只用 x_offset.
+        let new_x_advance = if is_first_in_cluster {
+            cluster_advance
+        } else {
+            0.0
+        };
         out.push(ShapedGlyph {
-            x_advance: forced_advance,
+            x_advance: new_x_advance,
             x_offset: new_x_offset,
-            ..g
+            ..*g
         });
-        cursor_x += forced_advance;
     }
+    // double_w 仅供注释保留语义对照, 防意外死代码 warning.
+    let _ = double_w;
     out
 }
 
@@ -1251,6 +1313,188 @@ mod tests {
             double_w,
             glyphs[0].x_advance
         );
+    }
+
+    // ===== T-0807 A段 (M1): force_cjk_double_advance 按 cluster 聚合 =====
+    //
+    // 旧实装按每个 glyph 独立判 wide / narrow 推 cursor_x, 在以下情形错位:
+    // 1. 零宽 char (combining mark / U+200D ZWJ / variation selector): width(ch)
+    //    == 0 但走 unwrap_or(1) fallback, 当 1 cell 推 → cursor 越推越远
+    // 2. 共享 cluster 多 glyph (ZWJ emoji 序列 / 复合连字): 同 cluster 多个
+    //    glyph 重复推 forced_advance, cursor 严重前进过头
+    //
+    // 新算法: 按 cosmic-text/HarfBuzz cluster 边界聚合, cursor_x 仅在进入新
+    // cluster 时推一次 cluster_advance (= sum unicode_width(每 char) × cell_w_phys,
+    // 至少 1 cell 防退化为 0).
+
+    /// T-0807 M1: combining mark 不该让 cursor 多推 1 cell.
+    ///
+    /// `"a\u{0301}"` (a + combining acute, NFD 'á' 形式) 视觉占 1 cell.
+    /// `unicode_width::UnicodeWidthStr::width("a\u{0301}") == 1`. 旧实装把
+    /// combining mark 当 1 cell (unwrap_or(1) fallback) 共推 2 cell.
+    ///
+    /// 锁: x_advance 之和 == 1 cell (新算法: cluster 第一 glyph x_advance =
+    /// cluster_advance, 同 cluster 后续 glyph x_advance = 0, sum 自然等
+    /// cluster_advance). 与 cell 数 sanity 对齐: width("a\u{0301}") = 1.
+    #[test]
+    fn force_cjk_double_advance_combining_mark_is_one_cell() {
+        use unicode_width::UnicodeWidthStr;
+        let mut ts = TextSystem::new().expect("TextSystem::new on user machine");
+        let text = "a\u{0301}";
+        let glyphs = ts.shape_line(text);
+        assert!(
+            !glyphs.is_empty(),
+            "'a + combining acute' should yield at least 1 glyph"
+        );
+        assert_eq!(
+            UnicodeWidthStr::width(text),
+            1,
+            "sanity: width('a + combining acute') = 1 (combining mark 零宽)"
+        );
+        let cell_w_phys = crate::wl::CELL_W_PX * (crate::wl::HIDPI_SCALE as f32);
+        let total_advance: f32 = glyphs.iter().map(|g| g.x_advance).sum();
+        assert!(
+            (total_advance - cell_w_phys).abs() < 0.001,
+            "T-0807 M1: combining mark cluster 总 advance 应严等 1 cell ({}) \
+             不是 2 cell, got {}; glyphs = {:?}",
+            cell_w_phys,
+            total_advance,
+            glyphs
+        );
+        // 同 cluster 多 glyph: 共享 x_offset 起点 (后续 glyph x_offset 等
+        // cluster 第一 glyph x_offset, 不分别加 cluster_advance). narrow
+        // cluster center_pad = 0, 起点直接是 cluster_start_x.
+        if glyphs.len() > 1 {
+            for g in &glyphs[1..] {
+                assert!(
+                    (g.x_offset - glyphs[0].x_offset).abs() < cell_w_phys / 2.0,
+                    "T-0807 M1: 同 cluster 后续 glyph 应共享 cursor 起点 ({}), \
+                     got x_offset = {}",
+                    glyphs[0].x_offset,
+                    g.x_offset
+                );
+            }
+        }
+    }
+
+    /// T-0807 M1: variation selector U+FE0F (emoji presentation) 不该让 cursor
+    /// 多推 1 cell.
+    ///
+    /// `"⚠\u{FE0F}"` 在 unicode-width 计 2 cell (warning sign W=1 + VS16 W=0,
+    /// 但 unicode-width 把 emoji presentation 序列整体当 wide ⚠️). 实测
+    /// width("⚠\u{FE0F}") 取决于 unicode-width 版本: 0.1.13 给 1 (按 char sum
+    /// = 1+0), 0.1.14+ 把 emoji presentation 整体计 2. 测试锁:
+    ///
+    /// 1. cluster 总 x_advance 与 unicode_width::width(text) 对齐 (max 1 防退化)
+    /// 2. 同 cluster 多 glyph 共享 cursor 起点 (旧 bug 第二 glyph 在 cell 1)
+    ///
+    /// 旧实装 bug: 把 VS16 第二 glyph 推 1 cell, 第一 glyph 居中在 cell 0,
+    /// 第二 glyph (.notdef) 画在 cell 1, grid 占位与字形分裂.
+    #[test]
+    fn force_cjk_double_advance_variation_selector_no_extra_cell() {
+        use unicode_width::UnicodeWidthStr;
+        let mut ts = TextSystem::new().expect("TextSystem::new on user machine");
+        let text = "\u{26A0}\u{FE0F}";
+        let glyphs = ts.shape_line(text);
+        assert!(
+            !glyphs.is_empty(),
+            "'⚠ + VS16' should yield at least 1 glyph"
+        );
+        let cell_w_phys = crate::wl::CELL_W_PX * (crate::wl::HIDPI_SCALE as f32);
+        let expected_cells = UnicodeWidthStr::width(text).max(1);
+        let expected_total = (expected_cells as f32) * cell_w_phys;
+        let total_advance: f32 = glyphs.iter().map(|g| g.x_advance).sum();
+        assert!(
+            (total_advance - expected_total).abs() < 0.001,
+            "T-0807 M1: VS16 cluster 总 advance 应严等 width(text)*cell = {} \
+             ({} cells); got {}; glyphs = {:?}",
+            expected_total,
+            expected_cells,
+            total_advance,
+            glyphs
+        );
+        // 同 cluster 多 glyph 共享 cursor 起点 — 用 x_offset 一致性验证
+        // (wide cluster 仅第一 glyph 有 center_pad, 后续 glyph x_offset =
+        // cluster_start_x = 0; 第一 glyph x_offset = cluster_start_x + center_pad).
+        // 旧 bug: 第二 glyph x_offset = cell_w_phys (推到 cell 1).
+        if glyphs.len() > 1 {
+            for g in &glyphs[1..] {
+                assert!(
+                    g.x_offset < cell_w_phys,
+                    "T-0807 M1: 同 cluster 后续 glyph x_offset 应 < cell_w_phys = {}, \
+                     不该被推到 cell 1; got {}",
+                    cell_w_phys,
+                    g.x_offset
+                );
+            }
+        }
+    }
+
+    /// T-0807 M1: ZWJ emoji 序列 (家庭 emoji) 共享 cluster, 总 advance 不应
+    /// 每 glyph 重复推.
+    ///
+    /// `"👨\u{200D}👩\u{200D}👧"` 用户机 (有 emoji face) shape 出 1 cluster N
+    /// glyph (cosmic-text/HarfBuzz 把 ZWJ 序列归为同一 cluster, cluster=0). CI
+    /// 退化 (无 emoji face) 给主 face tofu 单 glyph 也归一 cluster. 视觉
+    /// width("👨\u{200D}👩\u{200D}👧") = 6 (3 emoji × 2 cell, ZWJ 0 cell).
+    ///
+    /// 旧 bug: 每 glyph 按 width('👨')=2 推 wide → cursor 推 N × 2 cell, ≥ 6
+    /// 推到 8/10/12 cell 错位. 新算法: 整 cluster 推 6 cell.
+    ///
+    /// 锁: cluster 总 x_advance == width(text) × cell_w_phys.
+    #[test]
+    fn force_cjk_double_advance_zwj_emoji_shares_cluster_cursor() {
+        use unicode_width::UnicodeWidthStr;
+        let mut ts = TextSystem::new().expect("TextSystem::new on user machine");
+        let text = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        let glyphs = ts.shape_line(text);
+        assert!(
+            !glyphs.is_empty(),
+            "ZWJ family emoji should yield at least 1 glyph"
+        );
+        let cell_w_phys = crate::wl::CELL_W_PX * (crate::wl::HIDPI_SCALE as f32);
+        // unicode-width 0.1.x 对 ZWJ 序列各 char 独立 sum: 2+0+2+0+2 = 6 cells.
+        // 用户机若装 emoji face shape 出多 glyph 单 cluster, 新算法仍按 width
+        // 算 substring 总宽 = 6 cell.
+        let expected_cells = UnicodeWidthStr::width(text).max(1);
+        let expected_total = (expected_cells as f32) * cell_w_phys;
+        // 按 cluster 分组算每 cluster 的总 x_advance, 累加.
+        let mut by_cluster: std::collections::BTreeMap<usize, Vec<&ShapedGlyph>> =
+            std::collections::BTreeMap::new();
+        for g in &glyphs {
+            by_cluster.entry(g.cluster).or_default().push(g);
+        }
+        // 同 cluster 内 cluster_advance 在第一 glyph (其余 0), sum 即 cluster 总.
+        let total_advance: f32 = glyphs.iter().map(|g| g.x_advance).sum();
+        assert!(
+            (total_advance - expected_total).abs() < 0.001,
+            "T-0807 M1: ZWJ 总 advance 应严等 width(text)*cell = {} ({} cells); \
+             got {}; cluster groups = {}; glyphs = {:?}",
+            expected_total,
+            expected_cells,
+            total_advance,
+            by_cluster.len(),
+            glyphs
+        );
+        // 同 cluster 内 glyph 共享起点 (在 cluster_start_x ± cell_w_phys/2 内
+        // 居中量容差范围) — 不该被推到下一 cell.
+        for (cluster, gs) in &by_cluster {
+            if gs.len() < 2 {
+                continue;
+            }
+            let first = gs[0];
+            for g in gs.iter().skip(1) {
+                assert!(
+                    (g.x_offset - first.x_offset).abs() < cell_w_phys,
+                    "T-0807 M1: cluster={} 同 cluster 后续 glyph 应在 cluster 起点 \
+                     ± cell_w_phys 内 (即未被推到下一 cell); first.x_offset={}, \
+                     got x_offset={}",
+                    cluster,
+                    first.x_offset,
+                    g.x_offset
+                );
+            }
+        }
     }
 
     /// T-0403: ASCII 'a' shape + raster 必须给非空 bitmap。
