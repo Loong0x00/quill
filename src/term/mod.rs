@@ -578,6 +578,19 @@ pub struct TermState {
     dirty: bool,
 }
 
+/// **T-0617 / T-0809**: alacritty `Config::scrolling_history` 上限. 默认 alacritty
+/// 给 10K 对 daily-drive 偏紧 (一周 cargo build verbose + Claude Code 对话就快
+/// 满). 拉到 100K 行 ≈ 100 MB 内存预算, 现代主机 (5090 64GB) 完全 fit, 长跑
+/// trace / 大输出命令 (find / / cargo build verbose / pacman -Syu) 都能保留.
+/// 200 MB 才警觉.
+///
+/// **T-0809**: 公开 const 让 selection rebase (ADR 0012) 知道 `selection.line`
+/// clamp 下界. 调用方走 `super::selection::SelectionState::rebase_for_grid_scroll(
+/// delta, SCROLLBACK_HISTORY_MAX)`. 用 const 而非动态 `term.scrollback_size()`
+/// 因为 clamp 上限是"理论最旧字所在 line 距离 viewport 顶最大值", 永远是
+/// `-(scrolling_history)` 不随实际 history_size 抖.
+pub const SCROLLBACK_HISTORY_MAX: usize = 100_000;
+
 impl TermState {
     /// 起一个初始尺寸为 `cols × rows` 的终端。`cols`/`rows` 由上游(T-0202
     /// 写死的 80×24,Phase 3 T-0306 才接 Wayland resize)传进来。
@@ -588,12 +601,8 @@ impl TermState {
     /// [`clear_dirty`]: Self::clear_dirty
     pub fn new(cols: u16, rows: u16) -> Self {
         let size = TermSize::new(cols as usize, rows as usize);
-        // T-0617 follow-up: scrollback 默认 10K 行 (alacritty_terminal Config::default)
-        // 对 daily-drive 偏紧 (一周 cargo build verbose + Claude Code 对话就快满). 拉到
-        // 100K 行 ≈ 100 MB 内存预算, 现代主机 (5090 64GB) 完全 fit, 长跑 trace / 大输出
-        // 命令 (find / / cargo build verbose / pacman -Syu) 都能保留. 200 MB 才警觉.
         let config = Config {
-            scrolling_history: 100_000,
+            scrolling_history: SCROLLBACK_HISTORY_MAX,
             ..Config::default()
         };
         // T-0617: title 起步空字符串. listener / TermState / TabInstance 共享同

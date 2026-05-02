@@ -464,24 +464,57 @@ fn pty_read_tick(
     tab_id: crate::tab::TabId,
     loop_signal: &LoopSignal,
 ) -> std::io::Result<PostAction> {
+    // T-0809 / ADR 0012 split-borrow: state.tabs 与 state.selection_state 是
+    // disjoint fields, 必须通过字段 path 取 &mut 才能共存. tabs_unchecked_mut()
+    // 走 &mut self 一次性吃掉整个 state, 不能再拿 selection_state.
+    let State {
+        tabs,
+        selection_state,
+        ..
+    } = state;
     // 找对应 tab. close race 下可能找不到 (Remove 已发但 calloop fire 队列还有
     // 一次), 走 PostAction::Remove 让 calloop 自然清理.
-    let Some(tab_idx) = state.tabs_unchecked().idx_of(tab_id) else {
+    let Some(tabs) = tabs.as_mut() else {
+        return Ok(PostAction::Remove);
+    };
+    let Some(tab_idx) = tabs.idx_of(tab_id) else {
         tracing::trace!(target: "quill::pty", id=tab_id.raw(), "pty_read_tick: tab gone (race)");
         return Ok(PostAction::Remove);
     };
-    let Some(tab) = state.tabs_unchecked_mut().get_mut(tab_idx) else {
+    // T-0809: 仅 active tab 的 PTY scroll 影响 selection (selection state 是
+    // per-window 单例, 跟随 active tab 显示). 后台 tab 输出 history 增长不动
+    // user 视野中的 selection.
+    let is_active = tabs.active().id() == tab_id;
+    let Some(tab) = tabs.get_mut(tab_idx) else {
         return Ok(PostAction::Remove);
     };
     let (term, pty) = tab.split_term_pty();
-    pty_read_tick_inner(pty, Some(term), loop_signal)
+    let selection_for_inner = if is_active {
+        Some(selection_state)
+    } else {
+        None
+    };
+    pty_read_tick_inner(pty, Some(term), selection_for_inner, loop_signal)
 }
 
 /// T-0608 inner impl: 真 read PTY + advance term. 与原 pty_read_tick 同, 抽出
 /// 让 tab_id 定位逻辑独立 (上一段 fn).
+///
+/// **T-0809 / ADR 0012 selection rebase**: `selection_state` 仅 active tab 调用
+/// 时传 `Some`, 其它 tab 传 `None` (selection 跟 active tab 走). 每个 PTY
+/// chunk advance 后比 `scrollback_size()` 前后差 = `delta`, `delta > 0` 调
+/// `selection_state.rebase_for_grid_scroll(delta, HISTORY_SIZE_MAX)` 让 selection
+/// 钉字而非钉 cell.
+///
+/// **why per-chunk 而非 per-tick**: 单次 readable callback 内部 PTY drain 多
+/// chunk (PTY_READ_BUF=64KB 满后再读), 每 chunk 都该独立 rebase — 累计 total
+/// delta 在 multi-chunk 路径下没问题 (总数对), 但若中间 chunk 致 history 滚出
+/// max 上限 clamp, 后续 chunk 算 delta 会少算 (after - before 不再代表"实际滚
+/// 了多少"). per-chunk 简单且正确.
 fn pty_read_tick_inner(
     pty: &mut PtyHandle,
     mut term: Option<&mut crate::term::TermState>,
+    mut selection_state: Option<&mut super::selection::SelectionState>,
     loop_signal: &LoopSignal,
 ) -> std::io::Result<PostAction> {
     // INV-009 sanity check:master fd 必须 O_NONBLOCK。由 T-0201 的 `spawn_program`
@@ -524,7 +557,23 @@ fn pty_read_tick_inner(
                     // Option<&mut TermState> 保险:正常路径 term 是 Some(ctor 设好),
                     // None 跳过(未来可能 T-0305+ 在 resize 时临时 take/put)。
                     if let Some(t) = term.as_mut() {
+                        // T-0809 / ADR 0012: chunk advance 前后比 scrollback_size,
+                        // 差值 = alacritty grid 内部 ring-buffer 因 PTY scroll 旋转
+                        // 的行数. delta>0 时主动 rebase active tab 的 selection 让
+                        // SelectionPos 钉字 (字进 history 时 .line 跟着减 delta).
+                        // 三 bug 同源 (yes hello / pacman ANSI / CC + history view).
+                        let history_before = t.scrollback_size();
                         t.advance(&buf[..n]);
+                        let history_after = t.scrollback_size();
+                        let scroll_delta = history_after.saturating_sub(history_before) as i32;
+                        if scroll_delta > 0 {
+                            if let Some(sel) = selection_state.as_mut() {
+                                sel.rebase_for_grid_scroll(
+                                    scroll_delta,
+                                    crate::term::SCROLLBACK_HISTORY_MAX,
+                                );
+                            }
+                        }
                         // T-0303:`cursor_point` → `cursor_pos`,返 CellPos 而非
                         // `(usize, i32)`。trace 字段保持 col / line 命名兼容
                         // 旧日志工具,但读自 `pos.col / pos.line` 都是 usize。

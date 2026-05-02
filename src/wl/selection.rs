@@ -176,6 +176,53 @@ impl SelectionState {
         self.has_selection = false;
     }
 
+    /// **T-0809 / ADR 0012**: PTY 输出致 alacritty grid 内部 ring-buffer 旋转
+    /// `delta` 行 (顶 viewport 行进 scrollback) 后, **调整 anchor / cursor 让
+    /// SelectionPos 钉字而非钉 cell**.
+    ///
+    /// 具体: `anchor.line -= delta`, `cursor.line -= delta`. 字进 scrollback,
+    /// SelectionPos.line 跟着变负数, 渲染翻译 `viewport_line = sel_line +
+    /// display_offset` 自然落到 history 区 (滚出 viewport 时该 cell skip 不绘,
+    /// 数据保留, user 滚回时蓝框重现).
+    ///
+    /// **why 单点 mutation 而非 selected_cells_* 渲染补偿**: ADR 0012 §C 拒绝
+    /// "改渲染公式" 路径 — selection.line 仍指 viewport 第 N 行, 字已不在那,
+    /// 渲染层无论怎么算都还是 cell 而非字 (修不了 bug 1+2). 必须主动 mutate
+    /// SelectionState 让 .line 字段重新对准 "原字现在在第几行".
+    ///
+    /// **bug 3 同源 (CC 后台输出 + user 看 history)**: 用户 display_offset=D 时
+    /// 选了 history 一段, anchor.line = -k. CC 输出 N 行 → alacritty 内部
+    /// `display_offset += N` 维持 user 视角锚定 (alacritty grid::scroll_up 路径).
+    /// 不 rebase 时渲染 viewport_line = -k + (D+N) → 比原位置往下漂 N. rebase
+    /// 后 anchor.line = -(k+N), viewport_line = -(k+N) + (D+N) = -k+D 不变 →
+    /// 蓝框钉死. 三 bug 同根.
+    ///
+    /// **clamp 边界**: `delta > 0` 推 anchor / cursor 向负方向 (history). 字滚
+    /// 出 scrollback 顶 (line < `-(history_size_max as i32)`) 时 clamp 到上限
+    /// (= `-(history_size_max as i32)`), 让 user 仍能看到选区高亮上限边界标记
+    /// — 比 silent clear 直观. `history_size_max` 由调用方传入, 当前 quill 走
+    /// `TermState::new` 写死 `scrolling_history = 100_000` (term/mod.rs:596).
+    ///
+    /// **选区为空时 no-op**: `has_selection == false` 直接 return. 防止 PTY
+    /// 输出空跑时偶发干扰 anchor / cursor 默认零值.
+    ///
+    /// **why `i32` delta**: 上游 `term.scrollback_size()` 返 `usize`, 调用方
+    /// `as i32` 转 (cast 在调用方, 本 fn 接 i32 让 sign 显式). 调用方应保证
+    /// `delta > 0` (`history_after - history_before`); `delta == 0` no-op,
+    /// `delta < 0` 走防御 saturating_sub (history shrink 路径当前不存在 — 仅
+    /// alacritty 内部 reset / clear 才减 history, 本 fn 不该被调).
+    pub fn rebase_for_grid_scroll(&mut self, delta: i32, history_size_max: usize) {
+        if !self.has_selection {
+            return;
+        }
+        if delta <= 0 {
+            return;
+        }
+        let min_line = -(history_size_max as i32);
+        self.anchor.line = (self.anchor.line - delta).max(min_line);
+        self.cursor.line = (self.cursor.line - delta).max(min_line);
+    }
+
     /// 当前是否有选区可渲染 / 复制. `false` = 默认或 clear 后, `true` = start
     /// 之后 (即使 anchor==cursor 单 click).
     pub fn has_selection(&self) -> bool {
@@ -1107,5 +1154,120 @@ mod tests {
         };
         let out = extract_selection_text(&s, 80, 24, 0, row_text);
         assert_eq!(out, "DEFGH\ndef\n34567\n");
+    }
+
+    // ---- T-0809 / ADR 0012: rebase_for_grid_scroll ----
+
+    /// 场景 1 同源回归锁: viewport 内拖选 5 行后 PTY 输出 N 行致 grid 顶 N 行
+    /// 进 scrollback. 字本身位置物理不变 (滚到 history 区), anchor.line 必须
+    /// 同步减 N — 否则 .line 还指 viewport 顶, 渲染框圈住新输出的字 (bug 1).
+    #[test]
+    fn selection_anchor_follows_pty_scroll() {
+        let mut s = SelectionState::new();
+        s.start(sp(2, 0), SelectionMode::Linear); // viewport 第 0 行
+        s.update(sp(7, 4)); // viewport 第 4 行
+        s.rebase_for_grid_scroll(3, 100_000);
+        assert_eq!(
+            s.anchor(),
+            sp(2, -3),
+            "anchor 字进 scrollback 3 行, line=-3"
+        );
+    }
+
+    /// 场景 1 cursor 端: 同 anchor 同步减 delta. 单独锁防回归 (cursor 路径漏调
+    /// rebase 时 anchor 跟字 cursor 不跟会撕开选区).
+    #[test]
+    fn selection_cursor_follows_pty_scroll() {
+        let mut s = SelectionState::new();
+        s.start(sp(2, 0), SelectionMode::Linear);
+        s.update(sp(7, 4));
+        s.rebase_for_grid_scroll(3, 100_000);
+        assert_eq!(s.cursor(), sp(7, 1), "cursor line 4 - 3 = 1");
+    }
+
+    /// 字滚出 scrollback 顶 (history_size_max 满 + 仍输出): rebase 后 .line
+    /// 应 clamp 到 `-(history_size_max as i32)`, 不允许溢出表达"比最旧 history
+    /// 还旧"的不存在位置. 选区数据保留 (`has_selection==true`), 渲染走
+    /// `viewport_line = -hist + display_offset` 落 viewport 外 skip — 框消失
+    /// 但 user 滚回 history 顶 viewport 仍能看到上限边缘.
+    #[test]
+    fn selection_clamped_when_scrolled_past_history_top() {
+        let mut s = SelectionState::new();
+        s.start(sp(0, -5), SelectionMode::Linear);
+        s.update(sp(0, -5));
+        // history_size_max = 10, anchor 已在 -5, rebase delta=20 → 名义 -25,
+        // 应 clamp 到 -10.
+        s.rebase_for_grid_scroll(20, 10);
+        assert_eq!(s.anchor().line, -10, "clamp 到 -history_size_max");
+        assert_eq!(s.cursor().line, -10, "cursor 同步 clamp");
+        assert!(s.has_selection(), "选区数据仍保留");
+    }
+
+    /// 跨 history-viewport 边界: anchor 在 history (line=-2), cursor 在 viewport
+    /// (line=3). PTY 输出 5 行, 两端都应同步 -5. 单独锁防"只 rebase viewport
+    /// 一端" 漏 history 端 (反之亦然).
+    #[test]
+    fn selection_cross_boundary_rebase_both_ends() {
+        let mut s = SelectionState::new();
+        s.start(sp(2, -2), SelectionMode::Linear);
+        s.update(sp(10, 3));
+        s.rebase_for_grid_scroll(5, 100_000);
+        assert_eq!(s.anchor(), sp(2, -7), "history 端 -2 - 5 = -7");
+        assert_eq!(s.cursor(), sp(10, -2), "viewport 端 3 - 5 = -2 (进 history)");
+    }
+
+    /// **bug 3 真因回归锁**: user 在 history (display_offset=D) 选了一段, CC
+    /// 后台输出 N 行 → alacritty 内部 `display_offset += N` (维持 user 视角
+    /// 锚定, 见 alacritty grid::scroll_up 路径). 不 rebase 时渲染
+    /// `viewport_line = sel_line + (D+N)` → 蓝框相对屏幕往下漂 N. rebase 后
+    /// `selection.line -= N` → `viewport_line = (sel_line - N) + (D+N) =
+    /// sel_line + D` 不变 → 蓝框钉死.
+    ///
+    /// 本测试不直接调 alacritty Term, 走纯 selection 模块语义验证: rebase 前后
+    /// 同时改 display_offset, 算出的 viewport_line 应 stable.
+    #[test]
+    fn selection_render_does_not_drift_with_history_growth() {
+        let mut s = SelectionState::new();
+        // 模拟 user display_offset=10 时选 history 一段.
+        s.start(sp(2, -3), SelectionMode::Linear);
+        s.update(sp(2, -3));
+        let display_offset_before: usize = 10;
+        let viewport_line_before =
+            s.anchor().line + display_offset_before as i32;
+        assert_eq!(viewport_line_before, 7, "anchor 渲染落 viewport row 7");
+
+        // CC 输出 5 行: alacritty `display_offset += 5`, quill `selection.line -= 5`.
+        s.rebase_for_grid_scroll(5, 100_000);
+        let display_offset_after: usize = display_offset_before + 5;
+        let viewport_line_after = s.anchor().line + display_offset_after as i32;
+        assert_eq!(
+            viewport_line_after, viewport_line_before,
+            "rebase + display_offset auto-pin 抵消, 蓝框屏幕位置不漂"
+        );
+    }
+
+    /// 边界: 选区为空 (默认 / clear 后) 时 rebase 必须 no-op, 不能因为 PTY
+    /// 输出偶发改了 anchor / cursor 默认零值 (虽然不影响渲染 — has_selection
+    /// 守门 — 但污染默认状态会让 has_selection() 重启时单测失败).
+    #[test]
+    fn rebase_when_no_selection_is_noop() {
+        let mut s = SelectionState::new();
+        s.rebase_for_grid_scroll(5, 100_000);
+        assert_eq!(s.anchor(), sp(0, 0));
+        assert_eq!(s.cursor(), sp(0, 0));
+        assert!(!s.has_selection());
+    }
+
+    /// 边界: delta=0 (advance_bytes 没触发 grid scroll) no-op. delta<0
+    /// (history shrink — 当前 alacritty 路径不会到此, 防御兜底) 也 no-op.
+    #[test]
+    fn rebase_zero_or_negative_delta_is_noop() {
+        let mut s = SelectionState::new();
+        s.start(sp(3, 5), SelectionMode::Linear);
+        s.update(sp(3, 5));
+        s.rebase_for_grid_scroll(0, 100_000);
+        assert_eq!(s.anchor(), sp(3, 5));
+        s.rebase_for_grid_scroll(-3, 100_000);
+        assert_eq!(s.anchor(), sp(3, 5), "负 delta 不该 wrap 反向加");
     }
 }
