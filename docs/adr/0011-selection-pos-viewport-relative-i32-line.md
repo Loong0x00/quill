@@ -1,6 +1,6 @@
 # ADR 0011 — SelectionPos 用 viewport-relative i32 line (跨 history + viewport)
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-05-02
 **Phase**: 8 (terminal correctness)
 **Related**: T-0607 (selection 实装), T-0804 (本次落地)
