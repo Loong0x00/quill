@@ -89,3 +89,9 @@ selection.line + display_offset` 算回当前 viewport 中的位置.
   display_offset
 - 滚屏 callback 不动 selection
 - 详 T-0804 ticket
+
+## Update 2026-05-02 (T-0809 / ADR 0012)
+
+本 ADR 的"viewport 滚动 origin 不动"假设只覆盖 user 主动滚屏 (display_offset
+变), 不覆盖 PTY 输出导致的 alacritty grid 内部 ring-buffer 旋转. 后者需要
+selection 主动 rebase, 详见 ADR 0012.
