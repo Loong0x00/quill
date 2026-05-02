@@ -355,7 +355,9 @@ struct LoopData {
     /// `pending_resize_followup` 同 calloop Timer 单飞行套路 (派单 In #E).
     pending_autoscroll_timer: Option<RegistrationToken>,
     /// T-0607: 当前 autoscroll 方向 (`±1` line / 100ms tick). Timer fire 走
-    /// [`autoscroll_tick`] 读此值调 scroll_display + 同步 selection_state cursor.
+    /// [`autoscroll_tick`] 读此值调 `term.scroll_display(delta)`. T-0804 后
+    /// SelectionPos viewport-relative i32 line 自动跟随 viewport, Timer 路径
+    /// 不再动 selection_state cursor.
     autoscroll_delta: i32,
     /// T-0608: 每 tab 一个 PTY fd 注册到 calloop EventLoop (INV-005). 用 tab id
     /// 索引 RegistrationToken, close tab 时按 id 找 token + remove. 新 tab
@@ -1191,15 +1193,15 @@ fn apply_autoscroll_op(data: &mut LoopData) {
     }
 }
 
-/// T-0607: autoscroll Timer fire 一次 — `term.scroll_display(delta)` + cursor
-/// 跟随 (selection_state.cursor 不变, 但渲染重画, 用户视觉上看到选区延伸).
+/// T-0607 + T-0804: autoscroll Timer fire 一次 — `term.scroll_display(delta)`,
+/// 选区视觉自动同步 (蓝框跟字滚, 不跟 viewport 原位).
 ///
-/// **why 不更新 selection_state cursor 行号**: scroll_display 改 display_offset,
-/// alacritty 内部 grid 不变 — cursor 位置仍以"viewport row" 表示, scroll 后视
-/// 觉上 cursor 标的是新进入 viewport 的 row. selection_state 本身没动 (anchor
-/// / cursor 保持原 row), 但渲染层 selected_cells_linear 走 viewport row 索引
-/// 时, scroll 后 anchor 行号若超出 viewport 就部分剪裁 (派单 Out: 跨 scrollback
-/// 选择跟随历史 P2). KISS.
+/// **T-0804 关键: 不动 selection_state**. SelectionPos.line 是 viewport-relative
+/// i32 (origin = viewport 顶, 滚屏不变), 同一 SelectionPos 永远指向同一 cell.
+/// scroll_display 仅改 display_offset, 渲染层 selected_cells_* 走
+/// `viewport_line = sel_line + display_offset` 反查算回当前 viewport 位置 —
+/// 字滚出 viewport 时 viewport_line 越界, 蓝框该格 skip 不画 (但选区数据保留,
+/// 滚回视觉重现). 跨 history 部分复制走另开 ticket T-0805.
 fn autoscroll_tick(data: &mut LoopData) -> TimeoutAction {
     let delta = data.autoscroll_delta;
     if delta == 0 {
@@ -1235,14 +1237,19 @@ fn apply_selection_op(data: &mut LoopData, qh: &QueueHandle<State>) {
     // 算选区文本. T-0608: 走 active tab 的 term.
     let t = data.state.tabs_unchecked().active().term();
     let (cols, rows) = t.dimensions();
+    let display_offset = t.display_offset();
     // T-0618 follow-up: CJK 选区 cell→char idx 错位修. display_text 跳 spacer
     // 致 char idx != cell idx — substr_chars 走 cell.col 当 char idx 索引时,
     // 每个 CJK 在选区里多 1 char 在尾巴 (旧实现的 doc 注释错: 假设两者对齐,
     // 实际 CJK 占 2 cells / 1 char). 走 display_text_with_spacers 让 char 数 ==
     // cell 数, 提取后 strip '\0'.
-    let text = extract_selection_text(&data.state.selection_state, cols, rows, |line| {
-        t.display_text_with_spacers(line)
-    });
+    let text = extract_selection_text(
+        &data.state.selection_state,
+        cols,
+        rows,
+        display_offset,
+        |line| t.display_text_with_spacers(line),
+    );
     let text = text.replace('\0', "");
     data.state.last_selection_text = Some(text.clone());
 
@@ -2882,12 +2889,26 @@ pub fn run_window() -> Result<()> {
                     let selection_cells: Vec<crate::term::CellPos> = {
                         let sel = &state.selection_state;
                         if sel.has_selection() {
+                            // T-0804: viewport 反查 — selected_cells_* 现接
+                            // display_offset, 滚屏期间 anchor/cursor 不动但
+                            // emit 的 viewport CellPos 自动跟随当前滚动位置.
+                            let display_offset = t.display_offset();
                             match sel.mode() {
                                 crate::wl::selection::SelectionMode::Linear => {
-                                    crate::wl::selection::selected_cells_linear(sel, cols)
+                                    crate::wl::selection::selected_cells_linear(
+                                        sel,
+                                        cols,
+                                        rows,
+                                        display_offset,
+                                    )
                                 }
                                 crate::wl::selection::SelectionMode::Block => {
-                                    crate::wl::selection::selected_cells_block(sel, cols, rows)
+                                    crate::wl::selection::selected_cells_block(
+                                        sel,
+                                        cols,
+                                        rows,
+                                        display_offset,
+                                    )
                                 }
                             }
                         } else {
@@ -4512,7 +4533,16 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
         // event (motion / enter / axis) 不读此值, 但本路径单点入口 全部走
         // 同一调用避免分支.
         let alt_active = state.keyboard_state.alt_active();
-        let action = handle_pointer_event(event, &mut state.pointer_state, alt_active);
+        // T-0804: pixel_to_cell 现需 display_offset 算 SelectionPos.line. 单点
+        // 入口拿 active tab 当前 offset, 透传给 handle_pointer_event 让选区/
+        // autoscroll 路径都用同一快照 (避免多处独立读引发漂移).
+        let display_offset = state
+            .tabs
+            .as_ref()
+            .map(|tl| tl.active().term().display_offset())
+            .unwrap_or(0);
+        let action =
+            handle_pointer_event(event, &mut state.pointer_state, alt_active, display_offset);
         // T-0703-fix: 主 PointerAction 处理后, 顺手取出 pending_cursor_set 走
         // apply_cursor_shape (wl_cursor + xcursor theme + wl_pointer.set_cursor,
         // ADR 0009 — 单一消费者, 与 take_pending / pending_scroll_lines 同

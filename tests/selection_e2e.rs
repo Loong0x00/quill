@@ -21,8 +21,8 @@ use std::path::PathBuf;
 use quill::term::{CellPos, CellRef, Color};
 use quill::text::TextSystem;
 use quill::wl::{
-    render_headless, selected_cells_block, selected_cells_linear, SelectionMode, SelectionState,
-    HIDPI_SCALE,
+    render_headless, selected_cells_block, selected_cells_linear, SelectionMode, SelectionPos,
+    SelectionState, HIDPI_SCALE,
 };
 
 const LOGICAL_W: u32 = 800;
@@ -129,9 +129,9 @@ fn selection_linear_single_line_renders_selection_bg() {
     let row_texts: Vec<String> = vec![String::new(); ROWS];
 
     let mut sel = SelectionState::new();
-    sel.start(CellPos { col: 5, line: 10 }, SelectionMode::Linear);
-    sel.update(CellPos { col: 12, line: 10 });
-    let selected = selected_cells_linear(&sel, COLS);
+    sel.start(SelectionPos { col: 5, line: 10 }, SelectionMode::Linear);
+    sel.update(SelectionPos { col: 12, line: 10 });
+    let selected = selected_cells_linear(&sel, COLS, ROWS, 0);
     assert_eq!(selected.len(), 8, "Linear 5..=12 单行 应 8 cells");
 
     let (rgba, physical_w, physical_h) = render_headless(
@@ -191,9 +191,9 @@ fn selection_linear_multi_line_spans_rows() {
     let row_texts: Vec<String> = vec![String::new(); ROWS];
 
     let mut sel = SelectionState::new();
-    sel.start(CellPos { col: 75, line: 8 }, SelectionMode::Linear);
-    sel.update(CellPos { col: 10, line: 12 });
-    let selected = selected_cells_linear(&sel, COLS);
+    sel.start(SelectionPos { col: 75, line: 8 }, SelectionMode::Linear);
+    sel.update(SelectionPos { col: 10, line: 12 });
+    let selected = selected_cells_linear(&sel, COLS, ROWS, 0);
     assert_eq!(selected.len(), 5 + 80 * 3 + 11, "Linear 跨行 总 cell 数");
 
     let (rgba, physical_w, physical_h) = render_headless(
@@ -250,9 +250,9 @@ fn selection_block_rectangle() {
     let row_texts: Vec<String> = vec![String::new(); ROWS];
 
     let mut sel = SelectionState::new();
-    sel.start(CellPos { col: 5, line: 8 }, SelectionMode::Block);
-    sel.update(CellPos { col: 12, line: 12 });
-    let selected = selected_cells_block(&sel, COLS, ROWS);
+    sel.start(SelectionPos { col: 5, line: 8 }, SelectionMode::Block);
+    sel.update(SelectionPos { col: 12, line: 12 });
+    let selected = selected_cells_block(&sel, COLS, ROWS, 0);
     assert_eq!(selected.len(), 8 * 5, "Block 矩形 8×5 = 40");
 
     let (rgba, physical_w, physical_h) = render_headless(

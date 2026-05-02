@@ -312,21 +312,24 @@ pub enum PointerAction {
     /// 阈值 (见 [`PointerState`] 的 `scroll_accum`), 累够 1 cell 高 (24 logical
     /// px) 才发一次 Scroll(±1).
     Scroll(i32),
-    /// T-0607: 在 text area 按下左键 → 开始选区. 调用方
+    /// T-0607 + T-0804: 在 text area 按下左键 → 开始选区. 调用方
     /// (`Dispatch<WlPointer>`) 走 `selection_state.start(anchor, mode)` + 立即
     /// 重画一帧 (cell 反色)。
     SelectionStart {
-        /// 鼠标按下点 → cell. 调用方走 [`crate::wl::selection::pixel_to_cell`]
-        /// 把鼠标 logical px 映射到 viewport 内 cell 后填入.
-        anchor: crate::term::CellPos,
+        /// 鼠标按下点 → SelectionPos (viewport-relative i32 line, T-0804). 调用方
+        /// 走 [`crate::wl::selection::pixel_to_cell`] 把鼠标 logical px + 当前
+        /// display_offset 映射到选区坐标后填入.
+        anchor: crate::wl::selection::SelectionPos,
         /// Linear (普通拖) vs Block (Alt+drag). 调用方按下时读 keyboard
         /// `alt_active()` 走 [`crate::wl::selection::modifier_to_selection_mode`]
         /// 决定.
         mode: crate::wl::selection::SelectionMode,
     },
-    /// T-0607: 选区拖动中 → cursor 实时更新. anchor 不变. 调用方走
+    /// T-0607 + T-0804: 选区拖动中 → cursor 实时更新. anchor 不变. 调用方走
     /// `selection_state.update(cursor)` + 重画.
-    SelectionUpdate { cursor: crate::term::CellPos },
+    SelectionUpdate {
+        cursor: crate::wl::selection::SelectionPos,
+    },
     /// T-0607: 松开左键 → 选区结束 + 触发 PRIMARY auto-copy. 调用方走
     /// `selection_state.end()` + 算出选区文本 + `wp_primary_selection_v1.set_selection`.
     SelectionEnd,
@@ -669,10 +672,18 @@ impl PointerState {
 /// `alt_active()` 后传入, 由 [`apply_button`] 在 TextArea press 路径走
 /// [`crate::wl::selection::modifier_to_selection_mode`] 决定 Linear vs Block.
 /// 非 button event (motion / enter / leave / axis) 不读此值, 调用方传 false 即可.
+///
+/// **T-0804 `display_offset` 入参**: 当前 viewport 向上滚行数 (来自
+/// [`crate::term::TermState::display_offset`]). motion / button 路径走
+/// [`crate::wl::selection::pixel_to_cell`] 时传入, 让选区 anchor/cursor 落
+/// 正确的 viewport-relative 坐标 (display_offset>0 时鼠标在 viewport 第 0 行
+/// 实际是 history 第 -display_offset 行). 非 selection 路径 (axis / enter / leave)
+/// 不读此值.
 pub fn handle_pointer_event(
     event: wl_pointer::Event,
     state: &mut PointerState,
     alt_active: bool,
+    display_offset: usize,
 ) -> PointerAction {
     match event {
         wl_pointer::Event::Enter {
@@ -686,7 +697,7 @@ pub fn handle_pointer_event(
             surface_x,
             surface_y,
             ..
-        } => apply_motion(state, surface_x, surface_y),
+        } => apply_motion(state, surface_x, surface_y, display_offset),
         wl_pointer::Event::Button {
             serial,
             button,
@@ -694,7 +705,7 @@ pub fn handle_pointer_event(
             ..
         } => {
             let pressed = matches!(btn_state, WEnum::Value(wl_pointer::ButtonState::Pressed));
-            apply_button(state, serial, button, pressed, alt_active)
+            apply_button(state, serial, button, pressed, alt_active, display_offset)
         }
         // T-0618: 纵向滚轮走 AxisValue120 (Wayland 1.21+ 离散 notch 协议),
         // 1 notch = ±120 → 3 lines. 不再走 Axis smooth path — mutter 给 Axis
@@ -782,7 +793,12 @@ pub(crate) fn apply_leave(state: &mut PointerState) -> PointerAction {
 /// 内 + 跨等价 region 不重发 set_cursor, 减压 compositor) 时填
 /// pending_cursor_set. serial 用 [`PointerState::last_enter_serial`] (协议要
 /// 求 enter serial, motion event 自身无 serial 字段).
-pub(crate) fn apply_motion(state: &mut PointerState, x: f64, y: f64) -> PointerAction {
+pub(crate) fn apply_motion(
+    state: &mut PointerState,
+    x: f64,
+    y: f64,
+    display_offset: usize,
+) -> PointerAction {
     state.pos = Some((x, y));
     let new_hover = hit_test_with_tabs_ex(
         x,
@@ -863,6 +879,7 @@ pub(crate) fn apply_motion(state: &mut PointerState, x: f64, y: f64) -> PointerA
             cell_w,
             cell_h,
             top_reserved,
+            display_offset,
         ) {
             Some(p) => p,
             None => {
@@ -905,6 +922,7 @@ pub(crate) fn apply_button(
     button: u32,
     pressed: bool,
     alt_active: bool,
+    display_offset: usize,
 ) -> PointerAction {
     state.last_button_serial = serial;
     const BTN_LEFT: u32 = 0x110;
@@ -988,6 +1006,7 @@ pub(crate) fn apply_button(
                 cell_w,
                 cell_h,
                 top_reserved,
+                display_offset,
             ) {
                 Some(p) => p,
                 None => return PointerAction::Nothing,
@@ -1460,7 +1479,7 @@ mod tests {
         let mut state = fresh_state();
         let _ = apply_enter(&mut state, 1, 100.0, 10.0);
         // 在 titlebar 内移动
-        let action = apply_motion(&mut state, 200.0, 15.0);
+        let action = apply_motion(&mut state, 200.0, 15.0, 0);
         assert_eq!(action, PointerAction::Nothing);
     }
 
@@ -1468,7 +1487,7 @@ mod tests {
     fn motion_crosses_to_close_button_emits_hover_change() {
         let mut state = fresh_state();
         let _ = apply_enter(&mut state, 1, 100.0, 10.0);
-        let action = apply_motion(&mut state, 790.0, 12.0);
+        let action = apply_motion(&mut state, 790.0, 12.0, 0);
         assert_eq!(
             action,
             PointerAction::HoverChange(HoverRegion::Button(WindowButton::Close))
@@ -1488,7 +1507,7 @@ mod tests {
     fn left_button_press_on_titlebar_starts_move() {
         let mut state = fresh_state();
         let _ = apply_enter(&mut state, 1, 100.0, 10.0);
-        let action = apply_button(&mut state, 42, 0x110, true, false);
+        let action = apply_button(&mut state, 42, 0x110, true, false, 0);
         assert_eq!(action, PointerAction::StartMove { serial: 42 });
     }
 
@@ -1496,7 +1515,7 @@ mod tests {
     fn left_button_press_on_close_emits_button_click() {
         let mut state = fresh_state();
         let _ = apply_enter(&mut state, 1, 790.0, 12.0);
-        let action = apply_button(&mut state, 42, 0x110, true, false);
+        let action = apply_button(&mut state, 42, 0x110, true, false, 0);
         assert_eq!(action, PointerAction::ButtonClick(WindowButton::Close));
     }
 
@@ -1504,7 +1523,7 @@ mod tests {
     fn left_button_press_on_minimize_emits_click() {
         let mut state = fresh_state();
         let _ = apply_enter(&mut state, 1, 740.0, 12.0);
-        let action = apply_button(&mut state, 42, 0x110, true, false);
+        let action = apply_button(&mut state, 42, 0x110, true, false, 0);
         assert_eq!(action, PointerAction::ButtonClick(WindowButton::Minimize));
     }
 
@@ -1512,7 +1531,7 @@ mod tests {
     fn left_button_press_on_maximize_emits_click() {
         let mut state = fresh_state();
         let _ = apply_enter(&mut state, 1, 760.0, 12.0);
-        let action = apply_button(&mut state, 42, 0x110, true, false);
+        let action = apply_button(&mut state, 42, 0x110, true, false, 0);
         assert_eq!(action, PointerAction::ButtonClick(WindowButton::Maximize));
     }
 
@@ -1520,7 +1539,7 @@ mod tests {
     fn right_button_press_does_nothing() {
         let mut state = fresh_state();
         let _ = apply_enter(&mut state, 1, 790.0, 12.0);
-        let action = apply_button(&mut state, 42, 0x111, true, false);
+        let action = apply_button(&mut state, 42, 0x111, true, false, 0);
         assert_eq!(action, PointerAction::Nothing);
     }
 
@@ -1528,7 +1547,7 @@ mod tests {
     fn release_does_not_trigger_action() {
         let mut state = fresh_state();
         let _ = apply_enter(&mut state, 1, 790.0, 12.0);
-        let action = apply_button(&mut state, 42, 0x110, false, false);
+        let action = apply_button(&mut state, 42, 0x110, false, false, 0);
         assert_eq!(action, PointerAction::Nothing);
     }
 
@@ -1539,11 +1558,11 @@ mod tests {
     fn left_button_press_on_text_area_starts_selection_linear() {
         let mut state = fresh_state();
         let _ = apply_enter(&mut state, 1, 100.0, 200.0);
-        let action = apply_button(&mut state, 42, 0x110, true, false);
+        let action = apply_button(&mut state, 42, 0x110, true, false, 0);
         assert_eq!(
             action,
             PointerAction::SelectionStart {
-                anchor: crate::term::CellPos { col: 10, line: 6 },
+                anchor: crate::wl::selection::SelectionPos { col: 10, line: 6 },
                 mode: crate::wl::selection::SelectionMode::Linear,
             }
         );
@@ -1555,11 +1574,11 @@ mod tests {
     fn left_button_press_on_text_area_with_alt_starts_block() {
         let mut state = fresh_state();
         let _ = apply_enter(&mut state, 1, 100.0, 200.0);
-        let action = apply_button(&mut state, 42, 0x110, true, true);
+        let action = apply_button(&mut state, 42, 0x110, true, true, 0);
         assert_eq!(
             action,
             PointerAction::SelectionStart {
-                anchor: crate::term::CellPos { col: 10, line: 6 },
+                anchor: crate::wl::selection::SelectionPos { col: 10, line: 6 },
                 mode: crate::wl::selection::SelectionMode::Block,
             }
         );
@@ -1570,7 +1589,7 @@ mod tests {
     fn middle_button_press_emits_paste_primary() {
         let mut state = fresh_state();
         let _ = apply_enter(&mut state, 1, 100.0, 200.0);
-        let action = apply_button(&mut state, 42, 0x112, true, false);
+        let action = apply_button(&mut state, 42, 0x112, true, false, 0);
         assert_eq!(
             action,
             PointerAction::Paste(crate::wl::selection::PasteSource::Primary)
@@ -1582,9 +1601,9 @@ mod tests {
     fn left_button_release_after_drag_ends_selection() {
         let mut state = fresh_state();
         let _ = apply_enter(&mut state, 1, 100.0, 200.0);
-        let _ = apply_button(&mut state, 42, 0x110, true, false); // start drag
+        let _ = apply_button(&mut state, 42, 0x110, true, false, 0); // start drag
         assert!(state.selection_drag);
-        let action = apply_button(&mut state, 43, 0x110, false, false); // release
+        let action = apply_button(&mut state, 43, 0x110, false, false, 0); // release
         assert_eq!(action, PointerAction::SelectionEnd);
         assert!(!state.selection_drag);
     }
@@ -1594,12 +1613,12 @@ mod tests {
     fn motion_during_drag_emits_selection_update() {
         let mut state = fresh_state();
         let _ = apply_enter(&mut state, 1, 100.0, 200.0);
-        let _ = apply_button(&mut state, 42, 0x110, true, false);
-        let action = apply_motion(&mut state, 200.0, 250.0); // col=20 line=(250-28)/25=8
+        let _ = apply_button(&mut state, 42, 0x110, true, false, 0);
+        let action = apply_motion(&mut state, 200.0, 250.0, 0); // col=20 line=(250-28)/25=8
         assert_eq!(
             action,
             PointerAction::SelectionUpdate {
-                cursor: crate::term::CellPos { col: 20, line: 8 },
+                cursor: crate::wl::selection::SelectionPos { col: 20, line: 8 },
             }
         );
     }
@@ -1610,12 +1629,12 @@ mod tests {
     fn motion_below_bottom_during_drag_emits_autoscroll_start_once() {
         let mut state = fresh_state();
         let _ = apply_enter(&mut state, 1, 100.0, 200.0);
-        let _ = apply_button(&mut state, 42, 0x110, true, false);
-        let action1 = apply_motion(&mut state, 200.0, 599.5); // 下越 (h=600, 599 >= 599)
+        let _ = apply_button(&mut state, 42, 0x110, true, false, 0);
+        let action1 = apply_motion(&mut state, 200.0, 599.5, 0); // 下越 (h=600, 599 >= 599)
         assert_eq!(action1, PointerAction::AutoScrollStart { delta: -1 });
         assert!(state.autoscroll_active);
         // 第二次 motion 仍越界, 不重发.
-        let action2 = apply_motion(&mut state, 250.0, 599.5);
+        let action2 = apply_motion(&mut state, 250.0, 599.5, 0);
         assert_eq!(action2, PointerAction::Nothing);
     }
 
@@ -1624,9 +1643,9 @@ mod tests {
     fn motion_above_top_during_drag_emits_autoscroll_start_positive() {
         let mut state = fresh_state();
         let _ = apply_enter(&mut state, 1, 100.0, 200.0);
-        let _ = apply_button(&mut state, 42, 0x110, true, false);
+        let _ = apply_button(&mut state, 42, 0x110, true, false, 0);
         // y=10 < titlebar (28), 上越.
-        let action = apply_motion(&mut state, 200.0, 10.0);
+        let action = apply_motion(&mut state, 200.0, 10.0, 0);
         assert_eq!(action, PointerAction::AutoScrollStart { delta: 1 });
     }
 
@@ -1635,10 +1654,10 @@ mod tests {
     fn motion_back_in_viewport_after_autoscroll_emits_stop() {
         let mut state = fresh_state();
         let _ = apply_enter(&mut state, 1, 100.0, 200.0);
-        let _ = apply_button(&mut state, 42, 0x110, true, false);
-        let _ = apply_motion(&mut state, 200.0, 599.5); // start autoscroll
+        let _ = apply_button(&mut state, 42, 0x110, true, false, 0);
+        let _ = apply_motion(&mut state, 200.0, 599.5, 0); // start autoscroll
         assert!(state.autoscroll_active);
-        let action = apply_motion(&mut state, 200.0, 200.0); // 回 viewport
+        let action = apply_motion(&mut state, 200.0, 200.0, 0); // 回 viewport
         assert_eq!(action, PointerAction::AutoScrollStop);
         assert!(!state.autoscroll_active);
     }
@@ -1720,7 +1739,7 @@ mod tests {
             axis: WEnum::Value(wl_pointer::Axis::VerticalScroll),
             value120: 120,
         };
-        let action = handle_pointer_event(event_v120, &mut state, false);
+        let action = handle_pointer_event(event_v120, &mut state, false, 0);
         assert_eq!(
             action,
             PointerAction::Scroll(-3),
@@ -1732,7 +1751,7 @@ mod tests {
             value120: 120,
         };
         assert_eq!(
-            handle_pointer_event(event_h120, &mut state, false),
+            handle_pointer_event(event_h120, &mut state, false, 0),
             PointerAction::Nothing,
             "HorizontalScroll 应沉默 (quill 无横滚)"
         );
@@ -1743,7 +1762,7 @@ mod tests {
             value: 100.0,
         };
         assert_eq!(
-            handle_pointer_event(event_smooth, &mut state, false),
+            handle_pointer_event(event_smooth, &mut state, false, 0),
             PointerAction::Nothing,
             "T-0618: smooth Axis 不再消费"
         );
@@ -1873,7 +1892,7 @@ mod tests {
             HoverRegion::ResizeEdge(ResizeEdge::Left),
             "前置: enter 应记 Left edge hover"
         );
-        let action = apply_button(&mut state, 99, 0x110, true, false);
+        let action = apply_button(&mut state, 99, 0x110, true, false, 0);
         assert_eq!(
             action,
             PointerAction::StartResize {
@@ -1888,7 +1907,7 @@ mod tests {
         let mut state = fresh_state();
         // 进入右下角 (x=795 y=595) 触发 ResizeEdge::BottomRight
         let _ = apply_enter(&mut state, 1, 795.0, 595.0);
-        let action = apply_button(&mut state, 7, 0x110, true, false);
+        let action = apply_button(&mut state, 7, 0x110, true, false, 0);
         assert_eq!(
             action,
             PointerAction::StartResize {
@@ -2005,7 +2024,7 @@ mod tests {
         let _ = apply_enter(&mut state, 1, 100.0, 10.0);
         let _ = state.take_pending_cursor_set();
         // Motion 到 Close 按钮区 (仍 Default cursor)
-        let _ = apply_motion(&mut state, 790.0, 12.0);
+        let _ = apply_motion(&mut state, 790.0, 12.0, 0);
         assert_eq!(
             state.take_pending_cursor_set(),
             None,
@@ -2022,7 +2041,7 @@ mod tests {
         let _ = apply_enter(&mut state, 42, 100.0, 10.0);
         let _ = state.take_pending_cursor_set();
         // Motion 到 textarea — Default → Text
-        let _ = apply_motion(&mut state, 100.0, 200.0);
+        let _ = apply_motion(&mut state, 100.0, 200.0, 0);
         assert_eq!(
             state.take_pending_cursor_set(),
             Some((42, CursorShape::Text)),
@@ -2052,7 +2071,7 @@ mod tests {
         assert_eq!(state.current_cursor_shape(), CursorShape::Default);
         let _ = apply_enter(&mut state, 1, 400.0, 200.0); // textarea
         assert_eq!(state.current_cursor_shape(), CursorShape::Text);
-        let _ = apply_motion(&mut state, 100.0, 10.0); // titlebar
+        let _ = apply_motion(&mut state, 100.0, 10.0, 0); // titlebar
         assert_eq!(state.current_cursor_shape(), CursorShape::Default);
     }
 
@@ -2257,7 +2276,7 @@ mod tests {
             surface_x: 100.0,
             surface_y: 200.0, // → textarea
         };
-        let action = handle_pointer_event(event, &mut state, false);
+        let action = handle_pointer_event(event, &mut state, false, 0);
         assert_eq!(action, PointerAction::HoverChange(HoverRegion::TextArea));
         // cursor 应该填 pending (enter serial 5).
         assert_eq!(

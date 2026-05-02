@@ -70,7 +70,8 @@ pub use keyboard::{handle_key_event, KeyboardAction, KeyboardState};
 // bracketed_paste_wrap. quill 自有类型 (INV-010, 不漏 wayland-protocols).
 pub use selection::{
     bracketed_paste_wrap, extract_selection_text, modifier_to_selection_mode, pixel_to_cell,
-    selected_cells_block, selected_cells_linear, PasteSource, SelectionMode, SelectionState,
+    selected_cells_block, selected_cells_linear, PasteSource, SelectionMode, SelectionPos,
+    SelectionState,
 };
 
 // T-0608: multi-tab e2e 测试 + hit_test_with_tabs 公共 API (HoverRegion 加
