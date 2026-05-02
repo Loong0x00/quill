@@ -177,9 +177,19 @@ impl SelectionState {
 
 /// T-0607: 鼠标 logical px → viewport CellPos.
 ///
-/// **why titlebar 偏移**: cells 区从 `y >= TITLEBAR_H_LOGICAL_PX` 起绘 (T-0504),
-/// 鼠标在 titlebar 区不该映射到任何 cell (派单"鼠标在 viewport 之外不算选").
-/// 走 `Option<CellPos>` 让调用方判 None 直接早返.
+/// **why top_reserved 偏移**: cells 区从 `y >= top_reserved` 起绘. 单 tab 时
+/// `top_reserved = TITLEBAR_H_LOGICAL_PX` (T-0504), 多 tab 时
+/// `top_reserved = TITLEBAR_H + TAB_BAR_H` (T-0608/T-0617). 鼠标在 titlebar /
+/// tab bar 区不该映射到 cell (派单"鼠标在 viewport 之外不算选"). 走
+/// `Option<CellPos>` 让调用方判 None 直接早返.
+///
+/// **why 改名 titlebar_h_logical → top_reserved_h_logical** (T-0608 hotfix
+/// 2026-04-29): 多 tab 时 cells 区起点是 titlebar + tab_bar, 调用方应传整个
+/// `top_reserved` 给本函数. 老签名只传 titlebar_h 漏 tab_bar_h, 多 tab 时鼠标
+/// 视觉位置与算出的 cell row 差 1 行 (复现: 开 2 tab 后 hover/click 错位, 关
+/// 回 1 tab 后无错位). render 路径用 `titlebar_y_offset_px = (titlebar_h +
+/// tab_bar_h) * HIDPI`, hit_test 路径必须同 origin 才能视觉与逻辑同步 (与
+/// `cells_from_surface_px` / `tab_bar_h_logical_for` 同 invariants 套路).
 ///
 /// **why 接 logical px (而非 physical)**: wl_pointer 协议给的坐标本就是 logical
 /// (与 surface 尺寸 logical 同源, 见 [`crate::wl::pointer::PointerState`] 字段
@@ -196,9 +206,9 @@ pub fn pixel_to_cell(
     rows: usize,
     cell_w_logical: f64,
     cell_h_logical: f64,
-    titlebar_h_logical: f64,
+    top_reserved_h_logical: f64,
 ) -> Option<CellPos> {
-    if y < titlebar_h_logical {
+    if y < top_reserved_h_logical {
         return None;
     }
     if x < 0.0 {
@@ -207,7 +217,7 @@ pub fn pixel_to_cell(
     if cols == 0 || rows == 0 {
         return None;
     }
-    let usable_y = y - titlebar_h_logical;
+    let usable_y = y - top_reserved_h_logical;
     let col_f = (x / cell_w_logical).floor() as i64;
     let row_f = (usable_y / cell_h_logical).floor() as i64;
     let col = col_f.max(0) as usize;
@@ -663,6 +673,28 @@ mod tests {
     fn pixel_to_cell_zero_dimensions_returns_none() {
         assert_eq!(pixel_to_cell(100.0, 100.0, 0, 22, 10.0, 25.0, 28.0), None);
         assert_eq!(pixel_to_cell(100.0, 100.0, 80, 0, 10.0, 25.0, 28.0), None);
+    }
+
+    /// T-0608 hotfix 2026-04-29: 多 tab 时 top_reserved = titlebar + tab_bar.
+    /// 复现 bug: 用旧值 28 (仅 titlebar) 时 y=53 算出 row 1, 但 render 路径
+    /// 已让 cells 起点偏到 56 (28+28), 视觉上 y=53 还在 tab bar 区不该映射 cell.
+    /// 修后传 56 (top_reserved): y=53 < 56 → None (鼠标在 tab bar 区不算选).
+    #[test]
+    fn pixel_to_cell_with_tab_bar_offset() {
+        // 多 tab 场景: titlebar 28 + tab_bar 28 = top_reserved 56.
+        // y=55.9 落 tab bar 区 → None.
+        assert_eq!(pixel_to_cell(100.0, 55.9, 80, 22, 10.0, 25.0, 56.0), None);
+        // y=56 (== top_reserved) → row 0.
+        assert_eq!(
+            pixel_to_cell(100.0, 56.0, 80, 22, 10.0, 25.0, 56.0),
+            Some(cp(10, 0))
+        );
+        // y=81 (= 56 + 25) → row 1, 与单 tab y=53 (= 28 + 25) row 1 同 row idx.
+        // 验证: render origin 与 hit_test origin 同步, row idx 对相同 cell 一致.
+        assert_eq!(
+            pixel_to_cell(100.0, 81.0, 80, 22, 10.0, 25.0, 56.0),
+            Some(cp(10, 1))
+        );
     }
 
     // ---- modifier_to_selection_mode ----

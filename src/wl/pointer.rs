@@ -815,12 +815,17 @@ pub(crate) fn apply_motion(state: &mut PointerState, x: f64, y: f64) -> PointerA
     // hover change / cursor shape 切换 仍同步更新但不返 HoverChange (调用方
     // 处理 SelectionUpdate 即重画一次反色, 不需要再叠 redraw 信号).
     if state.selection_drag {
-        // 边缘自动滚屏决策 (派单 In #E): y < titlebar (上越) 或 y >=
-        // surface_h - 1 (下越) 触发 AutoScrollStart, 鼠标回到 viewport 内返
-        // AutoScrollStop. selection_drag 为前提 (鼠标未按住时不 autoscroll).
+        // 边缘自动滚屏决策 (派单 In #E): y < top_reserved (上越, 含 tab_bar 区)
+        // 或 y >= surface_h - 1 (下越) 触发 AutoScrollStart, 鼠标回到 viewport
+        // 内返 AutoScrollStop. selection_drag 为前提 (鼠标未按住时不 autoscroll).
+        // T-0608 hotfix: top_reserved = titlebar + tab_bar (多 tab 时 tab_bar
+        // 占 28 logical, 单 tab 0). 与 cells_from_surface_px / pixel_to_cell 同 origin.
         let titlebar_h = TITLEBAR_H_LOGICAL_PX as f64;
+        let tab_bar_h =
+            crate::wl::window::tab_bar_h_logical_for(state.tab_count) as f64;
+        let top_reserved = titlebar_h + tab_bar_h;
         let h = state.surface_h_logical as f64;
-        let above_top = y < titlebar_h;
+        let above_top = y < top_reserved;
         let below_bottom = y >= h - 1.0;
         if above_top {
             if !state.autoscroll_active {
@@ -847,6 +852,7 @@ pub(crate) fn apply_motion(state: &mut PointerState, x: f64, y: f64) -> PointerA
             return PointerAction::AutoScrollStop;
         }
         // 真 motion → 算 cursor cell, 发 SelectionUpdate.
+        // top_reserved 含 tab_bar (上方已算), 与 render 路径 origin 一致.
         let cell_w = crate::wl::render::CELL_W_PX as f64;
         let cell_h = crate::wl::render::CELL_H_PX as f64;
         let cursor = match crate::wl::selection::pixel_to_cell(
@@ -856,7 +862,7 @@ pub(crate) fn apply_motion(state: &mut PointerState, x: f64, y: f64) -> PointerA
             state.grid_rows,
             cell_w,
             cell_h,
-            titlebar_h,
+            top_reserved,
         ) {
             Some(p) => p,
             None => {
@@ -962,11 +968,16 @@ pub(crate) fn apply_button(
         HoverRegion::TextArea => {
             // T-0607: text area 左键 press → 开始选区. anchor 走当前 pos →
             // pixel_to_cell. mode 走 alt_active → SelectionMode.
+            // T-0608 hotfix: top_reserved 含 tab_bar (多 tab 时 28 logical, 单
+            // tab 0), 与 render 路径同 origin 防 hover/click row 错位 1 行.
             let Some((x, y)) = state.pos else {
                 // pos 未填 (Enter 之前 race) — 罕见, 静默吞.
                 return PointerAction::Nothing;
             };
             let titlebar_h = TITLEBAR_H_LOGICAL_PX as f64;
+            let tab_bar_h =
+                crate::wl::window::tab_bar_h_logical_for(state.tab_count) as f64;
+            let top_reserved = titlebar_h + tab_bar_h;
             let cell_w = crate::wl::render::CELL_W_PX as f64;
             let cell_h = crate::wl::render::CELL_H_PX as f64;
             let anchor = match crate::wl::selection::pixel_to_cell(
@@ -976,7 +987,7 @@ pub(crate) fn apply_button(
                 state.grid_rows,
                 cell_w,
                 cell_h,
-                titlebar_h,
+                top_reserved,
             ) {
                 Some(p) => p,
                 None => return PointerAction::Nothing,
