@@ -5407,4 +5407,102 @@ mod tests {
             "Modifiers event 即使 preedit 非空也必须透传 (state 同步)"
         );
     }
+
+    // ---------- T-0809 / ADR 0012 真实 TermState 集成测试 ----------
+    //
+    // selection.rs::tests::selection_render_does_not_drift_with_history_growth
+    // 用纯标量模拟 alacritty `display_offset += N` 自动锚定行为. 本组测试用真
+    // alacritty `TermState` + 真 selection 状态机走完整 PTY → grid → display_offset
+    // 协议链路, 锁住"alacritty 行为符合 ADR 0012 假设" — 万一 alacritty 上游改
+    // scroll_up 路径 (display_offset 不再 auto-pin) 这里会 fail, 提醒重新对齐 ADR.
+    // 跟 selection.rs 单测互补 (单测验语义, 集成测验真协议).
+
+    /// 场景 3 真因锁: user 在 history (display_offset > 0) 时 PTY 输出 N 行,
+    /// alacritty grid::scroll_up 内部检 `if display_offset != 0` 走
+    /// `display_offset = min(display_offset + positions, max_scroll_limit)` —
+    /// 维持 user 视角锚定. 此行为是 selection 渲染漂移 (bug 3) 的真因.
+    ///
+    /// 不 rebase 时: viewport_line = sel_line + (D + N) → 框相对屏幕往下漂 N.
+    /// rebase 后 (本 ticket A 段): viewport_line = (sel_line - N) + (D + N) =
+    /// sel_line + D → 框钉死.
+    #[test]
+    fn alacritty_auto_pins_display_offset_when_history_grows() {
+        use crate::term::TermState;
+        let mut t = TermState::new(80, 24);
+        // 先撑出 viewport + 5 行 history.
+        for i in 0..29 {
+            t.advance(format!("line_{:02}\r\n", i).as_bytes());
+        }
+        let history_before = t.scrollback_size();
+        assert!(
+            history_before >= 5,
+            "前置: 推 29 行后 scrollback >= 5, 实际 {history_before}"
+        );
+
+        // user 滚到 history (display_offset = 3).
+        t.scroll_display(3);
+        assert_eq!(t.display_offset(), 3);
+
+        // PTY 输出 4 行致 alacritty 内部 ring-buffer 旋转 4 行 (history += 4).
+        for i in 30..34 {
+            t.advance(format!("line_{:02}\r\n", i).as_bytes());
+        }
+        let history_after = t.scrollback_size();
+        let scroll_delta = history_after - history_before;
+        assert!(
+            scroll_delta >= 4,
+            "PTY 推 4 行后 history_size 应 >= +4, 实际 delta = {scroll_delta}"
+        );
+
+        // **bug 3 真因关键 assert**: alacritty 自动 display_offset += scroll_delta
+        // 维持 user 视角锚定 (alacritty grid/mod.rs:267-269 路径).
+        assert_eq!(
+            t.display_offset(),
+            3 + scroll_delta,
+            "alacritty 应在 history 增长时自动 display_offset += delta 锚定 user 视角"
+        );
+    }
+
+    /// **场景 3 端到端验证**: user 在 history 选段, PTY 输出, 走完整 quill 路径
+    /// (rebase + 渲染坐标计算), 验渲染屏幕位置 stable.
+    ///
+    /// 模拟 selection in history, 然后走 advance + rebase + 重新算 viewport_line,
+    /// 验值 stable. 不调 pty_read_tick (那需要 mock PTY fd), 直接复刻其内部逻辑.
+    #[test]
+    fn selection_screen_position_stable_across_pty_scroll_in_history_view() {
+        use crate::term::TermState;
+        use crate::wl::selection::{SelectionMode, SelectionPos, SelectionState};
+        let mut t = TermState::new(80, 24);
+        // 撑出 history.
+        for i in 0..29 {
+            t.advance(format!("line_{:02}\r\n", i).as_bytes());
+        }
+        // user 滚到 history (display_offset=3) + 选 history 第 -2 行.
+        t.scroll_display(3);
+        let mut sel = SelectionState::new();
+        // anchor.line=-2 表 viewport 上方第 2 行 (history 中). user 视角下渲染
+        // 落 viewport_line = -2 + 3 = 1 (viewport 第 1 行).
+        sel.start(SelectionPos { col: 5, line: -2 }, SelectionMode::Linear);
+        sel.update(SelectionPos { col: 10, line: -2 });
+        let viewport_line_before = sel.anchor().line + t.display_offset() as i32;
+        assert_eq!(viewport_line_before, 1, "前置: 选区渲染落 viewport row 1");
+
+        // PTY 输出 4 行 (复刻 pty_read_tick 内部逻辑: 比 history_size 前后 +
+        // rebase).
+        let history_before = t.scrollback_size();
+        for i in 30..34 {
+            t.advance(format!("line_{:02}\r\n", i).as_bytes());
+        }
+        let history_after = t.scrollback_size();
+        let scroll_delta = history_after.saturating_sub(history_before) as i32;
+        assert!(scroll_delta >= 4, "PTY 推 4 行 delta >= 4");
+        sel.rebase_for_grid_scroll(scroll_delta, crate::term::SCROLLBACK_HISTORY_MAX);
+
+        // bug 3 锁: 渲染 viewport_line stable (蓝框屏幕位置不漂).
+        let viewport_line_after = sel.anchor().line + t.display_offset() as i32;
+        assert_eq!(
+            viewport_line_after, viewport_line_before,
+            "rebase + alacritty display_offset auto-pin 抵消, 蓝框屏幕位置不漂"
+        );
+    }
 }
