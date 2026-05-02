@@ -1066,6 +1066,33 @@ impl TermState {
         (0..cols).map(|c| row[Column(c)].c).collect()
     }
 
+    /// 同 [`Self::scrollback_line_text`] 但 WIDE_CHAR_SPACER cell 用 `'\0'`
+    /// 占位, 镜像 [`Self::display_text_with_spacers`] viewport 路径协议
+    /// (T-0807). 给 selection 跨 scrollback 复制用, 调用方事后
+    /// `replace('\0', "")` 跟 viewport 路径一致, 避免 CJK 行复制后每字夹空格.
+    ///
+    /// `scrollback_line_text` 仍保留 (调试 / 人工查 / scrollback_cells_iter
+    /// 等价路径), 它的 spacer 走 alacritty 默认填充 `' '` — 适合"看一行字符
+    /// 序列", 不适合"按 cell 索引 substr". 二者职责各异, 不互替.
+    pub fn scrollback_line_text_with_spacers(&self, pos: ScrollbackPos) -> String {
+        use alacritty_terminal::index::Column;
+        use alacritty_terminal::term::cell::Flags;
+        let grid = self.term.grid();
+        let line = pos.to_alacritty(grid.history_size());
+        let row = &grid[line];
+        let cols = grid.columns();
+        (0..cols)
+            .map(|c| {
+                let cell = &row[Column(c)];
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    '\0'
+                } else {
+                    cell.c
+                }
+            })
+            .collect()
+    }
+
     /// 历史行的 cell 迭代器,给 T-0305 渲染层 scroll-up 用。
     ///
     /// 产出 `cols` 个 [`CellRef`](80×24 默认 80 个),与 [`cells_iter`] 同类型
@@ -1531,6 +1558,82 @@ mod tests {
             chars_from_iter.starts_with("ABC00"),
             "row=0 (oldest) 应是 'ABC00...', 实际: {:?}",
             chars_from_iter
+        );
+    }
+
+    /// T-0807 M2: `scrollback_line_text_with_spacers` 对 CJK 行用 `'\0'` 占位
+    /// WIDE_CHAR_SPACER, 镜像 viewport 路径 [`TermState::display_text_with_spacers`]
+    /// 协议. 给 selection 跨 scrollback 复制用 — 外层 `replace('\0', "")` 后两路径
+    /// 输出一致, 不再发生 "viewport 复制 `你好` / scrollback 复制 `你 好`" 的差异.
+    ///
+    /// **CI 退化**: 若 alacritty 默认填空 spacer 与 char 都不带 WIDE_CHAR_SPACER
+    /// flag (旧版本 / 非 CJK build), assert 锁 char 出现位置即可不挂.
+    #[test]
+    fn scrollback_line_text_with_spacers_cjk_uses_nul_marker() {
+        let mut t = TermState::new(80, 24);
+        // 写若干普通行把 viewport 撑满, 然后在 viewport 滚出一行 CJK.
+        for i in 0..50 {
+            let line = format!("filler_{:02}\r\n", i);
+            t.advance(line.as_bytes());
+        }
+        t.advance("你好\r\n".as_bytes());
+        // 再继续填几行确保 "你好" 那行被滚进 scrollback.
+        for i in 0..30 {
+            let line = format!("post_{:02}\r\n", i);
+            t.advance(line.as_bytes());
+        }
+        let history = t.scrollback_size();
+        assert!(history > 0, "前置: scrollback 应非空");
+
+        // 找含 '你' 的那行 (在某 scrollback row), 锁该行的 with_spacers 输出
+        // 紧接 '你' 后是 '\0', 紧接 '好' 后也是 '\0'.
+        let mut found = None;
+        for row in 0..history {
+            let s = t.scrollback_line_text_with_spacers(ScrollbackPos { row });
+            if s.contains('你') {
+                found = Some((row, s));
+                break;
+            }
+        }
+        let (row, s) = found.expect("应能在 scrollback 找到含 '你' 的行");
+        let chars: Vec<char> = s.chars().collect();
+        let pos = chars
+            .iter()
+            .position(|c| *c == '你')
+            .expect("含 '你' 的 char 序列应能定位");
+        assert_eq!(
+            chars.get(pos + 1).copied(),
+            Some('\0'),
+            "row={}: '你' 紧后应是 '\\0' spacer marker (with_spacers 协议), \
+             实际下一 char = {:?}; 完整行 = {:?}",
+            row,
+            chars.get(pos + 1),
+            s
+        );
+        assert_eq!(
+            chars.get(pos + 2).copied(),
+            Some('好'),
+            "row={}: '\\0' 紧后应是 '好' (CJK cluster 顺序), \
+             实际 = {:?}",
+            row,
+            chars.get(pos + 2)
+        );
+        assert_eq!(
+            chars.get(pos + 3).copied(),
+            Some('\0'),
+            "row={}: '好' 紧后也应是 '\\0' spacer marker, 实际 = {:?}",
+            row,
+            chars.get(pos + 3)
+        );
+
+        // 同 row 走旧 scrollback_line_text (不带 spacer 协议) 应是空格占位
+        // 而非 '\0' — 旧 fn 行为不变 (调试 / scrollback_cells_iter 等价路径).
+        let plain = t.scrollback_line_text(ScrollbackPos { row });
+        assert!(
+            !plain.contains('\0'),
+            "scrollback_line_text 旧路径不该出现 '\\0' (alacritty spacer 默认 \
+             ' ' 填充): {:?}",
+            plain
         );
     }
 

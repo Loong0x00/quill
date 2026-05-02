@@ -1274,7 +1274,10 @@ fn apply_selection_op(data: &mut LoopData, qh: &QueueHandle<State>) {
                     String::new()
                 } else {
                     let row = history_size - k;
-                    t.scrollback_line_text(crate::term::ScrollbackPos { row })
+                    // T-0807 M2: history 路径走 with_spacers 镜像 viewport
+                    // 协议. 外层 replace('\0', "") (line ~1282) 同步剥占位,
+                    // 避免 CJK 行复制后每字夹空格.
+                    t.scrollback_line_text_with_spacers(crate::term::ScrollbackPos { row })
                 }
             }
         },
