@@ -380,6 +380,26 @@ struct LoopData {
 /// 单次 calloop 回调里的 PTY read buffer 大小。4 KiB 覆盖 Linux PTY master 的典型
 /// 内核缓冲,一次 read 基本能吞完 bash prompt / ANSI escape;满了就循环再读一次。
 const PTY_READ_BUF: usize = 4096;
+const MAX_PASTE_PIPE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_GRID_COLS: usize = 1000;
+const MAX_GRID_ROWS: usize = 1000;
+
+// 修复 clipboard/DnD: 管道数据累积设上限，避免恶意 source 撑爆内存。
+fn extend_pipe_buf_bounded(buf: &mut Vec<u8>, chunk: &[u8], purpose: &'static str) -> bool {
+    if buf.len().saturating_add(chunk.len()) > MAX_PASTE_PIPE_BYTES {
+        tracing::warn!(
+            target: "quill::pointer",
+            purpose,
+            limit = MAX_PASTE_PIPE_BYTES,
+            current = buf.len(),
+            incoming = chunk.len(),
+            "paste/DnD pipe payload exceeds limit; aborting read"
+        );
+        return false;
+    }
+    buf.extend_from_slice(chunk);
+    true
+}
 
 /// `pty_readable_action` 的返回:告诉 [`pty_read_tick`] 下一步该做什么。
 ///
@@ -725,7 +745,8 @@ pub(crate) fn cells_from_surface_px(width: u32, height: u32, tab_count: usize) -
     let usable_h = height.saturating_sub(top_reserved);
     let cols = ((width as f32) / crate::wl::render::CELL_W_PX) as usize;
     let rows = ((usable_h as f32) / crate::wl::render::CELL_H_PX) as usize;
-    (cols.max(1), rows.max(1))
+    // 修复 resize: grid 尺寸加上限，避免异常 configure 触发超大分配。
+    (cols.clamp(1, MAX_GRID_COLS), rows.clamp(1, MAX_GRID_ROWS))
 }
 
 /// **T-0617**: 给定 tab 数量, 返 tab bar 占用的 logical px 高度.
@@ -875,7 +896,9 @@ fn propagate_resize_if_dirty(data: &mut LoopData) {
     // 实战 N ≤ 10 不慢.
     for tab in state.tabs_unchecked_mut().iter_mut() {
         tab.term_mut().resize(cols, rows);
-        if let Err(err) = tab.pty().resize(cols as u16, rows as u16) {
+        let cols_u16 = u16::try_from(cols).unwrap_or(u16::MAX);
+        let rows_u16 = u16::try_from(rows).unwrap_or(u16::MAX);
+        if let Err(err) = tab.pty().resize(cols_u16, rows_u16) {
             tracing::warn!(
                 ?err,
                 cols,
@@ -1787,10 +1810,19 @@ fn drop_read_tick(
         #[allow(unsafe_code)]
         let n = unsafe { libc::read(raw_fd, chunk.as_mut_ptr() as *mut _, chunk.len()) };
         if n > 0 {
-            drop_state
-                .borrow_mut()
-                .buf
-                .extend_from_slice(&chunk[..n as usize]);
+            let ok = {
+                let mut s = drop_state.borrow_mut();
+                extend_pipe_buf_bounded(&mut s.buf, &chunk[..n as usize], "dnd")
+            };
+            if !ok {
+                drop_state.borrow_mut().fd = None;
+                if let Some(offer) = data.state.dnd_current_offer.take() {
+                    offer.destroy();
+                }
+                data.state.dnd_current_offer_mimes.clear();
+                data.state.dnd_accepted_mime = None;
+                return Ok(PostAction::Remove);
+            }
             continue;
         }
         if n == 0 {
@@ -2136,10 +2168,18 @@ fn paste_read_tick(
         #[allow(unsafe_code)]
         let n = unsafe { libc::read(raw_fd, chunk.as_mut_ptr() as *mut _, chunk.len()) };
         if n > 0 {
-            pasta_state
-                .borrow_mut()
-                .buf
-                .extend_from_slice(&chunk[..n as usize]);
+            let ok = {
+                let mut s = pasta_state.borrow_mut();
+                extend_pipe_buf_bounded(&mut s.buf, &chunk[..n as usize], "paste")
+            };
+            if !ok {
+                pasta_state.borrow_mut().fd = None;
+                data.state.paste_in_progress = false;
+                if let Some(next) = data.state.pending_paste_followups.pop_front() {
+                    data.state.pending_paste_request = Some(next);
+                }
+                return Ok(PostAction::Remove);
+            }
             continue;
         }
         if n == 0 {
@@ -2813,7 +2853,11 @@ pub fn run_window() -> Result<()> {
                 let app = term.app_cursor_keys();
                 let arrow_bytes: Option<Vec<u8>> = if alt_mode {
                     let key: &[u8] = if n > 0 {
-                        if app { b"\x1bOA" } else { b"\x1b[A" }
+                        if app {
+                            b"\x1bOA"
+                        } else {
+                            b"\x1b[A"
+                        }
                     } else if app {
                         b"\x1bOB"
                     } else {

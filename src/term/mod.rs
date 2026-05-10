@@ -1706,24 +1706,24 @@ mod tests {
         );
     }
 
-    /// `Color::from_alacritty(Named(Red))` 解析到 ANSI 标准红 (170, 0, 0)。
+    /// `Color::from_alacritty(Named(Red))` 解析到 Tango/alacritty 默认红。
     /// 防回归:换调色板等于改用户文字色,不能"顺手"调亮 / 调暗。
-    /// 同时验另一个高频色 BrightGreen → (85, 255, 85)(`ls --color` 目录色)。
+    /// 同时验另一个高频色 BrightGreen → Tango 默认绿色 (`ls --color` 目录色)。
     #[test]
     fn color_from_alacritty_named_resolves_to_palette() {
         assert_eq!(
             Color::from_alacritty(AlacColor::Named(NamedColor::Red)),
-            Color { r: 170, g: 0, b: 0 },
-            "ANSI Named::Red → xterm-classic (170, 0, 0)"
+            Color { r: 204, g: 0, b: 0 },
+            "ANSI Named::Red → Tango/alacritty default"
         );
         assert_eq!(
             Color::from_alacritty(AlacColor::Named(NamedColor::BrightGreen)),
             Color {
-                r: 85,
-                g: 255,
-                b: 85
+                r: 138,
+                g: 226,
+                b: 52
             },
-            "ANSI Named::BrightGreen → xterm-classic (85, 255, 85)"
+            "ANSI Named::BrightGreen → Tango/alacritty default"
         );
         // Foreground / Background 走 quill 自定 default,不走标准色;锁住默认值。
         assert_eq!(
@@ -1746,7 +1746,7 @@ mod tests {
         // 0..16 复用 NamedColor 路径
         assert_eq!(
             Color::from_alacritty(AlacColor::Indexed(1)),
-            Color { r: 170, g: 0, b: 0 },
+            Color { r: 204, g: 0, b: 0 },
             "Indexed(1) == Red"
         );
         assert_eq!(

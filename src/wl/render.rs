@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::NonNull;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{anyhow, Context, Result};
 use raw_window_handle::{
@@ -1033,7 +1034,9 @@ fn append_quad_px(
     surface_h: f32,
     color: [f32; 3],
 ) {
-    append_quad_px_with_alpha(out, x0_px, y0_px, x1_px, y1_px, surface_w, surface_h, color, 1.0)
+    append_quad_px_with_alpha(
+        out, x0_px, y0_px, x1_px, y1_px, surface_w, surface_h, color, 1.0,
+    )
 }
 
 /// T-0618 follow-up: 同 [`append_quad_px`] 但带 per-vertex alpha. 默认调用方
@@ -1669,13 +1672,16 @@ fn create_corner_mask_resources(
 /// alpha=0.85 (uniform translucency 与 ghostty 一致). titlebar 与 tab_bar 与
 /// cells 与 border 在 bg fill 之上 REPLACE 覆盖 (它们也走 cell shader corner
 /// mask, corner 外 discard 不破透明效果).
-fn append_background_fill_quad(out: &mut Vec<u8>, surface_w: f32, surface_h: f32, color: [f32; 3]) {
-    // T-0618 follow-up: bg fill 用 alpha_live (CLEAR_ALPHA_LIVE = 0.85) 让壁纸
-    // 透出 15%. 其他 cell quads (SGR 染色 / cursor / selection) 用 alpha=1.0
-    // 满深度. 结果: 默认空区半透明显桌面, 字色 / SGR bg 块满色.
+fn append_background_fill_quad(
+    out: &mut Vec<u8>,
+    surface_w: f32,
+    surface_h: f32,
+    color: [f32; 3],
+    alpha_live: f32,
+) {
+    // T-0618 follow-up: bg fill 用调用方传入的 alpha_live；live 半透明，headless 满 alpha。
     append_quad_px_with_alpha(
-        out, 0.0, 0.0, surface_w, surface_h, surface_w, surface_h, color,
-        CLEAR_ALPHA_LIVE as f32,
+        out, 0.0, 0.0, surface_w, surface_h, surface_w, surface_h, color, alpha_live,
     );
 }
 
@@ -2498,7 +2504,13 @@ impl Renderer {
             b: CLEAR_COLOR_SRGB_U8[2],
         });
         let mut cell_vertex_bytes: Vec<u8> = Vec::new();
-        append_background_fill_quad(&mut cell_vertex_bytes, surface_w, surface_h, bg_fill_color);
+        append_background_fill_quad(
+            &mut cell_vertex_bytes,
+            surface_w,
+            surface_h,
+            bg_fill_color,
+            self.alpha_live,
+        );
 
         // Step 3: cell vertex bytes (T-0407 D fix: 走 bg 色, 让 glyph fg 字形
         // 在 cell bg 块上可见; T-0403 用 fg 致字形被 cell fg 块"涂同色"不可见,
@@ -3921,6 +3933,13 @@ pub fn render_headless(
     // 空 / None 时不画 selection bg.
     selection: Option<&[crate::term::CellPos]>,
 ) -> Result<(Vec<u8>, u32, u32)> {
+    // headless wgpu 初始化在同进程多测试并发时会触发驱动层崩溃，入口串行化。
+    static HEADLESS_RENDER_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _headless_render_guard = HEADLESS_RENDER_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     if width == 0 || height == 0 {
         return Err(anyhow!(
             "render_headless: width 与 height 必须 > 0 (got {}×{} logical)",
@@ -4109,7 +4128,13 @@ pub fn render_headless(
         },
         is_srgb,
     );
-    append_background_fill_quad(&mut cell_vertex_bytes, surface_w, surface_h, bg_fill_color);
+    append_background_fill_quad(
+        &mut cell_vertex_bytes,
+        surface_w,
+        surface_h,
+        bg_fill_color,
+        alpha_live,
+    );
     for cell in cells {
         // 跳过默认 bg cell (alacritty / xterm / foot / ghostty 标准: default bg
         // 不画, 让 clear color 透出). **空格非空格不分** —— claudecode 等 TUI
@@ -5736,17 +5761,15 @@ mod tests {
         );
     }
 
-    /// 空格 cell 仍跳过 (既有契约不破): cell.c = ' ' 优先短路, 与 default bg
-    /// 跳过逻辑独立。
+    /// 显式背景空格需要绘制: cell.c = ' ' 但 bg 非 default 时仍输出 bg quad。
     #[test]
-    fn build_vertex_bytes_still_skips_space_cell() {
+    fn build_vertex_bytes_keeps_explicit_bg_space_cell() {
         let red = crate::term::Color {
             r: 0xff,
             g: 0x00,
             b: 0x00,
         };
-        // 空格 cell 即使 bg = explicit 红, 也优先跳过 (空格短路在 default bg
-        // 检查之前).
+        // 空格 cell 的显式背景要保留，否则 shell 高亮空格不可见。
         let cells = vec![cell_with_bg(' ', red)];
         let renderer = MaybeRenderer::sentinel();
         let bytes = renderer.build_vertex_bytes(
@@ -5758,7 +5781,11 @@ mod tests {
             CellColorSource::Bg,
             0.0,
         );
-        assert!(bytes.is_empty(), "空格 cell 仍优先跳过");
+        assert_eq!(
+            bytes.len(),
+            6 * VERTEX_BYTES,
+            "Bg pass 必须绘制显式背景空格"
+        );
     }
 
     /// cursor inset 几何: Block 4 顶点 x 范围严格在 cell [col*cw + inset, col*cw +
@@ -6181,7 +6208,7 @@ mod tests {
     #[test]
     fn append_background_fill_quad_emits_one_quad() {
         let mut out = Vec::new();
-        append_background_fill_quad(&mut out, 1600.0, 1200.0, [0.1, 0.2, 0.3]);
+        append_background_fill_quad(&mut out, 1600.0, 1200.0, [0.1, 0.2, 0.3], 0.85);
         assert_eq!(
             out.len(),
             6 * VERTEX_BYTES,
@@ -6193,7 +6220,7 @@ mod tests {
     #[test]
     fn append_background_fill_quad_covers_full_ndc() {
         let mut out = Vec::new();
-        append_background_fill_quad(&mut out, 1600.0, 1200.0, [0.1, 0.2, 0.3]);
+        append_background_fill_quad(&mut out, 1600.0, 1200.0, [0.1, 0.2, 0.3], 0.85);
         // 第 1 顶点 = TL: NDC (-1, +1). pos[0..4] = x, pos[4..8] = y.
         let tl_x = f32::from_ne_bytes(out[0..4].try_into().unwrap());
         let tl_y = f32::from_ne_bytes(out[4..8].try_into().unwrap());
@@ -6355,7 +6382,7 @@ mod tests {
             [1.0, 1.0, 1.0],
         );
         assert_eq!(rounded.len(), 6 * 40);
-        assert_eq!(cell.len(), 6 * 20);
+        assert_eq!(cell.len(), 6 * VERTEX_BYTES);
     }
 
     // ---------- T-0615 圆形 button visual (append_titlebar_vertices 整合) ----------

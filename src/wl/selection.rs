@@ -588,16 +588,15 @@ fn substr_chars(s: &str, start_char: usize, end_char: usize) -> String {
 /// 包字节再 `pty.write`. shell 读到 `\x1b[200~` 知道接下来是粘贴而非真键入,
 /// 多行粘贴时不会每行 Enter 立即执行 (避免误执行剪贴板 bash 命令).
 ///
-/// **dirty pty 字节裸保留**: 粘贴文本若已含 `\x1b[201~` (恶意 / 凑巧) 会过早
-/// 终止 paste, shell 把后续部分当真键入. 派单接受此 risk (alacritty / foot
-/// 同等不过滤; 真防御走 shell `bind 'set enable-bracketed-paste off'` 关).
 pub fn bracketed_paste_wrap(text: &str, enabled: bool) -> Vec<u8> {
     if !enabled {
         return text.as_bytes().to_vec();
     }
-    let mut out = Vec::with_capacity(text.len() + 12);
+    // 修复 bracketed paste: 过滤内嵌起止标记，避免粘贴内容提前结束后注入输入。
+    let sanitized = text.replace("\x1b[200~", "").replace("\x1b[201~", "");
+    let mut out = Vec::with_capacity(sanitized.len() + 12);
     out.extend_from_slice(b"\x1b[200~");
-    out.extend_from_slice(text.as_bytes());
+    out.extend_from_slice(sanitized.as_bytes());
     out.extend_from_slice(b"\x1b[201~");
     out
 }
@@ -920,6 +919,12 @@ mod tests {
         let out = bracketed_paste_wrap("a\nb", true);
         // 包含换行不破坏包装语义 (shell 接收 \x1b[200~..\x1b[201~ 作整体粘贴)
         assert_eq!(out, b"\x1b[200~a\nb\x1b[201~");
+    }
+
+    #[test]
+    fn bracketed_paste_strips_nested_delimiters() {
+        let out = bracketed_paste_wrap("a\x1b[201~\nrm -rf /\x1b[200~b", true);
+        assert_eq!(out, b"\x1b[200~a\nrm -rf /b\x1b[201~");
     }
 
     // ---- extract_selection_text (display_offset=0 / 旧 viewport 等价) ----

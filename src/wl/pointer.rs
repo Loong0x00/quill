@@ -482,9 +482,8 @@ pub(crate) const RESIZE_CORNER_PX: f64 = 8.0;
 /// 单一阈值同时覆盖 wheel notch (10 px/格) 与 touchpad (px 累积), 避免分支
 /// 走两套阈值表 (KISS).
 /// smooth axis 累积阈值 (logical px). mutter 每 wheel notch 发 1-2 个 ±10 event,
-/// threshold = 10 让 1 notch 出 1 line, 体感"滚一下走一行" 直觉. 用户之前要求
-/// "3 行就行" 是基于 AxisValue120 离散 notch 路径 (一 notch 直接乘 3); 这里
-/// smooth 路径累积慢, 用 10 让累 1 notch 大概 1 line, 用户多滚几下补足.
+/// threshold = 10 识别一个 smooth step, 再统一乘 [`WHEEL_LINES_PER_NOTCH`]
+/// 输出 3 行，和 AxisValue120 离散 notch 的默认滚动量一致。
 pub(crate) const SCROLL_ACCUM_LINE_PX: f64 = 10.0;
 
 /// **T-0618: 滚轮一格 (notch) 滚多少行**. 3 行 = alacritty / foot / gnome-terminal
@@ -725,9 +724,9 @@ pub fn handle_pointer_event(
             }
         }
         // T-0618 follow-up: Axis (smooth) 是 mutter 50.x 实际发的 (AxisValue120
-        // 不发). 累积阈值 SCROLL_ACCUM_LINE_PX = 10 → 1 line, 余量留下次, 反向
-        // 时清累积器. value 协议规约: + = 向下手势 = 看新; quill Scroll(+) = 看老,
-        // 故取负.
+        // 不发). 累积阈值 SCROLL_ACCUM_LINE_PX = 10 → 一个 smooth step, 再按
+        // WHEEL_LINES_PER_NOTCH 转成默认 3 行. value 协议规约: + = 向下手势 =
+        // 看新; quill Scroll(+) = 看老, 故取负.
         wl_pointer::Event::Axis { axis, value, .. } => {
             if matches!(axis, WEnum::Value(wl_pointer::Axis::VerticalScroll)) {
                 apply_axis_smooth(state, value)
@@ -837,8 +836,7 @@ pub(crate) fn apply_motion(
         // T-0608 hotfix: top_reserved = titlebar + tab_bar (多 tab 时 tab_bar
         // 占 28 logical, 单 tab 0). 与 cells_from_surface_px / pixel_to_cell 同 origin.
         let titlebar_h = TITLEBAR_H_LOGICAL_PX as f64;
-        let tab_bar_h =
-            crate::wl::window::tab_bar_h_logical_for(state.tab_count) as f64;
+        let tab_bar_h = crate::wl::window::tab_bar_h_logical_for(state.tab_count) as f64;
         let top_reserved = titlebar_h + tab_bar_h;
         let h = state.surface_h_logical as f64;
         let above_top = y < top_reserved;
@@ -993,8 +991,7 @@ pub(crate) fn apply_button(
                 return PointerAction::Nothing;
             };
             let titlebar_h = TITLEBAR_H_LOGICAL_PX as f64;
-            let tab_bar_h =
-                crate::wl::window::tab_bar_h_logical_for(state.tab_count) as f64;
+            let tab_bar_h = crate::wl::window::tab_bar_h_logical_for(state.tab_count) as f64;
             let top_reserved = titlebar_h + tab_bar_h;
             let cell_w = crate::wl::render::CELL_W_PX as f64;
             let cell_h = crate::wl::render::CELL_H_PX as f64;
@@ -1075,8 +1072,9 @@ pub(crate) fn apply_axis_value120(value120: i32) -> PointerAction {
 }
 
 /// smooth axis 累积器 — mutter 50.x 实测发的是 Axis (value=±10/event), 不发
-/// AxisValue120. 累 |accum| ≥ SCROLL_ACCUM_LINE_PX → 出整 line, 余量留下次,
-/// 反向时清。同 apply_axis_value120 取负让 quill Scroll(+) = 看老历史.
+/// AxisValue120. 累 |accum| ≥ SCROLL_ACCUM_LINE_PX → 出 smooth step, 再乘默认
+/// 3 行，余量留下次, 反向时清。同 apply_axis_value120 取负让 quill Scroll(+)
+/// = 看老历史.
 pub(crate) fn apply_axis_smooth(state: &mut PointerState, value: f64) -> PointerAction {
     if value == 0.0 {
         return PointerAction::Nothing;
@@ -1091,7 +1089,8 @@ pub(crate) fn apply_axis_smooth(state: &mut PointerState, value: f64) -> Pointer
         return PointerAction::Nothing;
     }
     state.scroll_accum_y -= (lines as f64) * SCROLL_ACCUM_LINE_PX;
-    PointerAction::Scroll(-lines)
+    // 修复滚轮默认量: smooth Axis 每个累积步也滚 3 行，alt screen 转发同源生效。
+    PointerAction::Scroll(-(lines * WHEEL_LINES_PER_NOTCH))
 }
 
 /// 纯逻辑 hit-test: 给定 surface 内坐标 (logical px) 与 surface 尺寸 (logical),
@@ -1730,8 +1729,8 @@ mod tests {
     }
 
     /// T-0618: handle_pointer_event 整体路径覆盖: VerticalScroll AxisValue120
-    /// 走 apply_axis_value120, smooth Axis 沉默 (T-0618 deprecated), 横向 (HorizontalScroll)
-    /// 也沉默 (quill 无横滚).
+    /// 走 apply_axis_value120, smooth Axis 也按默认 3 行滚动, 横向 (HorizontalScroll)
+    /// 沉默 (quill 无横滚).
     #[test]
     fn handle_event_dispatches_vertical_axis_value120_and_silences_others() {
         let mut state = fresh_state();
@@ -1759,12 +1758,12 @@ mod tests {
         let event_smooth = wl_pointer::Event::Axis {
             time: 0,
             axis: WEnum::Value(wl_pointer::Axis::VerticalScroll),
-            value: 100.0,
+            value: 10.0,
         };
         assert_eq!(
             handle_pointer_event(event_smooth, &mut state, false, 0),
-            PointerAction::Nothing,
-            "T-0618: smooth Axis 不再消费"
+            PointerAction::Scroll(-3),
+            "smooth Axis 一个 step 应按默认 3 行滚动"
         );
     }
 

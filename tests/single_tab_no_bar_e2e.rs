@@ -22,10 +22,11 @@ const LOGICAL_H: u32 = 600;
 const TITLEBAR_H_LOGICAL: usize = 28;
 
 fn empty_cells(cols: usize, rows: usize) -> Vec<CellRef> {
+    // 空白 cell 使用 term 默认 bg (#000000)，让 render_headless 的 terminal clear 色透出。
     let bg = Color {
-        r: 0x0a,
-        g: 0x10,
-        b: 0x30,
+        r: 0x00,
+        g: 0x00,
+        b: 0x00,
     };
     let fg = Color {
         r: 0xd3,

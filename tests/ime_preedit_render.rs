@@ -118,27 +118,18 @@ fn preedit_overlay_renders_underline_to_png() {
     eprintln!("writer-T0505 wrote PNG: {}", path.display());
 
     // 验证 underline 区域 (cursor cell 底部 4 phys px) 有非 clear-color 像素。
-    // cursor (5, 10) → cell px logical (50, 250), physical (100, 500).
-    // cell h logical 25 → phys 50; underline 在 cell 底部, y ∈ [500+50-4, 500+50)
-    // = [546, 550)。preedit "你好" 2 char × 2 cell wide = 4 cell logical wide
-    // ≈ 80 logical px → 160 physical px。x ∈ [100, 100+80)（按 char_count=2 算 2
-    // cell 但实际中文 1 char = 2 cell wide; 我们 char count 在 underline_to_cell_bytes
-    // 用 chars().count() = 2 char → 2 cell 宽度 underline）
-    //
-    // why 用 4 cell 而不是 2: 派单 In #D char 数即 cell 数 (Phase 5 KISS, 不接
-    // east-asian width 表). "你好" 2 chars → 2 cells underline = 100..120 logical
-    // → 200..240 physical. 验该区有亮像素即可。
+    // render_headless 默认单 tab 隐藏 tab bar，但 cell 区仍位于 titlebar 28 logical
+    // px 下方；CJK preedit 下划线按 unicode-width 计算，"你好" = 4 cell。
 
     let row_stride = (physical_w as usize) * 4;
     let mut underline_bright_pixels: u32 = 0;
 
-    // physical underline y range: cell_line=10, cell_h_phys=50, underline phys=4
-    // y ∈ [10*50+50-4, 10*50+50) = [546, 550)
-    // Phase 4/5 cell px hardcode: CELL_H_PX=25 logical → 50 physical
-    let underline_y_start = (10 * 25 + 25 - 2) as usize * 2; // logical 273 → phys 546
-    let underline_y_end = (10 * 25 + 25) as usize * 2; // logical 275 → phys 550
+    // physical underline y range includes titlebar offset:
+    // (28 + 10*25 + 25 - 2) * 2 .. (28 + 10*25 + 25) * 2 = [602, 606)
+    let underline_y_start = (28 + 10 * 25 + 25 - 2) as usize * 2;
+    let underline_y_end = (28 + 10 * 25 + 25) as usize * 2;
     let underline_x_start = (5 * 10) as usize * 2; // logical 50 → phys 100
-    let underline_x_end = ((5 + 2) * 10) as usize * 2; // 2 chars × 10 logical → phys 140
+    let underline_x_end = ((5 + 4) * 10) as usize * 2; // 4 cells × 10 logical → phys 180
 
     for y in underline_y_start..underline_y_end.min(physical_h as usize) {
         for x in underline_x_start..underline_x_end.min(physical_w as usize) {
@@ -166,12 +157,11 @@ fn preedit_overlay_renders_underline_to_png() {
          wide ≈ 160 px 满, 50 是宽松下限防 anti-alias 边界); got {underline_bright_pixels}"
     );
 
-    // 还要验 preedit 字像素也存在 (preedit "你好" glyph 在 underline 上方):
-    // cell vertical center ≈ phys y in (10*50+5, 10*50+45) = (505, 545)
-    let glyph_y_start = (10 * 25 + 5) as usize * 2; // logical 255 → phys 510
-    let glyph_y_end = (10 * 25 + 22) as usize * 2; // logical 272 → phys 544
+    // 还要验 preedit 字像素也存在 (preedit "你好" glyph 在 underline 上方)。
+    let glyph_y_start = (28 + 10 * 25 + 5) as usize * 2;
+    let glyph_y_end = (28 + 10 * 25 + 22) as usize * 2;
     let glyph_x_start = (5 * 10) as usize * 2;
-    let glyph_x_end = ((5 + 2) * 10) as usize * 2;
+    let glyph_x_end = ((5 + 4) * 10) as usize * 2;
 
     let mut glyph_pixels: u32 = 0;
     for y in glyph_y_start..glyph_y_end.min(physical_h as usize) {
@@ -214,10 +204,10 @@ fn no_preedit_means_no_underline() {
     let row_stride = (physical_w as usize) * 4;
     // 同 cursor cell 底部区域 — 应全是 clear color (depth = 0 ± 几 because
     // sRGB rounding)
-    let underline_y_start = (10 * 25 + 23) as usize * 2;
-    let underline_y_end = (10 * 25 + 25) as usize * 2;
+    let underline_y_start = (28 + 10 * 25 + 23) as usize * 2;
+    let underline_y_end = (28 + 10 * 25 + 25) as usize * 2;
     let underline_x_start = (5 * 10) as usize * 2;
-    let underline_x_end = ((5 + 2) * 10) as usize * 2;
+    let underline_x_end = ((5 + 4) * 10) as usize * 2;
 
     let mut bright_pixels: u32 = 0;
     for y in underline_y_start..underline_y_end {
@@ -263,10 +253,10 @@ fn empty_preedit_text_means_no_underline() {
     .expect("render_headless empty preedit failed");
 
     let row_stride = (physical_w as usize) * 4;
-    let underline_y_start = (10 * 25 + 23) as usize * 2;
-    let underline_y_end = (10 * 25 + 25) as usize * 2;
+    let underline_y_start = (28 + 10 * 25 + 23) as usize * 2;
+    let underline_y_end = (28 + 10 * 25 + 25) as usize * 2;
     let underline_x_start = (5 * 10) as usize * 2;
-    let underline_x_end = ((5 + 2) * 10) as usize * 2;
+    let underline_x_end = ((5 + 4) * 10) as usize * 2;
 
     let mut bright: u32 = 0;
     for y in underline_y_start..underline_y_end {

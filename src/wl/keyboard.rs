@@ -45,12 +45,12 @@
 //!
 //! ## 安全边界
 //!
-//! `Event::Keymap` 传 `OwnedFd` + `size: u32`。我们走 `mmap` 读 size 字节
+//! `Event::Keymap` 传 `OwnedFd` + `size: u32`。我们 clone fd 后按 size 有界读取
 //! → utf8 String → `Keymap::new_from_string` (safe API 路径, 避开 xkbcommon
-//! 的 `unsafe Keymap::new_from_fd`)。mmap 的 unsafe 集中在 [`load_keymap_from_fd`]
-//! 单一函数, 配 `// SAFETY:` 注释块。
+//! 的 `unsafe Keymap::new_from_fd`)。
 
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::io::{Read as _, Seek as _};
+use std::os::fd::{AsFd, OwnedFd};
 
 use anyhow::{anyhow, Context, Result};
 use wayland_client::protocol::wl_keyboard::{self, KeyState, KeymapFormat};
@@ -697,53 +697,36 @@ fn update_modifiers(
     xkb_state.update_mask(mods_depressed, mods_latched, mods_locked, 0, 0, group);
 }
 
-/// mmap fd 的 size 字节 → UTF-8 String。失败任意一步返 anyhow Error, 调用方
+/// 读取 keymap fd 的 size 字节 → UTF-8 String。失败任意一步返 anyhow Error, 调用方
 /// (`handle_keymap_event`) 仅 warn, 不 panic。
-///
-/// **why mmap 而非 read**: wl_keyboard 协议保证 fd 内容是 size 字节的 keymap
-/// 文本; 但有些 compositor (mutter / weston) 用 `MAP_PRIVATE` shm fd, read
-/// 不一定合法 (可能 ENOSYS 或返 0)。mmap 是 wayland 客户端事实上的协议
-/// 处理方式 (libwayland-client / SCTK / wlroots 客户端示例都 mmap)。
 fn load_keymap_from_fd(fd: &OwnedFd, size: usize) -> Result<String> {
+    const MAX_KEYMAP_BYTES: usize = 1024 * 1024;
     if size == 0 {
         return Err(anyhow!("keymap size = 0"));
     }
-    // SAFETY:
-    // - `fd` 是 wl_keyboard 协议保证活的 OwnedFd, 我们仅借用 raw fd 不夺所有权
-    // - mmap PROT_READ + MAP_PRIVATE: 进程私有只读映射, 改不破坏其他进程
-    // - size 直接来自 wl_keyboard 协议 (compositor 推); 若 compositor 撒谎超
-    //   实际 fd 大小, mmap 在 read 越界时给 SIGBUS, 但该协议层假设 compositor
-    //   守约 (与 SCTK / wlroots / cosmic-comp 假设一致)
-    // - munmap 在 mmap 成功后必跑 (defer 通过 scope 末尾显式 libc::munmap),
-    //   `?` 早返路径不触达 mmap 后, 无 leak
-    // - 本块**不**长持映射: 立即拷贝 size 字节到 Vec, mmap 区域随后 munmap 释放
-    #[allow(unsafe_code)]
-    let bytes = unsafe {
-        let raw_fd = fd.as_raw_fd();
-        let ptr = libc::mmap(
-            std::ptr::null_mut(),
-            size,
-            libc::PROT_READ,
-            libc::MAP_PRIVATE,
-            raw_fd,
-            0,
-        );
-        if ptr == libc::MAP_FAILED {
-            return Err(anyhow!(
-                "mmap keymap fd 失败: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        // SAFETY: ptr 是有效 PROT_READ 映射区, 长度 size; from_raw_parts 只读
-        // 一次后立即拷贝到 Vec, 之后 munmap, 借用不外泄
-        let slice = std::slice::from_raw_parts(ptr as *const u8, size);
-        let bytes = slice.to_vec();
-        if libc::munmap(ptr, size) != 0 {
-            // munmap 失败极罕见, 仅 warn 不返错 — bytes 已拿到, 调用方可用
-            tracing::warn!(target: "quill::keyboard", "munmap keymap 区失败: {}", std::io::Error::last_os_error());
-        }
-        bytes
-    };
+    // 修复 keymap fd: 限制 compositor 声明的 size, 避免超大读取或 mmap SIGBUS。
+    if size > MAX_KEYMAP_BYTES {
+        return Err(anyhow!(
+            "keymap size {size} exceeds {MAX_KEYMAP_BYTES} byte limit"
+        ));
+    }
+    let dup = fd
+        .as_fd()
+        .try_clone_to_owned()
+        .context("clone keymap fd 失败")?;
+    let mut file = std::fs::File::from(dup);
+    file.rewind().context("rewind keymap fd 失败")?;
+    let mut bytes = Vec::with_capacity(size);
+    file.by_ref()
+        .take(size as u64)
+        .read_to_end(&mut bytes)
+        .context("read keymap fd 失败")?;
+    if bytes.len() != size {
+        return Err(anyhow!(
+            "keymap fd short read: expected {size}, got {}",
+            bytes.len()
+        ));
+    }
     // wl_keyboard keymap 字符串可能含末尾 \0 (libxkbcommon C 习惯), 先 trim
     let trimmed_len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     let s = std::str::from_utf8(&bytes[..trimmed_len])
