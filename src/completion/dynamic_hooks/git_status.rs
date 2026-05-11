@@ -64,7 +64,7 @@ impl Provider for GitStatusProvider {
 
     fn cancel(&self, _gen_id: GenerationId) {}
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "git_status"
     }
 }

@@ -60,7 +60,7 @@ impl Provider for PacmanProvider {
 
     fn cancel(&self, _gen_id: GenerationId) {}
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "pacman"
     }
 }

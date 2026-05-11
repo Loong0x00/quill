@@ -355,6 +355,11 @@ struct LoopData {
     /// 新; Stop / SelectionEnd 路径仅 take + remove. 与 `repeat_token` /
     /// `pending_resize_followup` 同 calloop Timer 单飞行套路 (派单 In #E).
     pending_autoscroll_timer: Option<RegistrationToken>,
+    /// T11: composer debounce Timer。键入只置 State pending 标记,这里统一
+    /// cancel旧timer并排30ms后查询completion,保持calloop线程不阻塞。
+    composer_debounce_token: Option<RegistrationToken>,
+    /// T11: completion worker 用 std::mpsc 回传结果,用短Timer轮询并触发重绘。
+    completion_poll_token: Option<RegistrationToken>,
     /// T-0607: 当前 autoscroll 方向 (`±1` line / 100ms tick). Timer fire 走
     /// [`autoscroll_tick`] 读此值调 `term.scroll_display(delta)`. T-0804 后
     /// SelectionPos viewport-relative i32 line 自动跟随 viewport, Timer 路径
@@ -1145,6 +1150,85 @@ fn apply_repeat_request(data: &mut LoopData) {
                 }
             }
         }
+    }
+}
+
+const COMPOSER_DEBOUNCE_MS: u64 = 30;
+const COMPLETION_POLL_MS: u64 = 16;
+
+fn apply_composer_debounce_request(data: &mut LoopData) {
+    if !data.state.pending_composer_debounce {
+        return;
+    }
+    data.state.pending_composer_debounce = false;
+
+    if let Some(tok) = data.composer_debounce_token.take() {
+        data.loop_handle.remove(tok);
+    }
+
+    let timer = Timer::from_duration(std::time::Duration::from_millis(COMPOSER_DEBOUNCE_MS));
+    match data
+        .loop_handle
+        .insert_source(timer, |_deadline, _meta, data: &mut LoopData| {
+            composer_debounce_tick(data)
+        }) {
+        Ok(token) => {
+            data.composer_debounce_token = Some(token);
+        }
+        Err(err) => {
+            tracing::warn!(
+                target: "quill::completion",
+                ?err,
+                "calloop insert_source(composer debounce) 失败"
+            );
+        }
+    }
+}
+
+fn composer_debounce_tick(data: &mut LoopData) -> TimeoutAction {
+    data.composer_debounce_token = None;
+    let composer = &mut data.state.tabs_unchecked_mut().active_mut().composer;
+    composer.trigger_query();
+    data.state.presentation_dirty = true;
+    schedule_completion_poll(data);
+    TimeoutAction::Drop
+}
+
+fn schedule_completion_poll(data: &mut LoopData) {
+    if data.completion_poll_token.is_some() {
+        return;
+    }
+    let timer = Timer::from_duration(std::time::Duration::from_millis(COMPLETION_POLL_MS));
+    match data
+        .loop_handle
+        .insert_source(timer, |_deadline, _meta, data: &mut LoopData| {
+            completion_poll_tick(data)
+        }) {
+        Ok(token) => {
+            data.completion_poll_token = Some(token);
+        }
+        Err(err) => {
+            tracing::warn!(
+                target: "quill::completion",
+                ?err,
+                "calloop insert_source(completion poll) 失败"
+            );
+        }
+    }
+}
+
+fn completion_poll_tick(data: &mut LoopData) -> TimeoutAction {
+    let composer = &mut data.state.tabs_unchecked_mut().active_mut().composer;
+    let changed = composer.poll_results();
+    let keep_polling = composer.has_pending_results();
+    if changed {
+        data.state.presentation_dirty = true;
+    }
+    if keep_polling {
+        TimeoutAction::ToDuration(std::time::Duration::from_millis(COMPLETION_POLL_MS))
+    } else {
+        data.completion_poll_token = None;
+        TimeoutAction::Drop
     }
 }
 
@@ -2337,6 +2421,7 @@ fn drive_wayland(data: &mut LoopData) -> std::io::Result<PostAction> {
     // 已置 `state.pending_repeat` (按键 Pressed → Start 或 Released / modifier
     // 变化 → Stop). 在 flush 之前把 calloop Timer source 真 insert / remove.
     apply_repeat_request(data);
+    apply_composer_debounce_request(data);
 
     // Step 3.7 (T-0607): selection / paste / autoscroll 副作用 — 与 repeat
     // 同套路, dispatch 期间 Dispatch<WlPointer> / Dispatch<WlKeyboard> 写
@@ -2620,6 +2705,7 @@ pub fn run_window() -> Result<()> {
         text_input: None,
         ime_state: ImeState::new(),
         pending_repeat: None,
+        pending_composer_debounce: false,
         // T-0607 selection / clipboard 起步全空, 协议 device 在 SeatHandler::
         // new_capability(Pointer) 时 lazy 创建.
         selection_state: SelectionState::new(),
@@ -2796,6 +2882,8 @@ pub fn run_window() -> Result<()> {
         pending_resize_followup: None,
         // T-0607: autoscroll Timer 起步空, AutoScrollStart 时 lazy schedule.
         pending_autoscroll_timer: None,
+        composer_debounce_token: None,
+        completion_poll_token: None,
         autoscroll_delta: 0,
         // T-0608: 启动后第一个 tab 的 PTY fd 已在上方 insert_source, 把
         // (tab_id, token) push 进 token 表 — close tab 时按 id 找 token + remove.
@@ -2906,8 +2994,8 @@ pub fn run_window() -> Result<()> {
                 }
                 state.pending_scroll_lines = 0;
             }
-            // 重新拿 term 引用 — alt-screen path 上方已 release.
-            let t = tab_list.active_mut().term_mut();
+            // 重新拿 active tab 引用 — alt-screen path 上方已 release.
+            let (t, composer) = tab_list.active_mut().split_term_composer();
             // T-0504: 检查 term cell 内容 dirty || presentation (CSD hover) dirty.
             // 任一为真即重画. presentation_dirty 由 Dispatch<WlPointer> 在
             // HoverChange 时置位, 重画后清.
@@ -3012,6 +3100,33 @@ pub fn run_window() -> Result<()> {
                 })
             };
 
+            let completion_overlay: Option<crate::wl::render::CompletionOverlay> =
+                if composer.popup_visible() {
+                    let pos = t.cursor_pos();
+                    let typed_cols = unicode_width::UnicodeWidthStr::width(
+                        composer
+                            .buffer()
+                            .get(..composer.cursor())
+                            .unwrap_or_else(|| composer.buffer()),
+                    );
+                    Some(crate::wl::render::CompletionOverlay {
+                        items: composer
+                            .candidates()
+                            .iter()
+                            .map(|suggestion| crate::wl::render::CompletionItem {
+                                display: suggestion.display.clone(),
+                                description: suggestion.description.clone(),
+                            })
+                            .collect(),
+                        selected: composer.selected(),
+                        anchor_row: pos.line,
+                        anchor_col: pos.col.saturating_add(typed_cols),
+                        max_visible: 10,
+                    })
+                } else {
+                    None
+                };
+
             let draw_result = match text_system.as_mut() {
                 Some(ts) => {
                     // 收集每行的文本快照, 喂给 draw_frame shape。
@@ -3069,7 +3184,7 @@ pub fn run_window() -> Result<()> {
                             preedit: preedit_overlay.as_ref(),
                             cursor: cursor_info.as_ref(),
                             selection: selection_slice,
-                            completion: None,
+                            completion: completion_overlay.as_ref(),
                         },
                     )
                 }
@@ -3209,6 +3324,8 @@ struct State {
     /// 单一上游消费者推副作用. drop 顺序: `RepeatScheduleRequest` 是 POD enum,
     /// 无 GPU / wayland 引用, 顺序无关.
     pending_repeat: Option<RepeatScheduleRequest>,
+    /// T11: composer输入改变后请求重置30ms debounce timer。
+    pending_composer_debounce: bool,
     /// T-0607: 鼠标选区状态. anchor / cursor / mode / active / has_selection
     /// 全藏在 SelectionState 内, 字段私有 (INV-010 类型隔离). 渲染 / 复制路径
     /// 走公共 method (selected_cells_linear / extract_selection_text).
@@ -4662,12 +4779,17 @@ fn dispatch_composer_text(state: &mut State, text: &str) -> ComposerDispatchResu
 }
 
 fn dispatch_composer_input(state: &mut State, input: ComposerInput) -> ComposerDispatchResult {
-    let outcome = {
+    let (outcome, needs_debounce) = {
         let composer = &mut state.tabs_unchecked_mut().active_mut().composer;
-        composer.handle_input(input)
+        let outcome = composer.handle_input(input);
+        let needs_debounce = composer.take_debounce_request();
+        (outcome, needs_debounce)
     };
     match outcome {
         ComposerOutcome::Consumed => {
+            if needs_debounce {
+                state.pending_composer_debounce = true;
+            }
             state.presentation_dirty = true;
             ComposerDispatchResult::Handled
         }
@@ -4692,6 +4814,8 @@ fn composer_input_from_keyboard_bytes(bytes: &[u8]) -> Option<ComposerInput> {
         b"\r" => Some(ComposerInput::Enter),
         b"\x1b" => Some(ComposerInput::Escape),
         b"\x7f" => Some(ComposerInput::Backspace),
+        b"\t" => Some(ComposerInput::Tab),
+        b"\x1b[Z" => Some(ComposerInput::BackTab),
         b"\x1b[3~" => Some(ComposerInput::Delete),
         b"\x1b[D" => Some(ComposerInput::LeftArrow),
         b"\x1b[C" => Some(ComposerInput::RightArrow),

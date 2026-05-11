@@ -128,14 +128,21 @@ impl HelpIndexerProvider {
         self.cache
             .lock()
             .map_err(|_| ProviderErr::Io("completion cache lock poisoned".to_string()))
-            .map(|mut cache| cache.get(key))
+            .map(|mut cache| {
+                cache
+                    .get(key)
+                    .or_else(|| cache.load_from_disk(key).ok().flatten())
+            })
     }
 
     fn cache_put(&self, key: CacheKey, suggestions: Vec<Suggestion>) -> Result<(), ProviderErr> {
         self.cache
             .lock()
             .map_err(|_| ProviderErr::Io("completion cache lock poisoned".to_string()))
-            .map(|mut cache| cache.put(key, suggestions))
+            .map(|mut cache| {
+                cache.put(key.clone(), suggestions);
+                let _ = cache.save_to_disk(&key);
+            })
     }
 
     fn mark_inflight(&self, key: CacheKey) -> Result<InflightGuard, ProviderErr> {
@@ -209,7 +216,7 @@ impl Provider for HelpIndexerProvider {
 
     fn cancel(&self, _gen_id: GenerationId) {}
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "help_indexer"
     }
 }
@@ -371,7 +378,7 @@ fn command_token(ctx: &QueryCtx) -> Option<String> {
         if let Some(token) = tokenized
             .tokens
             .iter()
-            .find(|token| matches!(token.kind, TokenKind::Word | TokenKind::Unterminated))
+            .find(|token| matches!(&token.kind, TokenKind::Word | TokenKind::Unterminated))
         {
             if !token.text.is_empty() {
                 return Some(token.text.clone());

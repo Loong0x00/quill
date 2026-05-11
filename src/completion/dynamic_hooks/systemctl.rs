@@ -65,7 +65,7 @@ impl Provider for SystemctlProvider {
 
     fn cancel(&self, _gen_id: GenerationId) {}
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "systemctl"
     }
 }

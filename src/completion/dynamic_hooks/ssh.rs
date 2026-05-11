@@ -80,7 +80,7 @@ impl Provider for SshProvider {
 
     fn cancel(&self, _gen_id: GenerationId) {}
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "ssh"
     }
 }

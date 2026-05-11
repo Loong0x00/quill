@@ -13,7 +13,6 @@ use serde::{Deserialize, Serialize};
 use crate::completion::Suggestion;
 
 const DEFAULT_CAP: usize = 100;
-const DEFAULT_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const FORMAT_VERSION: u8 = 1;
 const FNV_OFFSET: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
@@ -36,7 +35,6 @@ pub struct CacheKey {
 pub struct CacheEntry {
     pub suggestions: Vec<Suggestion>,
     pub stored_at: SystemTime,
-    pub ttl: Duration,
 }
 
 impl CompletionCache {
@@ -50,16 +48,6 @@ impl CompletionCache {
     }
 
     pub fn get(&mut self, key: &CacheKey) -> Option<Vec<Suggestion>> {
-        let expired = match self.entries.get(key) {
-            Some(entry) => entry.is_expired_at(SystemTime::now()),
-            None => return None,
-        };
-
-        if expired {
-            self.remove(key);
-            return None;
-        }
-
         let suggestions = self.entries.get(key)?.suggestions.clone();
         self.touch(key);
         Some(suggestions)
@@ -69,7 +57,6 @@ impl CompletionCache {
         let entry = CacheEntry {
             suggestions,
             stored_at: SystemTime::now(),
-            ttl: DEFAULT_TTL,
         };
         self.put_entry(key, entry);
     }
@@ -101,11 +88,6 @@ impl CompletionCache {
         }
 
         let entry = disk_entry.into_cache_entry();
-        if entry.is_expired_at(SystemTime::now()) {
-            let _ = fs::remove_file(path);
-            return Ok(None);
-        }
-
         let suggestions = entry.suggestions.clone();
         self.put_entry(key.clone(), entry);
         Ok(Some(suggestions))
@@ -115,11 +97,6 @@ impl CompletionCache {
         self.entries.insert(key.clone(), entry);
         self.touch(&key);
         self.evict_to_cap();
-    }
-
-    fn remove(&mut self, key: &CacheKey) {
-        self.entries.remove(key);
-        self.order.retain(|candidate| candidate != key);
     }
 
     fn touch(&mut self, key: &CacheKey) {
@@ -148,15 +125,6 @@ impl Default for CompletionCache {
     }
 }
 
-impl CacheEntry {
-    fn is_expired_at(&self, now: SystemTime) -> bool {
-        self.stored_at
-            .checked_add(self.ttl)
-            .map(|expires_at| now >= expires_at)
-            .unwrap_or(true)
-    }
-}
-
 #[derive(Debug, Deserialize, Serialize)]
 struct DiskCacheEntry {
     format_version: u8,
@@ -164,7 +132,6 @@ struct DiskCacheEntry {
     suggestions: Vec<Suggestion>,
     stored_at_secs: u64,
     stored_at_nanos: u32,
-    ttl_secs: u64,
 }
 
 impl DiskCacheEntry {
@@ -176,7 +143,6 @@ impl DiskCacheEntry {
             suggestions: entry.suggestions.clone(),
             stored_at_secs,
             stored_at_nanos,
-            ttl_secs: entry.ttl.as_secs(),
         }
     }
 
@@ -184,7 +150,6 @@ impl DiskCacheEntry {
         CacheEntry {
             suggestions: self.suggestions,
             stored_at: system_time_from_parts(self.stored_at_secs, self.stored_at_nanos),
-            ttl: Duration::from_secs(self.ttl_secs),
         }
     }
 }
@@ -342,19 +307,19 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_ttl_expires() {
-        let mut cache = CompletionCache::new(temp_cache_dir("ttl"), 100);
-        let key = key("/usr/bin/git", 1, "expired");
+    fn test_cache_ignores_entry_age() {
+        let mut cache = CompletionCache::new(temp_cache_dir("mtime-only"), 100);
+        let key = key("/usr/bin/git", 1, "old-but-valid");
+        let suggestions = vec![suggestion("--still-valid")];
         cache.put_entry(
             key.clone(),
             CacheEntry {
-                suggestions: vec![suggestion("--expired")],
-                stored_at: SystemTime::now() - Duration::from_secs(10),
-                ttl: Duration::from_secs(1),
+                suggestions: suggestions.clone(),
+                stored_at: SystemTime::now() - Duration::from_secs(10 * 24 * 60 * 60),
             },
         );
 
-        assert!(cache.get(&key).is_none());
+        assert_eq!(cache.get(&key), Some(suggestions));
     }
 
     #[test]
@@ -412,7 +377,7 @@ mod tests {
             self.cancelled.store(true, Ordering::SeqCst);
         }
 
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "test"
         }
     }
@@ -443,9 +408,10 @@ mod tests {
             result_sender: sender,
         });
 
-        let (gen_id, result) = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (gen_id, result, provider) = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(gen_id, GenerationId(1));
-        assert_eq!(result.unwrap(), vec![suggestion("checkout")]);
+        assert_eq!(provider, "test");
+        assert_eq!(result, vec![suggestion("checkout")]);
     }
 
     #[test]

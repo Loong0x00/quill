@@ -1,14 +1,19 @@
 use std::collections::{HashMap, HashSet};
-use std::{env, fs, io};
 use std::path::{Path, PathBuf};
-use std::sync::{atomic::{AtomicBool, Ordering}, mpsc, Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc, Mutex,
+};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
+use std::{env, fs, io};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use crate::completion::help_indexer::{parse_help_suggestions, run_help_command, HelpIndexerConfig, HelpRunError};
+use crate::completion::help_indexer::{
+    parse_help_suggestions, run_help_command, HelpIndexerConfig, HelpRunError,
+};
 use crate::completion::{CacheKey, CompletionCache};
 
 const DEFAULT_MAX_CONCURRENT: usize = 4;
@@ -80,7 +85,9 @@ impl Bootstrapper {
         self.run_sync_inner()
     }
 
-    pub fn cancel(&self) { self.cancel.store(true, Ordering::SeqCst); }
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::SeqCst);
+    }
 
     fn run_sync_inner(&self) -> Result<BootstrapStats, BootstrapErr> {
         let started_at = Instant::now();
@@ -116,7 +123,14 @@ impl Bootstrapper {
             p.finished_at = Some(Instant::now());
             p.state = BootstrapState::Completed;
         });
-        tracing::info!(total_scanned = stats.total_scanned, already_cached = stats.already_cached, indexed = stats.indexed, failed = stats.failed, elapsed_ms = stats.elapsed.as_millis(), "completion bootstrap finished");
+        tracing::info!(
+            total_scanned = stats.total_scanned,
+            already_cached = stats.already_cached,
+            indexed = stats.indexed,
+            failed = stats.failed,
+            elapsed_ms = stats.elapsed.as_millis(),
+            "completion bootstrap finished"
+        );
         Ok(stats)
     }
 
@@ -133,18 +147,29 @@ impl Bootstrapper {
             };
             for entry in entries.flatten() {
                 let path = entry.path();
-                let Ok(metadata) = entry.metadata() else { continue };
+                let Ok(metadata) = entry.metadata() else {
+                    continue;
+                };
                 if !metadata.is_file() || !is_executable(&metadata) {
                     continue;
                 }
-                let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_string)
-                else { continue };
+                let Some(name) = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(str::to_string)
+                else {
+                    continue;
+                };
                 let canonical = fs::canonicalize(&path).unwrap_or(path);
                 if is_denied(&canonical, &self.config.deny_list) || !seen.insert(name.clone()) {
                     continue;
                 }
                 if let Ok(mtime) = metadata.modified() {
-                    out.push(Binary { name, path: canonical, mtime });
+                    out.push(Binary {
+                        name,
+                        path: canonical,
+                        mtime,
+                    });
                 }
             }
         }
@@ -195,19 +220,40 @@ impl Bootstrapper {
 
 impl Clone for Bootstrapper {
     fn clone(&self) -> Self {
-        Self { config: self.config.clone(), cache: Arc::clone(&self.cache), progress: Arc::clone(&self.progress), cancel: Arc::clone(&self.cancel), negative_cache: Arc::clone(&self.negative_cache) }
+        Self {
+            config: self.config.clone(),
+            cache: Arc::clone(&self.cache),
+            progress: Arc::clone(&self.progress),
+            cancel: Arc::clone(&self.cancel),
+            negative_cache: Arc::clone(&self.negative_cache),
+        }
     }
 }
 
 impl Default for BootstrapConfig {
     fn default() -> Self {
-        Self { max_concurrent: DEFAULT_MAX_CONCURRENT, start_delay: DEFAULT_START_DELAY, binary_timeout: DEFAULT_BINARY_TIMEOUT, allow_paths: default_path_entries(), deny_list: Vec::new() }
+        Self {
+            max_concurrent: DEFAULT_MAX_CONCURRENT,
+            start_delay: DEFAULT_START_DELAY,
+            binary_timeout: DEFAULT_BINARY_TIMEOUT,
+            allow_paths: default_path_entries(),
+            deny_list: Vec::new(),
+        }
     }
 }
 
 impl Default for BootstrapProgress {
     fn default() -> Self {
-        Self { total: 0, completed: 0, succeeded: 0, failed: 0, current_binary: None, started_at: None, finished_at: None, state: BootstrapState::NotStarted }
+        Self {
+            total: 0,
+            completed: 0,
+            succeeded: 0,
+            failed: 0,
+            current_binary: None,
+            started_at: None,
+            finished_at: None,
+            state: BootstrapState::NotStarted,
+        }
     }
 }
 
@@ -244,17 +290,29 @@ fn worker_loop(ctx: WorkerCtx, rx: Arc<Mutex<mpsc::Receiver<Binary>>>) {
 }
 
 fn index_one(ctx: &WorkerCtx, binary: Binary) {
-    set_progress(&ctx.progress, |p| p.current_binary = Some(binary.name.clone()));
+    set_progress(&ctx.progress, |p| {
+        p.current_binary = Some(binary.name.clone())
+    });
     if negative_cached(&ctx.negative_cache, &binary.path) {
         finish(ctx, false, true, false);
         return;
     }
-    let key = CacheKey { binary_path: binary.path.clone(), binary_mtime: binary.mtime, query_signature: format!("help:{}", binary.name) };
-    if ctx.cache.lock().ok().is_some_and(|mut cache| cache.get(&key).is_some() || cache.load_from_disk(&key).ok().flatten().is_some()) {
+    let key = CacheKey {
+        binary_path: binary.path.clone(),
+        binary_mtime: binary.mtime,
+        query_signature: format!("help:{}", binary.name),
+    };
+    if ctx.cache.lock().ok().is_some_and(|mut cache| {
+        cache.get(&key).is_some() || cache.load_from_disk(&key).ok().flatten().is_some()
+    }) {
         finish(ctx, true, false, true);
         return;
     }
-    let help_config = HelpIndexerConfig { timeout: ctx.config.binary_timeout, allow_paths: ctx.config.allow_paths.clone(), ..HelpIndexerConfig::default() };
+    let help_config = HelpIndexerConfig {
+        timeout: ctx.config.binary_timeout,
+        allow_paths: ctx.config.allow_paths.clone(),
+        ..HelpIndexerConfig::default()
+    };
     let suggestions = match run_help_command(&binary.path, &help_config) {
         Ok(output) => parse_help_suggestions(&output),
         Err(HelpRunError::Timeout | HelpRunError::Io(_)) => Vec::new(),
@@ -304,7 +362,10 @@ fn scan_paths(config: &BootstrapConfig) -> Result<Vec<PathBuf>, BootstrapErr> {
     if !config.allow_paths.is_empty() {
         return Ok(config.allow_paths.clone());
     }
-    env::var_os("PATH").map(|p| env::split_paths(&p).collect()).filter(|p: &Vec<PathBuf>| !p.is_empty()).ok_or(BootstrapErr::NoPath)
+    env::var_os("PATH")
+        .map(|p| env::split_paths(&p).collect())
+        .filter(|p: &Vec<PathBuf>| !p.is_empty())
+        .ok_or(BootstrapErr::NoPath)
 }
 
 fn default_path_entries() -> Vec<PathBuf> {
@@ -315,8 +376,13 @@ fn default_path_entries() -> Vec<PathBuf> {
 
 fn is_denied(binary_path: &Path, deny_list: &[String]) -> bool {
     let path = binary_path.to_string_lossy();
-    let file = binary_path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
-    deny_list.iter().any(|denied| denied == path.as_ref() || denied == file.as_ref())
+    let file = binary_path
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_default();
+    deny_list
+        .iter()
+        .any(|denied| denied == path.as_ref() || denied == file.as_ref())
 }
 
 fn is_executable(metadata: &fs::Metadata) -> bool {
@@ -337,7 +403,9 @@ fn mark_negative(cache: &Arc<Mutex<HashMap<PathBuf, Instant>>>, path: &Path) {
 }
 
 fn negative_cached(cache: &Arc<Mutex<HashMap<PathBuf, Instant>>>, path: &Path) -> bool {
-    let Ok(mut cache) = cache.lock() else { return false };
+    let Ok(mut cache) = cache.lock() else {
+        return false;
+    };
     match cache.get(path).copied() {
         Some(stored_at) if stored_at.elapsed() < DEFAULT_NEGATIVE_TTL => true,
         Some(_) => {
@@ -362,8 +430,14 @@ mod tests {
     use std::time::UNIX_EPOCH;
 
     fn tmp(name: &str) -> PathBuf {
-        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        env::temp_dir().join(format!("quill-bootstrap-{name}-{}-{stamp}", std::process::id()))
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        env::temp_dir().join(format!(
+            "quill-bootstrap-{name}-{}-{stamp}",
+            std::process::id()
+        ))
     }
     fn write_bin(dir: &Path, name: &str, body: &str) -> PathBuf {
         fs::create_dir_all(dir).unwrap();
@@ -374,28 +448,50 @@ mod tests {
         fs::set_permissions(&path, mode).unwrap();
         path
     }
-    fn cache() -> Arc<Mutex<CompletionCache>> { Arc::new(Mutex::new(CompletionCache::new(tmp("cache"), 100))) }
-    fn config(paths: Vec<PathBuf>) -> BootstrapConfig {
-        BootstrapConfig { max_concurrent: 4, start_delay: Duration::ZERO, binary_timeout: Duration::from_secs(2), allow_paths: paths, deny_list: Vec::new() }
+    fn cache() -> Arc<Mutex<CompletionCache>> {
+        Arc::new(Mutex::new(CompletionCache::new(tmp("cache"), 100)))
     }
-    fn bootstrap(paths: Vec<PathBuf>) -> Bootstrapper { Bootstrapper::new(config(paths), cache()) }
+    fn config(paths: Vec<PathBuf>) -> BootstrapConfig {
+        BootstrapConfig {
+            max_concurrent: 4,
+            start_delay: Duration::ZERO,
+            binary_timeout: Duration::from_secs(2),
+            allow_paths: paths,
+            deny_list: Vec::new(),
+        }
+    }
+    fn bootstrap(paths: Vec<PathBuf>) -> Bootstrapper {
+        Bootstrapper::new(config(paths), cache())
+    }
     fn wait_for<F: FnMut() -> bool>(mut f: F) -> bool {
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(2) {
-            if f() { return true; }
+            if f() {
+                return true;
+            }
             thread::sleep(Duration::from_millis(5));
         }
         false
     }
     fn suggestion(text: &str) -> Suggestion {
-        Suggestion { text: text.to_string(), display: text.to_string(), description: String::new(), group: SuggestionGroup::Flag }
+        Suggestion {
+            text: text.to_string(),
+            display: text.to_string(),
+            description: String::new(),
+            group: SuggestionGroup::Flag,
+        }
     }
     #[test]
     fn test_scan_path_collects_executables() {
         let dir = tmp("scan");
         write_bin(&dir, "ok", "#!/bin/sh\nprintf '  --ok  ok\\n'\n");
         fs::write(dir.join("plain"), "no").unwrap();
-        let names: Vec<_> = bootstrap(vec![dir.clone()]).scan_binaries().unwrap().into_iter().map(|b| b.name).collect();
+        let names: Vec<_> = bootstrap(vec![dir.clone()])
+            .scan_binaries()
+            .unwrap()
+            .into_iter()
+            .map(|b| b.name)
+            .collect();
         assert_eq!(names, vec!["ok"]);
         let _ = fs::remove_dir_all(dir);
     }
@@ -404,7 +500,9 @@ mod tests {
         let (a, b) = (tmp("dedup-a"), tmp("dedup-b"));
         write_bin(&a, "dup", "#!/bin/sh\nprintf '  --a  a\\n'\n");
         write_bin(&b, "dup", "#!/bin/sh\nprintf '  --b  b\\n'\n");
-        let bins = bootstrap(vec![a.clone(), b.clone()]).scan_binaries().unwrap();
+        let bins = bootstrap(vec![a.clone(), b.clone()])
+            .scan_binaries()
+            .unwrap();
         assert_eq!(bins.len(), 1);
         assert!(bins[0].path.starts_with(&a));
         let _ = fs::remove_dir_all(a);
@@ -416,21 +514,37 @@ mod tests {
         write_bin(&dir, "skip", "#!/bin/sh\nprintf '  --skip  skip\\n'\n");
         let mut cfg = config(vec![dir.clone()]);
         cfg.deny_list = vec!["skip".to_string()];
-        assert!(Bootstrapper::new(cfg, cache()).scan_binaries().unwrap().is_empty());
+        assert!(Bootstrapper::new(cfg, cache())
+            .scan_binaries()
+            .unwrap()
+            .is_empty());
         let _ = fs::remove_dir_all(dir);
     }
     #[test]
     fn test_progress_updates_during_indexing() {
         let dir = tmp("progress");
-        write_bin(&dir, "slow", "#!/bin/sh\nsleep 0.2\nprintf '  --slow  slow\\n'\n");
-        write_bin(&dir, "slower", "#!/bin/sh\nsleep 0.2\nprintf '  --slower  slower\\n'\n");
+        write_bin(
+            &dir,
+            "slow",
+            "#!/bin/sh\nsleep 0.2\nprintf '  --slow  slow\\n'\n",
+        );
+        write_bin(
+            &dir,
+            "slower",
+            "#!/bin/sh\nsleep 0.2\nprintf '  --slower  slower\\n'\n",
+        );
         let boot = Arc::new(bootstrap(vec![dir.clone()]));
         let run = Arc::clone(&boot);
         let handle = thread::spawn(move || run.run_sync().unwrap());
-        assert!(wait_for(|| boot.progress.lock().unwrap().state == BootstrapState::Indexing && boot.progress.lock().unwrap().current_binary.is_some()));
+        assert!(wait_for(|| boot.progress.lock().unwrap().state
+            == BootstrapState::Indexing
+            && boot.progress.lock().unwrap().current_binary.is_some()));
         let stats = handle.join().unwrap();
         assert_eq!(stats.indexed, 2);
-        assert_eq!(boot.progress.lock().unwrap().state, BootstrapState::Completed);
+        assert_eq!(
+            boot.progress.lock().unwrap().state,
+            BootstrapState::Completed
+        );
         let _ = fs::remove_dir_all(dir);
     }
     #[test]
@@ -438,10 +552,23 @@ mod tests {
         let dir = tmp("cached");
         let bin = write_bin(&dir, "cached", "#!/bin/sh\nexit 99\n");
         let cache = cache();
-        let key = CacheKey { binary_path: fs::canonicalize(&bin).unwrap(), binary_mtime: fs::metadata(&bin).unwrap().modified().unwrap(), query_signature: "help:cached".to_string() };
-        { let mut cache = cache.lock().unwrap(); cache.put(key.clone(), vec![suggestion("--old")]); cache.save_to_disk(&key).unwrap(); }
-        let stats = Bootstrapper::new(config(vec![dir.clone()]), cache).run_sync().unwrap();
-        assert_eq!((stats.already_cached, stats.indexed, stats.failed), (1, 0, 0));
+        let key = CacheKey {
+            binary_path: fs::canonicalize(&bin).unwrap(),
+            binary_mtime: fs::metadata(&bin).unwrap().modified().unwrap(),
+            query_signature: "help:cached".to_string(),
+        };
+        {
+            let mut cache = cache.lock().unwrap();
+            cache.put(key.clone(), vec![suggestion("--old")]);
+            cache.save_to_disk(&key).unwrap();
+        }
+        let stats = Bootstrapper::new(config(vec![dir.clone()]), cache)
+            .run_sync()
+            .unwrap();
+        assert_eq!(
+            (stats.already_cached, stats.indexed, stats.failed),
+            (1, 0, 0)
+        );
         let _ = fs::remove_dir_all(dir);
     }
     #[test]
@@ -451,18 +578,28 @@ mod tests {
         let boot = bootstrap(vec![dir.clone()]);
         let stats = boot.run_sync().unwrap();
         assert_eq!(stats.failed, 1);
-        assert!(boot.negative_cache.lock().unwrap().contains_key(&fs::canonicalize(&bin).unwrap()));
+        assert!(boot
+            .negative_cache
+            .lock()
+            .unwrap()
+            .contains_key(&fs::canonicalize(&bin).unwrap()));
         let _ = fs::remove_dir_all(dir);
     }
     #[test]
     fn test_max_concurrent_respected() {
         let dir = tmp("concurrent");
         let body = format!("#!/bin/sh\nD={}\nwhile ! mkdir \"$D/lock\" 2>/dev/null; do sleep 0.01; done\na=$(cat \"$D/active\" 2>/dev/null || echo 0); a=$((a+1)); echo $a > \"$D/active\"; m=$(cat \"$D/max\" 2>/dev/null || echo 0); [ $a -gt $m ] && echo $a > \"$D/max\"; rmdir \"$D/lock\"\nsleep 0.15\nwhile ! mkdir \"$D/lock\" 2>/dev/null; do sleep 0.01; done\na=$(cat \"$D/active\"); echo $((a-1)) > \"$D/active\"; rmdir \"$D/lock\"\nprintf '  --ok  ok\\n'\n", dir.display());
-        for i in 0..6 { write_bin(&dir, &format!("cmd{i}"), &body); }
+        for i in 0..6 {
+            write_bin(&dir, &format!("cmd{i}"), &body);
+        }
         let mut cfg = config(vec![dir.clone()]);
         cfg.max_concurrent = 2;
         Bootstrapper::new(cfg, cache()).run_sync().unwrap();
-        let max_seen: usize = fs::read_to_string(dir.join("max")).unwrap().trim().parse().unwrap();
+        let max_seen: usize = fs::read_to_string(dir.join("max"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
         assert!(max_seen <= 2, "max_seen={max_seen}");
         let _ = fs::remove_dir_all(dir);
     }
@@ -470,13 +607,24 @@ mod tests {
     #[test]
     fn test_cancel_stops_indexing() {
         let dir = tmp("cancel");
-        for i in 0..6 { write_bin(&dir, &format!("cmd{i}"), "#!/bin/sh\nsleep 0.25\nprintf '  --ok  ok\\n'\n"); }
+        for i in 0..6 {
+            write_bin(
+                &dir,
+                &format!("cmd{i}"),
+                "#!/bin/sh\nsleep 0.25\nprintf '  --ok  ok\\n'\n",
+            );
+        }
         let boot = Arc::new(bootstrap(vec![dir.clone()]));
         let run = Arc::clone(&boot);
         let handle = thread::spawn(move || run.run_sync());
-        assert!(wait_for(|| boot.progress.lock().unwrap().state == BootstrapState::Indexing));
+        assert!(wait_for(
+            || boot.progress.lock().unwrap().state == BootstrapState::Indexing
+        ));
         boot.cancel();
-        assert!(matches!(handle.join().unwrap(), Err(BootstrapErr::CancelledByUser)));
+        assert!(matches!(
+            handle.join().unwrap(),
+            Err(BootstrapErr::CancelledByUser)
+        ));
         let progress = boot.progress.lock().unwrap().clone();
         assert!(progress.completed < progress.total);
         let _ = fs::remove_dir_all(dir);

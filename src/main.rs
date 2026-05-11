@@ -29,9 +29,23 @@ fn main() -> Result<()> {
     }
 
     tracing::info!("quill booting");
+    start_completion_bootstrap();
     quill::wl::run_window()?;
     tracing::info!("quill exited cleanly");
     Ok(())
+}
+
+fn start_completion_bootstrap() {
+    let bootstrapper = quill::completion::bootstrap::Bootstrapper::new(
+        quill::completion::bootstrap::BootstrapConfig::default(),
+        quill::completion::shared_completion_cache(),
+    );
+    let progress = bootstrapper.start();
+    tracing::info!(
+        target: "quill::completion",
+        "completion bootstrap scheduled with delayed start"
+    );
+    drop(progress);
 }
 
 /// 扫 argv 找 `--headless-screenshot=<PATH>` (单一形式, 不接受空格分隔

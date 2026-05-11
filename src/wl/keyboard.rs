@@ -729,6 +729,7 @@ fn terminal_keysym_override(keysym: xkb::Keysym) -> Option<Vec<u8>> {
         0xff50 => Some(b"\x1b[H".to_vec()), // Home  → CSI H
         0xff57 => Some(b"\x1b[F".to_vec()), // End   → CSI F
         0xff09 => Some(b"\t".to_vec()),     // Tab → \t (xkbcommon 默认已对, 显式锁)
+        0xfe20 => Some(b"\x1b[Z".to_vec()), // Shift-Tab → CSI Z (BackTab)
         _ => None,
     }
 }

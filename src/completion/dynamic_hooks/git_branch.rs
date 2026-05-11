@@ -65,7 +65,7 @@ impl Provider for GitBranchProvider {
 
     fn cancel(&self, _gen_id: GenerationId) {}
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "git_branch"
     }
 }

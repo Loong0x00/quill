@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
-use crate::completion::{GenerationId, Provider, ProviderErr, QueryCtx, Suggestion};
+use crate::completion::{GenerationId, Provider, ProviderResult, QueryCtx};
 
 pub struct WorkerPool {
     sender: mpsc::Sender<WorkItem>,
@@ -15,7 +15,7 @@ pub struct WorkItem {
     pub provider: Arc<dyn Provider>,
     pub ctx: QueryCtx,
     pub gen_id: GenerationId,
-    pub result_sender: mpsc::Sender<(GenerationId, Result<Vec<Suggestion>, ProviderErr>)>,
+    pub result_sender: mpsc::Sender<ProviderResult>,
 }
 
 impl WorkerPool {
@@ -109,9 +109,25 @@ fn run_item(
     }
 
     let gen_id = item.gen_id;
+    let provider_name = item.provider.name();
     let result = futures::executor::block_on(item.provider.query(item.ctx, gen_id));
     if is_active(gen_id, inflight) {
-        let _ = item.result_sender.send((gen_id, result));
+        match result {
+            Ok(suggestions) => {
+                let _ = item
+                    .result_sender
+                    .send((gen_id, suggestions, provider_name));
+            }
+            Err(err) => {
+                tracing::trace!(
+                    target: "quill::completion",
+                    provider = provider_name,
+                    ?err,
+                    "completion provider returned no suggestions"
+                );
+                let _ = item.result_sender.send((gen_id, Vec::new(), provider_name));
+            }
+        }
     }
     finish_generation(gen_id, inflight, counts, providers);
 }

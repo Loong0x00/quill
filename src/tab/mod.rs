@@ -229,6 +229,10 @@ impl TabInstance {
         (&mut self.term, &mut self.pty)
     }
 
+    pub fn split_term_composer(&mut self) -> (&mut TermState, &mut composer::state::ComposerState) {
+        (&mut self.term, &mut self.composer)
+    }
+
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
     }
