@@ -7,8 +7,10 @@ authors = ["Loong0x00 <loong.0x00@gmail.com>"]
 [dependencies]
 alacritty_terminal = "0.26"
 anyhow = "1"
+async-trait = "0.1"
 calloop = { version = "0.14", features = ["signals"] }
 cosmic-text = "0.12"
+futures = "0.3"
 # T-0408: PNG encoding for --headless-screenshot CLI flag (offscreen render →
 # PNG, agent 自验视觉)。default-features=false 关 jpg/webp/tiff 等不用 codec,
 # 仅留 png feature。详见 docs/adr/0005-image-crate-png-encoding.md。
@@ -17,6 +19,8 @@ libc = "0.2"
 pollster = "0.4"
 portable-pty = "0.9"
 raw-window-handle = "0.6"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 smithay-client-toolkit = "0.19"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
