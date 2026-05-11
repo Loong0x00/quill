@@ -39,7 +39,8 @@ use calloop::signals::{Signal, Signals};
 use calloop::timer::{TimeoutAction, Timer};
 use calloop::{EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction, RegistrationToken};
 
-use crate::pty::PtyHandle;
+use crate::composer::prompt_track::Segment;
+use crate::composer::state::{ComposerInput, ComposerOutcome};
 use crate::tab::{TabInstance, TabList};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
@@ -508,13 +509,12 @@ fn pty_read_tick(
     let Some(tab) = tabs.get_mut(tab_idx) else {
         return Ok(PostAction::Remove);
     };
-    let (term, pty) = tab.split_term_pty();
     let selection_for_inner = if is_active {
         Some(selection_state)
     } else {
         None
     };
-    pty_read_tick_inner(pty, Some(term), selection_for_inner, loop_signal)
+    pty_read_tick_inner(tab, selection_for_inner, loop_signal)
 }
 
 /// T-0608 inner impl: 真 read PTY + advance term. 与原 pty_read_tick 同, 抽出
@@ -532,8 +532,7 @@ fn pty_read_tick(
 /// max 上限 clamp, 后续 chunk 算 delta 会少算 (after - before 不再代表"实际滚
 /// 了多少"). per-chunk 简单且正确.
 fn pty_read_tick_inner(
-    pty: &mut PtyHandle,
-    mut term: Option<&mut crate::term::TermState>,
+    tab: &mut TabInstance,
     mut selection_state: Option<&mut super::selection::SelectionState>,
     loop_signal: &LoopSignal,
 ) -> std::io::Result<PostAction> {
@@ -545,7 +544,7 @@ fn pty_read_tick_inner(
     #[cfg(debug_assertions)]
     {
         #[allow(unsafe_code)]
-        let flags = unsafe { libc::fcntl(pty.raw_fd(), libc::F_GETFL) };
+        let flags = unsafe { libc::fcntl(tab.pty().raw_fd(), libc::F_GETFL) };
         debug_assert!(
             flags >= 0 && (flags & libc::O_NONBLOCK) != 0,
             "INV-009 破坏:master fd 未置 O_NONBLOCK(T-0201 的 set_nonblocking 应已设;\
@@ -556,7 +555,7 @@ fn pty_read_tick_inner(
 
     let mut buf = [0u8; PTY_READ_BUF];
     loop {
-        let result = pty.read(&mut buf);
+        let result = tab.pty_mut().read(&mut buf);
         match pty_readable_action(&result) {
             PtyAction::ContinueReading => {
                 // Ok(n>0) 路径:trace 字节 + T-0301 喂进 alacritty Term 状态机。
@@ -573,19 +572,34 @@ fn pty_read_tick_inner(
                         bytes = %preview,
                         "pty bytes"
                     );
-                    // T-0301: 喂 alacritty_terminal 的 `vte::ansi::Processor`。
-                    // Option<&mut TermState> 保险:正常路径 term 是 Some(ctor 设好),
-                    // None 跳过(未来可能 T-0305+ 在 resize 时临时 take/put)。
-                    if let Some(t) = term.as_mut() {
-                        // T-0809 / ADR 0012: chunk advance 前后比 scrollback_size,
-                        // 差值 = alacritty grid 内部 ring-buffer 因 PTY scroll 旋转
-                        // 的行数. delta>0 时主动 rebase active tab 的 selection 让
-                        // SelectionPos 钉字 (字进 history 时 .line 跟着减 delta).
-                        // 三 bug 同源 (yes hello / pacman ANSI / CC + history view).
-                        let history_before = t.scrollback_size();
-                        t.advance(&buf[..n]);
-                        let history_after = t.scrollback_size();
-                        let scroll_delta = history_after.saturating_sub(history_before) as i32;
+                    // T5b:先让composer扫描OSC 133,marker只改composer内部提示态,
+                    // 普通字节才继续交给终端状态机。
+                    let history_before = tab.term().scrollback_size();
+                    let alt_before = tab.term().is_alt_screen();
+                    let term_bytes: Vec<Vec<u8>> = {
+                        let segments = tab.composer.feed_pty_output(&buf[..n]);
+                        let mut term_bytes = Vec::new();
+                        for seg in segments {
+                            match seg {
+                                Segment::Bytes(b) => term_bytes.push(b.to_vec()),
+                                Segment::Marker(_) => {}
+                            }
+                        }
+                        term_bytes
+                    };
+                    if !term_bytes.is_empty() {
+                        let (scroll_delta, alt_after, pos) = {
+                            let t = tab.term_mut();
+                            for bytes in &term_bytes {
+                                t.advance(bytes);
+                            }
+                            let history_after = t.scrollback_size();
+                            let scroll_delta = history_after.saturating_sub(history_before) as i32;
+                            (scroll_delta, t.is_alt_screen(), t.cursor_pos())
+                        };
+                        if alt_before != alt_after {
+                            tab.composer.set_alt_screen(alt_after);
+                        }
                         if scroll_delta > 0 {
                             if let Some(sel) = selection_state.as_mut() {
                                 sel.rebase_for_grid_scroll(
@@ -597,7 +611,6 @@ fn pty_read_tick_inner(
                         // T-0303:`cursor_point` → `cursor_pos`,返 CellPos 而非
                         // `(usize, i32)`。trace 字段保持 col / line 命名兼容
                         // 旧日志工具,但读自 `pos.col / pos.line` 都是 usize。
-                        let pos = t.cursor_pos();
                         tracing::trace!(
                             target: "quill::term",
                             n,
@@ -633,7 +646,7 @@ fn pty_read_tick_inner(
                 // 非阻塞收尸。Ok(None) 接受:race 下 try_wait 可能还没见到 exit
                 // status,主循环反正要退,PtyHandle 的 Drop 路径再配合 init
                 // adopt zombie 兜底。
-                match pty.try_wait() {
+                match tab.pty_mut().try_wait() {
                     Ok(Some(code)) => {
                         tracing::info!(
                             target: "quill::pty",
@@ -4322,6 +4335,12 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
 /// 抽出来理由 (conventions §3): Composite variant 内部递归调用方便; Dispatch
 /// callback 内 split-borrow 复杂 — 单独 fn 让 borrow 路径更清晰。
 fn apply_ime_action(action: ImeAction, text_input: &ZwpTextInputV3, state: &mut State) {
+    let ime_preedit_active = state.ime_state.is_preedit_active();
+    if let Some(tabs) = state.tabs.as_mut() {
+        tabs.active_mut()
+            .composer
+            .set_ime_preedit_active(ime_preedit_active);
+    }
     match action {
         ImeAction::Nothing => {}
         ImeAction::Commit(bytes) => {
@@ -4527,8 +4546,10 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
         };
         match action {
             KeyboardAction::Nothing => {}
-            KeyboardAction::Composer(_) => {
-                // T5b实施真正dispatch。
+            KeyboardAction::Composer(text) => {
+                if dispatch_composer_text(state, &text).is_passthrough() {
+                    write_keyboard_bytes(state, text.as_bytes());
+                }
             }
             KeyboardAction::Scroll(delta) => {
                 // T-0602: 累积到 State.pending_scroll_lines, 由 idle callback 消费.
@@ -4547,6 +4568,12 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
             // T-0603: Pressed → 立即写一次 (即时回显) + 设 pending_repeat=Start
             // 让 drive_wayland step 3.6 真 schedule timer.
             KeyboardAction::StartRepeat { bytes } => {
+                if let Some(input) = composer_input_from_keyboard_bytes(&bytes) {
+                    if dispatch_composer_input(state, input).is_handled() {
+                        state.pending_repeat = Some(RepeatScheduleRequest::Stop);
+                        return;
+                    }
+                }
                 write_keyboard_bytes(state, &bytes);
                 state.pending_repeat = Some(RepeatScheduleRequest::Start);
             }
@@ -4604,6 +4631,71 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
 /// 同步, 否则 modifier mask / keymap 会错位).
 fn key_event_swallowed_for_preedit(event: &wl_keyboard::Event, preedit_active: bool) -> bool {
     preedit_active && matches!(event, wl_keyboard::Event::Key { .. })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposerDispatchResult {
+    Handled,
+    Passthrough,
+}
+
+impl ComposerDispatchResult {
+    fn is_handled(self) -> bool {
+        matches!(self, Self::Handled)
+    }
+
+    fn is_passthrough(self) -> bool {
+        matches!(self, Self::Passthrough)
+    }
+}
+
+fn dispatch_composer_text(state: &mut State, text: &str) -> ComposerDispatchResult {
+    for ch in text.chars() {
+        if dispatch_composer_input(state, ComposerInput::Char(ch)).is_passthrough() {
+            return ComposerDispatchResult::Passthrough;
+        }
+    }
+    ComposerDispatchResult::Handled
+}
+
+fn dispatch_composer_input(state: &mut State, input: ComposerInput) -> ComposerDispatchResult {
+    let outcome = {
+        let composer = &mut state.tabs_unchecked_mut().active_mut().composer;
+        composer.handle_input(input)
+    };
+    match outcome {
+        ComposerOutcome::Consumed => {
+            state.presentation_dirty = true;
+            ComposerDispatchResult::Handled
+        }
+        ComposerOutcome::Submit(line) => {
+            state
+                .tabs_unchecked_mut()
+                .active_mut()
+                .term_mut()
+                .reset_display();
+            let mut bytes = line.into_bytes();
+            bytes.push(b'\n');
+            queue_or_write_pty(state, &bytes, "composer");
+            state.presentation_dirty = true;
+            ComposerDispatchResult::Handled
+        }
+        ComposerOutcome::Passthrough => ComposerDispatchResult::Passthrough,
+    }
+}
+
+fn composer_input_from_keyboard_bytes(bytes: &[u8]) -> Option<ComposerInput> {
+    match bytes {
+        b"\r" => Some(ComposerInput::Enter),
+        b"\x1b" => Some(ComposerInput::Escape),
+        b"\x7f" => Some(ComposerInput::Backspace),
+        b"\x1b[3~" => Some(ComposerInput::Delete),
+        b"\x1b[D" => Some(ComposerInput::LeftArrow),
+        b"\x1b[C" => Some(ComposerInput::RightArrow),
+        b"\x1b[H" => Some(ComposerInput::Home),
+        b"\x1b[F" => Some(ComposerInput::End),
+        _ => None,
+    }
 }
 
 /// T-0603 + T-0501: 写 keyboard 字节到 PTY (Pressed 即时回显路径). 抽出来
