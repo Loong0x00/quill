@@ -624,28 +624,17 @@ fn key_press_action(
 }
 
 fn composer_key_action(
-    composer: &crate::composer::state::ComposerState,
-    xkb_state: &xkb::State,
-    xkb_keycode: xkb::Keycode,
-    keysym: xkb::Keysym,
-    ctrl_active: bool,
-    alt_active: bool,
-    super_active: bool,
+    _composer: &crate::composer::state::ComposerState,
+    _xkb_state: &xkb::State,
+    _xkb_keycode: xkb::Keycode,
+    _keysym: xkb::Keysym,
+    _ctrl_active: bool,
+    _alt_active: bool,
+    _super_active: bool,
 ) -> Option<KeyboardAction> {
-    if !composer.is_active()
-        || ctrl_active
-        || alt_active
-        || super_active
-        || is_function_keysym(keysym)
-    {
-        return None;
-    }
-
-    let text = xkb_state.key_get_utf8(xkb_keycode);
-    if text.is_empty() || text.chars().any(char::is_control) {
-        return None;
-    }
-    Some(KeyboardAction::Composer(text))
+    // 字符不再在键盘层走特殊 Composer 路径. 改成走默认 StartRepeat 路径让
+    // calloop key repeat work, dispatch 时额外喂 composer.buffer (双写).
+    None
 }
 
 fn is_function_keysym(keysym: xkb::Keysym) -> bool {
@@ -872,13 +861,17 @@ mod tests {
     }
 
     #[test]
-    fn composer_active_consumes_char() {
+    fn composer_active_does_not_steal_char() {
+        // 字符不再在键盘层走 Composer 路径 — 走默认 StartRepeat, dispatch
+        // 时再喂 composer (双写), 让 calloop key repeat 可以 work.
         let mut state = KeyboardState::new().expect("ctx new");
         state.load_default_us_keymap().expect("keymap");
         let composer = active_composer();
         let action = press_with_composer(&mut state, &composer, 30);
-        assert_eq!(action, KeyboardAction::Composer("a".to_string()));
-        assert!(!state.has_repeat());
+        assert_eq!(
+            action,
+            KeyboardAction::StartRepeat { bytes: b"a".to_vec() }
+        );
     }
 
     #[test]

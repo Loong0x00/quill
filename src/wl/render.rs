@@ -633,9 +633,9 @@ const COMPLETION_GAP_COLS: usize = 2;
 const COMPLETION_RADIUS_PX: f32 = 6.0;
 const COMPLETION_HIGHLIGHT_RADIUS_PX: f32 = 4.0;
 const COMPLETION_BG: crate::term::Color = crate::term::Color {
-    r: 0x1f,
-    g: 0x23,
-    b: 0x28,
+    r: 0x2d,
+    g: 0x32,
+    b: 0x3a,
 };
 const COMPLETION_SELECTED_BG: crate::term::Color = crate::term::Color {
     r: 0x3e,
@@ -1063,7 +1063,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         elem_aa = clamp(0.5 - ed, 0.0, 1.0);
     }
 
-    let final_a = mask.alpha_live * surface_aa * elem_aa;
+    // popup / titlebar 等 rounded element 应不透明, 不跟窗口半透明 (alpha_live).
+    // 否则 popup 会跟 cell BG 混在一起几乎看不见.
+    let final_a = surface_aa * elem_aa;
     return vec4<f32>(in.color * final_a, final_a);
 }
 "#;
@@ -1186,6 +1188,9 @@ struct CompletionLayout {
     y1_px: f32,
     cols: usize,
     visible_rows: usize,
+    /// scroll offset: 显示 items[scroll_offset..scroll_offset+visible_rows].
+    /// 根据 selected 算, 让 selected 永远在 visible 窗口内.
+    scroll_offset: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1241,6 +1246,15 @@ fn completion_layout(
     let max_y0 = (surface_h - popup_h).max(titlebar_y_offset_px);
     y0 = y0.max(titlebar_y_offset_px).min(max_y0);
 
+    // scroll offset: 让 selected 永远在 [scroll_offset, scroll_offset+visible_rows) 内
+    let scroll_offset = match overlay.selected {
+        Some(sel) if sel >= visible_rows => {
+            let max_offset = overlay.items.len().saturating_sub(visible_rows);
+            (sel + 1).saturating_sub(visible_rows).min(max_offset)
+        }
+        _ => 0,
+    };
+
     Some(CompletionLayout {
         x0_px: x0,
         y0_px: y0,
@@ -1248,6 +1262,7 @@ fn completion_layout(
         y1_px: y0 + popup_h,
         cols: popup_cols,
         visible_rows,
+        scroll_offset,
     })
 }
 
@@ -1303,12 +1318,18 @@ fn append_completion_boxes(
         bg_color,
         COMPLETION_RADIUS_PX * HIDPI_SCALE as f32,
     );
-    let Some(selected_idx) = selected else { return };
-    if selected_idx >= layout.visible_rows {
+    let Some(selected_idx) = selected else {
+        return;
+    };
+    // selected 在 visible 窗口内的相对行号 (减去 scroll_offset)
+    let Some(visible_row) = selected_idx.checked_sub(layout.scroll_offset) else {
+        return;
+    };
+    if visible_row >= layout.visible_rows {
         return;
     }
     let inset = 2.0 * HIDPI_SCALE as f32;
-    let y0 = layout.y0_px + selected_idx as f32 * cell_h_px + inset;
+    let y0 = layout.y0_px + visible_row as f32 * cell_h_px + inset;
     let y1 = y0 + cell_h_px - inset * 2.0;
     append_rounded_quad_px(
         rounded_out,
@@ -1396,7 +1417,13 @@ fn append_completion_glyphs<F>(
 {
     let inner_cols = layout.cols.saturating_sub(COMPLETION_PAD_COLS * 2);
     let pad_px = COMPLETION_PAD_COLS as f32 * cell_w_px;
-    for (row_idx, item) in overlay.items.iter().take(layout.visible_rows).enumerate() {
+    for (row_idx, item) in overlay
+        .items
+        .iter()
+        .skip(layout.scroll_offset)
+        .take(layout.visible_rows)
+        .enumerate()
+    {
         let (display, desc, desc_cols) = completion_item_columns(item, inner_cols);
         let row_top = layout.y0_px + row_idx as f32 * cell_h_px;
         if !display.is_empty() {
@@ -3084,7 +3111,9 @@ impl Renderer {
             );
         }
 
-        let base_rounded_vertex_count = (rounded_vertex_bytes.len() / ROUNDED_VERTEX_BYTES) as u32;
+        // base_rounded 当前用合并 draw workaround 不再单独读, 留下来防 split draw
+        // 真修后再用. 用 _ 前缀消 unused warning.
+        let _base_rounded_vertex_count = (rounded_vertex_bytes.len() / ROUNDED_VERTEX_BYTES) as u32;
         let base_glyph_vertex_count = (glyph_vertex_bytes.len() / GLYPH_VERTEX_BYTES) as u32;
         if let Some(completion) = overlays.completion {
             if let Some(layout) = completion_layout(
@@ -3229,8 +3258,13 @@ impl Renderer {
                 pass.draw(0..cell_vertex_count, 0..1);
             }
 
-            // T-0615:常规圆角元素先画,completion圆角元素拆到基础glyph之后画。
-            if base_rounded_vertex_count > 0 {
+            // workaround: 一次画完所有 rounded vertex (含 popup BG + 高亮) 在
+            // base_glyph 之前. 原本是 split draw — base 段先画, glyph 之后再画
+            // popup 段. 但 split 路径 popup quad 不真画到 fb (疑似 wgpu pipeline
+            // 切换间 group 0 bind 残留导致 GPU silently skip). 副作用: popup
+            // 区下方若有终端字符会浮在 popup BG 上 (实测 popup 一般弹空 cell 行,
+            // 不暴露). 真修要重排 bind group 或用 dummy bind. 暂保此 workaround.
+            if rounded_vertex_count > 0 {
                 let rp = self
                     .rounded_pipeline
                     .as_ref()
@@ -3242,7 +3276,7 @@ impl Renderer {
                 pass.set_pipeline(rp);
                 pass.set_bind_group(1, &self.corner_bind_group, &[]);
                 pass.set_vertex_buffer(0, rb.slice(..));
-                pass.draw(0..base_rounded_vertex_count, 0..1);
+                pass.draw(0..rounded_vertex_count, 0..1);
             }
 
             // 基础glyph pass:终端字形、titlebar、preedit先画。
@@ -3267,21 +3301,8 @@ impl Renderer {
                 pass.draw(0..base_glyph_vertex_count, 0..1);
             }
 
-            // completion背景/高亮在基础glyph之后画,盖住底下grid文本。
-            if rounded_vertex_count > base_rounded_vertex_count {
-                let rp = self
-                    .rounded_pipeline
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("rounded_pipeline 应已 lazy 初始化"))?;
-                let rb = self
-                    .rounded_vertex_buffer
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("rounded_vertex_buffer 应已 lazy 初始化"))?;
-                pass.set_pipeline(rp);
-                pass.set_bind_group(1, &self.corner_bind_group, &[]);
-                pass.set_vertex_buffer(0, rb.slice(..));
-                pass.draw(base_rounded_vertex_count..rounded_vertex_count, 0..1);
-            }
+            // 调试: 上面已一次性画完, 这里跳过避免重复
+            // (原本是 popup 段拆开画在 base_glyph 之后, 让 popup 盖住终端字符)
 
             // completion文字最后画。
             if glyph_vertex_count > base_glyph_vertex_count {

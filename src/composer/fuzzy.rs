@@ -19,6 +19,13 @@ pub fn fuzzy_filter(candidates: Vec<Suggestion>, query: &str) -> Vec<Suggestion>
         right_score
             .cmp(left_score)
             .then_with(|| left.display.len().cmp(&right.display.len()))
+            // 末位排序 case-insensitive: 让 -A / -a 挨在一起, 不再 A-Z 后面接 a-z
+            .then_with(|| {
+                left.display
+                    .chars()
+                    .map(|c| c.to_ascii_lowercase())
+                    .cmp(right.display.chars().map(|c| c.to_ascii_lowercase()))
+            })
             .then_with(|| left.display.cmp(&right.display))
     });
     scored.into_iter().map(|(_, candidate)| candidate).collect()

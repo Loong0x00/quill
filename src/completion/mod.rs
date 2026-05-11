@@ -3,6 +3,7 @@ pub mod cache;
 pub mod dynamic_hooks;
 pub mod help_indexer;
 pub mod parser;
+pub mod path_binaries;
 pub mod worker;
 
 use std::path::PathBuf;
@@ -14,6 +15,7 @@ use dynamic_hooks::{
     KubectlProvider, PacmanProvider, ReaddirProvider, SshProvider, SystemctlProvider,
 };
 use help_indexer::{HelpIndexerConfig, HelpIndexerProvider};
+use path_binaries::PathBinariesProvider;
 pub use worker::{WorkItem, WorkerPool};
 
 pub type ProviderResult = (GenerationId, Vec<Suggestion>, &'static str);
@@ -81,6 +83,7 @@ impl ProviderRegistry {
 
     pub fn new_default() -> Self {
         let mut registry = Self::new();
+        registry.register(Arc::new(PathBinariesProvider::new()));
         registry.register(Arc::new(HelpIndexerProvider::new(
             shared_completion_cache(),
             HelpIndexerConfig::default(),

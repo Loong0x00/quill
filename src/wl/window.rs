@@ -1257,6 +1257,38 @@ fn repeat_timer_tick(data: &mut LoopData) -> TimeoutAction {
             return TimeoutAction::Drop;
         }
     };
+    // 普通字符 repeat: 喂 composer 让 buffer 跟 PTY 同步 (popup query 才能用最新
+    // 字符). 不 return — fall through 到下面的 PTY write + reschedule.
+    if let Ok(text) = std::str::from_utf8(&bytes) {
+        if !text.is_empty() && !text.chars().any(char::is_control) {
+            let _ = dispatch_composer_text(&mut data.state, text);
+        }
+    }
+    // composer 拦截: 长按 popup-aware 键 (Tab/方向键/Esc) 让 repeat tick 也走
+    // composer.handle_input 而不是直接灌 PTY (否则 zsh 会收到 Tab 触发自己补全).
+    if let Some(input) = composer_input_from_keyboard_bytes(&bytes) {
+        let dual_write = matches!(
+            input,
+            ComposerInput::Backspace | ComposerInput::Delete
+        );
+        let result = dispatch_composer_input(&mut data.state, input);
+        if result.is_handled() {
+            // Backspace/Delete 双写: composer 删 buffer + PTY 写 \x7f 让 zsh 也删.
+            // 否则长按 Backspace zsh prompt 不动.
+            if dual_write {
+                let pty = data.state.tabs_unchecked().active().pty();
+                let _ = pty.write(&bytes);
+            }
+            // reschedule 下一次 tick
+            let (rate, _delay) = data.state.keyboard_state.repeat_info();
+            let interval_ms = if rate > 0 {
+                (1000 / rate as u64).max(1)
+            } else {
+                100
+            };
+            return TimeoutAction::ToDuration(std::time::Duration::from_millis(interval_ms));
+        }
+    }
     // 写 PTY (复用 Dispatch<WlKeyboard> 的相同策略). T-0608: 写 active tab 的
     // PTY (repeat 跟 keyboard focus 走 active tab).
     {
@@ -4667,9 +4699,10 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
         match action {
             KeyboardAction::Nothing => {}
             KeyboardAction::Composer(text) => {
-                if dispatch_composer_text(state, &text).is_passthrough() {
-                    write_keyboard_bytes(state, text.as_bytes());
-                }
+                // 字符双写: 既给 zsh 回显 (走 PTY), 也喂 composer 更新候选 buffer.
+                // composer 不再独占输入流 — 它只是 popup 候选源, 让 shell 继续主导显示.
+                write_keyboard_bytes(state, text.as_bytes());
+                let _ = dispatch_composer_text(state, &text);
             }
             KeyboardAction::Scroll(delta) => {
                 // T-0602: 累积到 State.pending_scroll_lines, 由 idle callback 消费.
@@ -4689,9 +4722,41 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
             // 让 drive_wayland step 3.6 真 schedule timer.
             KeyboardAction::StartRepeat { bytes } => {
                 if let Some(input) = composer_input_from_keyboard_bytes(&bytes) {
+                    // Backspace / Delete 双写: zsh 删字符 + composer.buffer 同步删,
+                    // 否则 zsh 不删用户看不到反馈.
+                    let dual_write = matches!(
+                        input,
+                        ComposerInput::Backspace | ComposerInput::Delete
+                    );
+                    // popup-aware key (Tab/方向键/BackTab) 长按需 cycle, 必须
+                    // schedule repeat=Start 让 calloop timer 持续 fire,
+                    // repeat_timer_tick 内的 composer 拦截才有机会跑.
+                    let allow_repeat = dual_write
+                        || matches!(
+                            input,
+                            ComposerInput::Tab
+                                | ComposerInput::BackTab
+                                | ComposerInput::UpArrow
+                                | ComposerInput::DownArrow
+                        );
                     if dispatch_composer_input(state, input).is_handled() {
-                        state.pending_repeat = Some(RepeatScheduleRequest::Stop);
+                        if dual_write {
+                            write_keyboard_bytes(state, &bytes);
+                        }
+                        state.pending_repeat = Some(if allow_repeat {
+                            RepeatScheduleRequest::Start
+                        } else {
+                            RepeatScheduleRequest::Stop
+                        });
                         return;
+                    }
+                }
+                // 普通字符路径 (composer_input_from_keyboard_bytes 不识别): 喂
+                // composer 让 buffer + popup query 跟 PTY 同步, 同时写 PTY +
+                // schedule repeat 让长按 work.
+                if let Ok(text) = std::str::from_utf8(&bytes) {
+                    if !text.is_empty() && !text.chars().any(char::is_control) {
+                        let _ = dispatch_composer_text(state, text);
                     }
                 }
                 write_keyboard_bytes(state, &bytes);
@@ -4785,24 +4850,14 @@ fn dispatch_composer_input(state: &mut State, input: ComposerInput) -> ComposerD
         let needs_debounce = composer.take_debounce_request();
         (outcome, needs_debounce)
     };
+    if needs_debounce {
+        state.pending_composer_debounce = true;
+    }
+    state.presentation_dirty = true;
     match outcome {
-        ComposerOutcome::Consumed => {
-            if needs_debounce {
-                state.pending_composer_debounce = true;
-            }
-            state.presentation_dirty = true;
-            ComposerDispatchResult::Handled
-        }
-        ComposerOutcome::Submit(line) => {
-            state
-                .tabs_unchecked_mut()
-                .active_mut()
-                .term_mut()
-                .reset_display();
-            let mut bytes = line.into_bytes();
-            bytes.push(b'\n');
-            queue_or_write_pty(state, &bytes, "composer");
-            state.presentation_dirty = true;
+        ComposerOutcome::Consumed => ComposerDispatchResult::Handled,
+        ComposerOutcome::WritePty(bytes) => {
+            queue_or_write_pty(state, &bytes, "composer-accept");
             ComposerDispatchResult::Handled
         }
         ComposerOutcome::Passthrough => ComposerDispatchResult::Passthrough,
@@ -4819,6 +4874,8 @@ fn composer_input_from_keyboard_bytes(bytes: &[u8]) -> Option<ComposerInput> {
         b"\x1b[3~" => Some(ComposerInput::Delete),
         b"\x1b[D" => Some(ComposerInput::LeftArrow),
         b"\x1b[C" => Some(ComposerInput::RightArrow),
+        b"\x1b[A" => Some(ComposerInput::UpArrow),
+        b"\x1b[B" => Some(ComposerInput::DownArrow),
         b"\x1b[H" => Some(ComposerInput::Home),
         b"\x1b[F" => Some(ComposerInput::End),
         _ => None,

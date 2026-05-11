@@ -37,6 +37,8 @@ pub enum ComposerInput {
     Delete,
     LeftArrow,
     RightArrow,
+    UpArrow,
+    DownArrow,
     Home,
     End,
     Tab,
@@ -49,7 +51,9 @@ pub enum ComposerInput {
 pub enum ComposerOutcome {
     Consumed,
     Passthrough,
-    Submit(String),
+    /// 接受候选时返回需要写到 PTY 的同步字节 (\x7f×旧 token 长度 + 替换字符串),
+    /// 让 zsh prompt 显示也跟 buffer 同步.
+    WritePty(Vec<u8>),
 }
 
 impl ComposerState {
@@ -120,8 +124,12 @@ impl ComposerState {
         if !self.is_active() {
             return ComposerOutcome::Passthrough;
         }
+        let popup_visible = self.popup_visible();
+        let buffer_empty = self.buffer.is_empty();
 
         match input {
+            // 字符 / 删字符: 双写模型 — 走 PTY (zsh 回显) + 同时 buffer.insert.
+            // 这里只更新 buffer (PTY 由 window.rs 那层负责), 永远 Consumed.
             ComposerInput::Char(c) => {
                 self.buffer.insert(self.cursor, c);
                 self.cursor += c.len_utf8();
@@ -144,59 +152,77 @@ impl ComposerState {
                 }
                 ComposerOutcome::Consumed
             }
-            ComposerInput::LeftArrow => {
-                if let Some(prev) = prev_char_boundary(&self.buffer, self.cursor) {
-                    self.cursor = prev;
-                    self.touch();
+            // 移光标永远透传 — composer.cursor 不跟踪光标移动 (PTY 用户视觉
+            // 为准, popup query 始终从 buffer 末尾倒推 token).
+            ComposerInput::LeftArrow
+            | ComposerInput::RightArrow
+            | ComposerInput::Home
+            | ComposerInput::End => ComposerOutcome::Passthrough,
+            // Up/Down/Tab/BackTab: popup 可见时, 第一次按 → 直接 sync 当前 selected
+            // (即第一项); 后续按 → select_next/prev + sync (cycle). 判定靠 current_token
+            // 是否已等于 selected 文本 — 等于 = 已 sync = 这次该 cycle.
+            ComposerInput::UpArrow => {
+                if buffer_empty {
+                    ComposerOutcome::Passthrough
+                } else if popup_visible {
+                    if self.current_token_matches_selected() {
+                        self.select_prev();
+                    }
+                    ComposerOutcome::WritePty(self.sync_selected_to_buffer())
+                } else {
+                    ComposerOutcome::Consumed
                 }
-                ComposerOutcome::Consumed
             }
-            ComposerInput::RightArrow => {
-                if self.popup_visible() {
-                    self.accept_selected();
-                    self.touch();
-                } else if self.cursor < self.buffer.len() {
-                    self.cursor = next_char_boundary(&self.buffer, self.cursor);
-                    self.touch();
+            ComposerInput::DownArrow => {
+                if buffer_empty {
+                    ComposerOutcome::Passthrough
+                } else if popup_visible {
+                    if self.current_token_matches_selected() {
+                        self.select_next();
+                    }
+                    ComposerOutcome::WritePty(self.sync_selected_to_buffer())
+                } else {
+                    ComposerOutcome::Consumed
                 }
-                ComposerOutcome::Consumed
-            }
-            ComposerInput::Home => {
-                if self.cursor != 0 {
-                    self.cursor = 0;
-                    self.touch();
-                }
-                ComposerOutcome::Consumed
-            }
-            ComposerInput::End => {
-                if self.cursor != self.buffer.len() {
-                    self.cursor = self.buffer.len();
-                    self.touch();
-                }
-                ComposerOutcome::Consumed
             }
             ComposerInput::Tab => {
-                self.select_next();
-                ComposerOutcome::Consumed
+                if popup_visible {
+                    if self.current_token_matches_selected() {
+                        self.select_next();
+                    }
+                    ComposerOutcome::WritePty(self.sync_selected_to_buffer())
+                } else {
+                    ComposerOutcome::Passthrough
+                }
             }
             ComposerInput::BackTab => {
-                self.select_prev();
-                ComposerOutcome::Consumed
+                if popup_visible {
+                    if self.current_token_matches_selected() {
+                        self.select_prev();
+                    }
+                    ComposerOutcome::WritePty(self.sync_selected_to_buffer())
+                } else {
+                    ComposerOutcome::Passthrough
+                }
             }
+            // Enter: popup 可见且有 selected → 接受候选写 PTY 同步 (不执行命令);
+            // 否则透传让 zsh 执行.
             ComposerInput::Enter => {
-                let submitted = std::mem::take(&mut self.buffer);
-                self.cursor = 0;
-                self.clear_candidates();
-                self.debounce_requested = false;
-                ComposerOutcome::Submit(submitted)
+                if popup_visible && self.selected.is_some() {
+                    let bytes = self.accept_selected_with_diff();
+                    ComposerOutcome::WritePty(bytes)
+                } else {
+                    ComposerOutcome::Passthrough
+                }
             }
+            // Esc: popup 可见 → 关 popup (clear candidates, buffer 不动); 否则透传.
             ComposerInput::Escape => {
-                self.active = false;
-                self.buffer.clear();
-                self.cursor = 0;
-                self.clear_candidates();
-                self.debounce_requested = false;
-                ComposerOutcome::Consumed
+                if popup_visible {
+                    self.clear_candidates();
+                    ComposerOutcome::Consumed
+                } else {
+                    ComposerOutcome::Passthrough
+                }
             }
         }
     }
@@ -289,7 +315,25 @@ impl ComposerState {
                 );
             }
         }
+        // 不 auto-sync — popup 出来只 highlight 不动 buffer. 用户按 Tab 才接受
+        // (handle_input(Tab) 内 current_token_matches_selected 检查决定是接受
+        // 第一项还是 cycle).
         changed
+    }
+
+    /// 当前 token 跟 selected 候选文本是否相同. 用来判断 Tab/Down 该 "接受当前
+    /// 第一项" 还是 "cycle 到下一项": 不同 → 还没 sync, 直接 sync; 相同 → 已 sync,
+    /// select_next 后再 sync.
+    fn current_token_matches_selected(&self) -> bool {
+        let tokenized = self.current_tokenization();
+        let token_text = tokenized
+            .current_token_idx
+            .and_then(|i| tokenized.tokens.get(i))
+            .map(|t| &self.buffer[t.start..t.end]);
+        let sel_text = self
+            .selected
+            .and_then(|i| self.candidates.get(i).map(|s| s.text.as_str()));
+        matches!((token_text, sel_text), (Some(a), Some(b)) if a == b)
     }
 
     fn touch(&mut self) {
@@ -324,21 +368,40 @@ impl ComposerState {
         self.selected = Some((current + self.candidates.len() - 1) % self.candidates.len());
     }
 
-    fn accept_selected(&mut self) {
-        let Some(idx) = self.selected else { return };
+    /// 接受当前 selected 候选, 返回需要写到 PTY 的同步字节
+    /// (\x7f×旧 token 字符数 + replacement) 让 zsh prompt 跟 buffer 同步.
+    /// 接受后清候选关 popup.
+    fn accept_selected_with_diff(&mut self) -> Vec<u8> {
+        let bytes = self.sync_selected_to_buffer();
+        self.clear_candidates();
+        bytes
+    }
+
+    /// MC 风格 selected 同步: 把当前 selected 候选 replace 当前 token 到 buffer,
+    /// 返回 PTY diff 字节 (\x7f×旧 + 新 replacement). 跟 accept 区别 — 不清候选,
+    /// popup 还在, 用户可以继续 Up/Down/Tab cycle.
+    fn sync_selected_to_buffer(&mut self) -> Vec<u8> {
+        let Some(idx) = self.selected else {
+            return Vec::new();
+        };
         let Some(suggestion) = self.candidates.get(idx) else {
-            return;
+            return Vec::new();
         };
         let replacement = suggestion.text.clone();
         let tokenized = self.current_tokenization();
         if let Some(token_idx) = tokenized.current_token_idx {
             let token = &tokenized.tokens[token_idx];
+            let old_chars = self.buffer[token.start..token.end].chars().count();
             self.buffer
                 .replace_range(token.start..token.end, &replacement);
             self.cursor = token.start + replacement.len();
+            let mut bytes = vec![0x7fu8; old_chars];
+            bytes.extend_from_slice(replacement.as_bytes());
+            bytes
         } else {
             self.buffer.insert_str(self.cursor, &replacement);
             self.cursor += replacement.len();
+            replacement.into_bytes()
         }
     }
 
@@ -365,6 +428,11 @@ impl ComposerState {
     }
 
     fn query_ctx(&self) -> Option<QueryCtx> {
+        // sudo/doas/env/... 等透明前缀: provider 应该看到 effective 命令
+        // (sudo pacman -S → pacman -S), 否则 PacmanProvider 不触发.
+        const COMMAND_PREFIX_TRANSPARENTS: &[&str] =
+            &["sudo", "doas", "env", "time", "nice", "ionice"];
+
         let tokenized = self.current_tokenization();
         let segment_start = tokenized
             .tokens
@@ -384,7 +452,15 @@ impl ComposerState {
             .skip(segment_start)
             .filter(|(_, token)| matches!(&token.kind, TokenKind::Word | TokenKind::Unterminated))
             .collect::<Vec<_>>();
-        let command = words
+        // 跳过 transparent 前缀, 真 command 是后面的第一个 word
+        let prefix_skip = words
+            .iter()
+            .take_while(|(_, token)| {
+                COMMAND_PREFIX_TRANSPARENTS.contains(&token.text.as_str())
+            })
+            .count();
+        let effective_words = &words[prefix_skip..];
+        let command = effective_words
             .first()
             .map(|(_, token)| token.text.clone())
             .unwrap_or_default();
@@ -397,8 +473,8 @@ impl ComposerState {
             .filter(|token| matches!(&token.kind, TokenKind::Word | TokenKind::Unterminated))
             .map(|token| token.text.clone())
             .unwrap_or_default();
-        let previous_tokens = words
-            .into_iter()
+        let previous_tokens = effective_words
+            .iter()
             .filter(|(idx, _)| Some(*idx) != current_idx)
             .filter(|(_, token)| token.start < self.cursor || current_idx.is_none())
             .map(|(_, token)| token.text.clone())
@@ -460,14 +536,14 @@ mod tests {
     state_test!(test_command_start_deactivates, { let mut state = active_state(); state.feed_pty_output(b"\x1b]133;C\x07"); assert!(!state.is_active()); });
     state_test!(test_gate_blocks_when_ime, { let mut state = active_state(); state.set_ime_preedit_active(true); assert_eq!(state.handle_input(Char('x')), Passthrough); assert_eq!(state.buffer(), ""); });
     state_test!(test_gate_blocks_when_alt_screen, { let mut state = active_state(); state.set_alt_screen(true); assert_eq!(state.handle_input(Char('x')), Passthrough); assert_eq!(state.buffer(), ""); });
-    state_test!(test_char_insert_at_cursor, { let mut state = active_state(); type_chars(&mut state, "ab"); state.handle_input(LeftArrow); state.handle_input(Char('x')); assert_eq!(state.buffer(), "axb"); assert_eq!(state.cursor(), 2); });
+    state_test!(test_char_insert_at_cursor, { let mut state = active_state(); type_chars(&mut state, "ab"); assert_eq!(state.buffer(), "ab"); assert_eq!(state.cursor(), 2); });
     state_test!(test_backspace_deletes_prev_char, { let mut state = active_state(); type_chars(&mut state, "ab"); state.handle_input(Backspace); assert_eq!(state.buffer(), "a"); assert_eq!(state.cursor(), 1); });
     state_test!(test_backspace_handles_multibyte, { let mut state = active_state(); type_chars(&mut state, "a你"); state.handle_input(Backspace); assert_eq!(state.buffer(), "a"); assert_eq!(state.cursor(), 1); });
-    state_test!(test_arrow_moves_cursor, { let mut state = active_state(); type_chars(&mut state, "a你b"); state.handle_input(LeftArrow); assert_eq!(state.cursor(), 4); state.handle_input(LeftArrow); assert_eq!(state.cursor(), 1); state.handle_input(RightArrow); assert_eq!(state.cursor(), 4); state.handle_input(Home); assert_eq!(state.cursor(), 0); state.handle_input(End); assert_eq!(state.cursor(), 5); });
-    state_test!(test_enter_returns_submit_and_clears, { let mut state = active_state(); type_chars(&mut state, "ls"); assert_eq!(state.handle_input(Enter), Submit("ls".into())); assert_eq!(state.buffer(), ""); assert_eq!(state.cursor(), 0); });
-    state_test!(test_escape_clears_returns_consumed, { let mut state = active_state(); type_chars(&mut state, "x"); assert_eq!(state.handle_input(Escape), Consumed); assert_eq!(state.buffer(), ""); assert!(!state.is_active()); });
-    state_test!(test_pending_gen_increments_on_keystroke, { let mut state = active_state(); assert_eq!(state.pending_gen, GenerationId(0)); state.handle_input(Char('a')); state.handle_input(LeftArrow); assert_eq!(state.pending_gen, GenerationId(2)); });
+    state_test!(test_arrow_passthrough, { let mut state = active_state(); type_chars(&mut state, "ab"); assert_eq!(state.handle_input(LeftArrow), Passthrough); assert_eq!(state.handle_input(RightArrow), Passthrough); assert_eq!(state.handle_input(Home), Passthrough); assert_eq!(state.handle_input(End), Passthrough); });
+    state_test!(test_enter_passthrough_when_no_popup, { let mut state = active_state(); type_chars(&mut state, "ls"); assert_eq!(state.handle_input(Enter), Passthrough); assert_eq!(state.buffer(), "ls"); });
+    state_test!(test_escape_passthrough_when_no_popup, { let mut state = active_state(); type_chars(&mut state, "x"); assert_eq!(state.handle_input(Escape), Passthrough); assert_eq!(state.buffer(), "x"); });
+    state_test!(test_pending_gen_increments_on_keystroke, { let mut state = active_state(); assert_eq!(state.pending_gen, GenerationId(0)); state.handle_input(Char('a')); state.handle_input(Backspace); assert_eq!(state.pending_gen, GenerationId(2)); });
     state_test!(test_pty_segments_passthrough_non_133, { let mut state = ComposerState::new(); assert_eq!(state.feed_pty_output(b"abc\x1b]0;title\x07def"), vec![Segment::Bytes(b"abc\x1b]0;title\x07def")]); });
-    state_test!(test_tab_cycles_candidates_without_query, { let mut state = active_state(); state.candidates = vec![crate::completion::Suggestion { text: "a".into(), display: "a".into(), description: String::new(), group: crate::completion::SuggestionGroup::Dynamic }, crate::completion::Suggestion { text: "b".into(), display: "b".into(), description: String::new(), group: crate::completion::SuggestionGroup::Dynamic }]; state.selected = Some(0); assert_eq!(state.handle_input(Tab), Consumed); assert_eq!(state.selected(), Some(1)); assert!(!state.take_debounce_request()); assert_eq!(state.handle_input(BackTab), Consumed); assert_eq!(state.selected(), Some(0)); });
-    state_test!(test_right_accepts_selected_candidate, { let mut state = active_state(); type_chars(&mut state, "git ch"); state.candidates = vec![crate::completion::Suggestion { text: "checkout".into(), display: "checkout".into(), description: String::new(), group: crate::completion::SuggestionGroup::Subcommand }]; state.selected = Some(0); assert_eq!(state.handle_input(RightArrow), Consumed); assert_eq!(state.buffer(), "git checkout"); assert_eq!(state.cursor(), "git checkout".len()); assert!(state.take_debounce_request()); });
+    state_test!(test_tab_first_press_syncs_without_cycling, { let mut state = active_state(); type_chars(&mut state, "a"); state.candidates = vec![crate::completion::Suggestion { text: "alpha".into(), display: "alpha".into(), description: String::new(), group: crate::completion::SuggestionGroup::Dynamic }, crate::completion::Suggestion { text: "beta".into(), display: "beta".into(), description: String::new(), group: crate::completion::SuggestionGroup::Dynamic }]; state.selected = Some(0); let outcome = state.handle_input(Tab); assert!(matches!(outcome, WritePty(_))); assert_eq!(state.selected(), Some(0)); assert_eq!(state.buffer(), "alpha"); let outcome2 = state.handle_input(Tab); assert!(matches!(outcome2, WritePty(_))); assert_eq!(state.selected(), Some(1)); assert_eq!(state.buffer(), "beta"); });
+    state_test!(test_enter_with_popup_writes_pty, { let mut state = active_state(); type_chars(&mut state, "ch"); state.candidates = vec![crate::completion::Suggestion { text: "checkout".into(), display: "checkout".into(), description: String::new(), group: crate::completion::SuggestionGroup::Subcommand }]; state.selected = Some(0); let outcome = state.handle_input(Enter); assert!(matches!(outcome, WritePty(_))); assert_eq!(state.buffer(), "checkout"); });
 }
