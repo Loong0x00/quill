@@ -343,9 +343,17 @@ fn filter_suggestions(suggestions: Vec<Suggestion>, current_token: &str) -> Vec<
     if current_token.is_empty() {
         return suggestions;
     }
+    // 双向 prefix 匹配: 候选 starts_with token (常规) OR token starts_with 候选
+    // (用户敲了合并 short flag 比如 -Syu, 候选 -S 仍提示 — 让用户看到 -S 描述).
     suggestions
         .into_iter()
-        .filter(|suggestion| suggestion.text.starts_with(current_token))
+        .filter(|suggestion| {
+            suggestion.text.starts_with(current_token)
+                || (current_token.len() > 2
+                    && current_token.starts_with('-')
+                    && !current_token.starts_with("--")
+                    && current_token.starts_with(&suggestion.text))
+        })
         .collect()
 }
 

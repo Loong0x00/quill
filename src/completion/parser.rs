@@ -40,12 +40,77 @@ pub struct ArgSpec { pub name: String, pub description: String, pub required: bo
 pub struct ParseErr { pub message: String }
 
 pub fn parse(help_output: &str) -> ParsedHelp {
-    match detect_format(help_output) {
-        HelpFormat::Clap => parse_clap(help_output),
-        HelpFormat::Argparse => parse_argparse(help_output),
-        HelpFormat::Docopt => parse_docopt(help_output),
-        HelpFormat::Unknown => parse_heuristic(help_output),
+    // GNU coreutils 新版 --help 输出含 OSC 8 hyperlink + ANSI bold (尤其
+    // ls / pacman / 部分国际化版本), 让 line.starts_with('-') 失败导致解析 0 flag.
+    // 入口 strip 所有 ANSI escape, 不影响纯文本路径.
+    let cleaned = strip_ansi(help_output);
+    let text = cleaned.as_str();
+    let mut parsed = match detect_format(text) {
+        HelpFormat::Clap => parse_clap(text),
+        HelpFormat::Argparse => parse_argparse(text),
+        HelpFormat::Docopt => parse_docopt(text),
+        HelpFormat::Unknown => parse_heuristic(text),
+    };
+    // 兜底: 抓所有 `{-X --xxx}` / `{-X|--xxx}` 大括号内的 flag (pacman 风格 op flag).
+    // 不重复 push (parse_*_*  已用 seen_flags 排重).
+    extract_brace_flags(text, &mut parsed);
+    parsed
+}
+
+fn extract_brace_flags(text: &str, parsed: &mut ParsedHelp) {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"\{(-[A-Za-z0-9][^}]*)\}").expect("brace flag regex must compile")
+    });
+    let mut seen: std::collections::HashSet<(Option<String>, Option<String>)> = parsed
+        .flags
+        .iter()
+        .map(|f| (f.short.clone(), f.long.clone()))
+        .collect();
+    for cap in re.captures_iter(text) {
+        let inside = &cap[1];
+        // 抓所有 -X 跟 --xxx
+        let tokens: Vec<&str> = inside
+            .split(|c: char| c == ',' || c == '|' || c.is_whitespace())
+            .filter(|t| !t.is_empty())
+            .collect();
+        let short = tokens
+            .iter()
+            .copied()
+            .find(|t| t.starts_with('-') && !t.starts_with("--") && t.len() == 2)
+            .map(|t| t.to_string());
+        let long = tokens
+            .iter()
+            .copied()
+            .find(|t| t.starts_with("--") && t.len() > 2)
+            .map(|t| t.to_string());
+        if short.is_none() && long.is_none() {
+            continue;
+        }
+        if seen.insert((short.clone(), long.clone())) {
+            parsed.flags.push(FlagSpec {
+                short,
+                long,
+                takes_value: false,
+                value_name: None,
+                description: String::new(),
+            });
+        }
     }
+}
+
+/// 去掉 ANSI escape: CSI (\x1b[...letter), OSC (\x1b]...\x07 或 \x1b]...\x1b\\),
+/// 单字符 (\x1b 后跟字母数字单字符). 简化版, 不严格解析全部 escape, 但能搞掉
+/// `--help` 输出常见的颜色/超链接.
+fn strip_ansi(input: &str) -> String {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][\x20-\x7e]",
+        )
+        .expect("strip_ansi regex must compile")
+    });
+    re.replace_all(input, "").into_owned()
 }
 
 pub fn to_suggestions(parsed: &ParsedHelp, current_token: &str) -> Vec<Suggestion> {
