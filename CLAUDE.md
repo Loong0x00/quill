@@ -24,7 +24,8 @@
 - [ ] 2x HiDPI 整数缩放 + CJK 字形正常
 - [ ] fcitx5 输入法(Wayland `text-input-v3` 协议)
 - [ ] 事件循环零 starvation(单线程 `ppoll` 绑所有 fd)
-- [ ] 3-5K LOC 左右,架构读得懂
+- [ ] ~30K LOC 左右,架构读得懂
+- [ ] inline composer + popup 候选不依赖 readline
 
 ## 非目标(暂不做,不纠结)
 
