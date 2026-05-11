@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod help_indexer;
+pub mod parser;
 pub mod worker;
 
 use std::path::PathBuf;

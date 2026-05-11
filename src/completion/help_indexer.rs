@@ -15,6 +15,7 @@ use std::os::unix::process::CommandExt;
 
 use regex::Regex;
 
+use crate::completion::parser;
 use crate::completion::{
     CacheKey, CompletionCache, GenerationId, Provider, ProviderErr, QueryCtx, Suggestion,
     SuggestionGroup,
@@ -104,7 +105,7 @@ impl HelpIndexerProvider {
         let _guard = self.mark_inflight(key.clone())?;
         match run_help_command(&binary_path, &self.config) {
             Ok(help_output) => {
-                let suggestions = simple_regex_parse(&help_output, "");
+                let suggestions = parse_help_suggestions(&help_output);
                 if suggestions.is_empty() {
                     self.mark_negative(&binary_path)?;
                     return Err(ProviderErr::NotFound);
@@ -299,6 +300,14 @@ pub fn simple_regex_parse(help_output: &str, current_token: &str) -> Vec<Suggest
         }
     }
     suggestions
+}
+
+fn parse_help_suggestions(help_output: &str) -> Vec<Suggestion> {
+    std::panic::catch_unwind(|| {
+        let parsed = parser::parse(help_output);
+        parser::to_suggestions(&parsed, "")
+    })
+    .unwrap_or_else(|_| simple_regex_parse(help_output, ""))
 }
 
 fn push_suggestion(
