@@ -54,6 +54,13 @@ pub use render::{reset_headless_squircle_exponent, set_headless_squircle_exponen
 // 常数同步 re-export 给测试 / Phase 6 计算用。
 pub use render::{PreeditOverlay, PREEDIT_UNDERLINE_PX};
 
+// T6b: completion候选浮窗类型与headless测试注入点。T11接composer真实数据前,
+// 集成测试可用dummy overlay验证渲染像素。
+pub use render::{
+    reset_headless_completion_overlay, set_headless_completion_overlay, CompletionItem,
+    CompletionOverlay,
+};
+
 // T-0601: 光标 quad 入参 (集成测试 tests/cursor_render_e2e.rs + window.rs
 // idle callback 用). quill 自有 struct + enum (INV-010, 不漏 alacritty
 // CursorShape).

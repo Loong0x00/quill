@@ -579,6 +579,23 @@ pub struct PreeditOverlay {
     pub cursor_line: usize,
 }
 
+/// T6b:候选浮窗渲染入参。composer真实数据在T11接入,本类型先让渲染层能独立
+/// 生成浮窗背景、高亮和候选文本顶点。
+#[derive(Debug, Clone)]
+pub struct CompletionOverlay {
+    pub items: Vec<CompletionItem>,
+    pub selected: Option<usize>,
+    pub anchor_row: usize,
+    pub anchor_col: usize,
+    pub max_visible: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompletionItem {
+    pub display: String,
+    pub description: String,
+}
+
 /// **T-0601: 光标渲染厚度** (logical px, render 内部 × HIDPI_SCALE).
 /// Underline 模式底部横线 / Beam 模式左侧竖线 / HollowBlock 边框 厚度共用。
 /// 2 logical = 4 physical (HIDPI_SCALE=2), 视觉清晰且不喧宾夺主。
@@ -607,6 +624,33 @@ pub const SELECTION_BG: crate::term::Color = crate::term::Color {
     r: 0x3e,
     g: 0x6e,
     b: 0x9e,
+};
+
+const COMPLETION_MIN_COLS: usize = 40;
+const COMPLETION_MAX_COLS: usize = 80;
+const COMPLETION_PAD_COLS: usize = 1;
+const COMPLETION_GAP_COLS: usize = 2;
+const COMPLETION_RADIUS_PX: f32 = 6.0;
+const COMPLETION_HIGHLIGHT_RADIUS_PX: f32 = 4.0;
+const COMPLETION_BG: crate::term::Color = crate::term::Color {
+    r: 0x1f,
+    g: 0x23,
+    b: 0x28,
+};
+const COMPLETION_SELECTED_BG: crate::term::Color = crate::term::Color {
+    r: 0x3e,
+    g: 0x6e,
+    b: 0x9e,
+};
+const COMPLETION_FG: crate::term::Color = crate::term::Color {
+    r: 0xe6,
+    g: 0xe6,
+    b: 0xe6,
+};
+const COMPLETION_DESC_FG: crate::term::Color = crate::term::Color {
+    r: 0xa8,
+    g: 0xb0,
+    b: 0xb8,
 };
 
 /// **T-0604: cell.bg default skip 比较常数**, 与 [`crate::term::Color::DEFAULT_BG`]
@@ -670,14 +714,11 @@ pub enum CursorStyle {
 }
 
 /// 单帧所有overlay的聚合结构体。
-///
-/// completion暂用占位类型,T6b再替换为真实渲染输入。
 pub struct FrameOverlays<'a> {
     pub preedit: Option<&'a PreeditOverlay>,
     pub cursor: Option<&'a CursorInfo>,
     pub selection: Option<&'a [crate::term::CellPos]>,
-    #[allow(dead_code)]
-    pub completion: Option<()>,
+    pub completion: Option<&'a CompletionOverlay>,
 }
 
 /// **HiDPI 整数缩放常数** (T-0404 简化版, hardcode 2x)。
@@ -1134,6 +1175,258 @@ fn append_rounded_quad_px(
         out.extend_from_slice(&bounds[2].to_ne_bytes());
         out.extend_from_slice(&bounds[3].to_ne_bytes());
         out.extend_from_slice(&elem_radius_phys.to_ne_bytes());
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CompletionLayout {
+    x0_px: f32,
+    y0_px: f32,
+    x1_px: f32,
+    y1_px: f32,
+    cols: usize,
+    visible_rows: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn completion_layout(
+    overlay: &CompletionOverlay,
+    cols: usize,
+    rows: usize,
+    cell_w_px: f32,
+    cell_h_px: f32,
+    titlebar_y_offset_px: f32,
+    surface_w: f32,
+    surface_h: f32,
+) -> Option<CompletionLayout> {
+    if cols == 0 || rows == 0 || overlay.items.is_empty() || overlay.max_visible == 0 {
+        return None;
+    }
+    let visible_rows = overlay.items.len().min(overlay.max_visible);
+    let max_display = overlay
+        .items
+        .iter()
+        .map(|i| unicode_width::UnicodeWidthStr::width(i.display.as_str()))
+        .max()
+        .unwrap_or(0);
+    let max_desc = overlay
+        .items
+        .iter()
+        .map(|i| unicode_width::UnicodeWidthStr::width(i.description.as_str()))
+        .max()
+        .unwrap_or(0);
+    let wanted_cols = (max_display + COMPLETION_GAP_COLS + max_desc + COMPLETION_PAD_COLS * 2)
+        .max(COMPLETION_MIN_COLS)
+        .min(COMPLETION_MAX_COLS);
+    let popup_cols = wanted_cols.min(cols.max(1));
+    let popup_w = popup_cols as f32 * cell_w_px;
+    let popup_h = visible_rows as f32 * cell_h_px;
+
+    let anchor_col = overlay.anchor_col.min(cols.saturating_sub(1));
+    let mut x0 = anchor_col as f32 * cell_w_px;
+    if x0 + popup_w > surface_w {
+        x0 = (surface_w - popup_w).max(0.0);
+    }
+
+    let anchor_row = overlay.anchor_row.min(rows.saturating_sub(1));
+    let below_y = titlebar_y_offset_px + (anchor_row + 1) as f32 * cell_h_px;
+    let above_y = titlebar_y_offset_px + anchor_row as f32 * cell_h_px - popup_h;
+    let mut y0 = if below_y + popup_h <= surface_h {
+        below_y
+    } else if above_y >= titlebar_y_offset_px {
+        above_y
+    } else {
+        titlebar_y_offset_px
+    };
+    let max_y0 = (surface_h - popup_h).max(titlebar_y_offset_px);
+    y0 = y0.max(titlebar_y_offset_px).min(max_y0);
+
+    Some(CompletionLayout {
+        x0_px: x0,
+        y0_px: y0,
+        x1_px: x0 + popup_w,
+        y1_px: y0 + popup_h,
+        cols: popup_cols,
+        visible_rows,
+    })
+}
+
+fn truncate_to_width(text: &str, max_cols: usize) -> String {
+    if unicode_width::UnicodeWidthStr::width(text) <= max_cols {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > max_cols {
+            break;
+        }
+        used += w;
+        out.push(ch);
+    }
+    out
+}
+
+fn completion_item_columns(item: &CompletionItem, inner_cols: usize) -> (String, String, usize) {
+    let desc_limit = inner_cols.saturating_sub(COMPLETION_GAP_COLS + 1);
+    let desc = truncate_to_width(&item.description, desc_limit);
+    let desc_cols = unicode_width::UnicodeWidthStr::width(desc.as_str());
+    let display_limit = if desc_cols == 0 {
+        inner_cols
+    } else {
+        inner_cols.saturating_sub(desc_cols + COMPLETION_GAP_COLS)
+    };
+    let display = truncate_to_width(&item.display, display_limit);
+    (display, desc, desc_cols)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_completion_boxes(
+    rounded_out: &mut Vec<u8>,
+    layout: CompletionLayout,
+    selected: Option<usize>,
+    cell_h_px: f32,
+    surface_w: f32,
+    surface_h: f32,
+    bg_color: [f32; 3],
+    selected_color: [f32; 3],
+) {
+    append_rounded_quad_px(
+        rounded_out,
+        layout.x0_px,
+        layout.y0_px,
+        layout.x1_px,
+        layout.y1_px,
+        surface_w,
+        surface_h,
+        bg_color,
+        COMPLETION_RADIUS_PX * HIDPI_SCALE as f32,
+    );
+    let Some(selected_idx) = selected else { return };
+    if selected_idx >= layout.visible_rows {
+        return;
+    }
+    let inset = 2.0 * HIDPI_SCALE as f32;
+    let y0 = layout.y0_px + selected_idx as f32 * cell_h_px + inset;
+    let y1 = y0 + cell_h_px - inset * 2.0;
+    append_rounded_quad_px(
+        rounded_out,
+        layout.x0_px + inset,
+        y0,
+        layout.x1_px - inset,
+        y1,
+        surface_w,
+        surface_h,
+        selected_color,
+        COMPLETION_HIGHLIGHT_RADIUS_PX * HIDPI_SCALE as f32,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_overlay_text_glyphs<F>(
+    text_system: &mut TextSystem,
+    glyph_vertex_bytes: &mut Vec<u8>,
+    text: &str,
+    x_px: f32,
+    row_top_px: f32,
+    baseline_y_px: f32,
+    surface_w: f32,
+    surface_h: f32,
+    glyph_color: [f32; 3],
+    slot_for: &mut F,
+) where
+    F: FnMut(&mut TextSystem, &crate::text::ShapedGlyph) -> Option<AtlasSlot>,
+{
+    let glyphs = text_system.shape_line(text);
+    for glyph in &glyphs {
+        if !glyph.x_advance.is_finite() || !glyph.x_offset.is_finite() {
+            continue;
+        }
+        let Some(slot) = slot_for(text_system, glyph) else {
+            continue;
+        };
+        if slot.width == 0 || slot.height == 0 {
+            continue;
+        }
+        let x_left = x_px + glyph.x_offset + slot.bearing_x as f32;
+        let y_top = row_top_px + baseline_y_px - slot.bearing_y as f32;
+        let x_right = x_left + slot.width as f32;
+        let y_bot = y_top + slot.height as f32;
+        let ndc_left = x_left / surface_w * 2.0 - 1.0;
+        let ndc_right = x_right / surface_w * 2.0 - 1.0;
+        let ndc_top = 1.0 - y_top / surface_h * 2.0;
+        let ndc_bot = 1.0 - y_bot / surface_h * 2.0;
+        let verts: [([f32; 2], [f32; 2]); 6] = [
+            ([ndc_left, ndc_top], [slot.uv_min[0], slot.uv_min[1]]),
+            ([ndc_left, ndc_bot], [slot.uv_min[0], slot.uv_max[1]]),
+            ([ndc_right, ndc_bot], [slot.uv_max[0], slot.uv_max[1]]),
+            ([ndc_left, ndc_top], [slot.uv_min[0], slot.uv_min[1]]),
+            ([ndc_right, ndc_bot], [slot.uv_max[0], slot.uv_max[1]]),
+            ([ndc_right, ndc_top], [slot.uv_max[0], slot.uv_min[1]]),
+        ];
+        for (pos, uv) in verts {
+            glyph_vertex_bytes.extend_from_slice(&pos[0].to_ne_bytes());
+            glyph_vertex_bytes.extend_from_slice(&pos[1].to_ne_bytes());
+            glyph_vertex_bytes.extend_from_slice(&uv[0].to_ne_bytes());
+            glyph_vertex_bytes.extend_from_slice(&uv[1].to_ne_bytes());
+            glyph_vertex_bytes.extend_from_slice(&glyph_color[0].to_ne_bytes());
+            glyph_vertex_bytes.extend_from_slice(&glyph_color[1].to_ne_bytes());
+            glyph_vertex_bytes.extend_from_slice(&glyph_color[2].to_ne_bytes());
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_completion_glyphs<F>(
+    text_system: &mut TextSystem,
+    glyph_vertex_bytes: &mut Vec<u8>,
+    overlay: &CompletionOverlay,
+    layout: CompletionLayout,
+    cell_w_px: f32,
+    cell_h_px: f32,
+    baseline_y_px: f32,
+    surface_w: f32,
+    surface_h: f32,
+    display_color: [f32; 3],
+    desc_color: [f32; 3],
+    mut slot_for: F,
+) where
+    F: FnMut(&mut TextSystem, &crate::text::ShapedGlyph) -> Option<AtlasSlot>,
+{
+    let inner_cols = layout.cols.saturating_sub(COMPLETION_PAD_COLS * 2);
+    let pad_px = COMPLETION_PAD_COLS as f32 * cell_w_px;
+    for (row_idx, item) in overlay.items.iter().take(layout.visible_rows).enumerate() {
+        let (display, desc, desc_cols) = completion_item_columns(item, inner_cols);
+        let row_top = layout.y0_px + row_idx as f32 * cell_h_px;
+        if !display.is_empty() {
+            append_overlay_text_glyphs(
+                text_system,
+                glyph_vertex_bytes,
+                &display,
+                layout.x0_px + pad_px,
+                row_top,
+                baseline_y_px,
+                surface_w,
+                surface_h,
+                display_color,
+                &mut slot_for,
+            );
+        }
+        if !desc.is_empty() {
+            append_overlay_text_glyphs(
+                text_system,
+                glyph_vertex_bytes,
+                &desc,
+                layout.x1_px - pad_px - desc_cols as f32 * cell_w_px,
+                row_top,
+                baseline_y_px,
+                surface_w,
+                surface_h,
+                desc_color,
+                &mut slot_for,
+            );
+        }
     }
 }
 
@@ -2791,6 +3084,46 @@ impl Renderer {
             );
         }
 
+        let base_rounded_vertex_count = (rounded_vertex_bytes.len() / ROUNDED_VERTEX_BYTES) as u32;
+        let base_glyph_vertex_count = (glyph_vertex_bytes.len() / GLYPH_VERTEX_BYTES) as u32;
+        if let Some(completion) = overlays.completion {
+            if let Some(layout) = completion_layout(
+                completion,
+                cols,
+                rows,
+                cell_w_px,
+                cell_h_px,
+                titlebar_y_offset_px,
+                surface_w,
+                surface_h,
+            ) {
+                append_completion_boxes(
+                    &mut rounded_vertex_bytes,
+                    layout,
+                    completion.selected,
+                    cell_h_px,
+                    surface_w,
+                    surface_h,
+                    self.color_for_vertex(COMPLETION_BG),
+                    self.color_for_vertex(COMPLETION_SELECTED_BG),
+                );
+                append_completion_glyphs(
+                    text_system,
+                    &mut glyph_vertex_bytes,
+                    completion,
+                    layout,
+                    cell_w_px,
+                    cell_h_px,
+                    baseline_y_px,
+                    surface_w,
+                    surface_h,
+                    self.color_for_vertex(COMPLETION_FG),
+                    self.color_for_vertex(COMPLETION_DESC_FG),
+                    |ts, glyph| self.allocate_glyph_slot(ts, glyph),
+                );
+            }
+        }
+
         // cell_vertex_count 重新算 (preedit underline / cursor quad 可能已 append)
         let cell_vertex_count = (cell_vertex_bytes.len() / VERTEX_BYTES) as u32;
         let glyph_vertex_count = (glyph_vertex_bytes.len() / GLYPH_VERTEX_BYTES) as u32;
@@ -2896,10 +3229,8 @@ impl Renderer {
                 pass.draw(0..cell_vertex_count, 0..1);
             }
 
-            // T-0615: rounded element pass (圆形 button bg / 圆角 tab body / + box).
-            // 在 cells 之后, glyphs 之前 — REPLACE blend 让圆角 box 覆盖底层 cell
-            // 矩形 quad, glyph (icon / title) 在其上 alpha-blend.
-            if rounded_vertex_count > 0 {
+            // T-0615:常规圆角元素先画,completion圆角元素拆到基础glyph之后画。
+            if base_rounded_vertex_count > 0 {
                 let rp = self
                     .rounded_pipeline
                     .as_ref()
@@ -2911,11 +3242,11 @@ impl Renderer {
                 pass.set_pipeline(rp);
                 pass.set_bind_group(1, &self.corner_bind_group, &[]);
                 pass.set_vertex_buffer(0, rb.slice(..));
-                pass.draw(0..rounded_vertex_count, 0..1);
+                pass.draw(0..base_rounded_vertex_count, 0..1);
             }
 
-            // glyphs pass
-            if glyph_vertex_count > 0 {
+            // 基础glyph pass:终端字形、titlebar、preedit先画。
+            if base_glyph_vertex_count > 0 {
                 let glyph_pipeline = self
                     .glyph_pipeline
                     .as_ref()
@@ -2933,7 +3264,44 @@ impl Renderer {
                 // T-0610 part 2: glyph shader group=1 corner mask uniform.
                 pass.set_bind_group(1, &self.corner_bind_group, &[]);
                 pass.set_vertex_buffer(0, glyph_buf.slice(..));
-                pass.draw(0..glyph_vertex_count, 0..1);
+                pass.draw(0..base_glyph_vertex_count, 0..1);
+            }
+
+            // completion背景/高亮在基础glyph之后画,盖住底下grid文本。
+            if rounded_vertex_count > base_rounded_vertex_count {
+                let rp = self
+                    .rounded_pipeline
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("rounded_pipeline 应已 lazy 初始化"))?;
+                let rb = self
+                    .rounded_vertex_buffer
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("rounded_vertex_buffer 应已 lazy 初始化"))?;
+                pass.set_pipeline(rp);
+                pass.set_bind_group(1, &self.corner_bind_group, &[]);
+                pass.set_vertex_buffer(0, rb.slice(..));
+                pass.draw(base_rounded_vertex_count..rounded_vertex_count, 0..1);
+            }
+
+            // completion文字最后画。
+            if glyph_vertex_count > base_glyph_vertex_count {
+                let glyph_pipeline = self
+                    .glyph_pipeline
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("glyph_pipeline 应已 lazy 初始化"))?;
+                let atlas = self
+                    .glyph_atlas
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("glyph_atlas 应已 lazy 初始化"))?;
+                let glyph_buf = self
+                    .glyph_vertex_buffer
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("glyph_vertex_buffer 应已 lazy 初始化"))?;
+                pass.set_pipeline(glyph_pipeline);
+                pass.set_bind_group(0, &atlas.bind_group, &[]);
+                pass.set_bind_group(1, &self.corner_bind_group, &[]);
+                pass.set_vertex_buffer(0, glyph_buf.slice(..));
+                pass.draw(base_glyph_vertex_count..glyph_vertex_count, 0..1);
             }
         }
 
@@ -3638,6 +4006,7 @@ impl Renderer {
             }
         }
     }
+
 }
 
 /// T-0505: 在 cell_vertex_bytes 上追加 preedit 下划线矩形 (cell pass REPLACE
@@ -4662,6 +5031,58 @@ pub fn render_headless(
         );
     }
 
+    let base_rounded_vertex_count = (rounded_vertex_bytes.len() / ROUNDED_VERTEX_BYTES) as u32;
+    let base_glyph_vertex_count = (glyph_vertex_bytes.len() / GLYPH_VERTEX_BYTES) as u32;
+    let completion_overlay = HEADLESS_COMPLETION_OVERLAY.with(|c| c.borrow().clone());
+    if let Some(completion) = completion_overlay.as_ref() {
+        if let Some(layout) = completion_layout(
+            completion,
+            cols,
+            rows,
+            cell_w_px,
+            cell_h_px,
+            titlebar_y_offset_px,
+            surface_w,
+            surface_h,
+        ) {
+            append_completion_boxes(
+                &mut rounded_vertex_bytes,
+                layout,
+                completion.selected,
+                cell_h_px,
+                surface_w,
+                surface_h,
+                color_for_vertex_with_srgb(COMPLETION_BG, is_srgb),
+                color_for_vertex_with_srgb(COMPLETION_SELECTED_BG, is_srgb),
+            );
+            append_completion_glyphs(
+                text_system,
+                &mut glyph_vertex_bytes,
+                completion,
+                layout,
+                cell_w_px,
+                cell_h_px,
+                baseline_y_px,
+                surface_w,
+                surface_h,
+                color_for_vertex_with_srgb(COMPLETION_FG, is_srgb),
+                color_for_vertex_with_srgb(COMPLETION_DESC_FG, is_srgb),
+                |ts, glyph| {
+                    headless_allocate_glyph_slot(
+                        ts,
+                        glyph,
+                        &queue,
+                        &glyph_texture,
+                        &mut allocations,
+                        &mut atlas_cursor_x,
+                        &mut atlas_cursor_y,
+                        &mut atlas_row_height,
+                    )
+                },
+            );
+        }
+    }
+
     // 重新算 vertex count (preedit 已可能 append cell underline + glyph + cursor)
     let cell_vertex_count = (cell_vertex_bytes.len() / VERTEX_BYTES) as u32;
     let glyph_vertex_count = (glyph_vertex_bytes.len() / GLYPH_VERTEX_BYTES) as u32;
@@ -4747,20 +5168,42 @@ pub fn render_headless(
             pass.set_vertex_buffer(0, buf.slice(..));
             pass.draw(0..cell_vertex_count, 0..1);
         }
-        // T-0615: rounded element pass (cells 之后, glyphs 之前).
-        if let Some(buf) = rounded_vbuf.as_ref() {
+        // 常规圆角元素先画,completion圆角元素等基础glyph画完再盖上。
+        if let Some(buf) = rounded_vbuf
+            .as_ref()
+            .filter(|_| base_rounded_vertex_count > 0)
+        {
             pass.set_pipeline(&rounded_pipeline);
             pass.set_bind_group(1, &corner_bind_group, &[]);
             pass.set_vertex_buffer(0, buf.slice(..));
-            pass.draw(0..rounded_vertex_count, 0..1);
+            pass.draw(0..base_rounded_vertex_count, 0..1);
         }
-        if let Some(buf) = glyph_vbuf.as_ref() {
+        if let Some(buf) = glyph_vbuf.as_ref().filter(|_| base_glyph_vertex_count > 0) {
             pass.set_pipeline(&glyph_pipeline);
             pass.set_bind_group(0, &glyph_bg, &[]);
             // T-0610 part 2: glyph shader group=1 corner mask uniform.
             pass.set_bind_group(1, &corner_bind_group, &[]);
             pass.set_vertex_buffer(0, buf.slice(..));
-            pass.draw(0..glyph_vertex_count, 0..1);
+            pass.draw(0..base_glyph_vertex_count, 0..1);
+        }
+        if let Some(buf) = rounded_vbuf
+            .as_ref()
+            .filter(|_| rounded_vertex_count > base_rounded_vertex_count)
+        {
+            pass.set_pipeline(&rounded_pipeline);
+            pass.set_bind_group(1, &corner_bind_group, &[]);
+            pass.set_vertex_buffer(0, buf.slice(..));
+            pass.draw(base_rounded_vertex_count..rounded_vertex_count, 0..1);
+        }
+        if let Some(buf) = glyph_vbuf
+            .as_ref()
+            .filter(|_| glyph_vertex_count > base_glyph_vertex_count)
+        {
+            pass.set_pipeline(&glyph_pipeline);
+            pass.set_bind_group(0, &glyph_bg, &[]);
+            pass.set_bind_group(1, &corner_bind_group, &[]);
+            pass.set_vertex_buffer(0, buf.slice(..));
+            pass.draw(base_glyph_vertex_count..glyph_vertex_count, 0..1);
         }
     }
 
@@ -4834,6 +5277,85 @@ pub fn render_headless(
     readback_buf.unmap();
 
     Ok((out, physical_w, physical_h))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn headless_allocate_glyph_slot(
+    text_system: &mut TextSystem,
+    glyph: &crate::text::ShapedGlyph,
+    queue: &wgpu::Queue,
+    glyph_texture: &wgpu::Texture,
+    allocations: &mut HashMap<crate::text::GlyphKey, AtlasSlot>,
+    atlas_cursor_x: &mut u32,
+    atlas_cursor_y: &mut u32,
+    atlas_row_height: &mut u32,
+) -> Option<AtlasSlot> {
+    let key = glyph.atlas_key();
+    if let Some(slot) = allocations.get(&key).copied() {
+        return Some(slot);
+    }
+    let raster = text_system.rasterize(glyph)?;
+    if raster.width == 0 || raster.height == 0 {
+        let slot = AtlasSlot {
+            uv_min: [0.0, 0.0],
+            uv_max: [0.0, 0.0],
+            width: 0,
+            height: 0,
+            bearing_x: raster.bearing_x,
+            bearing_y: raster.bearing_y,
+        };
+        allocations.insert(key, slot);
+        return Some(slot);
+    }
+    if *atlas_cursor_x + raster.width > ATLAS_W {
+        *atlas_cursor_y += *atlas_row_height;
+        *atlas_cursor_x = 0;
+        *atlas_row_height = 0;
+    }
+    if *atlas_cursor_y + raster.height > ATLAS_H {
+        allocations.clear();
+        *atlas_cursor_x = 0;
+        *atlas_cursor_y = 0;
+        *atlas_row_height = 0;
+    }
+    let x = *atlas_cursor_x;
+    let y = *atlas_cursor_y;
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: glyph_texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d { x, y, z: 0 },
+            aspect: wgpu::TextureAspect::All,
+        },
+        &raster.bitmap,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(raster.width),
+            rows_per_image: Some(raster.height),
+        },
+        wgpu::Extent3d {
+            width: raster.width,
+            height: raster.height,
+            depth_or_array_layers: 1,
+        },
+    );
+    let slot = AtlasSlot {
+        uv_min: [x as f32 / ATLAS_W as f32, y as f32 / ATLAS_H as f32],
+        uv_max: [
+            (x + raster.width) as f32 / ATLAS_W as f32,
+            (y + raster.height) as f32 / ATLAS_H as f32,
+        ],
+        width: raster.width,
+        height: raster.height,
+        bearing_x: raster.bearing_x,
+        bearing_y: raster.bearing_y,
+    };
+    allocations.insert(key, slot);
+    *atlas_cursor_x += raster.width;
+    if raster.height > *atlas_row_height {
+        *atlas_row_height = raster.height;
+    }
+    Some(slot)
 }
 
 /// [`render_headless`] 用的 sRGB-aware 色彩转换 (`Color` → linear `[f32; 3]`)。
@@ -5029,6 +5551,9 @@ thread_local! {
     /// render_headless 之前 set, 让 PNG 输出含 hover 圆形 bg / + box 高亮等视觉.
     pub(crate) static HEADLESS_HOVER_OVERRIDE: std::cell::Cell<super::pointer::HoverRegion> =
         const { std::cell::Cell::new(super::pointer::HoverRegion::None) };
+
+    pub(crate) static HEADLESS_COMPLETION_OVERLAY:
+        std::cell::RefCell<Option<CompletionOverlay>> = std::cell::RefCell::new(None);
 }
 
 /// **T-0615: headless 测试调用前 set 当前 hover, render_headless append 走此值**.
@@ -5039,6 +5564,16 @@ pub fn set_headless_hover_state(hover: super::pointer::HoverRegion) {
 /// **T-0615: 重置 hover override 到 None. 测试末尾 / setUp 调**.
 pub fn reset_headless_hover_state() {
     HEADLESS_HOVER_OVERRIDE.with(|c| c.set(super::pointer::HoverRegion::None));
+}
+
+/// T6b:headless测试调用前注入候选浮窗overlay。
+pub fn set_headless_completion_overlay(overlay: CompletionOverlay) {
+    HEADLESS_COMPLETION_OVERLAY.with(|c| *c.borrow_mut() = Some(overlay));
+}
+
+/// T6b:重置headless候选浮窗overlay。
+pub fn reset_headless_completion_overlay() {
+    HEADLESS_COMPLETION_OVERLAY.with(|c| *c.borrow_mut() = None);
 }
 
 /// **T-0615: headless 路径 rounded element pipeline** (与 Renderer::ensure_rounded_pipeline

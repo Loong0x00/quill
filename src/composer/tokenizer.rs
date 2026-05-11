@@ -1,7 +1,14 @@
 //! shell风格tokenizer，用于composer buffer解析。ASCII优先，复杂unicode归Word。
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum RedirectKind { Out, Append, In, Heredoc, ErrTo, Unknown }
+pub enum RedirectKind {
+    Out,
+    Append,
+    In,
+    Heredoc,
+    ErrTo,
+    Unknown,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
@@ -15,10 +22,10 @@ pub enum TokenKind {
 
 #[derive(Debug, Clone)]
 pub struct Token {
-    pub text: String,  // unescape后的实际文本
-    pub raw: String,   // buffer里的原始文本(含引号/转义)
-    pub start: usize,  // raw在buffer里的起始字节位置
-    pub end: usize,    // raw在buffer里的结束字节位置(exclusive)
+    pub text: String, // unescape后的实际文本
+    pub raw: String,  // buffer里的原始文本(含引号/转义)
+    pub start: usize, // raw在buffer里的起始字节位置
+    pub end: usize,   // raw在buffer里的结束字节位置(exclusive)
     pub kind: TokenKind,
 }
 
@@ -37,47 +44,124 @@ pub fn tokenize(buffer: &str, cursor: usize) -> Tokenized {
     let mut i = 0usize;
 
     while i < n {
-        if b[i] == b' ' || b[i] == b'\t' { i += 1; continue; }
+        if b[i] == b' ' || b[i] == b'\t' {
+            i += 1;
+            continue;
+        }
         let start = i;
 
         // 2> 或 &> 重定向前缀
         if (b[i] == b'2' || b[i] == b'&') && i + 1 < n && b[i + 1] == b'>' {
-            let k = if b[i] == b'2' { RedirectKind::ErrTo } else { RedirectKind::Out };
+            let k = if b[i] == b'2' {
+                RedirectKind::ErrTo
+            } else {
+                RedirectKind::Out
+            };
             let raw = format!("{}>", b[i] as char);
             i += 2;
-            tokens.push(Token { text: raw.clone(), raw, start, end: i, kind: TokenKind::Redirect(k) });
+            tokens.push(Token {
+                text: raw.clone(),
+                raw,
+                start,
+                end: i,
+                kind: TokenKind::Redirect(k),
+            });
             continue;
         }
         // > >>
         if b[i] == b'>' {
             i += 1;
-            let (k, raw): (RedirectKind, String) = if i < n && b[i] == b'>' { i += 1; (RedirectKind::Append, ">>".into()) } else { (RedirectKind::Out, ">".into()) };
-            tokens.push(Token { text: raw.clone(), raw, start, end: i, kind: TokenKind::Redirect(k) });
+            let (k, raw): (RedirectKind, String) = if i < n && b[i] == b'>' {
+                i += 1;
+                (RedirectKind::Append, ">>".into())
+            } else {
+                (RedirectKind::Out, ">".into())
+            };
+            tokens.push(Token {
+                text: raw.clone(),
+                raw,
+                start,
+                end: i,
+                kind: TokenKind::Redirect(k),
+            });
             continue;
         }
         // < <<
         if b[i] == b'<' {
             i += 1;
-            let (k, raw): (RedirectKind, String) = if i < n && b[i] == b'<' { i += 1; (RedirectKind::Heredoc, "<<".into()) } else { (RedirectKind::In, "<".into()) };
-            tokens.push(Token { text: raw.clone(), raw, start, end: i, kind: TokenKind::Redirect(k) });
+            let (k, raw): (RedirectKind, String) = if i < n && b[i] == b'<' {
+                i += 1;
+                (RedirectKind::Heredoc, "<<".into())
+            } else {
+                (RedirectKind::In, "<".into())
+            };
+            tokens.push(Token {
+                text: raw.clone(),
+                raw,
+                start,
+                end: i,
+                kind: TokenKind::Redirect(k),
+            });
             continue;
         }
         // | 或 ||
         if b[i] == b'|' {
             i += 1;
-            if i < n && b[i] == b'|' { i += 1; tokens.push(Token { text: "||".into(), raw: "||".into(), start, end: i, kind: TokenKind::Sequence }); }
-            else { tokens.push(Token { text: "|".into(), raw: "|".into(), start, end: i, kind: TokenKind::Pipe }); }
+            if i < n && b[i] == b'|' {
+                i += 1;
+                tokens.push(Token {
+                    text: "||".into(),
+                    raw: "||".into(),
+                    start,
+                    end: i,
+                    kind: TokenKind::Sequence,
+                });
+            } else {
+                tokens.push(Token {
+                    text: "|".into(),
+                    raw: "|".into(),
+                    start,
+                    end: i,
+                    kind: TokenKind::Pipe,
+                });
+            }
             continue;
         }
         // && 或 &(background)
         if b[i] == b'&' {
             i += 1;
-            if i < n && b[i] == b'&' { i += 1; tokens.push(Token { text: "&&".into(), raw: "&&".into(), start, end: i, kind: TokenKind::Sequence }); }
-            else { tokens.push(Token { text: "&".into(), raw: "&".into(), start, end: i, kind: TokenKind::Background }); }
+            if i < n && b[i] == b'&' {
+                i += 1;
+                tokens.push(Token {
+                    text: "&&".into(),
+                    raw: "&&".into(),
+                    start,
+                    end: i,
+                    kind: TokenKind::Sequence,
+                });
+            } else {
+                tokens.push(Token {
+                    text: "&".into(),
+                    raw: "&".into(),
+                    start,
+                    end: i,
+                    kind: TokenKind::Background,
+                });
+            }
             continue;
         }
         // ;
-        if b[i] == b';' { i += 1; tokens.push(Token { text: ";".into(), raw: ";".into(), start, end: i, kind: TokenKind::Sequence }); continue; }
+        if b[i] == b';' {
+            i += 1;
+            tokens.push(Token {
+                text: ";".into(),
+                raw: ";".into(),
+                start,
+                end: i,
+                kind: TokenKind::Sequence,
+            });
+            continue;
+        }
 
         // Word或Unterminated
         let mut raw = String::new();
@@ -89,46 +173,108 @@ pub fn tokenize(buffer: &str, cursor: usize) -> Tokenized {
                 c if c == b'|' || c == b'&' || c == b';' || c == b'>' || c == b'<' => break,
                 b'\'' => {
                     // 单引号字面
-                    raw.push('\''); i += 1;
-                    while i < n && b[i] != b'\'' { text.push(b[i] as char); raw.push(b[i] as char); i += 1; }
-                    if i < n { raw.push('\''); i += 1; } else { unt = true; break; }
+                    raw.push('\'');
+                    i += 1;
+                    while i < n && b[i] != b'\'' {
+                        text.push(b[i] as char);
+                        raw.push(b[i] as char);
+                        i += 1;
+                    }
+                    if i < n {
+                        raw.push('\'');
+                        i += 1;
+                    } else {
+                        unt = true;
+                        break;
+                    }
                 }
                 b'"' => {
                     // 双引号，支持\" \\转义
-                    raw.push('"'); i += 1;
+                    raw.push('"');
+                    i += 1;
                     while i < n && b[i] != b'"' {
                         if b[i] == b'\\' && i + 1 < n {
-                            let nx = b[i + 1]; raw.push('\\'); raw.push(nx as char); i += 2;
-                            match nx { b'"' => text.push('"'), b'\\' => text.push('\\'), _ => { text.push('\\'); text.push(nx as char); } }
-                        } else { text.push(b[i] as char); raw.push(b[i] as char); i += 1; }
+                            let nx = b[i + 1];
+                            raw.push('\\');
+                            raw.push(nx as char);
+                            i += 2;
+                            match nx {
+                                b'"' => text.push('"'),
+                                b'\\' => text.push('\\'),
+                                _ => {
+                                    text.push('\\');
+                                    text.push(nx as char);
+                                }
+                            }
+                        } else {
+                            text.push(b[i] as char);
+                            raw.push(b[i] as char);
+                            i += 1;
+                        }
                     }
-                    if i < n { raw.push('"'); i += 1; } else { unt = true; break; }
+                    if i < n {
+                        raw.push('"');
+                        i += 1;
+                    } else {
+                        unt = true;
+                        break;
+                    }
                 }
                 b'\\' if i + 1 < n => {
                     // 反斜杠转义
-                    let nx = b[i + 1]; raw.push('\\'); raw.push(nx as char); i += 2;
-                    if nx != b'\n' { text.push(nx as char); }
+                    let nx = b[i + 1];
+                    raw.push('\\');
+                    raw.push(nx as char);
+                    i += 2;
+                    if nx != b'\n' {
+                        text.push(nx as char);
+                    }
                 }
-                c => { text.push(c as char); raw.push(c as char); i += 1; }
+                c => {
+                    text.push(c as char);
+                    raw.push(c as char);
+                    i += 1;
+                }
             }
         }
-        let kind = if unt { TokenKind::Unterminated } else { TokenKind::Word };
-        tokens.push(Token { text, raw, start, end: i, kind });
+        let kind = if unt {
+            TokenKind::Unterminated
+        } else {
+            TokenKind::Word
+        };
+        tokens.push(Token {
+            text,
+            raw,
+            start,
+            end: i,
+            kind,
+        });
     }
 
     // 光标定位
     let mut idx = None;
     let mut off = 0usize;
     for (ti, tok) in tokens.iter().enumerate() {
-        if cursor >= tok.start && cursor < tok.end { idx = Some(ti); off = cursor - tok.start; break; }
+        if cursor >= tok.start && cursor < tok.end {
+            idx = Some(ti);
+            off = cursor - tok.start;
+            break;
+        }
     }
     // cursor==buffer.len()且末尾非空白：归到最后token
     if idx.is_none() && cursor == n && n > 0 && b[n - 1] != b' ' && b[n - 1] != b'\t' {
         if let Some(last) = tokens.len().checked_sub(1) {
-            if cursor == tokens[last].end { idx = Some(last); off = tokens[last].end - tokens[last].start; }
+            if cursor == tokens[last].end {
+                idx = Some(last);
+                off = tokens[last].end - tokens[last].start;
+            }
         }
     }
-    Tokenized { tokens, current_token_idx: idx, current_token_offset: off }
+    Tokenized {
+        tokens,
+        current_token_idx: idx,
+        current_token_offset: off,
+    }
 }
 
 #[cfg(test)]
