@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 
+use crate::composer;
 use crate::pty::PtyHandle;
 use crate::term::TermState;
 
@@ -105,6 +106,8 @@ pub struct TabInstance {
     term: TermState,
     /// 子 shell 进程 + master fd. INV-009 master fd O_NONBLOCK.
     pty: PtyHandle,
+    /// 每个标签页独立持有的补全输入状态机。
+    pub composer: composer::state::ComposerState,
     /// 当前显示标题. **T-0617 起改 `Rc<RefCell<String>>`** 持 [`TermState`]
     /// 的 OSC title 共享态 (alacritty `EventListener::send_event(Event::Title)`
     /// 路径写入). 默认空字符串 → 渲染层 fallback 到 [`crate::wl::render::DEFAULT_TITLE`]
@@ -144,6 +147,7 @@ impl TabInstance {
         Ok(Self {
             term,
             pty,
+            composer: composer::state::ComposerState::new(),
             title,
             dirty: true,
             id: TabRegistry::next_id(),
@@ -164,6 +168,7 @@ impl TabInstance {
         Self {
             term,
             pty,
+            composer: composer::state::ComposerState::new(),
             title: title_handle,
             dirty: false,
             id: TabRegistry::next_id(),
