@@ -227,7 +227,7 @@ impl Drop for InflightGuard {
     }
 }
 
-enum HelpRunError {
+pub(crate) enum HelpRunError {
     Timeout,
     Io(io::Error),
 }
@@ -302,7 +302,7 @@ pub fn simple_regex_parse(help_output: &str, current_token: &str) -> Vec<Suggest
     suggestions
 }
 
-fn parse_help_suggestions(help_output: &str) -> Vec<Suggestion> {
+pub(crate) fn parse_help_suggestions(help_output: &str) -> Vec<Suggestion> {
     std::panic::catch_unwind(|| {
         let parsed = parser::parse(help_output);
         parser::to_suggestions(&parsed, "")
@@ -428,7 +428,7 @@ fn query_signature(ctx: &QueryCtx) -> String {
     format!("help:{command}")
 }
 
-fn run_help_command(
+pub(crate) fn run_help_command(
     binary_path: &Path,
     config: &HelpIndexerConfig,
 ) -> Result<String, HelpRunError> {

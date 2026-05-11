@@ -1,4 +1,5 @@
 pub mod cache;
+pub mod bootstrap;
 pub mod dynamic_hooks;
 pub mod help_indexer;
 pub mod parser;
