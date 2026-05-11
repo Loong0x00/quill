@@ -65,7 +65,7 @@ use wayland_client::{
 };
 
 use super::dnd::{build_drop_command, parse_uri_list};
-use super::keyboard::{handle_key_event, KeyboardAction, KeyboardState};
+use super::keyboard::{handle_key_event_with_composer, KeyboardAction, KeyboardState};
 use super::pointer::{
     handle_pointer_event, quill_edge_to_wayland, xcursor_names_for, CursorShape, PointerAction,
     PointerState, WindowButton,
@@ -4520,9 +4520,16 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
             );
             return;
         }
-        let action = handle_key_event(event, &mut state.keyboard_state, rows_u16);
+        let action = {
+            let tabs = state.tabs.as_ref().expect("tabs not initialized — bug");
+            let composer = &tabs.active().composer;
+            handle_key_event_with_composer(event, &mut state.keyboard_state, rows_u16, composer)
+        };
         match action {
             KeyboardAction::Nothing => {}
+            KeyboardAction::Composer(_) => {
+                // T5b实施真正dispatch。
+            }
             KeyboardAction::Scroll(delta) => {
                 // T-0602: 累积到 State.pending_scroll_lines, 由 idle callback 消费.
                 // saturating_add 防极端连按 PgUp 溢出 i32 (实际不可能, 但廉价防御).

@@ -261,6 +261,9 @@ pub enum KeyboardAction {
     /// 兜底 (INV-010 enum 防御 — 加新 variant 时编译期 catch).
     #[allow(dead_code)]
     WriteToPty(Vec<u8>),
+    /// T5a: composer active 时由键盘层先接管普通字符。真正写入 composer
+    /// state machine 留给 T5b 的 window dispatch。
+    Composer(String),
     /// T-0603: Pressed 且字节非空 → 立即写一次 + schedule repeat timer.
     StartRepeat { bytes: Vec<u8> },
     /// T-0603: Released 或 modifier 变化 → cancel repeat timer.
@@ -327,6 +330,16 @@ pub fn handle_key_event(
     state: &mut KeyboardState,
     rows: u16,
 ) -> KeyboardAction {
+    let inactive_composer = crate::composer::state::ComposerState::new();
+    handle_key_event_with_composer(event, state, rows, &inactive_composer)
+}
+
+pub(crate) fn handle_key_event_with_composer(
+    event: wl_keyboard::Event,
+    state: &mut KeyboardState,
+    rows: u16,
+    composer: &crate::composer::state::ComposerState,
+) -> KeyboardAction {
     match event {
         wl_keyboard::Event::Keymap { format, fd, size } => {
             handle_keymap_event(state, format, fd, size);
@@ -344,7 +357,7 @@ pub fn handle_key_event(
             key,
             state: key_state,
             ..
-        } => key_press_action(state, key, key_state, rows),
+        } => key_press_action(state, key, key_state, rows, composer),
         wl_keyboard::Event::Modifiers {
             mods_depressed,
             mods_latched,
@@ -458,6 +471,7 @@ fn key_press_action(
     evdev_keycode: u32,
     key_state: WEnum<KeyState>,
     rows: u16,
+    composer: &crate::composer::state::ComposerState,
 ) -> KeyboardAction {
     // Released 分支
     if matches!(key_state, WEnum::Value(KeyState::Released)) {
@@ -502,9 +516,25 @@ fn key_press_action(
     // dead key / compose 全交给 xkbcommon)。
     let keysym = xkb_state.key_get_one_sym(xkb_keycode);
 
+    let shift_active = xkb_state.mod_name_is_active(xkb::MOD_NAME_SHIFT, xkb::STATE_MODS_EFFECTIVE);
+    let ctrl_active = xkb_state.mod_name_is_active(xkb::MOD_NAME_CTRL, xkb::STATE_MODS_EFFECTIVE);
+    let alt_active = xkb_state.mod_name_is_active(xkb::MOD_NAME_ALT, xkb::STATE_MODS_EFFECTIVE);
+    let super_active = xkb_state.mod_name_is_active(xkb::MOD_NAME_LOGO, xkb::STATE_MODS_EFFECTIVE);
+
+    if let Some(action) = composer_key_action(
+        composer,
+        xkb_state,
+        xkb_keycode,
+        keysym,
+        ctrl_active,
+        alt_active,
+        super_active,
+    ) {
+        return action;
+    }
+
     // T-0602: PageUp / PageDown → scrollback (早返, 不进 repeat).
     // Shift modifier 区分半屏 vs 整屏.
-    let shift_active = xkb_state.mod_name_is_active(xkb::MOD_NAME_SHIFT, xkb::STATE_MODS_EFFECTIVE);
     if let Some(action) = scroll_keysym_override(keysym, rows, shift_active) {
         return action;
     }
@@ -525,7 +555,6 @@ fn key_press_action(
     // foot / kitty 同热键). 必须**先于** utf8 路径检测 — Ctrl+C 单独走 utf8
     // 给 \x03 (SIGINT 字节, 派单不动) 但 Ctrl+Shift+C 我们劫持. xkb keysym 在
     // Shift 激活时返大写字母 XK_C / XK_V (0x43 / 0x56), 用 raw 比.
-    let ctrl_active = xkb_state.mod_name_is_active(xkb::MOD_NAME_CTRL, xkb::STATE_MODS_EFFECTIVE);
     if ctrl_active && shift_active {
         let raw = keysym.raw();
         // XK_C = 0x43, XK_c = 0x63; Shift active 时 keysym 为大写, 但极端
@@ -592,6 +621,35 @@ fn key_press_action(
         bytes: bytes.clone(),
     });
     KeyboardAction::StartRepeat { bytes }
+}
+
+fn composer_key_action(
+    composer: &crate::composer::state::ComposerState,
+    xkb_state: &xkb::State,
+    xkb_keycode: xkb::Keycode,
+    keysym: xkb::Keysym,
+    ctrl_active: bool,
+    alt_active: bool,
+    super_active: bool,
+) -> Option<KeyboardAction> {
+    if !composer.is_active()
+        || ctrl_active
+        || alt_active
+        || super_active
+        || is_function_keysym(keysym)
+    {
+        return None;
+    }
+
+    let text = xkb_state.key_get_utf8(xkb_keycode);
+    if text.is_empty() || text.chars().any(char::is_control) {
+        return None;
+    }
+    Some(KeyboardAction::Composer(text))
+}
+
+fn is_function_keysym(keysym: xkb::Keysym) -> bool {
+    matches!(keysym.raw(), 0xffbe..=0xffc9)
 }
 
 /// T-0602: PageUp (keysym 0xff55) / PageDown (0xff56) → 滚 scrollback.
@@ -756,6 +814,20 @@ mod tests {
         handle_key_event(event, state, TEST_ROWS)
     }
 
+    fn press_with_composer(
+        state: &mut KeyboardState,
+        composer: &crate::composer::state::ComposerState,
+        evdev_key: u32,
+    ) -> KeyboardAction {
+        let event = wl_keyboard::Event::Key {
+            serial: 0,
+            time: 0,
+            key: evdev_key,
+            state: WEnum::Value(KeyState::Pressed),
+        };
+        handle_key_event_with_composer(event, state, TEST_ROWS, composer)
+    }
+
     fn release(state: &mut KeyboardState, evdev_key: u32) -> KeyboardAction {
         let event = wl_keyboard::Event::Key {
             serial: 0,
@@ -775,6 +847,113 @@ mod tests {
             group: 0,
         };
         let _ = handle_key_event(event, state, TEST_ROWS);
+    }
+
+    fn active_composer() -> crate::composer::state::ComposerState {
+        let mut composer = crate::composer::state::ComposerState::new();
+        let segments = composer.feed_pty_output(b"\x1b]133;A\x07");
+        drop(segments);
+        composer
+    }
+
+    #[test]
+    fn composer_inactive_passthrough() {
+        let mut state = KeyboardState::new().expect("ctx new");
+        state.load_default_us_keymap().expect("keymap");
+        let composer = crate::composer::state::ComposerState::new();
+        let action = press_with_composer(&mut state, &composer, 30);
+        assert_eq!(
+            action,
+            KeyboardAction::StartRepeat {
+                bytes: b"a".to_vec()
+            }
+        );
+    }
+
+    #[test]
+    fn composer_active_consumes_char() {
+        let mut state = KeyboardState::new().expect("ctx new");
+        state.load_default_us_keymap().expect("keymap");
+        let composer = active_composer();
+        let action = press_with_composer(&mut state, &composer, 30);
+        assert_eq!(action, KeyboardAction::Composer("a".to_string()));
+        assert!(!state.has_repeat());
+    }
+
+    #[test]
+    fn composer_arrow_key_passthrough() {
+        let mut state = KeyboardState::new().expect("ctx new");
+        state.load_default_us_keymap().expect("keymap");
+        let composer = active_composer();
+        let action = press_with_composer(&mut state, &composer, 105);
+        assert_eq!(
+            action,
+            KeyboardAction::StartRepeat {
+                bytes: b"\x1b[D".to_vec()
+            }
+        );
+    }
+
+    #[test]
+    fn composer_enter_passthrough() {
+        let mut state = KeyboardState::new().expect("ctx new");
+        state.load_default_us_keymap().expect("keymap");
+        let composer = active_composer();
+        let action = press_with_composer(&mut state, &composer, 28);
+        assert_eq!(
+            action,
+            KeyboardAction::StartRepeat {
+                bytes: b"\r".to_vec()
+            }
+        );
+    }
+
+    #[test]
+    fn composer_esc_passthrough() {
+        let mut state = KeyboardState::new().expect("ctx new");
+        state.load_default_us_keymap().expect("keymap");
+        let composer = active_composer();
+        let action = press_with_composer(&mut state, &composer, 1);
+        assert_eq!(
+            action,
+            KeyboardAction::StartRepeat {
+                bytes: b"\x1b".to_vec()
+            }
+        );
+    }
+
+    #[test]
+    fn ctrl_c_passthrough() {
+        let mut state = KeyboardState::new().expect("ctx new");
+        state.load_default_us_keymap().expect("keymap");
+        set_modifiers(&mut state, 1 << 2);
+        let composer = active_composer();
+        let action = press_with_composer(&mut state, &composer, 46);
+        assert_eq!(action, KeyboardAction::StartRepeat { bytes: vec![0x03] });
+    }
+
+    #[test]
+    fn alt_passthrough() {
+        let mut state = KeyboardState::new().expect("ctx new");
+        state.load_default_us_keymap().expect("keymap");
+        set_modifiers(&mut state, 1 << 3);
+        let composer = active_composer();
+        let action = press_with_composer(&mut state, &composer, 30);
+        assert_eq!(
+            action,
+            KeyboardAction::StartRepeat {
+                bytes: b"a".to_vec()
+            }
+        );
+    }
+
+    #[test]
+    fn function_key_passthrough() {
+        let mut state = KeyboardState::new().expect("ctx new");
+        state.load_default_us_keymap().expect("keymap");
+        let composer = active_composer();
+        let action = press_with_composer(&mut state, &composer, 59);
+        assert_eq!(action, KeyboardAction::Nothing);
     }
 
     /// 'a' key (evdev KEY_A = 30) 单按 → StartRepeat { b"a" }. T-0603 起改为
