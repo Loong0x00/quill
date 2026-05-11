@@ -3065,9 +3065,12 @@ pub fn run_window() -> Result<()> {
                         rows,
                         &row_texts,
                         hover,
-                        preedit_overlay.as_ref(),
-                        cursor_info.as_ref(),
-                        selection_slice,
+                        crate::wl::render::FrameOverlays {
+                            preedit: preedit_overlay.as_ref(),
+                            cursor: cursor_info.as_ref(),
+                            selection: selection_slice,
+                            completion: None,
+                        },
                     )
                 }
                 None => r.draw_cells(&cells, cols, rows),

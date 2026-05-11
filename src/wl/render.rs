@@ -669,6 +669,17 @@ pub enum CursorStyle {
     HollowBlock,
 }
 
+/// 单帧所有overlay的聚合结构体。
+///
+/// completion暂用占位类型,T6b再替换为真实渲染输入。
+pub struct FrameOverlays<'a> {
+    pub preedit: Option<&'a PreeditOverlay>,
+    pub cursor: Option<&'a CursorInfo>,
+    pub selection: Option<&'a [crate::term::CellPos]>,
+    #[allow(dead_code)]
+    pub completion: Option<()>,
+}
+
 /// **HiDPI 整数缩放常数** (T-0404 简化版, hardcode 2x)。
 ///
 /// **why hardcode 而非 wl_output.scale event**: 用户硬偏好 (派单 Out 段),
@@ -2446,16 +2457,7 @@ impl Renderer {
         row_texts: &[String],
         // T-0504: 当前鼠标 hover 区域. Renderer 据此在 titlebar 三按钮中高亮.
         hover: super::pointer::HoverRegion,
-        // T-0505: preedit overlay (None = 无 IME 组词). 见 PreeditOverlay struct.
-        preedit: Option<&PreeditOverlay>,
-        // T-0601: cursor info (None = 调用方明确不画光标 / 测试). 常态 Some(_),
-        // 调用方在 IME preedit 显示时把 visible=false (光标位置与 preedit 起点
-        // 视觉冲突). 见 [`CursorInfo`] doc.
-        cursor: Option<&CursorInfo>,
-        // T-0607: 选中 cell 列表 (Linear / Block 模式由调用方计算后传 Vec<CellPos>).
-        // 空 vec / None 时不画 selection bg. quill 自有类型 (CellPos), INV-010
-        // 安全 (与 hover / preedit / cursor 同).
-        selection: Option<&[crate::term::CellPos]>,
+        overlays: FrameOverlays<'_>,
     ) -> Result<()> {
         if cols == 0 || rows == 0 {
             return self.render();
@@ -2532,7 +2534,7 @@ impl Renderer {
         // T-0607: 追加 selection bg quads (在常规 cell quads 之后, REPLACE blend
         // 让 selection 视觉覆盖 cell 默认 bg). 字形随后走 alpha-blend pass 在
         // selection bg 上仍可见.
-        if let Some(sel) = selection {
+        if let Some(sel) = overlays.selection {
             let sel_color = self.color_for_vertex(SELECTION_BG);
             append_selection_bg_to_cell_bytes(
                 &mut cell_vertex_bytes,
@@ -2725,7 +2727,7 @@ impl Renderer {
         // 下划线走 cell pass (REPLACE color rect, append 到 cell_vertex_bytes).
         // 颜色: preedit 文字浅灰 (cell.fg 默认值 #d3d3d3, 跟主流 IME 一致); 下
         // 划线略亮 #ffffff 让用户区分组词态 vs 已 commit 字。
-        if let Some(p) = preedit {
+        if let Some(p) = overlays.preedit {
             if !p.text.is_empty() {
                 // T-0605: preedit 文字用 fg_default (跟 IME 中性), 不走 cell.fg
                 // (preedit 是 IME 临时层不绑 alacritty cell SGR).
@@ -2773,7 +2775,7 @@ impl Renderer {
         // alacritty unfocused / foot 一致 (派单 acceptance "光标位置可见").
         //
         // visible=false (DECRST 25 / IME preedit 显示) 时跳过, 见 append fn.
-        if let Some(c) = cursor {
+        if let Some(c) = overlays.cursor {
             let cursor_color = self.color_for_vertex(c.color);
             append_cursor_quads_to_cell_bytes(
                 &mut cell_vertex_bytes,
