@@ -1245,6 +1245,16 @@ fn completion_poll_tick(data: &mut LoopData) -> TimeoutAction {
 /// **PTY 错误处理**: 与 `Dispatch<WlKeyboard>` WriteToPty 路径一致 —
 /// WouldBlock 丢字节 (背压, INV-005), partial write 丢剩余, 其它 IO 错 warn.
 fn repeat_timer_tick(data: &mut LoopData) -> TimeoutAction {
+    // 兜底: preedit 激活时停掉在途 repeat. 正常路径已由 Released 放行 + StopRepeat
+    // 清掉 (修复 1), 但若 press 在 preedit 前、preedit 在 release 前激活, 这一段
+    // 在途 timer 会绕过吞键防护直接灌 PTY (runaway). 这里直接 Drop, 不写 PTY.
+    if data.state.ime_state.is_preedit_active() {
+        tracing::trace!(
+            target: "quill::keyboard",
+            "repeat tick: preedit active, dropping timer (防 runaway)"
+        );
+        return TimeoutAction::Drop;
+    }
     let bytes = match data.state.keyboard_state.tick_repeat() {
         Some(b) => b,
         None => {
@@ -4815,7 +4825,20 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
 /// Enter / Leave / Modifiers / RepeatInfo 都不吞 (协议层 state 必须跟 compositor
 /// 同步, 否则 modifier mask / keymap 会错位).
 fn key_event_swallowed_for_preedit(event: &wl_keyboard::Event, preedit_active: bool) -> bool {
-    preedit_active && matches!(event, wl_keyboard::Event::Key { .. })
+    // preedit 激活时只吞 **Pressed** — Pressed 才会往 PTY 灌字节 (destructive,
+    // 实测拼音 preedit 按 backspace 删了已 commit 的 "你好"). Released 必须放行:
+    // 它本身不写 PTY, 但要走 handle_key_event 清 `current_repeat` / 发 StopRepeat.
+    // 漏放 Released 会让"按住键时 preedit 中途激活 → release 被吞 → current_repeat
+    // 永不清 → repeat timer 连发 (runaway backspace 删光整行)". 见
+    // tests/preedit_repeat_runaway.rs.
+    preedit_active
+        && matches!(
+            event,
+            wl_keyboard::Event::Key {
+                state: wayland_client::WEnum::Value(wl_keyboard::KeyState::Pressed),
+                ..
+            }
+        )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5706,14 +5729,18 @@ mod tests {
     }
 
     #[test]
-    fn key_release_swallowed_when_preedit_active() {
-        // release 也吞: 防 release 路径触发 StopRepeat / 其它副作用引发 race
-        // (例 press 在 preedit 前送了 PTY, preedit 期间 release 若不吞会去
-        // cancel timer, 状态机错位). 派单 In #B "key release event 同样吞".
+    fn key_release_passed_through_when_preedit_active() {
+        // 修复 (2026-05-26): release **必须放行**, 不能吞.
+        //
+        // 旧行为吞 release 的理由 ("防 race / 状态机错位") 是错的, 正是它制造了
+        // runaway: 按住键时 preedit 中途激活 → release 被吞 → handle_key_event 不跑
+        // → keyboard_state.current_repeat 永不清 → repeat timer 一直 fire → backspace
+        // 连发删光整行 (user 2026-05-26 实测反馈). release 本身不写 PTY (只产生
+        // StopRepeat / Nothing), 放行零副作用且是停 repeat 的唯一途径.
         let event = key_event(14, KeyState::Released);
         assert!(
-            key_event_swallowed_for_preedit(&event, true),
-            "preedit 非空时 KeyRelease 必须被吞"
+            !key_event_swallowed_for_preedit(&event, true),
+            "preedit 非空时 KeyRelease 必须放行 (清 repeat 状态, 防 runaway)"
         );
     }
 
@@ -5732,6 +5759,95 @@ mod tests {
         assert!(
             !key_event_swallowed_for_preedit(&event, true),
             "Modifiers event 即使 preedit 非空也必须透传 (state 同步)"
+        );
+    }
+
+    // ---------- preedit 中途激活 → repeat runaway 回归 (2026-05-26) ----------
+    //
+    // user 反馈: Claude Code 里偶尔 backspace 被连续触发删光整行. 根因 = 按住键时
+    // fcitx5 preedit 中途激活, 旧 key_event_swallowed_for_preedit 把 release 也吞,
+    // handle_key_event 不跑 → current_repeat 不清 → repeat timer 永远 fire.
+    //
+    // 这里不起 calloop/GUI: repeat timer 是否继续 fire 的**唯一依据**是
+    // keyboard_state.tick_repeat() 是否仍返 Some. 所以在 logic 层重演事件序 +
+    // 走真 swallow 决策, 断言键释放后 tick_repeat()==None (timer 下次 fire 会
+    // TimeoutAction::Drop, 不 runaway).
+
+    /// 重演 runaway 场景: press(无 preedit) → preedit 激活 → release.
+    /// 修复后 release 放行清掉 repeat, tick_repeat 返 None = 不 runaway.
+    #[test]
+    fn preedit_midhold_release_stops_repeat_no_runaway() {
+        use crate::wl::keyboard::{handle_key_event, KeyboardState};
+
+        const KEY_BACKSPACE: u32 = 14;
+        const ROWS: u16 = 24;
+
+        let mut kb = KeyboardState::new().expect("ctx new");
+        kb.load_default_us_keymap().expect("us keymap");
+
+        // 1. preedit 未激活, 按住 backspace.
+        let press = key_event(KEY_BACKSPACE, KeyState::Pressed);
+        assert!(
+            !key_event_swallowed_for_preedit(&press, false),
+            "preedit 空时 press 应透传"
+        );
+        let action = handle_key_event(press, &mut kb, ROWS);
+        assert_eq!(
+            action,
+            KeyboardAction::StartRepeat { bytes: vec![0x7f] },
+            "backspace press 应 StartRepeat (DEL), repeat 进行中"
+        );
+        assert!(
+            kb.tick_repeat().is_some(),
+            "press 后 repeat timer 会持续 fire (tick_repeat=Some)"
+        );
+
+        // 2. preedit 中途激活 (fcitx5 开始一段组合).
+        let preedit_active = true;
+
+        // 3. backspace 物理释放. 修复关键: release 不被吞, handle_key_event 跑.
+        let release = key_event(KEY_BACKSPACE, KeyState::Released);
+        let swallowed = key_event_swallowed_for_preedit(&release, preedit_active);
+        assert!(
+            !swallowed,
+            "修复后: preedit 激活时 release 必须放行 (旧 bug 在此吞掉 → runaway)"
+        );
+        let action = handle_key_event(release, &mut kb, ROWS);
+        assert_eq!(
+            action,
+            KeyboardAction::StopRepeat,
+            "release 应 StopRepeat"
+        );
+
+        // 4. 断言: 键已释放, repeat timer 下次 fire 会读到 None → Drop. 不 runaway.
+        assert!(
+            kb.tick_repeat().is_none(),
+            "release 放行后 current_repeat 必须清空 — tick_repeat=None 即 timer 终止, 不 runaway"
+        );
+    }
+
+    /// 反向锁: 证明"若 release 被吞"就会 runaway — 直接断言旧行为的危害, 防回退.
+    /// 不调被吞的 handle_key_event (模拟旧 swallow=true 路径), tick_repeat 仍 Some.
+    #[test]
+    fn swallowing_release_would_strand_repeat_runaway_witness() {
+        use crate::wl::keyboard::{handle_key_event, KeyboardState};
+
+        const KEY_BACKSPACE: u32 = 14;
+        const ROWS: u16 = 24;
+
+        let mut kb = KeyboardState::new().expect("ctx new");
+        kb.load_default_us_keymap().expect("us keymap");
+
+        let press = key_event(KEY_BACKSPACE, KeyState::Pressed);
+        let _ = handle_key_event(press, &mut kb, ROWS);
+        assert!(kb.tick_repeat().is_some());
+
+        // 模拟旧 bug: preedit 激活时 release 被吞 → handle_key_event 根本不跑.
+        // (这里就是"不调用"来代表被吞.)
+        // 结果: current_repeat 永不清, timer 每次 fire 都拿到 Some → runaway.
+        assert!(
+            kb.tick_repeat().is_some(),
+            "见证: release 被吞 → repeat 悬空 → backspace 连发 (这正是修复要消除的)"
         );
     }
 
