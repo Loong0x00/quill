@@ -205,15 +205,15 @@ impl ComposerState {
                     ComposerOutcome::Passthrough
                 }
             }
-            // Enter: popup 可见且有 selected → 接受候选写 PTY 同步 (不执行命令);
-            // 否则透传让 zsh 执行.
+            // Enter 永远执行命令, 绝不被 popup 劫持: 改完 typo 后直接回车必须运行
+            // 命令而非接受第一候选 (user 2026-05-16, poll_results 会把 selected
+            // 重置成 Some(0), 旧逻辑下 Enter 被吞去补全). 接受候选只走 Tab.
+            // popup 可见时仅清候选关弹窗再透传, 不动 buffer.
             ComposerInput::Enter => {
-                if popup_visible && self.selected.is_some() {
-                    let bytes = self.accept_selected_with_diff();
-                    ComposerOutcome::WritePty(bytes)
-                } else {
-                    ComposerOutcome::Passthrough
+                if popup_visible {
+                    self.clear_candidates();
                 }
+                ComposerOutcome::Passthrough
             }
             // Esc: popup 可见 → 关 popup (clear candidates, buffer 不动); 否则透传.
             ComposerInput::Escape => {
@@ -366,15 +366,6 @@ impl ComposerState {
         }
         let current = self.selected.unwrap_or(0);
         self.selected = Some((current + self.candidates.len() - 1) % self.candidates.len());
-    }
-
-    /// 接受当前 selected 候选, 返回需要写到 PTY 的同步字节
-    /// (\x7f×旧 token 字符数 + replacement) 让 zsh prompt 跟 buffer 同步.
-    /// 接受后清候选关 popup.
-    fn accept_selected_with_diff(&mut self) -> Vec<u8> {
-        let bytes = self.sync_selected_to_buffer();
-        self.clear_candidates();
-        bytes
     }
 
     /// MC 风格 selected 同步: 把当前 selected 候选 replace 当前 token 到 buffer,
@@ -545,5 +536,5 @@ mod tests {
     state_test!(test_pending_gen_increments_on_keystroke, { let mut state = active_state(); assert_eq!(state.pending_gen, GenerationId(0)); state.handle_input(Char('a')); state.handle_input(Backspace); assert_eq!(state.pending_gen, GenerationId(2)); });
     state_test!(test_pty_segments_passthrough_non_133, { let mut state = ComposerState::new(); assert_eq!(state.feed_pty_output(b"abc\x1b]0;title\x07def"), vec![Segment::Bytes(b"abc\x1b]0;title\x07def")]); });
     state_test!(test_tab_first_press_syncs_without_cycling, { let mut state = active_state(); type_chars(&mut state, "a"); state.candidates = vec![crate::completion::Suggestion { text: "alpha".into(), display: "alpha".into(), description: String::new(), group: crate::completion::SuggestionGroup::Dynamic }, crate::completion::Suggestion { text: "beta".into(), display: "beta".into(), description: String::new(), group: crate::completion::SuggestionGroup::Dynamic }]; state.selected = Some(0); let outcome = state.handle_input(Tab); assert!(matches!(outcome, WritePty(_))); assert_eq!(state.selected(), Some(0)); assert_eq!(state.buffer(), "alpha"); let outcome2 = state.handle_input(Tab); assert!(matches!(outcome2, WritePty(_))); assert_eq!(state.selected(), Some(1)); assert_eq!(state.buffer(), "beta"); });
-    state_test!(test_enter_with_popup_writes_pty, { let mut state = active_state(); type_chars(&mut state, "ch"); state.candidates = vec![crate::completion::Suggestion { text: "checkout".into(), display: "checkout".into(), description: String::new(), group: crate::completion::SuggestionGroup::Subcommand }]; state.selected = Some(0); let outcome = state.handle_input(Enter); assert!(matches!(outcome, WritePty(_))); assert_eq!(state.buffer(), "checkout"); });
+    state_test!(test_enter_with_popup_passes_through_to_execute, { let mut state = active_state(); type_chars(&mut state, "ch"); state.candidates = vec![crate::completion::Suggestion { text: "checkout".into(), display: "checkout".into(), description: String::new(), group: crate::completion::SuggestionGroup::Subcommand }]; state.selected = Some(0); let outcome = state.handle_input(Enter); assert!(matches!(outcome, Passthrough), "Enter 必须透传执行命令, 不被 popup 劫持"); assert_eq!(state.buffer(), "ch", "Enter 不接受候选, buffer 不变"); assert!(state.candidates().is_empty(), "Enter 透传时关闭弹窗"); });
 }
