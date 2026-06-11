@@ -34,6 +34,11 @@ pub use systemctl::SystemctlProvider;
 
 use crate::completion::{ProviderErr, ProviderRegistry, QueryCtx, Suggestion, SuggestionGroup};
 
+/// 外部 hook(git / docker / kubectl …)的 TTL 缓存:`(上次结果, 取到的时刻)`。
+/// 抽别名是为读得懂 + 消 clippy::type_complexity —— 同一类型在 10 个 provider
+/// 的 `cache` 字段及 `cached_values` / `spawn_external_refresh` 签名里复用。
+pub(crate) type ExternalCache = Arc<Mutex<Option<(Vec<String>, Instant)>>>;
+
 const EXTERNAL_TIMEOUT: Duration = Duration::from_millis(500);
 const EXTERNAL_OUTPUT_CAP: usize = 2 * 1024 * 1024;
 const EXTERNAL_KILL_REAP_WAIT: Duration = Duration::from_millis(50);
@@ -136,7 +141,7 @@ pub(crate) fn ctx_tokens(ctx: &QueryCtx) -> Vec<String> {
 }
 
 pub(crate) fn cached_values(
-    cache: &Arc<Mutex<Option<(Vec<String>, Instant)>>>,
+    cache: &ExternalCache,
     ttl: Duration,
     now: Instant,
 ) -> Result<Option<Vec<String>>, ProviderErr> {
@@ -164,7 +169,7 @@ pub(crate) fn matching_cache_values(values: Vec<String>, signature: &str) -> Opt
 
 pub(crate) fn spawn_external_refresh<F>(
     thread_name: &str,
-    cache: Arc<Mutex<Option<(Vec<String>, Instant)>>>,
+    cache: ExternalCache,
     working_dir: PathBuf,
     program: &str,
     args: Vec<String>,

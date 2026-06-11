@@ -9,7 +9,7 @@ use super::{
 };
 
 pub struct KillProvider {
-    cache: Arc<Mutex<Option<(Vec<String>, Instant)>>>,
+    cache: super::ExternalCache,
     ttl: Duration,
 }
 
@@ -35,10 +35,7 @@ impl Provider for KillProvider {
         ctx: QueryCtx,
         _gen_id: GenerationId,
     ) -> Result<Vec<Suggestion>, ProviderErr> {
-        if !ctx_tokens(&ctx)
-            .first()
-            .is_some_and(|token| token == "kill")
-        {
+        if ctx_tokens(&ctx).first().is_none_or(|token| token != "kill") {
             return Ok(Vec::new());
         }
 

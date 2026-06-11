@@ -56,6 +56,12 @@ pub enum ComposerOutcome {
     WritePty(Vec<u8>),
 }
 
+impl Default for ComposerState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ComposerState {
     pub fn new() -> Self {
         let (result_tx, result_rx) = mpsc::channel();

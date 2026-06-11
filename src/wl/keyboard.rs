@@ -637,10 +637,6 @@ fn composer_key_action(
     None
 }
 
-fn is_function_keysym(keysym: xkb::Keysym) -> bool {
-    matches!(keysym.raw(), 0xffbe..=0xffc9)
-}
-
 /// T-0602: PageUp (keysym 0xff55) / PageDown (0xff56) → 滚 scrollback.
 ///
 /// **量级**:

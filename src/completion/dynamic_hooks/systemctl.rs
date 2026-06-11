@@ -9,7 +9,7 @@ use super::{
 };
 
 pub struct SystemctlProvider {
-    cache: Arc<Mutex<Option<(Vec<String>, Instant)>>>,
+    cache: super::ExternalCache,
     ttl: Duration,
 }
 

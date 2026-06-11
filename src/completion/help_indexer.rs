@@ -473,7 +473,7 @@ pub(crate) fn run_help_command(
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| HelpRunError::Io(io::Error::new(io::ErrorKind::Other, "missing stdout")))?;
+        .ok_or_else(|| HelpRunError::Io(io::Error::other("missing stdout")))?;
 
     let (output_tx, output_rx) = mpsc::channel();
     let (done_tx, done_rx) = mpsc::channel();

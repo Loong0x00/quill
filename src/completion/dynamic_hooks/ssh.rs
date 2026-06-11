@@ -12,7 +12,7 @@ const CACHE_TTL: Duration = Duration::from_secs(60);
 
 pub struct SshProvider {
     config_path: PathBuf,
-    cache: Arc<Mutex<Option<(Vec<String>, Instant)>>>,
+    cache: super::ExternalCache,
 }
 
 impl SshProvider {

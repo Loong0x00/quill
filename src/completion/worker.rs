@@ -4,11 +4,15 @@ use std::thread;
 
 use crate::completion::{GenerationId, Provider, ProviderResult, QueryCtx};
 
+/// 按 generation 分桶的 provider 表(in-flight 查询用)。抽别名是为读得懂 +
+/// 消 clippy::type_complexity —— 同一类型在 WorkerPool 字段与两处函数签名复用。
+type ProviderMap = Arc<Mutex<HashMap<GenerationId, Vec<Arc<dyn Provider>>>>>;
+
 pub struct WorkerPool {
     sender: mpsc::Sender<WorkItem>,
     pub(crate) inflight: Arc<Mutex<HashMap<GenerationId, ()>>>,
     counts: Arc<Mutex<HashMap<GenerationId, usize>>>,
-    providers: Arc<Mutex<HashMap<GenerationId, Vec<Arc<dyn Provider>>>>>,
+    providers: ProviderMap,
 }
 
 pub struct WorkItem {
@@ -101,7 +105,7 @@ fn run_item(
     item: WorkItem,
     inflight: &Arc<Mutex<HashMap<GenerationId, ()>>>,
     counts: &Arc<Mutex<HashMap<GenerationId, usize>>>,
-    providers: &Arc<Mutex<HashMap<GenerationId, Vec<Arc<dyn Provider>>>>>,
+    providers: &ProviderMap,
 ) {
     if !is_active(item.gen_id, inflight) {
         finish_generation(item.gen_id, inflight, counts, providers);
@@ -143,7 +147,7 @@ fn finish_generation(
     gen_id: GenerationId,
     inflight: &Arc<Mutex<HashMap<GenerationId, ()>>>,
     counts: &Arc<Mutex<HashMap<GenerationId, usize>>>,
-    providers: &Arc<Mutex<HashMap<GenerationId, Vec<Arc<dyn Provider>>>>>,
+    providers: &ProviderMap,
 ) {
     let remove_generation = match counts.lock() {
         Ok(mut counts) => match counts.get_mut(&gen_id) {

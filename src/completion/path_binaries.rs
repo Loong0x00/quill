@@ -18,6 +18,12 @@ struct CachedBinaries {
     refreshed_at: Instant,
 }
 
+impl Default for PathBinariesProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PathBinariesProvider {
     pub fn new() -> Self {
         Self {

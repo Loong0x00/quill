@@ -1221,8 +1221,7 @@ fn completion_layout(
         .max()
         .unwrap_or(0);
     let wanted_cols = (max_display + COMPLETION_GAP_COLS + max_desc + COMPLETION_PAD_COLS * 2)
-        .max(COMPLETION_MIN_COLS)
-        .min(COMPLETION_MAX_COLS);
+        .clamp(COMPLETION_MIN_COLS, COMPLETION_MAX_COLS);
     let popup_cols = wanted_cols.min(cols.max(1));
     let popup_w = popup_cols as f32 * cell_w_px;
     let popup_h = visible_rows as f32 * cell_h_px;
@@ -5573,7 +5572,7 @@ thread_local! {
         const { std::cell::Cell::new(super::pointer::HoverRegion::None) };
 
     pub(crate) static HEADLESS_COMPLETION_OVERLAY:
-        std::cell::RefCell<Option<CompletionOverlay>> = std::cell::RefCell::new(None);
+        std::cell::RefCell<Option<CompletionOverlay>> = const { std::cell::RefCell::new(None) };
 }
 
 /// **T-0615: headless 测试调用前 set 当前 hover, render_headless append 走此值**.
