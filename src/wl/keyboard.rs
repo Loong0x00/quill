@@ -870,7 +870,9 @@ mod tests {
         let action = press_with_composer(&mut state, &composer, 30);
         assert_eq!(
             action,
-            KeyboardAction::StartRepeat { bytes: b"a".to_vec() }
+            KeyboardAction::StartRepeat {
+                bytes: b"a".to_vec()
+            }
         );
     }
 

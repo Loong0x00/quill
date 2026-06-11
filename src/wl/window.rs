@@ -1277,10 +1277,7 @@ fn repeat_timer_tick(data: &mut LoopData) -> TimeoutAction {
     // composer 拦截: 长按 popup-aware 键 (Tab/方向键/Esc) 让 repeat tick 也走
     // composer.handle_input 而不是直接灌 PTY (否则 zsh 会收到 Tab 触发自己补全).
     if let Some(input) = composer_input_from_keyboard_bytes(&bytes) {
-        let dual_write = matches!(
-            input,
-            ComposerInput::Backspace | ComposerInput::Delete
-        );
+        let dual_write = matches!(input, ComposerInput::Backspace | ComposerInput::Delete);
         let result = dispatch_composer_input(&mut data.state, input);
         if result.is_handled() {
             // Backspace/Delete 双写: composer 删 buffer + PTY 写 \x7f 让 zsh 也删.
@@ -4738,10 +4735,8 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                 if let Some(input) = composer_input_from_keyboard_bytes(&bytes) {
                     // Backspace / Delete 双写: zsh 删字符 + composer.buffer 同步删,
                     // 否则 zsh 不删用户看不到反馈.
-                    let dual_write = matches!(
-                        input,
-                        ComposerInput::Backspace | ComposerInput::Delete
-                    );
+                    let dual_write =
+                        matches!(input, ComposerInput::Backspace | ComposerInput::Delete);
                     // popup-aware key (Tab/方向键/BackTab) 长按需 cycle, 必须
                     // schedule repeat=Start 让 calloop timer 持续 fire,
                     // repeat_timer_tick 内的 composer 拦截才有机会跑.
@@ -5819,11 +5814,7 @@ mod tests {
             "修复后: preedit 激活时 release 必须放行 (旧 bug 在此吞掉 → runaway)"
         );
         let action = handle_key_event(release, &mut kb, ROWS);
-        assert_eq!(
-            action,
-            KeyboardAction::StopRepeat,
-            "release 应 StopRepeat"
-        );
+        assert_eq!(action, KeyboardAction::StopRepeat, "release 应 StopRepeat");
 
         // 4. 断言: 键已释放, repeat timer 下次 fire 会读到 None → Drop. 不 runaway.
         assert!(

@@ -1,4 +1,6 @@
-use crate::completion::{GenerationId, Provider, ProviderErr, QueryCtx, Suggestion, SuggestionGroup};
+use crate::completion::{
+    GenerationId, Provider, ProviderErr, QueryCtx, Suggestion, SuggestionGroup,
+};
 use std::collections::BTreeSet;
 use std::env;
 use std::sync::{Arc, Mutex};

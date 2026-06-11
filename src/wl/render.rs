@@ -4027,7 +4027,6 @@ impl Renderer {
             }
         }
     }
-
 }
 
 /// T-0505: 在 cell_vertex_bytes 上追加 preedit 下划线矩形 (cell pass REPLACE

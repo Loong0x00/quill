@@ -446,9 +446,7 @@ impl ComposerState {
         // 跳过 transparent 前缀, 真 command 是后面的第一个 word
         let prefix_skip = words
             .iter()
-            .take_while(|(_, token)| {
-                COMMAND_PREFIX_TRANSPARENTS.contains(&token.text.as_str())
-            })
+            .take_while(|(_, token)| COMMAND_PREFIX_TRANSPARENTS.contains(&token.text.as_str()))
             .count();
         let effective_words = &words[prefix_skip..];
         let command = effective_words
