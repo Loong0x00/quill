@@ -27,6 +27,7 @@
 
 use std::io::{self, Read};
 use std::os::fd::RawFd;
+use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
@@ -61,6 +62,18 @@ impl PtyHandle {
     /// 的构造入口。`cols`/`rows` 在 Phase 2 由 T-0202 硬编码 80x24,Phase 3 T-0306
     /// 接窗口 resize 后才会真动态传入。
     pub fn spawn_shell(cols: u16, rows: u16) -> Result<Self> {
+        Self::spawn_shell_in(cols, rows, None)
+    }
+
+    /// 同 [`spawn_shell`],但允许指定子 shell 的初始工作目录。
+    ///
+    /// why:portable-pty 的 `CommandBuilder` 在未显式 `cwd` 时默认把子进程起在
+    /// `$HOME`(cmdbuilder `as_command` 的 `.unwrap_or(home)`),所以光让 quill
+    /// 进程自己 `chdir` 没用 —— 子 shell 仍回 `$HOME`。GNOME Files 右键"在此打开
+    /// quill"经 `--working-directory=<dir>`(main.rs)→ `run_window` → 初始 tab
+    /// 走这条路,把目标目录显式传到 `cmd.cwd`。`cwd == None` 时行为与
+    /// [`spawn_shell`] 完全一致(退回 `$HOME`)。
+    pub fn spawn_shell_in(cols: u16, rows: u16, cwd: Option<&Path>) -> Result<Self> {
         // T-0618 follow-up: 读 $SHELL 用户实际默认 shell (zsh / fish / etc),
         // 不再硬编码 bash. user .zshrc / .config/fish/config.fish 里加的 PATH
         // (例 npm prefix / asdf / nvm) 才能加载, 否则 `claude` 等命令找不到.
@@ -71,7 +84,7 @@ impl PtyHandle {
             .unwrap_or_else(|| "/bin/bash".to_string());
         // -l = login shell (加载 .zprofile / .bash_profile), -i = interactive
         // (加载 .zshrc / .bashrc + 启 readline). 两个 flag 主流 shell 都认.
-        Self::spawn_program(&shell, &["-li"], cols, rows)
+        Self::spawn_program_in(&shell, &["-li"], cols, rows, cwd)
     }
 
     /// 起任意程序(给 T-0206 集成测试用,将来也可能服务 Phase 6 的 shell 配置)。
@@ -80,6 +93,22 @@ impl PtyHandle {
     /// 暴露通用 spawn 让测试能直接跑 `echo hello` 这类一次性命令。`spawn_shell`
     /// 内部就是调本函数。
     pub fn spawn_program(program: &str, args: &[&str], cols: u16, rows: u16) -> Result<Self> {
+        Self::spawn_program_in(program, args, cols, rows, None)
+    }
+
+    /// 同 [`spawn_program`],但允许指定子进程初始工作目录(`cwd`)。
+    ///
+    /// why:见 [`spawn_shell_in`] —— portable-pty 不设 `cwd` 时默认 `$HOME`,
+    /// 故"在此打开"必须显式 `cmd.cwd(dir)`。`cwd == None` 退回默认行为。传入的
+    /// 目录不在此校验是否存在:portable-pty `CommandBuilder::as_command` 会
+    /// `.filter(Path::is_dir)`,非目录自动 fallback 回 `$HOME`,再校验一层只是重复。
+    pub fn spawn_program_in(
+        program: &str,
+        args: &[&str],
+        cols: u16,
+        rows: u16,
+        cwd: Option<&Path>,
+    ) -> Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -92,6 +121,9 @@ impl PtyHandle {
 
         let mut cmd = CommandBuilder::new(program);
         cmd.args(args);
+        if let Some(dir) = cwd {
+            cmd.cwd(dir);
+        }
         // `CommandBuilder::new` 默认带一套 base_env(PATH / USER 等),`TERM` 不在
         // 其中。若父进程 `TERM` 已设,继承之;否则用 `xterm-256color` —— 几乎所有
         // 现代 ncurses / readline 程序都认这个值,比空字符串安全得多。

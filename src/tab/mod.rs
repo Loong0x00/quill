@@ -138,7 +138,14 @@ impl TabInstance {
     /// `cols` / `rows` 是初始 grid 尺寸 (与 PTY winsize 同步).
     /// `title` 默认走 "shell" (派单 In #H 实装偏离: OSC 0/2 自动更新延后到后续 ticket).
     pub fn spawn(cols: u16, rows: u16) -> Result<Self> {
-        let pty = PtyHandle::spawn_shell(cols, rows)
+        Self::spawn_in(cols, rows, None)
+    }
+
+    /// 同 [`spawn`],但让子 shell 起在指定初始目录 `cwd`(`None` = `$HOME`,
+    /// 与 [`spawn`] 等价)。启动期第一个 tab 经 `run_window(initial_cwd)` 走这条
+    /// 路实现 GNOME Files 右键"在此打开 quill";后开的新 tab 仍走 [`spawn`]。
+    pub fn spawn_in(cols: u16, rows: u16, cwd: Option<&std::path::Path>) -> Result<Self> {
+        let pty = PtyHandle::spawn_shell_in(cols, rows, cwd)
             .context("PtyHandle::spawn_shell 失败 (新 tab 不可建)")?;
         let term = TermState::new(cols, rows);
         // T-0617: title 与 TermListener 共享同一份 Rc<RefCell<String>>. OSC 0/1/2

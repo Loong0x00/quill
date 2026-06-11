@@ -30,7 +30,11 @@ fn main() -> Result<()> {
 
     tracing::info!("quill booting");
     start_completion_bootstrap();
-    quill::wl::run_window()?;
+    let working_dir = parse_working_directory_arg(&args);
+    if let Some(dir) = working_dir.as_ref() {
+        tracing::info!(dir = %dir.display(), "初始工作目录由 --working-directory= 指定");
+    }
+    quill::wl::run_window(working_dir)?;
     tracing::info!("quill exited cleanly");
     Ok(())
 }
@@ -74,6 +78,30 @@ fn parse_headless_screenshot_arg(args: &[String]) -> Result<Option<PathBuf>> {
         }
     }
     Ok(None)
+}
+
+/// 扫 argv 找 `--working-directory=<DIR>`(单一 `=` 形式,与
+/// `--headless-screenshot=` 同款手写解析,不引 clap)。
+///
+/// why:GNOME Files 右键空白处"在此打开 quill" 把当前文件夹路径作
+/// `--working-directory=<dir>` 传入,初始 tab 的子 shell 即在该目录起 prompt。
+/// portable-pty 默认把子 shell 起在 `$HOME`(见 `pty::PtyHandle::spawn_shell_in`),
+/// 不给此参数就维持历史行为。
+///
+/// 与 headless 不同,**非致命**:格式不对 / 路径空 → 返 `None` 当作没传(终端照常
+/// 在 `$HOME` 起),不 `Err` 中断启动 —— 桌面菜单误传不该让终端开不出来。目录是否
+/// 存在不在此校验:portable-pty `CommandBuilder` 对非目录自动 fallback 回 `$HOME`。
+fn parse_working_directory_arg(args: &[String]) -> Option<PathBuf> {
+    const PREFIX: &str = "--working-directory=";
+    for arg in args.iter().skip(1) {
+        if let Some(rest) = arg.strip_prefix(PREFIX) {
+            if rest.is_empty() {
+                return None;
+            }
+            return Some(PathBuf::from(rest));
+        }
+    }
+    None
 }
 
 /// **T-0408 主路径**: 不开 Wayland 窗口, 跑 PtyHandle::spawn_shell + 等 prompt

@@ -2516,7 +2516,7 @@ fn drive_wayland(data: &mut LoopData) -> std::io::Result<PostAction> {
 /// 退出后按 INV-001 声明顺序(renderer → window → conn)正向 drop,保证 wgpu
 /// surface 先放掉 wl_surface 裸指针再关连接,不给 compositor 留 "client didn't
 /// release surface" 告警。
-pub fn run_window() -> Result<()> {
+pub fn run_window(initial_cwd: Option<std::path::PathBuf>) -> Result<()> {
     let conn = Connection::connect_to_env()
         .context("连接 Wayland compositor 失败(是否在 Wayland session 下?)")?;
     let (globals, event_queue) =
@@ -2786,7 +2786,11 @@ pub fn run_window() -> Result<()> {
     // T-0608/T-0202/T-0108: spawn 第一个 tab 的子 shell + 把 master fd 注册进
     // calloop(INV-005)。初始尺寸 80x24 写死;Wayland configure 后 propagate_resize
     // 链路同步真实 cols/rows.
-    let initial_tab = TabInstance::spawn(80, 24).context("初始 tab spawn 失败")?;
+    // initial_cwd: GNOME Files 右键"在此打开 quill"经 `--working-directory=` 传入
+    // 的目标文件夹(无则 None → 退回 $HOME)。只作用于启动这第一个 tab;后续
+    // Ctrl+Shift+T 新建的 tab 仍走默认 TabInstance::spawn。
+    let initial_tab =
+        TabInstance::spawn_in(80, 24, initial_cwd.as_deref()).context("初始 tab spawn 失败")?;
     let pty_fd = initial_tab.pty().raw_fd();
     let initial_tab_id = initial_tab.id();
     state.tabs = Some(TabList::new(initial_tab));
@@ -5241,12 +5245,14 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
 mod tests {
     use super::*;
 
-    /// Smoke test:窗口模块只对外导出 [`run_window`],签名固定为 `fn() -> Result<()>`。
-    /// 这里通过函数指针绑定把 contract 固化在编译期,防止后续重构误改签名(比如加参数或
-    /// 返回 ())。实际 Wayland 连接的 runtime 行为依赖 compositor,留给集成测试与 soak。
+    /// Smoke test:窗口模块只对外导出 [`run_window`],签名固定为
+    /// `fn(Option<PathBuf>) -> Result<()>`(`Option<PathBuf>` = 启动期初始工作目录,
+    /// 给 `--working-directory=` / 右键"在此打开"用)。这里通过函数指针绑定把
+    /// contract 固化在编译期,防止后续重构误改签名。实际 Wayland 连接的 runtime
+    /// 行为依赖 compositor,留给集成测试与 soak。
     #[test]
     fn smoke_run_window_signature_is_stable() {
-        let f: fn() -> Result<()> = run_window;
+        let f: fn(Option<std::path::PathBuf>) -> Result<()> = run_window;
         // 仅保留引用,避免 dead_code;不调用 f(会阻塞事件循环)。
         let _ = &f;
     }
