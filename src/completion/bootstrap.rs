@@ -23,7 +23,7 @@ const DEFAULT_NEGATIVE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Clone, Debug)]
 #[rustfmt::skip]
-pub struct BootstrapConfig { pub max_concurrent: usize, pub start_delay: Duration, pub binary_timeout: Duration, pub allow_paths: Vec<PathBuf>, pub deny_list: Vec<String> }
+pub struct BootstrapConfig { pub max_concurrent: usize, pub start_delay: Duration, pub binary_timeout: Duration, pub allow_paths: Vec<PathBuf>, pub deny_list: Vec<String>, pub sandbox: bool }
 
 pub struct Bootstrapper {
     config: BootstrapConfig,
@@ -238,6 +238,7 @@ impl Default for BootstrapConfig {
             binary_timeout: DEFAULT_BINARY_TIMEOUT,
             allow_paths: default_path_entries(),
             deny_list: Vec::new(),
+            sandbox: true,
         }
     }
 }
@@ -311,6 +312,7 @@ fn index_one(ctx: &WorkerCtx, binary: Binary) {
     let help_config = HelpIndexerConfig {
         timeout: ctx.config.binary_timeout,
         allow_paths: ctx.config.allow_paths.clone(),
+        sandbox: ctx.config.sandbox,
         ..HelpIndexerConfig::default()
     };
     let suggestions = match run_help_command(&binary.path, &help_config) {
@@ -458,6 +460,7 @@ mod tests {
             binary_timeout: Duration::from_secs(2),
             allow_paths: paths,
             deny_list: Vec::new(),
+            sandbox: false,
         }
     }
     fn bootstrap(paths: Vec<PathBuf>) -> Bootstrapper {

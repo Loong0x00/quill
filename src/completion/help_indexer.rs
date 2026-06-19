@@ -44,6 +44,10 @@ pub struct HelpIndexerConfig {
     pub output_cap: usize,
     pub negative_ttl: Duration,
     pub allow_paths: Vec<PathBuf>,
+    /// 是否在 bwrap 沙箱里跑 `--help` 探测。默认 true (secure-by-default):
+    /// 探测任意外部程序都可能触发副作用 (脚本把 `--help` 当位置参数继续执行,
+    /// 见 gpu-psu-hold.sh 事故), 沙箱把副作用挡在宿主之外。仅测试可设 false。
+    pub sandbox: bool,
 }
 
 impl HelpIndexerProvider {
@@ -200,6 +204,7 @@ impl Default for HelpIndexerConfig {
             output_cap: DEFAULT_OUTPUT_CAP,
             negative_ttl: DEFAULT_NEGATIVE_TTL,
             allow_paths: default_allow_paths(),
+            sandbox: true,
         }
     }
 }
@@ -447,9 +452,8 @@ pub(crate) fn run_help_command(
     binary_path: &Path,
     config: &HelpIndexerConfig,
 ) -> Result<String, HelpRunError> {
-    let mut command = Command::new(binary_path);
+    let mut command = build_probe_command(binary_path, config.sandbox)?;
     command
-        .arg("--help")
         .env_clear()
         .current_dir("/tmp")
         .stdin(Stdio::null())
@@ -657,6 +661,131 @@ fn default_allow_paths() -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
+/// bwrap 沙箱参数: 只读整个根 + 隔离 /dev、/proc、/run、/tmp + unshare 所有
+/// namespace。被探测程序即便把 `--help` 当破坏性参数, 也无法写宿主文件、连
+/// systemd/dbus、碰 GPU 设备或杀宿主进程 (本机已实测逐条验证)。
+const SANDBOX_ARGS: &[&str] = &[
+    "--ro-bind",
+    "/",
+    "/",
+    "--dev",
+    "/dev",
+    "--proc",
+    "/proc",
+    "--tmpfs",
+    "/run",
+    "--tmpfs",
+    "/tmp",
+    "--unshare-all",
+    "--die-with-parent",
+    "--new-session",
+    "--chdir",
+    "/tmp",
+];
+
+/// 构造 `--help` 探测命令。探测任何外部程序都可能触发副作用, 故优先丢进 bwrap
+/// 沙箱里跑 (中和一切副作用又不损失补全能力); 沙箱不可用时退化为"拒绝探测解释
+/// 型脚本 / 可被组或他人写的程序", 堵住已知危险类 (脚本把 `--help` 当参数)。
+fn build_probe_command(binary_path: &Path, sandbox: bool) -> Result<Command, HelpRunError> {
+    let metadata = fs::metadata(binary_path).map_err(HelpRunError::Io)?;
+    // setuid/setgid 程序永不探测: 沙箱内不提权, 沙箱外更不能碰。
+    if is_setuid_or_setgid(&metadata) {
+        return Err(probe_refused("setuid/setgid binary"));
+    }
+
+    if sandbox {
+        if let Some(sandbox_bin) = sandbox_bin() {
+            let mut command = Command::new(sandbox_bin);
+            command
+                .args(SANDBOX_ARGS)
+                .arg("--")
+                .arg(binary_path)
+                .arg("--help");
+            return Ok(command);
+        }
+        // 要求沙箱但 bwrap 不可用/内核禁 userns: 拒绝高危类, 绝不裸跑。
+        if is_group_or_other_writable(&metadata) {
+            return Err(probe_refused(
+                "group/other-writable executable without sandbox",
+            ));
+        }
+        if is_shebang_script(binary_path) {
+            return Err(probe_refused("interpreted script without sandbox"));
+        }
+    }
+
+    let mut command = Command::new(binary_path);
+    command.arg("--help");
+    Ok(command)
+}
+
+fn probe_refused(reason: &str) -> HelpRunError {
+    HelpRunError::Io(io::Error::other(format!("help probe refused: {reason}")))
+}
+
+/// bwrap 候选绝对路径。故意**不走 $PATH** —— 否则用户可写的 PATH 目录
+/// (~/.local/bin 等, 还排在 PATH 前面) 里放个假 bwrap 就能让探测"自以为在沙箱里"
+/// 却裸跑, 反而绕过沙箱 + 脚本拦截。这几个都是 root 控制的系统目录。
+const BWRAP_CANDIDATES: &[&str] = &["/usr/bin/bwrap", "/usr/local/bin/bwrap", "/bin/bwrap"];
+
+/// 解析 bwrap 并一次性缓存。不仅查存在, 还功能性探测能否真正建起 user namespace
+/// 沙箱 (某些内核禁 unprivileged userns); 探测失败即当作不可用, 走退化路径而不是
+/// 误以为有沙箱保护却裸跑。
+fn sandbox_bin() -> Option<&'static Path> {
+    static SANDBOX: OnceLock<Option<PathBuf>> = OnceLock::new();
+    SANDBOX
+        .get_or_init(|| {
+            let bin = BWRAP_CANDIDATES
+                .iter()
+                .map(PathBuf::from)
+                .find(|candidate| candidate.is_file())?;
+            let works = Command::new(&bin)
+                .args(SANDBOX_ARGS)
+                .arg("--")
+                .arg("/bin/sh")
+                .arg("-c")
+                .arg("exit 0")
+                .env_clear()
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false);
+            works.then_some(bin)
+        })
+        .as_deref()
+}
+
+/// 读不到文件头 (权限/截断) 时返回 true → 退化路径据此拒绝探测 (fail-closed)。
+fn is_shebang_script(path: &Path) -> bool {
+    let mut buf = [0u8; 2];
+    match fs::File::open(path).and_then(|mut file| file.read_exact(&mut buf)) {
+        Ok(()) => &buf == b"#!",
+        Err(_) => true,
+    }
+}
+
+#[cfg(unix)]
+fn is_setuid_or_setgid(metadata: &fs::Metadata) -> bool {
+    metadata.permissions().mode() & 0o6000 != 0
+}
+
+#[cfg(not(unix))]
+fn is_setuid_or_setgid(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn is_group_or_other_writable(metadata: &fs::Metadata) -> bool {
+    metadata.permissions().mode() & 0o022 != 0
+}
+
+#[cfg(not(unix))]
+fn is_group_or_other_writable(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -790,6 +919,7 @@ Commands:
         let provider = Arc::new(provider_with_config(HelpIndexerConfig {
             timeout: Duration::from_secs(2),
             allow_paths: vec![dir.clone()],
+            sandbox: false,
             ..HelpIndexerConfig::default()
         }));
         let first_provider = Arc::clone(&provider);
@@ -828,6 +958,7 @@ Commands:
         let provider = provider_with_config(HelpIndexerConfig {
             negative_ttl: Duration::from_secs(24 * 60 * 60),
             allow_paths: vec![dir.clone()],
+            sandbox: false,
             ..HelpIndexerConfig::default()
         });
         let canonical = fs::canonicalize(&binary).unwrap();
@@ -856,6 +987,7 @@ Commands:
         let provider = provider_with_config(HelpIndexerConfig {
             output_cap: first_line.len(),
             allow_paths: vec![dir.clone()],
+            sandbox: false,
             ..HelpIndexerConfig::default()
         });
 
@@ -884,6 +1016,7 @@ Commands:
         let provider = provider_with_config(HelpIndexerConfig {
             timeout: Duration::from_millis(100),
             allow_paths: vec![dir.clone()],
+            sandbox: false,
             ..HelpIndexerConfig::default()
         });
 
@@ -940,5 +1073,63 @@ Commands:
     #[cfg(not(unix))]
     fn process_exists(_pid: i32) -> bool {
         false
+    }
+
+    // 一个把 `--help` 当无关参数、无条件制造副作用 (写宿主文件) 的恶意脚本。
+    // 这正是 gpu-psu-hold.sh 事故那一类: 探测 `--help` 触发真实破坏。
+    #[test]
+    fn test_sandbox_neutralizes_side_effect() {
+        // 无 bwrap / 内核禁 userns 时跳过 (本机应可用)。
+        if sandbox_bin().is_none() {
+            return;
+        }
+        let dir = temp_dir("sandbox-sideeffect");
+        fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("SIDE_EFFECT_HAPPENED");
+        let script = write_executable(
+            &dir,
+            "landmine",
+            &format!(
+                "#!/bin/sh\ntouch '{}'\nprintf '  --flag  desc\\n'\n",
+                marker.display()
+            ),
+        );
+        let config = HelpIndexerConfig {
+            allow_paths: vec![dir.clone()],
+            sandbox: true,
+            ..HelpIndexerConfig::default()
+        };
+
+        // 探测仍拿得到 `--help` 输出 (沙箱内 printf 照常)...
+        let output = run_help_command(&script, &config);
+        assert!(
+            output.is_ok(),
+            "sandboxed probe should still capture --help output"
+        );
+        // ...但写文件副作用被挡在宿主之外。
+        assert!(
+            !marker.exists(),
+            "sandbox must block the script's host-side side effect"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // 退化路径 (无沙箱) 的核心判定: 解释型脚本必须被识别并拒绝探测。
+    #[test]
+    fn test_shebang_detection_gates_scripts() {
+        let dir = temp_dir("shebang");
+        let script = write_executable(&dir, "scripty", "#!/bin/sh\nprintf 'hi\\n'\n");
+        let elf_like = write_executable(&dir, "binny", "\x7fELF stand-in, not a script\n");
+
+        assert!(is_shebang_script(&script));
+        assert!(!is_shebang_script(&elf_like));
+
+        // 0o755 脚本不是 setuid 也非组/他人可写; setuid 位检测独立成立。
+        let meta = fs::metadata(&script).unwrap();
+        assert!(!is_setuid_or_setgid(&meta));
+        assert!(!is_group_or_other_writable(&meta));
+
+        let _ = fs::remove_dir_all(dir);
     }
 }
