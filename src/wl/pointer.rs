@@ -606,6 +606,13 @@ impl PointerState {
         self.hover
     }
 
+    /// 最近一次指针 logical px 位置 ([`apply_motion`] / [`apply_enter`] 写入).
+    /// 鼠标上报路径用: 滚轮发生时调用方据此 + [`crate::wl::selection::pixel_to_cell`]
+    /// 算出事件 cell. `None` = 指针尚未进入 surface (启动期 / leave 后).
+    pub(crate) fn pos(&self) -> Option<(f64, f64)> {
+        self.pos
+    }
+
     /// T-0703-fix: 取出并清空待下发的 cursor 形状变更请求. `Dispatch<wl_pointer>`
     /// 在处理主 [`PointerAction`] 后调一次, 拿到 `Some((serial, shape))` 时走
     /// `apply_cursor_shape` (src/wl/window.rs 段) — 按 [`xcursor_names_for`]

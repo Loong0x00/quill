@@ -2740,6 +2740,8 @@ pub fn run_window(initial_cwd: Option<std::path::PathBuf>) -> Result<()> {
         is_fullscreen: false,
         presentation_dirty: false,
         pending_scroll_lines: 0,
+        pending_wheel: Vec::new(),
+        pending_page_keys: 0,
         text_input_manager,
         text_input: None,
         ime_state: ImeState::new(),
@@ -2977,64 +2979,154 @@ pub fn run_window(initial_cwd: Option<std::path::PathBuf>) -> Result<()> {
             let Some(tab_list) = state.tabs.as_mut() else {
                 return; // tabs 未初始化 (启动期 race) — 跳过本帧
             };
-            // T-0602: 消费 Dispatch<WlPointer> / Dispatch<WlKeyboard> 累积的
-            // scrollback line 数. State 拿不到 term (在 LoopData 兄弟字段), 所以
-            // 滚动决定推到 idle 回放. scroll_display 内部已置 dirty, 不再单独
-            // 触发 — 后续 is_dirty 检查自然命中 redraw 路径.
-            //
-            // alt screen + alternate_scroll → 滚轮转 cursor 键转发 PTY (xterm /
-            // alacritty / foot 标准: 让 claudecode / vim / less / tmux 自处理
-            // transcript 滚动). 否则正常 scroll_display 看 scrollback.
-            //
-            // 协议: n > 0 = wheel up = 看老内容 = cursor up; n < 0 = wheel
-            // down = cursor down. cursor 键序列按 DECCKM (app_cursor_keys)
-            // 选 SS3 (`\x1bOA/B`) 还是 CSI (`\x1b[A/B`).
-            if state.pending_scroll_lines != 0 {
-                let n = state.pending_scroll_lines;
-                let active = tab_list.active_mut();
-                let term = active.term_mut();
-                let alt_mode = term.is_alt_screen() && term.alternate_scroll_active();
-                let app = term.app_cursor_keys();
-                let arrow_bytes: Option<Vec<u8>> = if alt_mode {
-                    let key: &[u8] = if n > 0 {
-                        if app {
-                            b"\x1bOA"
+            // 滚轮鼠标上报: Dispatch<WlPointer> 把滚轮 + 指针位置 + Shift 态暂存
+            // pending_wheel (拿不到 term 无法当场判 mouse_reporting). 此处有 term,
+            // 逐条决定: mouse_reporting() 命中且未按 Shift → 编码 SGR/X10 鼠标上报
+            // 写 PTY (claudecode / vim / tmux 自滚 transcript); 否则折回
+            // pending_scroll_lines 走下方本地 scrollback / alternate-scroll 逻辑.
+            // **Shift override**: 按住 Shift 滚轮强制本地 scrollback (xterm 标准),
+            // 给用户在 TUI 抓鼠标时仍能翻 quill 自身历史的逃生口.
+            if !state.pending_wheel.is_empty() {
+                let ticks = std::mem::take(&mut state.pending_wheel);
+                let mut fold: i32 = 0;
+                {
+                    let active = tab_list.active_mut();
+                    let (cols, rows) = active.term().dimensions();
+                    // 滚轮非上报回退: alt-screen + alternate_scroll → 转 cursor 键
+                    // (xterm/alacritty/foot 标准, 给 less/vim 等不开 mouse 的 TUI).
+                    let alt_scroll =
+                        active.term().is_alt_screen() && active.term().alternate_scroll_active();
+                    let app_cursor = active.term().app_cursor_keys();
+                    let cell_w = crate::wl::render::CELL_W_PX as f64;
+                    let cell_h = crate::wl::render::CELL_H_PX as f64;
+                    let top_reserved = (crate::wl::render::TITLEBAR_H_LOGICAL_PX
+                        + tab_bar_h_logical_for(tab_count))
+                        as f64;
+                    let mut report: Vec<u8> = Vec::new();
+                    for tick in ticks {
+                        // Shift = 强制本地 override → 不取 cell (跳过上报). 否则把
+                        // 事件 logical px 映射到当前视口 cell (display_offset=0:
+                        // 上报永远指视口屏幕坐标, 与 alt-screen TUI 一致).
+                        let cell = if tick.shift {
+                            None
                         } else {
-                            b"\x1b[A"
+                            crate::wl::selection::pixel_to_cell(
+                                tick.x,
+                                tick.y,
+                                cols,
+                                rows,
+                                cell_w,
+                                cell_h,
+                                top_reserved,
+                                0,
+                            )
+                        };
+                        let mut reported = false;
+                        if let Some(cell) = cell {
+                            let up = tick.lines > 0;
+                            let row0 = cell.line.max(0) as usize;
+                            // 每行发一个上报: claudecode 等 TUI 每个滚轮上报只滚
+                            // 1 行, 故 1 notch (= WHEEL_LINES_PER_NOTCH 行) 要发同样
+                            // 多个上报才滚够 3 行, 跟普通终端 scrollback 手感一致.
+                            let count = (tick.lines.unsigned_abs() as usize).max(1);
+                            for _ in 0..count {
+                                if let Some(bytes) =
+                                    active.term().encode_mouse_wheel(up, cell.col, row0)
+                                {
+                                    report.extend_from_slice(&bytes);
+                                    reported = true;
+                                }
+                            }
                         }
-                    } else if app {
-                        b"\x1bOB"
-                    } else {
-                        b"\x1b[B"
-                    };
-                    let count = n.unsigned_abs() as usize;
-                    let mut buf = Vec::with_capacity(count * key.len());
-                    for _ in 0..count {
-                        buf.extend_from_slice(key);
+                        // 非鼠标上报模式下的 alternate_scroll 回退: 滚轮转 cursor 键.
+                        // 仅滚轮走此分支 (键盘 PgUp/PgDn 不会到这, 永不转方向键);
+                        // Shift 滚轮强制本地, 不转发.
+                        if !reported && !tick.shift && alt_scroll {
+                            let key: &[u8] = if tick.lines > 0 {
+                                if app_cursor {
+                                    b"\x1bOA"
+                                } else {
+                                    b"\x1b[A"
+                                }
+                            } else if app_cursor {
+                                b"\x1bOB"
+                            } else {
+                                b"\x1b[B"
+                            };
+                            for _ in 0..tick.lines.unsigned_abs() as usize {
+                                report.extend_from_slice(key);
+                            }
+                            reported = true;
+                        }
+                        if !reported {
+                            // 未开上报 / 按 Shift / 指针在 titlebar 区 → 走本地 scrollback.
+                            fold = fold.saturating_add(tick.lines);
+                        }
                     }
-                    Some(buf)
-                } else {
-                    term.scroll_display(n);
-                    None
-                };
-                if let Some(buf) = arrow_bytes {
-                    let pty = active.pty_mut();
-                    let _ = pty.write(&buf);
+                    if !report.is_empty() {
+                        let _ = active.pty_mut().write(&report);
+                        tracing::trace!(
+                            target: "quill::scroll",
+                            bytes = report.len(),
+                            "wheel → mouse report → PTY"
+                        );
+                    }
+                }
+                // active 借用已结束, 折回的行数现在能安全写 disjoint 字段
+                // (与上方既有 pending_scroll_lines 读写同 NLL 分字段借用套路).
+                if fold != 0 {
+                    state.pending_scroll_lines = state.pending_scroll_lines.saturating_add(fold);
+                }
+            }
+            // 键盘 plain PgUp/PgDn (pending_page_keys): 全屏 (alt-screen) → 转发
+            // \x1b[5~ / \x1b[6~ 给程序自滚 transcript (claudecode "use PgUp/PgDn
+            // to scroll" 即此); 非全屏 → quill 自身 scrollback 半页. **alternate_scroll
+            // 转 cursor 键只对滚轮**, 键盘永不转 — 否则 claudecode 把方向键当输入
+            // 历史 (T-08xx 用户实测 bug).
+            if state.pending_page_keys != 0 {
+                let n = state.pending_page_keys;
+                let active = tab_list.active_mut();
+                if active.term().is_alt_screen() {
+                    // PgUp/PgDn escape 与 DECCKM 无关, 永远 CSI 5~/6~.
+                    let seq: &[u8] = if n > 0 { b"\x1b[5~" } else { b"\x1b[6~" };
+                    let presses = n.unsigned_abs() as usize;
+                    let mut buf = Vec::with_capacity(presses * seq.len());
+                    for _ in 0..presses {
+                        buf.extend_from_slice(seq);
+                    }
+                    let _ = active.pty_mut().write(&buf);
                     tracing::trace!(
                         target: "quill::scroll",
-                        delta = n,
-                        app_cursor = app,
+                        presses = n,
                         bytes = buf.len(),
-                        "alt screen scroll → cursor keys → PTY"
+                        "plain PgUp/PgDn → CSI 5~/6~ → PTY (alt screen)"
                     );
                 } else {
+                    // 非全屏: 每次按键半页 quill 自身 scrollback.
+                    let (_cols, rows) = active.term().dimensions();
+                    let half = (rows as i32 / 2).max(1);
+                    let lines = n.saturating_mul(half);
+                    active.term_mut().scroll_display(lines);
                     tracing::trace!(
                         target: "quill::scroll",
-                        delta = n,
-                        new_offset = active.term().display_offset(),
-                        "scrollback applied"
+                        presses = n,
+                        lines,
+                        "plain PgUp/PgDn → quill scrollback (non-alt)"
                     );
                 }
+                state.pending_page_keys = 0;
+            }
+            // 本地 scrollback 行 (pending_scroll_lines): 现只承 Shift+PgUp/PgDn 强制
+            // 本地 + 滚轮非全屏回退. 纯 scroll_display — 滚轮的 alternate_scroll 转
+            // cursor 键已上移到 pending_wheel 块, 此处不再转方向键.
+            if state.pending_scroll_lines != 0 {
+                let n = state.pending_scroll_lines;
+                tab_list.active_mut().term_mut().scroll_display(n);
+                tracing::trace!(
+                    target: "quill::scroll",
+                    delta = n,
+                    "scrollback applied"
+                );
                 state.pending_scroll_lines = 0;
             }
             // 重新拿 active tab 引用 — alt-screen path 上方已 release.
@@ -3270,6 +3362,18 @@ pub fn run_window(initial_cwd: Option<std::path::PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// 一次滚轮事件的待上报快照 (见 [`State::pending_wheel`]). `Dispatch<WlPointer>`
+/// 拿不到 term, 无法当场判 `mouse_reporting()`, 故连同指针 logical px (`x`/`y`)
+/// 与 Shift 态暂存, 由 idle callback (有 term) 再决定走鼠标上报还是本地 scrollback.
+/// `lines` = 滚动行数 (notch × `WHEEL_LINES_PER_NOTCH`, 正 = 向上看老内容).
+#[derive(Debug, Clone, Copy)]
+struct WheelTick {
+    lines: i32,
+    x: f64,
+    y: f64,
+    shift: bool,
+}
+
 struct State {
     registry_state: RegistryState,
     output_state: OutputState,
@@ -3354,6 +3458,24 @@ struct State {
     /// PgUp 合并为一次 scroll_display, 避免 alacritty 内部多次 mark_fully_damaged.
     /// 单帧 (16 ms) 内多次累积是常态 (滚轮 + 触摸板 axis 一次 frame 可发多 event).
     pending_scroll_lines: i32,
+    /// 待上报的滚轮事件 (鼠标上报模式). Dispatch<WlPointer> 拿不到 term, 无法
+    /// 当场判 `mouse_reporting()`, 故与 [`pending_scroll_lines`] 同套路暂存
+    /// ([`WheelTick`]: 指针 px + 行数 + Shift), 由 idle callback 查 term 模式后
+    /// 决定: 命中上报 → 编码写 PTY; 否则折回 `pending_scroll_lines` 走本地
+    /// scrollback. **why 独立于 `pending_scroll_lines`**: 键盘 PgUp/PgDn 永远走
+    /// 本地 scrollback (不该被编码成鼠标上报), 必须与滚轮分流暂存.
+    ///
+    /// [`pending_scroll_lines`]: Self::pending_scroll_lines
+    pending_wheel: Vec<WheelTick>,
+    /// 待处理的不带 Shift 的 PgUp/PgDn 净次数 (+1=PageUp 看老 / -1=PageDown).
+    /// Dispatch<WlKeyboard> 拿不到 term 判不了 alt-screen, 故暂存, 由 idle
+    /// callback 决定: 全屏 (alt-screen) → 转发 `\x1b[5~`/`\x1b[6~` 给程序自滚;
+    /// 非全屏 → quill 自身 scrollback 半页. 与 [`pending_wheel`] 同 defer 套路.
+    /// **why 独立于 `pending_scroll_lines`**: 后者只承本地 scrollback (Shift+PgUp /
+    /// 滚轮非全屏回退), 不该被转发; 本字段才走 alt-screen 转发分支.
+    ///
+    /// [`pending_wheel`]: Self::pending_wheel
+    pending_page_keys: i32,
     // T-0505: zwp_text_input_v3 (TIv3) IME 协议绑定 (fcitx5 / ibus 中文输入).
     text_input_manager: Option<ZwpTextInputManagerV3>,
     text_input: Option<ZwpTextInputV3>,
@@ -4717,13 +4839,28 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
             }
             KeyboardAction::Scroll(delta) => {
                 // T-0602: 累积到 State.pending_scroll_lines, 由 idle callback 消费.
-                // saturating_add 防极端连按 PgUp 溢出 i32 (实际不可能, 但廉价防御).
+                // 现仅 Shift+PgUp/PgDn 走这里 (强制本地 scrollback). saturating_add
+                // 防极端连按溢出 i32 (实际不可能, 但廉价防御).
                 state.pending_scroll_lines = state.pending_scroll_lines.saturating_add(delta);
                 tracing::trace!(
                     target: "quill::keyboard",
                     delta,
                     pending = state.pending_scroll_lines,
-                    "PageUp/PageDown queued for scrollback"
+                    "Shift+PageUp/PageDown queued for scrollback"
+                );
+            }
+            KeyboardAction::PageKey { up } => {
+                // 不带 Shift 的 PgUp/PgDn: 暂存净次数, idle callback 据 alt-screen
+                // 决定转发 \x1b[5~/\x1b[6~ 给程序还是走本地 scrollback.
+                state.pending_page_keys =
+                    state
+                        .pending_page_keys
+                        .saturating_add(if up { 1 } else { -1 });
+                tracing::trace!(
+                    target: "quill::keyboard",
+                    up,
+                    pending = state.pending_page_keys,
+                    "plain PageUp/PageDown queued (forward-or-scrollback at idle)"
                 );
             }
             KeyboardAction::WriteToPty(bytes) => {
@@ -5085,16 +5222,28 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 state.window.resize(seat, serial, wl_edge);
             }
             PointerAction::Scroll(delta) => {
-                // T-0602: 滚轮 / 触摸板累积到 State.pending_scroll_lines, 由
-                // idle callback 一次性应用到 term.scroll_display. 与 keyboard
-                // PgUp/Dn 同 sink — 同帧多 source 滚动合并避免 alacritty 内部
-                // mark_fully_damaged 多次开销.
-                state.pending_scroll_lines = state.pending_scroll_lines.saturating_add(delta);
+                // 滚轮事件先连同指针位置 + Shift 态快照入 pending_wheel, 由 idle
+                // callback (有 term) 查 mouse_reporting() 决定走鼠标上报 (转 PTY)
+                // 还是本地 scrollback. 键盘 PgUp/PgDn 走 KeyboardAction::Scroll 仍
+                // 直接进 pending_scroll_lines, 不受影响 —— 两条滚动源在此分流
+                // (鼠标可被 TUI 抓取上报, 键盘永远走本地 scrollback).
+                if let Some((x, y)) = state.pointer_state.pos() {
+                    state.pending_wheel.push(WheelTick {
+                        lines: delta,
+                        x,
+                        y,
+                        shift: state.keyboard_state.shift_active(),
+                    });
+                } else {
+                    // 指针位置未知 (滚轮事件理论上必在 enter 之后, 防御性回退):
+                    // 当本地 scrollback 处理, 不丢滚动.
+                    state.pending_scroll_lines = state.pending_scroll_lines.saturating_add(delta);
+                }
                 tracing::trace!(
                     target: "quill::pointer",
                     delta,
-                    pending = state.pending_scroll_lines,
-                    "axis scroll queued"
+                    queued_wheel = state.pending_wheel.len(),
+                    "wheel queued (mouse-report vs scrollback decided at idle)"
                 );
             }
             PointerAction::ButtonClick(button) => match button {

@@ -874,6 +874,43 @@ impl TermState {
         self.term.mode().contains(TermMode::APP_CURSOR)
     }
 
+    /// 鼠标上报模式 (DECSET 1000 `MOUSE_REPORT_CLICK` / 1002 `MOUSE_DRAG` /
+    /// 1003 `MOUSE_MOTION` 任一) 是否开启. claudecode / vim / tmux 等全屏 TUI
+    /// 想自己处理鼠标 (滚轮翻 transcript、点选菜单) 时发这些 DECSET —— 此时
+    /// quill 不该吞滚轮做本地 scrollback, 应把鼠标事件编码成上报序列转发 PTY.
+    ///
+    /// **与 [`alternate_scroll_active`] 的关系**: TUI 开 SGR mouse 时通常**关**
+    /// `ALTERNATE_SCROLL` 自己处理滚轮 (见该方法 doc), 所以滚轮转发要**先**查
+    /// 本方法, 命中走鼠标上报, 否则才退回 alternate-scroll cursor 键 / scrollback.
+    ///
+    /// **why `intersects` 而非 `contains`**: `MOUSE_MODE` 是三 bit 的并集, 任一
+    /// 置位即上报开启; `contains` 要求**全**置 (永远 false), 必须用 `intersects`.
+    ///
+    /// [`alternate_scroll_active`]: Self::alternate_scroll_active
+    pub fn mouse_reporting(&self) -> bool {
+        self.term.mode().intersects(TermMode::MOUSE_MODE)
+    }
+
+    /// 把一次滚轮 notch 编码成鼠标上报字节, 调用方写回 PTY 让全屏 TUI 自己滚.
+    /// `None` = 当前未开鼠标上报 ([`mouse_reporting`] 为 false), 调用方应退回
+    /// 本地 scrollback / alternate-scroll.
+    ///
+    /// - `up`: true = 向上滚 (看更老内容) = button 64; false = 向下 = button 65.
+    /// - `col0` / `row0`: **0-based** 视口 cell 坐标 (上报里转 1-based).
+    /// - 编码: `SGR_MOUSE` (DECSET 1006) 开 → `ESC[<cb;col;row M`; 否则 X10 →
+    ///   `ESC[M (32+cb)(32+col)(32+row)` 三字节 (单字节坐标上限 223 cell, 超出
+    ///   clamp —— xterm 同款, 需大网格的 TUI 会自启 SGR).
+    ///
+    /// [`mouse_reporting`]: Self::mouse_reporting
+    pub fn encode_mouse_wheel(&self, up: bool, col0: usize, row0: usize) -> Option<Vec<u8>> {
+        if !self.mouse_reporting() {
+            return None;
+        }
+        let cb: u8 = if up { 64 } else { 65 };
+        let sgr = self.term.mode().contains(TermMode::SGR_MOUSE);
+        Some(encode_mouse_report(cb, col0, row0, sgr))
+    }
+
     /// 光标形状,见 [`CursorShape`]。**与 [`cursor_visible`] 正交,两个都得查**:
     /// 渲染层伪代码 `if t.cursor_visible() { draw_cursor(t.cursor_shape()) }`。
     ///
@@ -1134,6 +1171,32 @@ impl TermState {
     }
 }
 
+/// X10 / SGR 鼠标上报编码 (滚轮路径, 永远 press —— 滚轮无 release 事件).
+/// `cb` 已含按钮码 (滚轮上 = 64 / 下 = 65). 坐标 **0-based 入, 1-based 出**
+/// (xterm 协议 cell 从 1 计).
+///
+/// **why 与 alacritty 类型解耦的自由函数**: 不依赖 `Term`, 纯字节编码可独立
+/// 单测 (见 `tests::encode_mouse_report_*`); [`TermState::encode_mouse_wheel`]
+/// 读 mode flag 后调本函数. 沿袭模块"alacritty 类型锁在 wrapper 内"的 SOP.
+fn encode_mouse_report(cb: u8, col0: usize, row0: usize, sgr: bool) -> Vec<u8> {
+    if sgr {
+        // SGR (DECSET 1006): 文本十进制, 无 223 cell 上限; 滚轮永远 press → 'M'.
+        format!("\x1b[<{};{};{}M", cb, col0 + 1, row0 + 1).into_bytes()
+    } else {
+        // X10: 每字段 +32 偏移成单字节. 坐标先转 1-based 再 +32; >255 clamp
+        // (单字节天花板, xterm 同款 —— 需大网格的 TUI 会自启 SGR 绕开).
+        let enc = |v: usize| -> u8 { (v + 1 + 32).min(255) as u8 };
+        vec![
+            0x1b,
+            b'[',
+            b'M',
+            cb.saturating_add(32),
+            enc(col0),
+            enc(row0),
+        ]
+    }
+}
+
 /// [`TermState::cells_iter`] 的 iterator。把 alacritty 的
 /// `GridIterator<Cell>` 的 `Indexed<&Cell>` 重映射成我们自己的 [`CellRef`]
 /// —— 隔离上游类型,T-0305 / T-0303 只对本模块 API 编码,不直接抓
@@ -1376,6 +1439,67 @@ mod tests {
 
         t.advance(b"\x1b[?25h"); // 开
         assert!(t.cursor_visible(), "DECSET 25 后光标应重现");
+    }
+
+    /// SGR (DECSET 1006) 鼠标上报字节编码. 滚轮上 cb=64 / 下 cb=65, 坐标
+    /// 0-based 入转 1-based 出, 终止符永远 'M' (滚轮无 release).
+    #[test]
+    fn encode_mouse_report_sgr_wheel() {
+        assert_eq!(
+            encode_mouse_report(64, 0, 0, true),
+            b"\x1b[<64;1;1M".to_vec()
+        );
+        assert_eq!(
+            encode_mouse_report(65, 5, 9, true),
+            b"\x1b[<65;6;10M".to_vec()
+        );
+    }
+
+    /// X10 鼠标上报字节编码. `ESC[M` + (32+cb)(32+1+col0)(32+1+row0); 坐标
+    /// 超单字节天花板时 clamp 到 255.
+    #[test]
+    fn encode_mouse_report_x10_wheel() {
+        // 滚轮上 @ (0,0): 32+64=96, 32+1=33, 32+1=33.
+        assert_eq!(
+            encode_mouse_report(64, 0, 0, false),
+            vec![0x1b, b'[', b'M', 96, 33, 33]
+        );
+        // 滚轮下 @ 大坐标: col0=250 → 250+1+32=283 → clamp 255; row 不变.
+        assert_eq!(
+            encode_mouse_report(65, 250, 0, false),
+            vec![0x1b, b'[', b'M', 97, 255, 33]
+        );
+    }
+
+    /// `mouse_reporting` / `encode_mouse_wheel` 跟随 DECSET 1000 (上报开关) 与
+    /// 1006 (SGR 编码切换). 未开上报时 `encode_mouse_wheel` 返 None 让调用方回退
+    /// 本地 scrollback.
+    #[test]
+    fn mouse_reporting_reacts_to_decset_1000_and_sgr_1006() {
+        let mut t = TermState::new(80, 24);
+        assert!(!t.mouse_reporting(), "初始无鼠标上报");
+        assert!(
+            t.encode_mouse_wheel(true, 0, 0).is_none(),
+            "未开上报应返 None"
+        );
+
+        t.advance(b"\x1b[?1000h"); // DECSET 1000: 基本点击上报
+        assert!(t.mouse_reporting(), "DECSET 1000 后上报开");
+        // 默认无 SGR → X10 编码.
+        assert_eq!(
+            t.encode_mouse_wheel(true, 0, 0),
+            Some(vec![0x1b, b'[', b'M', 96, 33, 33])
+        );
+
+        t.advance(b"\x1b[?1006h"); // DECSET 1006: 切 SGR
+        assert_eq!(
+            t.encode_mouse_wheel(false, 2, 3),
+            Some(b"\x1b[<65;3;4M".to_vec())
+        );
+
+        t.advance(b"\x1b[?1000l"); // DECRST 1000: 关上报
+        assert!(!t.mouse_reporting(), "DECRST 1000 后上报关");
+        assert!(t.encode_mouse_wheel(true, 0, 0).is_none());
     }
 
     /// dimensions 应原样返回 ctor 参数(cols, rows)。
