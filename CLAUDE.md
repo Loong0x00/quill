@@ -60,9 +60,16 @@ tty 时代单 stream 限制的产物, Wayland 窗口能开无数, 在 GUI 终端
 - ✅ **dirty 收口** `6db5945`:`TermState` 为 dirty 唯一真相源。
 - ✅ **T2** `14e2a33`:`src/kernel/daemon.rs` + bin `quill-kernel`(daemon)+ bin `quill-dump`(客户端)+ `tests/kernel_daemon_slice.rs`。**单线程 calloop** daemon:spawn 一 shell tab,PTY fd + UnixListener 同一 calloop,客户端连上发当前 Snapshot JSON。spine 通:**driven tab → Snapshot → unix socket → client**。故意单线程绕开 Rc 非 Send。
 - ✅ **T3a** `7e84b18`(+ ADR `ef28ff2`):带线程 WS 传输 —— `tungstenite 0.29`(同步,无 tokio/TLS)WS 线程 bind `0.0.0.0:7878`;calloop 线程 `serde_json::to_vec` 序列化 Snapshot → `mpsc::Sender<Vec<u8>>` → WS 线程 → 浏览器(`assets/web/index.html`)。**只有 owned `Vec<u8>` 过线程边界**(Lead 读码核实,Rc 非 Send 守住);手机经 VPN→路由器→`10.0.0.2:7878` 可达,VPN 把门。详见 ADR-0016。
-  - ⚠️ 遗留(非阻断,留硬化 ticket):① WS 每连接无上限起线程 + panic 隔离靠默认 unwind;② daemon 只 serve WS、**不 serve `index.html`**(现需另开页指向 `ws://host:7878`)→ 建议后续让 daemon 也 HTTP serve 那页,做到一个 URL。
+  - ⚠️ 遗留(非阻断):① WS 每连接无上限起线程;② daemon 只 serve WS、不 serve `index.html`(其中"同口 HTTP serve 页面"那点可摘出来留用)。
+- ⏸️ **T3b**(搁置,分支 `feat/kernel-ws-live` 不合并):做了"网格直播 + 同口 HTTP",对抗审查逮到背压 **drop-newest 阻断 bug**(慢客户端卡陈帧);修复时 agent 遇 API 529 中断成半截。**更关键:架构 R1 修订后"每帧广播网格"整体作废**(改传字节流本地渲染),故 T3b 搁置。
 
-**下一步**:T3b 直播(dirty 增量广播 —— 让手机看到**实时**输出而非一帧;每发完调 `Session::clear_dirty`)→ T3c 输入回灌(`Session::on_input` + `calloop::channel` 反向唤醒)→ 手机端(reflow + 软键栏,流式内容客户端按手机宽重折)→ 持久化(`~/.local/state/quill/workspace.json` 仅存意图,PTY 不跨重启)→ 多客户端尺寸策略(主控端定尺寸,余者缩放)。
+**⭐ 模型修订 R1(2026-06-29,与用户对齐;完整见 ADR-0015「修订 R1」)—— 取代下面旧链与部分 Decision:**
+- **真终端 ≠ ssh**:会话是常驻一等实体、设备是窗口;但也 ≠ tty(不是关机才死)。
+- **载荷传字节流、客户端本地渲染(不传网格)**:daemon = PTY 多路复用;客户端各自完整模拟器(Linux 原生 quill / 浏览器 xterm.js),**本地按自己宽度 reflow**。网格 `Snapshot` 降级为**连上时的关键帧**,不再逐帧广播网格。理由:网格/原始字节都按某宽折死,多端不同宽各自 reflow 须传"没焊死宽度的原料"(逻辑行)。
+- **生命周期 = 连接显示端引用计数,无租约**:holder = 连着的显示端;**桌面 quill = 稳定锚**(用户只 X 不 `exit`);**X = 释放该 holder,断线(后台/锁屏/网络)= 非事件,holder 归 0 才销毁**。手机 = 镜子、不拥有任何东西 → **无需租约/grace/TTL**;连上默认**同步桌面全部工作区**;仅当桌面没开 quill 才自动补窗当锚。**不落盘持久化**(取代旧 `workspace.json`,主机重启全死=合理)。
+- **客户端矩阵**:Linux 原生 quill;手机/Mac/其它 = web(xterm.js,通用)。**不为跨平台移植原生 quill**(Mac 本地用 ghostty,要连家里走 web)。"任意位置"+ 安全 = WireGuard VPN 把门(以后可加 token 当登录)。
+
+**重排下一步(取代旧链;ticket 表见 ADR R1)**:**T3c'** daemon 转发 PTY 字节流 + 客户端本地模拟器渲染(连上=关键帧+之后流)→ **T4** web 端 xterm.js 本地渲染 + reflow + 同口 serve 页 → **T5** 输入回灌(键盘→daemon→PTY,`calloop::channel`)→ **T6** 引用计数生命周期 + 桌面自动补窗 + 同步全部工作区 → **T7** web"X 关闭"语义/重连/PWA 壳(+ 可选登录 token)。
 
 **协作环(本阶段在用)**:每砖一个 worktree(`git worktree add ../quill-impl-<x> -b feat/<x>`)→ 写码 **Opus xhigh**(改 render 必自己读 `wl/render.rs`,别信摘要)→ 自跑 `scripts/ci.sh` 调全绿 → **多视角对抗审 Opus xhigh** → Lead(user + 主 session)裁决合并(纯加法的 cohesive 单模块 commit 可超 300 行软线)。⚠️ workflow 每个 agent 显式写 `model:'opus' effort:'xhigh'`,别靠默认(`agentType` 自带便宜模型如 Explore=Haiku)。
 
