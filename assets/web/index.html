@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<!--
+  quill 无头内核 WS 镜像 —— 极简浏览器客户端 (Phase 7 T3a, ADR-0016)。
+
+  验 spine:浏览器 → ws:// → quill-kernel 收一帧 Snapshot → 显示 row_texts。
+  刻意最小:不做 reflow / 不画 cell fg/bg / 不画光标 / 不持续直播(那些是
+  T3b / 手机端 ticket)。只证「被驱动的 tab → Snapshot → WS → 浏览器」通了。
+
+  线缆体 = 裸 Snapshot JSON(与 quill-dump / unix 路径一致):
+    { tab_id, cols, rows, cells[], row_texts[], cursor{}, title }
+  本切片只用 row_texts(每元素一整行 shaping 文本)。
+
+  用法:
+    1) 主机起 daemon:quill-kernel --ws-bind=0.0.0.0:7878
+    2) 浏览器开本文件(file:// 或 python -m http.server)
+    3) 地址栏填 ws://<主机 LAN/VPN IP>:7878/(手机经 VPN→10.0.0.2:7878)→ Connect
+-->
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>quill mirror</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; background: #111; color: #ddd;
+    font-family: system-ui, sans-serif;
+  }
+  header {
+    display: flex; gap: .5rem; align-items: center; flex-wrap: wrap;
+    padding: .5rem .75rem; background: #1b1b1b; border-bottom: 1px solid #333;
+    position: sticky; top: 0;
+  }
+  header input {
+    flex: 1 1 16rem; min-width: 12rem;
+    background: #000; color: #ddd; border: 1px solid #444;
+    border-radius: 4px; padding: .35rem .5rem; font: inherit;
+  }
+  header button {
+    background: #2a4; color: #000; border: 0; border-radius: 4px;
+    padding: .4rem .8rem; font: inherit; font-weight: 600; cursor: pointer;
+  }
+  #status { font-size: .85rem; opacity: .8; }
+  #title { font-weight: 600; padding: .35rem .75rem; opacity: .9; }
+  /* 等宽 + 预格式化:row_texts 每行原样,列对齐(无 reflow,T3a 故意) */
+  #screen {
+    margin: 0; padding: .5rem .75rem; white-space: pre;
+    font-family: "DejaVu Sans Mono", "Noto Sans Mono CJK SC", monospace;
+    font-size: 14px; line-height: 1.25; overflow: auto;
+  }
+</style>
+</head>
+<body>
+  <header>
+    <input id="url" type="text" spellcheck="false" />
+    <button id="connect">Connect</button>
+    <span id="status">未连接</span>
+  </header>
+  <div id="title"></div>
+  <pre id="screen"></pre>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const urlInput = $("url"), statusEl = $("status"),
+      titleEl = $("title"), screenEl = $("screen");
+
+// 默认连同主机当前 host;file:// 打开时 location.hostname 为空,留给用户填。
+urlInput.value = location.hostname
+  ? `ws://${location.hostname}:7878/`
+  : "ws://10.0.0.2:7878/";
+
+let ws = null;
+
+function setStatus(text) { statusEl.textContent = text; }
+
+// 线缆体是裸 Snapshot;若 T3b 切到 ServerMsg 信封(externally tagged),
+// 这里改读 msg.Snapshot.row_texts 即可。
+function render(snap) {
+  if (!snap || !Array.isArray(snap.row_texts)) {
+    setStatus("收到非预期消息");
+    return;
+  }
+  titleEl.textContent = snap.title && snap.title.length ? snap.title : "quill";
+  screenEl.textContent = snap.row_texts.join("\n");
+  setStatus(`已收一帧:${snap.cols}x${snap.rows},tab ${snap.tab_id}`);
+}
+
+function connect() {
+  const url = urlInput.value.trim();
+  if (ws) { try { ws.close(); } catch (_) {} ws = null; }
+  setStatus(`连接 ${url} …`);
+  try {
+    ws = new WebSocket(url);
+  } catch (e) {
+    setStatus(`URL 非法:${e}`);
+    return;
+  }
+  ws.onopen = () => setStatus("已连接,等待快照…");
+  ws.onmessage = (ev) => {
+    try {
+      render(JSON.parse(ev.data));
+    } catch (e) {
+      setStatus(`解析失败:${e}`);
+    }
+  };
+  // T3a 是一次性下发,服务端发完即 close —— 这是预期,不是错误。
+  ws.onclose = () => setStatus(statusEl.textContent.startsWith("已收一帧")
+    ? statusEl.textContent + "(连接已关,T3a 单帧)"
+    : "连接已关");
+  ws.onerror = () => setStatus("连接错误(daemon 在跑?地址/端口对?VPN 通?)");
+}
+
+$("connect").addEventListener("click", connect);
+urlInput.addEventListener("keydown", (e) => { if (e.key === "Enter") connect(); });
+</script>
+</body>
+</html>

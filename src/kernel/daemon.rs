@@ -7,23 +7,35 @@
 //!   的 JSON 行 (line-delimited);
 //! - `SIGINT` / `SIGTERM` 信号源 (signalfd) → 停 loop → 退出时清理 socket 文件。
 //!
-//! **刻意的边界 (留 T3)**:无 tokio / tungstenite (零新依赖);单线程天然回避
-//! [`Session`] 的 `Rc<RefCell<String>>` 非 `Send` 约束 (ADR-0015 头号约束)。
-//! WS fan-out、dirty 帧增量广播、客户端 [`crate::kernel::proto::ClientMsg`] 回灌
-//! (输入 / resize / tab 操作)、多 tab 动态增删 fd 全是后续 ticket。本切片只证
-//! "被驱动的 tab → Snapshot → unix socket → 客户端" 这条 spine。
+//! **T3a 增量 (ADR-0016)**:加一个**同步 `tungstenite` WS 子系统**(独立
+//! `std::thread`),让浏览器 / 手机经 `ws://<lan>:<port>` 连上即收一帧
+//! [`crate::kernel::proto::Snapshot`]。calloop 线程算快照 → `serde_json::to_vec`
+//! → `std::sync::mpsc` → WS 线程广播 **owned 字节**(`Rc` 非 Send 的 [`Session`]
+//! 全程钉在 calloop 线程,只有 `Vec<u8>` 过线程边界 = ADR-0015 头号约束的结构性
+//! 遵守)。unix socket 路径不动(`quill-dump` 仍走裸 `Snapshot` JSON 行)。
+//!
+//! **仍留后续 ticket**:直播 / dirty 增量广播(T3b,当前只「连上发一次最新
+//! 快照」)、客户端 [`crate::kernel::proto::ClientMsg`] 回灌(T3c,输入 / resize /
+//! tab 操作,需 `calloop::channel` 反向唤醒)、多 tab 动态增删 fd。
 
 use std::cell::RefCell;
 use std::io::{self, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::fd::BorrowedFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use calloop::generic::Generic;
 use calloop::signals::{Signal, Signals};
 use calloop::{EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction};
+use tungstenite::Message;
 
 use crate::kernel::proto::Snapshot;
 use crate::kernel::session::Session;
@@ -41,19 +53,32 @@ pub const DEFAULT_SOCKET_NAME: &str = "quill-kernel.sock";
 /// PTY 单次 read 缓冲。与 `wl::window` 的 `PTY_READ_BUF` 同值。
 const PTY_READ_BUF: usize = 4096;
 
+/// WS 监听默认端口。
+pub const DEFAULT_WS_PORT: u16 = 7878;
+
+/// WS acceptor 轮询关停的 sleep 间隔(非阻塞 accept WouldBlock 时)。
+const WS_ACCEPT_POLL: Duration = Duration::from_millis(50);
+
+/// 单连接握手 + 首帧的读超时,防静默客户端把短命连接线程挂死。
+const WS_CONN_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// daemon 启动参数。
 pub struct DaemonConfig {
     /// `UnixListener` 绑定路径。
     pub socket_path: PathBuf,
+    /// WS (tungstenite) TCP 监听地址。默认 `0.0.0.0:7878` —— LAN 可达,手机经
+    /// WireGuard VPN → 路由器 → `10.0.0.2:port` 连上;安全靠 VPN 把门 (ADR-0016)。
+    pub ws_bind: SocketAddr,
     pub cols: u16,
     pub rows: u16,
 }
 
 impl DaemonConfig {
-    /// 用给定 socket 路径 + 默认尺寸建配置。
+    /// 用给定 socket 路径 + 默认尺寸 + 默认 WS bind 建配置。
     pub fn with_socket(socket_path: PathBuf) -> Self {
         Self {
             socket_path,
+            ws_bind: SocketAddr::from(([0, 0, 0, 0], DEFAULT_WS_PORT)),
             cols: DEFAULT_COLS,
             rows: DEFAULT_ROWS,
         }
@@ -74,6 +99,21 @@ pub fn parse_socket_arg(args: &[String]) -> Option<PathBuf> {
     args.iter()
         .skip(1)
         .find_map(|a| a.strip_prefix(PREFIX).map(PathBuf::from))
+}
+
+/// 从 argv 抠 `--ws-bind=<addr:port>`(如 `10.0.0.2:7878` / `[::]:7878`)。未给返
+/// `Ok(None)`(调用方用默认);给了但解析失败返 `Err`(早失败,别静默吞掉错配)。
+pub fn parse_ws_bind_arg(args: &[String]) -> Result<Option<SocketAddr>> {
+    const PREFIX: &str = "--ws-bind=";
+    match args.iter().skip(1).find_map(|a| a.strip_prefix(PREFIX)) {
+        Some(s) => {
+            let addr = s.parse::<SocketAddr>().with_context(|| {
+                format!("解析 --ws-bind={s} 失败 (需 addr:port,如 0.0.0.0:7878)")
+            })?;
+            Ok(Some(addr))
+        }
+        None => Ok(None),
+    }
 }
 
 /// daemon 主循环。spawn shell tab、绑 socket、注册三源、`run` 阻塞到收信号 /
@@ -107,6 +147,14 @@ pub fn run(config: DaemonConfig) -> Result<()> {
     let tab_id = tab.id().raw();
     let session = Session::new(TabList::new(tab));
 
+    // WS 子系统(ADR-0016):同样必须在 `Signals::new` 之后 spawn(继承已 block 的
+    // SIGINT/SIGTERM mask)。出站走 `std::sync::mpsc` 发 owned `Vec<u8>`,WS 线程
+    // 永远拿不到 `!Send` 的 `Session`。先 spawn(绑 TCP)再建 unix socket:WS bind
+    // 失败(端口占用等)时早退,此刻还没落 unix socket 文件,无残留可清。
+    let (snap_tx, snap_rx) = mpsc::channel::<Vec<u8>>();
+    let ws = WsServer::spawn(config.ws_bind, snap_rx)
+        .with_context(|| format!("启动 WS 服务 (bind {}) 失败", config.ws_bind))?;
+
     prepare_socket_path(&config.socket_path)?;
     let listener = UnixListener::bind(&config.socket_path)
         .with_context(|| format!("bind UnixListener {} 失败", config.socket_path.display()))?;
@@ -121,7 +169,12 @@ pub fn run(config: DaemonConfig) -> Result<()> {
         loop_handle: loop_handle.clone(),
         loop_signal,
         tab_id,
+        snap_tx,
     };
+
+    // 种入一帧初始快照:让在任何 PTY 输出前就连上的浏览器也能立刻拿到一帧
+    // (否则 WS 线程的「最新字节」为空,早连客户端收不到东西)。
+    broadcast_snapshot(&mut data, tab_id);
 
     // Source 2:PTY master fd。
     let pty_fd = data.session.tabs().active().pty().raw_fd();
@@ -166,7 +219,10 @@ pub fn run(config: DaemonConfig) -> Result<()> {
     // 显式 drop 序:event_loop(持各 Generic source)先于 data(持 PtyHandle 的 fd),
     // 让 PTY source 的 EPOLL_CTL_DEL 在 fd 仍打开时执行(见上 SAFETY)。
     drop(event_loop);
+    // 先 drop data(连带丢掉唯一的 `snap_tx`)→ WS updater 线程的 `recv()` 返 Err
+    // 而退出;再 `ws.shutdown()` 置关停标志 + join 两个 WS 线程,干净收尾。
     drop(data);
+    ws.shutdown();
 
     remove_socket_quiet(&config.socket_path);
 
@@ -182,6 +238,9 @@ struct DaemonData {
     loop_signal: LoopSignal,
     /// 本切片唯一 tab 的 raw id(协议层 `u64`,INV-010 不能从 `u64` 重建 TabId)。
     tab_id: u64,
+    /// 出站快照字节 → WS 线程(ADR-0016)。只过 owned `Vec<u8>`,绝不让 `!Send`
+    /// 的 `Session` 越线程边界。
+    snap_tx: Sender<Vec<u8>>,
 }
 
 /// 一个客户端连接待写出的快照字节 + 已写偏移(非阻塞 write 可能分多次)。
@@ -218,10 +277,13 @@ fn classify_pty_read(res: &io::Result<usize>) -> PtyRead {
 }
 
 /// PTY master fd readable:drain 到 WouldBlock,每 chunk 喂 [`Session::on_pty_output`]。
+/// 一次 readable 唤醒可排空多个 chunk,但只在 **drain 完(WouldBlock)** 后取一帧
+/// 快照下发(per-readiness 而非 per-chunk),否则一次大输出会发几十帧重复全量快照。
 /// 子 shell 退出(EOF/EIO)→ 收尸 + 停 loop(单 tab 切片:shell 死即 daemon 退)。
 fn pty_readable(data: &mut DaemonData) -> io::Result<PostAction> {
     let tab_id = data.tab_id;
     let mut buf = [0u8; PTY_READ_BUF];
+    let mut dirty = false;
     loop {
         let read = data
             .session
@@ -232,11 +294,16 @@ fn pty_readable(data: &mut DaemonData) -> io::Result<PostAction> {
         match classify_pty_read(&read) {
             PtyRead::Feed => {
                 if let Ok(n) = read {
-                    data.session.on_pty_output(tab_id, &buf[..n]);
+                    dirty |= data.session.on_pty_output(tab_id, &buf[..n]);
                 }
             }
             PtyRead::Retry => continue,
-            PtyRead::Drained => return Ok(PostAction::Continue),
+            PtyRead::Drained => {
+                if dirty {
+                    broadcast_snapshot(data, tab_id);
+                }
+                return Ok(PostAction::Continue);
+            }
             PtyRead::Closed => {
                 tracing::info!(tab_id, "PTY EOF/EIO:子 shell 退出,停止 daemon");
                 let _ = data.session.tabs_mut().active_mut().pty_mut().try_wait();
@@ -318,10 +385,181 @@ fn write_pending(
 }
 
 /// 一条线缆帧 = `Snapshot` 的 JSON + 换行(line-delimited;ADR-0015 先 JSON 后 bincode)。
+/// **仅 unix socket 路径用**(行分隔)。WS 路径走帧分隔,不加换行(见 [`broadcast_snapshot`])。
 fn snapshot_line(snap: &Snapshot) -> Result<Vec<u8>> {
     let mut bytes = serde_json::to_vec(snap).context("序列化 Snapshot 为 JSON 失败")?;
     bytes.push(b'\n');
     Ok(bytes)
+}
+
+/// 取 active tab 快照 → 序列化成裸 JSON(无换行,WS 帧已自分隔)→ 经 `snap_tx`
+/// 推给 WS 线程 → 清 dirty(与置脏对称,防每 tick 重发)。
+///
+/// **跨线程边界只过 `Vec<u8>`**(ADR-0015 头号约束):`Session` 含 `Rc`,`!Send`,
+/// 序列化在本(calloop)线程做完。`snap_tx.send` 失败仅发生在 WS 子系统已关停
+/// (daemon 即将退出)时,best-effort 忽略。线缆体保持**裸 `Snapshot`**(与
+/// `quill-dump` / unix 路径一致;`ServerMsg` 信封等 T3b 发 Workspace 帧时再切)。
+fn broadcast_snapshot(data: &mut DaemonData, tab_id: u64) {
+    let snap = data.session.snapshot_active();
+    match serde_json::to_vec(&snap) {
+        Ok(bytes) => {
+            let _ = data.snap_tx.send(bytes);
+            data.session.clear_dirty(tab_id);
+        }
+        Err(e) => tracing::warn!(tab_id, ?e, "广播快照:序列化失败,跳过本帧"),
+    }
+}
+
+/// 同步 WebSocket 服务(ADR-0016)。两条 `std::thread`:
+/// - **updater**:`recv()` calloop 线程发来的快照字节,存进 `latest`(共享「最新
+///   帧」)。`snap_tx` 全丢弃后 `recv()` 返 Err → 线程退出。
+/// - **acceptor**:非阻塞轮询 `TcpListener::accept()`,每个新连接起一个**短命**
+///   线程做 tungstenite 握手 + 发一帧 `latest` + 关闭(慢客户端不阻塞 accept)。
+///
+/// 本切片只「连上发一次最新快照」;直播(dirty 增量持续推)留 T3b。
+struct WsServer {
+    shutdown: Arc<AtomicBool>,
+    acceptor: Option<JoinHandle<()>>,
+    updater: Option<JoinHandle<()>>,
+}
+
+/// WS 线程共享的「最新一帧」字节(`None` = 还没有任何快照)。
+type LatestFrame = Arc<Mutex<Option<Vec<u8>>>>;
+
+impl WsServer {
+    /// 绑 TCP + spawn updater/acceptor 线程。**调用方须保证已在 `Signals::new` 之后**
+    /// 调用(线程继承已 block 的 SIGINT/SIGTERM mask;见 [`run`] 信号顺序注释)。
+    fn spawn(bind: SocketAddr, snap_rx: Receiver<Vec<u8>>) -> Result<Self> {
+        let listener =
+            TcpListener::bind(bind).with_context(|| format!("WS TcpListener::bind {bind} 失败"))?;
+        // 非阻塞 + 轮询关停:让 acceptor 能周期检查 shutdown 标志而非永久阻塞在
+        // accept() 上(否则退出时 join 不回来)。
+        listener
+            .set_nonblocking(true)
+            .context("WS TcpListener 设非阻塞失败")?;
+
+        let latest: LatestFrame = Arc::new(Mutex::new(None));
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let latest_u = Arc::clone(&latest);
+        let updater = thread::Builder::new()
+            .name("quill-ws-update".to_string())
+            .spawn(move || {
+                while let Ok(bytes) = snap_rx.recv() {
+                    set_latest(&latest_u, bytes);
+                }
+            })
+            .context("spawn WS updater 线程失败")?;
+
+        let latest_a = Arc::clone(&latest);
+        let shutdown_a = Arc::clone(&shutdown);
+        let acceptor = thread::Builder::new()
+            .name("quill-ws-accept".to_string())
+            .spawn(move || ws_accept_loop(listener, latest_a, shutdown_a))
+            .context("spawn WS acceptor 线程失败")?;
+
+        tracing::info!(%bind, "WS 服务就绪 (tungstenite, ws://)");
+        Ok(Self {
+            shutdown,
+            acceptor: Some(acceptor),
+            updater: Some(updater),
+        })
+    }
+
+    /// 置关停标志 + join 两个线程(干净收尾)。调用前应已 drop `snap_tx`,否则
+    /// updater 的 `recv()` 不会返回、join 会卡住。
+    fn shutdown(mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        if let Some(h) = self.acceptor.take() {
+            let _ = h.join();
+        }
+        if let Some(h) = self.updater.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for WsServer {
+    fn drop(&mut self) {
+        // 安全网:即便未显式 shutdown()(如启动错误路径提前 drop),也让 acceptor
+        // 轮询循环尽快退出。join 只在 shutdown() 里做,Drop 不阻塞。
+        self.shutdown.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Mutex 上锁不 panic:中毒(别的线程持锁时 panic)也恢复内部值继续用 —— 这里只
+/// 是覆盖「最新帧」,旧值无所谓一致性,恢复即可(CLAUDE.md 禁 unwrap/expect)。
+fn set_latest(latest: &LatestFrame, bytes: Vec<u8>) {
+    let mut guard = latest
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = Some(bytes);
+}
+
+/// 读「最新帧」的克隆(同上,锁中毒可恢复)。
+fn latest_clone(latest: &LatestFrame) -> Option<Vec<u8>> {
+    latest
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// acceptor 线程主体:非阻塞轮询 accept,每连接起短命线程发一帧。
+fn ws_accept_loop(listener: TcpListener, latest: LatestFrame, shutdown: Arc<AtomicBool>) {
+    while !shutdown.load(Ordering::SeqCst) {
+        match listener.accept() {
+            Ok((stream, peer)) => {
+                let latest = Arc::clone(&latest);
+                // 短命 per-conn 线程:握手 + 发一帧可能阻塞(弱网),不能卡住 accept。
+                // 一次性发完即退,无需 join(进程退出兜底)。
+                if let Err(e) = thread::Builder::new()
+                    .name("quill-ws-conn".to_string())
+                    .spawn(move || serve_ws_connection(stream, latest))
+                {
+                    tracing::warn!(?peer, ?e, "spawn WS 连接线程失败");
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // 无新连接:歇一会儿再轮询关停标志(轻量 busy-wait,50ms 足够)。
+                thread::sleep(WS_ACCEPT_POLL);
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                tracing::warn!(?e, "WS accept 失败");
+                thread::sleep(WS_ACCEPT_POLL);
+            }
+        }
+    }
+}
+
+/// 单连接:tungstenite 握手 → 发一帧最新快照(text)→ 关闭。
+fn serve_ws_connection(stream: TcpStream, latest: LatestFrame) {
+    // 限握手 + 写的阻塞时长,防静默/弱网客户端把本线程挂死。
+    let _ = stream.set_read_timeout(Some(WS_CONN_READ_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(WS_CONN_READ_TIMEOUT));
+    let mut ws = match tungstenite::accept(stream) {
+        Ok(ws) => ws,
+        Err(e) => {
+            tracing::debug!(?e, "WS 握手失败");
+            return;
+        }
+    };
+    match latest_clone(&latest) {
+        Some(bytes) => match String::from_utf8(bytes) {
+            // JSON 必是合法 UTF-8;from_utf8 仅防御性。
+            Ok(text) => {
+                if let Err(e) = ws.send(Message::text(text)) {
+                    tracing::debug!(?e, "WS 发送快照失败");
+                }
+                let _ = ws.flush();
+            }
+            Err(e) => tracing::warn!(?e, "WS 快照字节非 UTF-8,跳过"),
+        },
+        None => tracing::debug!("WS 连接时尚无快照可发"),
+    }
+    // 主动 close:enqueue close 帧 + flush 送出;随后连接 drop 关闭 TCP。
+    let _ = ws.close(None);
+    let _ = ws.flush();
 }
 
 /// 启动期处理 socket 路径:已有活跃 daemon 监听则拒绝覆盖,否则删掉残留 socket 文件。
@@ -411,5 +649,49 @@ mod tests {
             Some(PathBuf::from("/run/user/x.sock"))
         );
         assert_eq!(parse_socket_arg(&["quill-kernel".to_string()]), None);
+    }
+
+    #[test]
+    fn parse_ws_bind_arg_extracts_and_validates() {
+        // 给了合法 addr:port → Some。
+        let args = vec![
+            "quill-kernel".to_string(),
+            "--ws-bind=10.0.0.2:7878".to_string(),
+        ];
+        assert_eq!(
+            parse_ws_bind_arg(&args).expect("合法 ws-bind 解析"),
+            Some("10.0.0.2:7878".parse().expect("test addr"))
+        );
+        // IPv6 形式也支持。
+        let v6 = vec![
+            "quill-kernel".to_string(),
+            "--ws-bind=[::1]:9000".to_string(),
+        ];
+        assert_eq!(
+            parse_ws_bind_arg(&v6).expect("合法 v6 ws-bind"),
+            Some("[::1]:9000".parse().expect("test v6 addr"))
+        );
+        // 没给 → Ok(None)(用默认)。
+        assert_eq!(
+            parse_ws_bind_arg(&["quill-kernel".to_string()]).expect("缺省"),
+            None
+        );
+        // 给了但非法 → Err(早失败)。
+        let bad = vec![
+            "quill-kernel".to_string(),
+            "--ws-bind=not-an-addr".to_string(),
+        ];
+        assert!(parse_ws_bind_arg(&bad).is_err());
+    }
+
+    #[test]
+    fn default_ws_bind_is_lan_reachable() {
+        // 默认绑 0.0.0.0:DEFAULT_WS_PORT —— LAN 可达(非 loopback),手机经 VPN 可连。
+        let cfg = DaemonConfig::with_socket(PathBuf::from("/tmp/x.sock"));
+        assert_eq!(
+            cfg.ws_bind,
+            SocketAddr::from(([0, 0, 0, 0], DEFAULT_WS_PORT))
+        );
+        assert!(!cfg.ws_bind.ip().is_loopback(), "默认不应绑 loopback");
     }
 }
