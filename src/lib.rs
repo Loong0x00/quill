@@ -5,6 +5,7 @@ pub mod completion;
 pub mod composer;
 pub mod frame_stats;
 pub mod ime;
+pub mod kernel;
 pub mod pty;
 pub mod tab;
 pub mod term;
