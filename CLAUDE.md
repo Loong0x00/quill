@@ -41,6 +41,32 @@ tty 时代单 stream 限制的产物, Wayland 窗口能开无数, 在 GUI 终端
 
 ---
 
+## Phase 7(进行中,2026-06-29):无头内核 + 多端镜像
+
+**目标**:把 quill 拆成「无头会话内核(daemon)+ 渲染客户端」,使**同一工作区(多 PTY/tab)能镜像到手机**,在外面盯/控 Claude Code 会话;**手机端自适应渲染**(流式内容按手机宽 reflow)。
+
+**不是回归 tmux** —— 恰恰要消灭 tmux 的繁琐(prefix/attach 仪式/嵌套 alt-screen 发癫)。把"持久 + 共享"烤进 quill 本体,桌面/手机都是同一内核的渲染端,零仪式。动机:user 已有移动 IPv6 + WireGuard VPN(全局记忆 `project_home_wireguard_vpn_over_v6`),手机能直连家里这台。
+
+**已知架构事实(审计 2026-06-29,完整见 ADR-0015):**
+- 拆分难度【中】:`tab/term/pty/composer` 数据类型零 GUI 耦合(term 包 alacritty,本就无头);但无现成 `Session` 抽象,tabs 塞在 `wl::State`(240 字段),整合点是 calloop。
+- ⚠️ **`Rc<RefCell<String>>` 单线程设计**(`term/mod.rs:512/570`)→ `TermState`/`TabInstance` **非 `Send`**。不挡单线程 daemon,但**挡 WS fan-out**:快照必先 `.clone()` 成 owned 纯结构才能跨线程发。最硬约束。
+- `CellRef` 含借用/字体引用**不能直接 serde** → 需 `CellWire`(owned)。Phase 1 主要新代码量。
+- ✅ 便宜:`render_headless`(`wl/render.rs`)+ `run_headless_screenshot`(`main.rs`)已是纯数据无头渲染路径 → 快照协议 ≈ 照其入参抄。
+- 边界画在 `State.tabs`;selection 归客户端(现掺在 `pty_read_tick`)。
+- ⚠️ **render 侧耦合(`Renderer::draw_frame` wgpu)审计没逐行读** → 改 render 的 ticket,impl/审码 agent **必须自己读 `wl/render.rs` / `wl/window.rs` draw 路径**,别信摘要。
+
+## CI(本地,不走远端)
+
+```bash
+./scripts/ci.sh          # 全门:fmt + clippy + build + test(AI 合并前 / main 把门)
+./scripts/ci.sh --fast   # 快门:fmt + clippy + build(pre-push 用)
+git config core.hooksPath scripts/hooks   # 启用 pre-push 钩子(一次性)
+```
+
+**为什么本地不走 GitHub Actions**:quill 的渲染/Wayland e2e 测试要本机 GPU + Wayland 会话,GitHub runner 跑不了;本机更快更全。**AI 协作环**:写码 agent 写 → 自跑 `ci.sh` 调全绿 → 审码 agent 审 → 合并 main → main 上全门把门。
+
+---
+
 ## 技术栈(锁死,非 ADR 不改)
 
 | 层 | crate | 为啥 |
@@ -79,13 +105,16 @@ tty 时代单 stream 限制的产物, Wayland 窗口能开无数, 在 GUI 终端
 2. 渲染线程不做 >1ms 的任何计算,长任务分帧
 3. PTY 写入必须非阻塞,背压时丢帧而非 stall
 
-**模块切分**(暂定,Phase 0 完后细化):
-- `wl/` — Wayland client + 渲染 surface
-- `pty/` — 子进程 + fd 读写
-- `vt/` — 解析 + 屏幕状态(包 alacritty_terminal)
+**模块切分**(实测 2026-06-29):
+- `wl/` — Wayland client + wgpu 渲染 + 事件循环(calloop)+ 240-字段 `State` 巨对象
+- `pty/` — 子进程 + fd 读写(`PtyHandle`)
+- `term/` — VT 解析 + 屏幕/滚回状态(包 `alacritty_terminal`)
+- `tab/` — 多 PTY/标签工作区(`TabList`/`TabInstance`/`TabId`)
+- `composer/` — inline 补全引擎
+- `completion/` — 补全触发/探测(bwrap 沙箱)
 - `text/` — cosmic-text 字体 cache + shaping
 - `ime/` — fcitx5 text-input-v3
-- `main.rs` — ppoll 绑所有源,事件 dispatch
+- `main.rs` / `lib.rs` — 入口 + 接线;`run_headless_screenshot` = 无头渲染范式
 
 ---
 
