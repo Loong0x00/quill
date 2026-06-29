@@ -62,6 +62,8 @@ tty 时代单 stream 限制的产物, Wayland 窗口能开无数, 在 GUI 终端
 - ✅ **T3a** `7e84b18`(+ ADR `ef28ff2`):带线程 WS 传输 —— `tungstenite 0.29`(同步,无 tokio/TLS)WS 线程 bind `0.0.0.0:7878`;calloop 线程 `serde_json::to_vec` 序列化 Snapshot → `mpsc::Sender<Vec<u8>>` → WS 线程 → 浏览器(`assets/web/index.html`)。**只有 owned `Vec<u8>` 过线程边界**(Lead 读码核实,Rc 非 Send 守住);手机经 VPN→路由器→`10.0.0.2:7878` 可达,VPN 把门。详见 ADR-0016。
   - ⚠️ 遗留(非阻断):① WS 每连接无上限起线程;② daemon 只 serve WS、不 serve `index.html`(其中"同口 HTTP serve 页面"那点可摘出来留用)。
 - ⏸️ **T3b**(搁置,分支 `feat/kernel-ws-live` 不合并):做了"网格直播 + 同口 HTTP",对抗审查逮到背压 **drop-newest 阻断 bug**(慢客户端卡陈帧);修复时 agent 遇 API 529 中断成半截。**更关键:架构 R1 修订后"每帧广播网格"整体作废**(改传字节流本地渲染),故 T3b 搁置。
+- ✅ **片1(T3c'+T4)** `e04f909`+`2ea1a68`:WS 载荷从网格 **pivot 成 PTY 字节流** + 浏览器 **xterm.js 本地渲染 + 本地 reflow** + **同口 HTTP**(`http://host:7878/` 一个 URL;xterm.js/css/fit vendor 进 `assets/web/vendor/`,零 CDN)。daemon 每 tab 有界字节环缓冲:连上重放重建屏 + 之后 live 字节(`Message::Binary`);背压 = 慢客户端 cap→断开重连(**不丢字节**,非网格的 drop-newest)。Lead 收口两 bug:① shell 退出 flush 尾字节;② web 重连先 `term.reset()` 防屏幕重复。**只读**(输入=片2)。
+  - ⚠️ 遗留(非阻断,硬化跟进):① **死客户端 tx 泄漏** —— 空闲 PTY 时 fan_out 不跑→不剪除,弱网手机每 ~10s 重连堆积 `clients` Vec(同 T3b 清理缺口,干净修法有 shutdown 死锁张力,需小心);② **"关键帧"用近期字节尾**(非真网格快照)→ 环缓冲若从转义序列中段起,重建屏可能不完整(代码注释"最近字节完整=可见屏恒完整"是 overstatement;真关键帧应发当前屏的 ANSI/Snapshot)。
 
 **⭐ 模型修订 R1(2026-06-29,与用户对齐;完整见 ADR-0015「修订 R1」)—— 取代下面旧链与部分 Decision:**
 - **真终端 ≠ ssh**:会话是常驻一等实体、设备是窗口;但也 ≠ tty(不是关机才死)。
@@ -70,7 +72,7 @@ tty 时代单 stream 限制的产物, Wayland 窗口能开无数, 在 GUI 终端
 - **⭐ 会话是反馈环,PTY ⟺ 桌面窗口【原子耦合】(关键,且治"反复找脆弱态"的病)**:一次 spawn 里 `PTY(源)→ {quill 桌面窗口, 手机}` 一起出生 —— PTY 是电脑进程、由 quill 管,**它一存在桌面就有窗口**。所以**"手机持有、桌面看不到"这个态根本构造不出来**(不是靠"事后自动补窗救援",是耦合让它不存在;"自动补窗"不是独立兜底步骤,是 spawn 的固有部分)。⟹ **桌面窗口靠构造永远是锚,手机永不会是唯一 holder** → 这才是"无租约"能成立、且手机后台/锁屏杀不掉会话的**真正原因**(不是因为补窗救了它,是脆弱态不存在)。
 - **客户端矩阵**:Linux 原生 quill;手机/Mac/其它 = web(xterm.js,通用)。**不为跨平台移植原生 quill**(Mac 本地用 ghostty,要连家里走 web)。"任意位置"+ 安全 = WireGuard VPN 把门(以后可加 token 当登录)。
 
-**重排下一步(取代旧链;ticket 表见 ADR R1)**:**T3c'** daemon 转发 PTY 字节流 + 客户端本地模拟器渲染(连上=关键帧+之后流)→ **T4** web 端 xterm.js 本地渲染 + reflow + 同口 serve 页 → **T5** 输入回灌(键盘→daemon→PTY,`calloop::channel`)→ **T6** 引用计数生命周期 + 桌面自动补窗 + 同步全部工作区 → **T7** web"X 关闭"语义/重连/PWA 壳(+ 可选登录 token)。
+**重排下一步(ticket 表见 ADR R1;T3c'+T4 = 片1 ✅ 已合并)**:**片2 = T5 输入/控制(核心,碾压 app)** —— xterm.js `onData` → WS → daemon → PTY 写回(`Session::on_input`,需 WS 反向收 + `calloop::channel` 唤醒单线程 loop)+ **软键栏**(`ESC` / `ESC ESC` 撤回改 / `Ctrl-C` / `Tab`·`Shift-Tab` / 方向键,手机软键盘没这些键)→ **T6** 引用计数生命周期 + 桌面自动补窗 + 同步全部工作区 → **T7** web"X 关闭"语义 / PWA 壳(+ 可选登录 token)→ **硬化**(死客户端清理、真网格关键帧、连接数上限)。
 
 **协作环(本阶段在用)**:每砖一个 worktree(`git worktree add ../quill-impl-<x> -b feat/<x>`)→ 写码 **Opus xhigh**(改 render 必自己读 `wl/render.rs`,别信摘要)→ 自跑 `scripts/ci.sh` 调全绿 → **多视角对抗审 Opus xhigh** → Lead(user + 主 session)裁决合并(纯加法的 cohesive 单模块 commit 可超 300 行软线)。⚠️ workflow 每个 agent 显式写 `model:'opus' effort:'xhigh'`,别靠默认(`agentType` 自带便宜模型如 Explore=Haiku)。
 
