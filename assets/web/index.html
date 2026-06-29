@@ -106,7 +106,12 @@ function connect() {
   // 关键:收二进制(原始字节)。默认是 'blob' 会异步化乱序,必须 arraybuffer。
   ws.binaryType = "arraybuffer";
 
-  ws.onopen = () => setLive(true, "已连接(直播)");
+  ws.onopen = () => {
+    // why: 每次(重)连先 reset,否则 daemon 的重放缓冲会叠加到 xterm 已有内容 →
+    // 屏幕重复。断线重连是手机高频路径(后台/锁屏/弱网),不 reset 每次都重复一屏。
+    term.reset();
+    setLive(true, "已连接(直播)");
+  };
   ws.onmessage = (ev) => {
     if (typeof ev.data === "string") return; // 本片不发文本帧;忽略防御
     term.write(new Uint8Array(ev.data));     // xterm 本地模拟 VT + 本地 reflow

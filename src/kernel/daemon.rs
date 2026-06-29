@@ -356,6 +356,12 @@ fn pty_readable(data: &mut DaemonData) -> io::Result<PostAction> {
             }
             PtyRead::Closed => {
                 tracing::info!(tab_id, "PTY EOF/EIO:子 shell 退出,停止 daemon");
+                // why: 退出前 flush 本次 readiness 已读出的尾部字节,否则 shell 退出的
+                // 最后一批输出会丢(字节流不可丢)。broadcaster 在 bytes_tx drop 前会先
+                // 收完通道里这批再退,best-effort 送达仍存活的客户端。
+                if !batch.is_empty() {
+                    let _ = data.bytes_tx.send(batch);
+                }
                 let _ = data.session.tabs_mut().active_mut().pty_mut().try_wait();
                 data.loop_signal.stop();
                 return Ok(PostAction::Remove);
@@ -363,6 +369,10 @@ fn pty_readable(data: &mut DaemonData) -> io::Result<PostAction> {
             PtyRead::Fatal => {
                 if let Err(e) = read {
                     tracing::error!(tab_id, ?e, "PTY read 非预期错误,停止 daemon");
+                }
+                // why: 同 Closed —— 出错前已读出的字节也要 flush,不静默丢弃。
+                if !batch.is_empty() {
+                    let _ = data.bytes_tx.send(batch);
                 }
                 data.loop_signal.stop();
                 return Ok(PostAction::Remove);
