@@ -55,6 +55,16 @@ tty 时代单 stream 限制的产物, Wayland 窗口能开无数, 在 GUI 终端
 - 边界画在 `State.tabs`;selection 归客户端(现掺在 `pty_read_tick`)。
 - ⚠️ **render 侧耦合(`Renderer::draw_frame` wgpu)审计没逐行读** → 改 render 的 ticket,impl/审码 agent **必须自己读 `wl/render.rs` / `wl/window.rs` draw 路径**,别信摘要。
 
+**进展(2026-06-29):**
+- ✅ **T1** `441168f`:`src/kernel/{mod,proto,session}.rs` —— `CellWire`/`Snapshot`/`ServerMsg`/`ClientMsg` + `Session{tabs}` 骨架 + roundtrip 测试。CellWire 镜像 CellRef 无损(fg 像素测试盲区由 serde/From 单测兜,等 T-0405 接 per-cell fg 自动覆盖)。
+- ✅ **dirty 收口** `6db5945`:`TermState` 为 dirty 唯一真相源。
+- ✅ **T2** `14e2a33`:`src/kernel/daemon.rs` + bin `quill-kernel`(daemon)+ bin `quill-dump`(客户端)+ `tests/kernel_daemon_slice.rs`。**单线程 calloop** daemon:spawn 一 shell tab,PTY fd + UnixListener 同一 calloop,客户端连上发当前 Snapshot JSON。spine 通:**driven tab → Snapshot → unix socket → client**。故意单线程绕开 Rc 非 Send。
+- 🚧 **T3a**(进行中):带线程 WS 传输 —— calloop 线程序列化 Snapshot 成 owned `Vec<u8>` → `mpsc` → `tungstenite` WS 线程 → 浏览器(bind LAN,手机经 VPN→路由器→`10.0.0.2:port` 可达)。新 WS 依赖记 ADR-0016。**只有 owned 字节过线程边界**(Rc 非 Send 在这真咬人)。
+
+**下一步**:T3b 直播(dirty 增量广播)→ T3c 输入回灌(`Session::on_input` + `calloop::channel`)→ 手机端(reflow + 软键栏,流式内容客户端按手机宽重折)→ 持久化(`~/.local/state/quill/workspace.json` 仅存意图,PTY 不跨重启)→ 多客户端尺寸策略(主控端定尺寸,余者缩放)。
+
+**协作环(本阶段在用)**:每砖一个 worktree(`git worktree add ../quill-impl-<x> -b feat/<x>`)→ 写码 **Opus xhigh**(改 render 必自己读 `wl/render.rs`,别信摘要)→ 自跑 `scripts/ci.sh` 调全绿 → **多视角对抗审 Opus xhigh** → Lead(user + 主 session)裁决合并(纯加法的 cohesive 单模块 commit 可超 300 行软线)。⚠️ workflow 每个 agent 显式写 `model:'opus' effort:'xhigh'`,别靠默认(`agentType` 自带便宜模型如 Explore=Haiku)。
+
 ## CI(本地,不走远端)
 
 ```bash
