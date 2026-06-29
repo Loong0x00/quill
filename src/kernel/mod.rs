@@ -8,10 +8,15 @@
 //!   / [`proto::CellWire`] / [`proto::ClientMsg`] / [`proto::ServerMsg`])。
 //! - [`session`] —— [`session::Session`]:tab 工作区 + 数据流入口
 //!   (`on_pty_output` / `on_input` / `apply_tab_op` / `snapshot`)。
+//! - [`daemon`] —— Phase 7 T2 单线程 calloop daemon 切片:注册 PTY fd +
+//!   `UnixListener`,客户端连上发当前快照。
 //!
-//! **Phase 7 T1 范围**:协议 + `Session` 骨架。daemon calloop 接线 (PTY fd +
-//! `UnixListener`) 与 WS fan-out 是后续 ticket (ADR-0015 Phase 1 §4-6)。
+//! **Phase 7 T1 范围**:协议 + `Session` 骨架。
+//! **Phase 7 T2 范围**([`daemon`]):单线程 calloop 接线 (PTY fd + `UnixListener`)。
+//! WS fan-out / dirty 增量广播 / 客户端 [`proto::ClientMsg`] 回灌仍是后续 ticket
+//! (ADR-0015 Phase 1 §5-6)。
 
+pub mod daemon;
 pub mod proto;
 pub mod session;
 
