@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# 推送前跑快门(fmt + clippy + build)。慢测留给 AI 合并循环里的全门 ./scripts/ci.sh。
+# 启用一次:git config core.hooksPath scripts/hooks
+# 紧急绕过:git push --no-verify
+exec "$(git rev-parse --show-toplevel)/scripts/ci.sh" --fast
