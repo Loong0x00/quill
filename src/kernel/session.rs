@@ -39,8 +39,19 @@ impl Session {
         &mut self.tabs
     }
 
-    /// PTY 吐出的字节喂进对应 tab 的终端状态机。返回该 tab 是否变 dirty
-    /// (= 需要重算快照下发)。tab 不存在 (close race) 时返 `false`。
+    /// PTY 吐出的字节喂进对应 tab 的终端状态机。返回喂入后该 tab 的终端是否
+    /// 处于 dirty 状态 (= 该重算快照下发);tab 不存在 (close race) 时返 `false`。
+    ///
+    /// **dirty 真相源 = [`crate::term::TermState`] 的 `dirty`**(经 `is_dirty` /
+    /// `clear_dirty` 读写)。`advance` 无条件置脏 (空切片也置),所以对一个**存在
+    /// 的** tab 本方法恒返 `true` —— 它是"喂了字节、该重算快照"的粗信号,不是
+    /// "内容精确变了"的判定 (term 层不提供后者)。消费方下发快照后用
+    /// [`Self::clear_dirty`] 复位,否则 dirty 信号长真、每 tick 重发。
+    ///
+    /// **T1 审码记的双标志已收口**:不再写 [`crate::tab::TabInstance::mark_dirty`]。
+    /// `TabInstance.dirty` 是渲染客户端 (`wl/window.rs`) 的 per-tab 累积位;内核
+    /// 快照/下发只认 term 层 dirty,内核路径再写它纯属冗余、且制造"两个真相源"
+    /// 的错觉。**内核侧 dirty 只认 `TermState.dirty` 一个源。**
     ///
     /// **Phase 1 范围**:直接 `term.advance`,不做 composer OSC133 扫描
     /// (inline 补全提示是客户端关注点) 也不做 selection scroll-rebase
@@ -53,8 +64,21 @@ impl Session {
             return false;
         };
         tab.term_mut().advance(bytes);
-        tab.mark_dirty();
         tab.term().is_dirty()
+    }
+
+    /// 清掉指定 tab 的 (term 层) dirty 真相源。快照下发后调用,与
+    /// [`Self::on_pty_output`] 的"置脏"对称,防止 dirty 信号长真而重复全量下发。
+    /// tab 不存在返 `false`。
+    pub fn clear_dirty(&mut self, tab_id: u64) -> bool {
+        let Some(idx) = self.idx_by_raw(tab_id) else {
+            return false;
+        };
+        let Some(tab) = self.tabs.get_mut(idx) else {
+            return false;
+        };
+        tab.term_mut().clear_dirty();
+        true
     }
 
     /// 客户端输入 (键盘 / 粘贴) 写到指定 tab 的 PTY。
@@ -309,5 +333,27 @@ mod tests {
         assert_eq!(ws.tabs.len(), 1);
         assert_eq!(ws.tabs[0].title, "renamed");
         assert_eq!(ws.active, 0);
+    }
+
+    /// dirty 真相源单一性 (T2 收口双标志):on_pty_output 置脏 → clear_dirty
+    /// 复位 → 再 advance 又置脏。内核侧 dirty 只有 term 层这一个源被读写。
+    #[test]
+    fn dirty_truth_source_set_and_clear() {
+        let mut s = session_one_tab();
+        let id = s.tabs().active().id().raw();
+
+        assert!(s.on_pty_output(id, b"x"), "advance 后应 dirty");
+        assert!(s.clear_dirty(id), "已知 tab clear 应成功");
+        assert!(
+            !s.tabs().active().term().is_dirty(),
+            "clear 后 term (唯一真相源) 不应 dirty"
+        );
+
+        // 再喂字节又置脏 (置脏/复位对称)。
+        assert!(s.on_pty_output(id, b"y"));
+        assert!(s.tabs().active().term().is_dirty());
+
+        // 未知 tab:clear 返 false。
+        assert!(!s.clear_dirty(9999));
     }
 }
