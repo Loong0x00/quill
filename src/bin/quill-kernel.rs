@@ -1,10 +1,12 @@
 //! `quill-kernel` —— 无头会话内核 daemon (Phase 7 T2, ADR-0015 Phase 1 §4)。
 //!
 //! 单线程 calloop:spawn 一个 shell tab,注册其 PTY master fd(出字节 →
-//! `Session::on_pty_output` 驱动 term)+ 一个 `UnixListener`;客户端连上即收当前
-//! 快照(`Snapshot`)的 JSON 行。**T3a (ADR-0016)** 另加一个同步 `tungstenite` WS
-//! 端点(独立线程),浏览器 / 手机经 `ws://<lan>:<port>` 连上即收一帧快照。多 tab
-//! 动态增删 / 客户端输入回灌(T3c)仍是后续 ticket。
+//! `Session::on_pty_output` 驱动 term)+ 一个 `UnixListener`(`quill-dump` 连上收
+//! 当前网格快照 `Snapshot` 的 JSON 行)。**片1 (ADR-0015 R1)** 另加一个同步
+//! `tungstenite` WS 子系统(独立线程)+ **同口 HTTP**:浏览器 / 手机经
+//! `http://<lan>:<port>/` 拿 xterm.js 页,WS 连上先收**字节环缓冲重放**(重建当前屏)
+//! 再持续收 PTY **原始字节流**(连接保持,本地渲染 + 本地 reflow)。客户端输入回灌
+//! (T5)/ 多 tab 动态增删(T6)仍是后续 ticket。
 //!
 //! 用法:`quill-kernel [--socket=<path>] [--ws-bind=<addr:port>]`
 //! (默认 socket `$XDG_RUNTIME_DIR/quill-kernel.sock`,WS bind `0.0.0.0:7878`)。

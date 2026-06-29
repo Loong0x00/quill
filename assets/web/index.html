@@ -1,118 +1,132 @@
 <!DOCTYPE html>
 <!--
-  quill 无头内核 WS 镜像 —— 极简浏览器客户端 (Phase 7 T3a, ADR-0016)。
+  quill 无头内核 web 镜像 —— xterm.js 本地渲染客户端 (Phase 7 片1, ADR-0015 R1)。
 
-  验 spine:浏览器 → ws:// → quill-kernel 收一帧 Snapshot → 显示 row_texts。
-  刻意最小:不做 reflow / 不画 cell fg/bg / 不画光标 / 不持续直播(那些是
-  T3b / 手机端 ticket)。只证「被驱动的 tab → Snapshot → WS → 浏览器」通了。
+  模型(R1):daemon 转发 PTY **原始字节流**,浏览器 xterm.js 本地模拟 + 本地按
+  窗口宽 reflow。不再传网格 Snapshot —— 连上先收环缓冲重放(重建当前屏),之后
+  持续收 live 字节(连接保持)。
 
-  线缆体 = 裸 Snapshot JSON(与 quill-dump / unix 路径一致):
-    { tab_id, cols, rows, cells[], row_texts[], cursor{}, title }
-  本切片只用 row_texts(每元素一整行 shaping 文本)。
+  线缆体 = WebSocket **二进制帧**(原样 PTY 字节,非 JSON):
+    onmessage(ArrayBuffer) → term.write(Uint8Array)
+  输入回灌(键盘 → PTY)是下一片(T5),本片只读/只看。
 
-  用法:
-    1) 主机起 daemon:quill-kernel --ws-bind=0.0.0.0:7878
-    2) 浏览器开本文件(file:// 或 python -m http.server)
-    3) 地址栏填 ws://<主机 LAN/VPN IP>:7878/(手机经 VPN→10.0.0.2:7878)→ Connect
+  自包含:xterm.js / css / fit addon 由 daemon 同口 HTTP serve(/vendor/*),
+  零 CDN 依赖(手机经 WireGuard VPN 离线可用)。
+
+  用法:浏览器开 http://<主机 LAN/VPN IP>:7878/(手机经 VPN→10.0.0.2:7878)。
 -->
 <html lang="zh">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>quill mirror</title>
+<link rel="stylesheet" href="/vendor/xterm.css" />
 <style>
   :root { color-scheme: dark; }
-  body {
-    margin: 0; background: #111; color: #ddd;
-    font-family: system-ui, sans-serif;
+  html, body { margin: 0; height: 100%; background: #000; }
+  body { display: flex; flex-direction: column; }
+  #bar {
+    display: flex; gap: .5rem; align-items: center;
+    padding: .25rem .6rem; background: #161616; color: #ccc;
+    font-family: system-ui, sans-serif; font-size: .8rem;
+    border-bottom: 1px solid #2a2a2a; flex: 0 0 auto;
   }
-  header {
-    display: flex; gap: .5rem; align-items: center; flex-wrap: wrap;
-    padding: .5rem .75rem; background: #1b1b1b; border-bottom: 1px solid #333;
-    position: sticky; top: 0;
-  }
-  header input {
-    flex: 1 1 16rem; min-width: 12rem;
-    background: #000; color: #ddd; border: 1px solid #444;
-    border-radius: 4px; padding: .35rem .5rem; font: inherit;
-  }
-  header button {
-    background: #2a4; color: #000; border: 0; border-radius: 4px;
-    padding: .4rem .8rem; font: inherit; font-weight: 600; cursor: pointer;
-  }
-  #status { font-size: .85rem; opacity: .8; }
-  #title { font-weight: 600; padding: .35rem .75rem; opacity: .9; }
-  /* 等宽 + 预格式化:row_texts 每行原样,列对齐(无 reflow,T3a 故意) */
-  #screen {
-    margin: 0; padding: .5rem .75rem; white-space: pre;
-    font-family: "DejaVu Sans Mono", "Noto Sans Mono CJK SC", monospace;
-    font-size: 14px; line-height: 1.25; overflow: auto;
-  }
+  #dot { width: .6rem; height: .6rem; border-radius: 50%; background: #844; }
+  #dot.live { background: #2a4; }
+  #title { font-weight: 600; opacity: .9; }
+  #status { margin-left: auto; opacity: .7; }
+  /* xterm 容器吃满剩余高度;fit addon 据此算 cols/rows 做本地 reflow */
+  #term { flex: 1 1 auto; min-height: 0; padding: .25rem; }
 </style>
 </head>
 <body>
-  <header>
-    <input id="url" type="text" spellcheck="false" />
-    <button id="connect">Connect</button>
-    <span id="status">未连接</span>
-  </header>
-  <div id="title"></div>
-  <pre id="screen"></pre>
+  <div id="bar">
+    <span id="dot"></span>
+    <span id="title">quill</span>
+    <span id="status">连接中…</span>
+  </div>
+  <div id="term"></div>
 
+<script src="/vendor/xterm.js"></script>
+<script src="/vendor/xterm-addon-fit.js"></script>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
-const urlInput = $("url"), statusEl = $("status"),
-      titleEl = $("title"), screenEl = $("screen");
+const dotEl = $("dot"), titleEl = $("title"), statusEl = $("status");
 
-// 默认连同主机当前 host;file:// 打开时 location.hostname 为空,留给用户填。
-urlInput.value = location.hostname
-  ? `ws://${location.hostname}:7878/`
-  : "ws://10.0.0.2:7878/";
+// 重连退避(ms):断线非事件(R1),后台/锁屏/网络抖动回来自动重连重放。
+const RECONNECT_MS = 1000;
 
-let ws = null;
+const term = new Terminal({
+  convertEol: false,          // daemon 转发原始字节,换行语义由字节流自带,别替客户端改
+  cursorBlink: true,
+  fontFamily: '"DejaVu Sans Mono", "Noto Sans Mono CJK SC", monospace',
+  fontSize: 14,
+  scrollback: 10000,
+  theme: { background: "#000000" },
+});
+const fit = new FitAddon.FitAddon();
+term.loadAddon(fit);
+term.open($("term"));
+fit.fit();
 
-function setStatus(text) { statusEl.textContent = text; }
+// 窗口尺寸变化 → 本地 reflow(xterm 据新 cols/rows 重折它已收到的字节缓冲)。
+// 本片不把新尺寸回灌 daemon(PTY winsize 仍 80x24,resize 回灌是 T5);xterm
+// 本地 reflow 对流式逻辑行(硬 \n)即正确,这是 R1「客户端各自按自己宽 reflow」。
+const refit = () => { try { fit.fit(); } catch (_) {} };
+window.addEventListener("resize", refit);
 
-// 线缆体是裸 Snapshot;若 T3b 切到 ServerMsg 信封(externally tagged),
-// 这里改读 msg.Snapshot.row_texts 即可。
-function render(snap) {
-  if (!snap || !Array.isArray(snap.row_texts)) {
-    setStatus("收到非预期消息");
-    return;
-  }
-  titleEl.textContent = snap.title && snap.title.length ? snap.title : "quill";
-  screenEl.textContent = snap.row_texts.join("\n");
-  setStatus(`已收一帧:${snap.cols}x${snap.rows},tab ${snap.tab_id}`);
+function setLive(live, text) {
+  dotEl.classList.toggle("live", live);
+  statusEl.textContent = text;
 }
 
+// 同源:页面由 daemon 同口 serve,WS 直接连同 host:port。file:// 兜底到 10.0.0.2。
+function wsUrl() {
+  if (location.host) {
+    const scheme = location.protocol === "https:" ? "wss:" : "ws:";
+    return `${scheme}//${location.host}/`;
+  }
+  return "ws://10.0.0.2:7878/";
+}
+
+let ws = null;
+let reconnectTimer = null;
+
 function connect() {
-  const url = urlInput.value.trim();
-  if (ws) { try { ws.close(); } catch (_) {} ws = null; }
-  setStatus(`连接 ${url} …`);
+  const url = wsUrl();
+  setLive(false, `连接 ${url} …`);
   try {
     ws = new WebSocket(url);
   } catch (e) {
-    setStatus(`URL 非法:${e}`);
+    setLive(false, `URL 非法:${e}`);
+    scheduleReconnect();
     return;
   }
-  ws.onopen = () => setStatus("已连接,等待快照…");
+  // 关键:收二进制(原始字节)。默认是 'blob' 会异步化乱序,必须 arraybuffer。
+  ws.binaryType = "arraybuffer";
+
+  ws.onopen = () => setLive(true, "已连接(直播)");
   ws.onmessage = (ev) => {
-    try {
-      render(JSON.parse(ev.data));
-    } catch (e) {
-      setStatus(`解析失败:${e}`);
-    }
+    if (typeof ev.data === "string") return; // 本片不发文本帧;忽略防御
+    term.write(new Uint8Array(ev.data));     // xterm 本地模拟 VT + 本地 reflow
   };
-  // T3a 是一次性下发,服务端发完即 close —— 这是预期,不是错误。
-  ws.onclose = () => setStatus(statusEl.textContent.startsWith("已收一帧")
-    ? statusEl.textContent + "(连接已关,T3a 单帧)"
-    : "连接已关");
-  ws.onerror = () => setStatus("连接错误(daemon 在跑?地址/端口对?VPN 通?)");
+  ws.onclose = () => { setLive(false, "连接已断,重连中…"); scheduleReconnect(); };
+  ws.onerror = () => { setLive(false, "连接错误(daemon 在跑?VPN 通?)"); };
 }
 
-$("connect").addEventListener("click", connect);
-urlInput.addEventListener("keydown", (e) => { if (e.key === "Enter") connect(); });
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connect();
+  }, RECONNECT_MS);
+}
+
+// OSC 标题(xterm 解析 \x1b]0;…\x07)→ 顶栏标题。
+term.onTitleChange((t) => { titleEl.textContent = t && t.length ? t : "quill"; });
+
+connect();
 </script>
 </body>
 </html>
