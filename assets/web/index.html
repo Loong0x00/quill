@@ -1,10 +1,12 @@
 <!DOCTYPE html>
 <!--
-  quill 无头内核 web 镜像 —— xterm.js 本地渲染客户端 (Phase 7 片1, ADR-0015 R1)。
+  quill 无头内核 web 镜像 —— xterm.js 本地渲染客户端 (Phase 7 片1 + A′ 响应式, ADR-0015 R1)。
 
-  模型(R1):daemon 转发 PTY **原始字节流**,浏览器 xterm.js 本地模拟 + 本地按
-  窗口宽 reflow。不再传网格 Snapshot —— 连上先收环缓冲重放(重建当前屏),之后
-  持续收 live 字节(连接保持)。
+  模型(R1 + A′):daemon 转发 PTY **原始字节流**,浏览器 xterm.js 本地模拟。**忠实视图
+  按【桌面宽】渲染**(收 ServerMsg::Dims → term.resize 到桌面 cols/rows,不再 fit 到浏览器)
+  —— 桌面把字节流按桌面宽烤死,客户端用同一宽渲染才能与桌面像素对齐、宽度不匹配的折行
+  artifact(整宽 `─────` 横线被重折成一摞)消失,且逻辑行可干净还原供响应式重排(增量2)。
+  不传网格 Snapshot —— 连上先收环缓冲重放(重建当前屏),之后持续收 live 字节(连接保持)。
 
   线缆体 = WebSocket **二进制帧**(原样 PTY 字节,非 JSON),双向:
     出站 onmessage(ArrayBuffer) → term.write(Uint8Array)   (PTY → 屏)
@@ -40,8 +42,10 @@
   #dot.live { background: #2a4; }
   #title { font-weight: 600; opacity: .9; }
   #status { margin-left: auto; opacity: .7; }
-  /* xterm 容器吃满剩余高度;fit addon 据此算 cols/rows 做本地 reflow */
-  #term { flex: 1 1 auto; min-height: 0; padding: .25rem; }
+  /* xterm 容器吃满剩余高度。A′ 增量1:忠实视图按【桌面宽】渲染(term.resize 到桌面 cols/rows,
+     不再 fit 到浏览器)→ 与桌面像素对齐、宽度不匹配的折行 artifact 消失。桌面宽通常比手机宽 →
+     这里 overflow:auto 给横/纵滑动(忠实保底"大不了缩放/横滑")。响应式重排是增量2 的事。 */
+  #term { flex: 1 1 auto; min-height: 0; padding: .25rem; overflow: auto; }
   /* 软键栏:底部一排可点控制键(手机软键盘没 ESC/Ctrl/方向键)。横向可滚,
      按钮够大可点(touch target)。占高度 → #term 变矮 → 本地 reflow,不回灌 daemon。 */
   #keys {
@@ -71,7 +75,6 @@
   <div id="keys"></div>
 
 <script src="/vendor/xterm.js"></script>
-<script src="/vendor/xterm-addon-fit.js"></script>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
@@ -88,16 +91,18 @@ const term = new Terminal({
   scrollback: 10000,
   theme: { background: "#000000" },
 });
-const fit = new FitAddon.FitAddon();
-term.loadAddon(fit);
 term.open($("term"));
-fit.fit();
 
-// 窗口尺寸变化 → 本地 reflow(xterm 据新 cols/rows 重折它已收到的字节缓冲)。
-// 本片不把新尺寸回灌 daemon(PTY winsize 仍 80x24,resize 回灌是 T5);xterm
-// 本地 reflow 对流式逻辑行(硬 \n)即正确,这是 R1「客户端各自按自己宽 reflow」。
-const refit = () => { try { fit.fit(); } catch (_) {} };
-window.addEventListener("resize", refit);
+// ── A′ 增量1:忠实视图按【桌面宽】渲染 ─────────────────────────────────────────────
+// 桌面把字节流按桌面 cols/rows 烤死;客户端必须用【同一个宽】渲染才能
+// 与桌面像素对齐(否则整宽 `─────` 横线被 xterm 按窄宽重折成一摞 = 宽度不匹配 artifact)。
+// 故收到 ServerMsg::Dims → term.resize(cols, rows) 设成桌面宽,**不再 fit 到浏览器**。
+// 桌面宽通常比手机宽 → #term 横/纵滑动(忠实保底)。响应式重排是增量2。
+function applyDims(cols, rows) {
+  if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols < 1 || rows < 1) return;
+  if (term.cols === cols && term.rows === rows) return;
+  try { term.resize(cols, rows); } catch (_) {}
+}
 
 // ── 输入回灌(片2):键盘/方向键/粘贴/IME → WS 二进制帧 → daemon → active tab PTY ──
 // 发原始字节(二进制帧),与片1 出站 Binary 对称;daemon 收到直接写 PTY。`ws` 是
@@ -149,8 +154,6 @@ const SOFTKEYS = [
     });
     keysEl.appendChild(b);
   }
-  // 软键栏占了高度 → #term 变矮 → 据新尺寸本地重折。
-  refit();
 })();
 
 function setLive(live, text) {
@@ -182,6 +185,7 @@ function handleServerControl(text) {
   if (msg.StreamFocus) activeWorkspaceId = msg.StreamFocus.workspace_id;
   else if (msg.Workspaces) activeWorkspaceId = msg.Workspaces.active;
   else if (msg.Workspace) activeWorkspaceId = msg.Workspace.workspace_id;
+  else if (msg.Dims) applyDims(msg.Dims.cols, msg.Dims.rows);  // A′ 增量1:按桌面宽渲染
   holdOnce();
 }
 

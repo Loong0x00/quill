@@ -218,6 +218,11 @@ pub enum ServerMsg {
     /// **字节流标签**:声明此后 WS **Binary** 帧承载的 PTY 字节属于哪个
     /// (workspace, tab)。连上发一次 (当前 active),active tab / workspace 切换时再发。
     StreamFocus { workspace_id: u64, tab_id: u64 },
+    /// **桌面 PTY 尺寸**(A′ 增量1):桌面终端当前的 cols/rows。客户端据此 `term.resize(cols,
+    /// rows)` 把 xterm.js 设成【桌面宽】渲染(**不再 fit 到浏览器**)→ 忠实镜像与桌面像素对齐、
+    /// 宽度不匹配的折行 artifact(整宽 `─────` 横线被重折成一摞)消失,且逻辑行可干净还原供
+    /// 客户端响应式重排。连上发一次(当前桌面尺寸),桌面窗口 resize 改 PTY 尺寸时再发。
+    Dims { cols: u16, rows: u16 },
 }
 
 /// 客户端发起的 tab 工作区操作。
@@ -427,6 +432,10 @@ mod tests {
             ServerMsg::StreamFocus {
                 workspace_id: 3,
                 tab_id: 11,
+            },
+            ServerMsg::Dims {
+                cols: 212,
+                rows: 56,
             },
         ];
         for m in msgs {

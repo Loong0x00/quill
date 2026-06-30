@@ -14,8 +14,10 @@
 //! - **小端、手写** (不引 byteorder 等新依赖,见 ADR-0018 "零新依赖")。
 //! - **(workspace, tab) 标签落二进制头** (借砖0 `StreamFocus` 概念,热路径零额外解析)。
 //! - **kind**:`PtyOutput`(父→子,payload = 原始 PTY 字节)/ `Input`(子→父,payload =
-//!   手机输入字节)/ `FocusChange`(父→子,payload 空,ws/tab = 新焦点)/ `WorkspaceAdd`
-//!   `WorkspaceRemove`(父→子,带元数据,砖1a 仅留接口)。
+//!   手机输入字节)/ `FocusChange`(父→子,payload 空,ws/tab = 新焦点)/ `Dims`(父→子,
+//!   payload = `cols:u16 LE + rows:u16 LE`,桌面 PTY 当前尺寸 —— 子据此让客户端 xterm.js 按
+//!   【桌面宽】渲染,忠实镜像与桌面像素对齐、宽度不匹配的折行 artifact 消失,A′ 增量1)/
+//!   `WorkspaceAdd` `WorkspaceRemove`(父→子,带元数据,砖1a 仅留接口)。
 //!
 //! 编码走 [`encode_into`](append 进调用方 buffer,tee 热路径复用一块 buffer 零额外
 //! 分配)或便利的 [`FeedFrame::encode`](自带分配)。解码走 [`FeedDecoder`] **增量**
@@ -40,6 +42,10 @@ pub enum FrameKind {
     /// 父→子:焦点切换。`payload` 空;`ws_id` / `tab_id` = 新焦点 (子据此更新 StreamFocus
     /// 广播给浏览器)。
     FocusChange,
+    /// 父→子:桌面 PTY 当前尺寸。`payload` = `cols:u16 LE + rows:u16 LE`(见 [`encode_dims`] /
+    /// [`decode_dims`]);`ws_id` / `tab_id` = 该尺寸所属焦点 (子转成 [`crate::kernel::proto::
+    /// ServerMsg::Dims`] 控制帧广播,客户端据此 `term.resize` 到桌面宽,A′ 增量1)。
+    Dims,
     /// 父→子:工作区新增 (带元数据,砖1a 仅留接口,控制面元数据接线在砖1b)。
     WorkspaceAdd,
     /// 父→子:工作区移除 (同 [`FrameKind::WorkspaceAdd`],砖1a 仅留接口)。
@@ -55,6 +61,9 @@ impl FrameKind {
             FrameKind::FocusChange => 3,
             FrameKind::WorkspaceAdd => 4,
             FrameKind::WorkspaceRemove => 5,
+            // Dims=6:在 enum 里排在 WorkspaceAdd 前,但线缆字节显式延后到 6,保住既有
+            // WorkspaceAdd=4 / WorkspaceRemove=5 的编号不变(线缆兼容)。
+            FrameKind::Dims => 6,
         }
     }
 
@@ -66,6 +75,7 @@ impl FrameKind {
             3 => Some(FrameKind::FocusChange),
             4 => Some(FrameKind::WorkspaceAdd),
             5 => Some(FrameKind::WorkspaceRemove),
+            6 => Some(FrameKind::Dims),
             _ => None,
         }
     }
@@ -107,6 +117,29 @@ pub fn encode_into(buf: &mut Vec<u8>, kind: FrameKind, ws_id: u64, tab_id: u64, 
     buf.extend_from_slice(&tab_id.to_le_bytes());
     buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     buf.extend_from_slice(payload);
+}
+
+/// [`FrameKind::Dims`] payload 字节数:`cols:u16 LE + rows:u16 LE`。
+pub const DIMS_PAYLOAD_LEN: usize = 4;
+
+/// 编码 [`FrameKind::Dims`] 的 payload(`cols:u16 LE + rows:u16 LE`)。父侧 tee 路径用,
+/// 配 [`encode_into`] 拼整帧。
+pub fn encode_dims(cols: u16, rows: u16) -> [u8; DIMS_PAYLOAD_LEN] {
+    let mut p = [0u8; DIMS_PAYLOAD_LEN];
+    p[0..2].copy_from_slice(&cols.to_le_bytes());
+    p[2..4].copy_from_slice(&rows.to_le_bytes());
+    p
+}
+
+/// 解码 [`FrameKind::Dims`] 的 payload → `(cols, rows)`。长度不对(流错位 / 协议不匹配)返
+/// `None`,调用方忽略该帧(不致命:尺寸丢一拍下次 resize 补)。
+pub fn decode_dims(payload: &[u8]) -> Option<(u16, u16)> {
+    if payload.len() != DIMS_PAYLOAD_LEN {
+        return None;
+    }
+    let cols = u16::from_le_bytes([payload[0], payload[1]]);
+    let rows = u16::from_le_bytes([payload[2], payload[3]]);
+    Some((cols, rows))
 }
 
 /// 解码错误。流错位 (坏 kind / 天文 len) 在可信父链下不该发生,出现即视为致命 —— 调用方
@@ -253,6 +286,7 @@ mod tests {
             frame(FrameKind::PtyOutput, 1, 2, b"\x1b[31mred\x1b[0m"),
             frame(FrameKind::Input, 7, 9, b"RUNDONE\n"),
             frame(FrameKind::FocusChange, 42, 43, b""),
+            frame(FrameKind::Dims, 1, 7, &encode_dims(212, 56)),
             frame(FrameKind::WorkspaceAdd, 5, 0, b"meta"),
             frame(FrameKind::WorkspaceRemove, 5, 0, b""),
         ];
@@ -362,6 +396,19 @@ mod tests {
             "缓冲应被压实,不随吞吐累计涨 (实际 {} 字节)",
             dec.buf.len()
         );
+    }
+
+    /// Dims payload 编解码往返 + 长度错拒绝。
+    #[test]
+    fn dims_payload_roundtrip_and_reject_bad_len() {
+        for (c, r) in [(80u16, 24u16), (1, 1), (u16::MAX, u16::MAX), (212, 56)] {
+            let p = encode_dims(c, r);
+            assert_eq!(p.len(), DIMS_PAYLOAD_LEN);
+            assert_eq!(decode_dims(&p), Some((c, r)));
+        }
+        assert_eq!(decode_dims(&[]), None, "空 payload 拒绝");
+        assert_eq!(decode_dims(&[1, 2, 3]), None, "短 payload 拒绝");
+        assert_eq!(decode_dims(&[1, 2, 3, 4, 5]), None, "长 payload 拒绝");
     }
 
     /// 坏 kind 字节 → InvalidKind (流错位致命错)。

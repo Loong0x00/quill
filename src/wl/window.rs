@@ -41,7 +41,9 @@ use calloop::{EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction, Reg
 
 use crate::composer::prompt_track::Segment;
 use crate::composer::state::{ComposerInput, ComposerOutcome};
-use crate::kernel::feed::{encode_into, FeedDecoder, FeedFrame, FrameKind, FEED_HEADER_LEN};
+use crate::kernel::feed::{
+    encode_dims, encode_into, FeedDecoder, FeedFrame, FrameKind, FEED_HEADER_LEN,
+};
 use crate::tab::{TabInstance, TabList};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
@@ -636,6 +638,10 @@ struct ShareChild {
     focus_ws: u64,
     /// 当前焦点 tab id(raw)。tee 只转 `focus_tab` 那个 tab 的字节(只读镜像焦点 tab)。
     focus_tab: u64,
+    /// 上次发给子的桌面尺寸 `(cols, rows)`(A′ 增量1)。去重:`propagate_resize_if_dirty` 每次
+    /// configure 都跑(focus / 重发 configure 等尺寸没变也跑),仅尺寸**真变**时才发 `Dims` 帧,
+    /// 避免给子 + 客户端刷一串相同尺寸。`None` = 还没发过(spawn 后首发必发)。
+    last_dims: Option<(u16, u16)>,
     /// 背压期间丢弃的整帧计数(诊断;[`Drop`] 时若 > 0 打一行 debug)。
     dropped_frames: u64,
 }
@@ -744,6 +750,7 @@ impl ShareChild {
             frame_scratch: Vec::with_capacity(FEED_HEADER_LEN + PTY_READ_BUF),
             focus_ws,
             focus_tab,
+            last_dims: None,
             dropped_frames: 0,
         })
     }
@@ -764,6 +771,21 @@ impl ShareChild {
         self.focus_ws = ws;
         self.focus_tab = tab;
         self.push_frame(FrameKind::FocusChange, ws, tab, &[]);
+    }
+
+    /// 桌面 PTY 尺寸变 → 发 `Dims` 帧告知子(A′ 增量1;子转 `ServerMsg::Dims` 广播,客户端
+    /// `term.resize` 到桌面宽,忠实镜像与桌面像素对齐、折行 artifact 消失)。**去重**:尺寸没真
+    /// 变(同一 (cols, rows))直接返回 —— `propagate_resize_if_dirty` 每次 configure 都调,但很多
+    /// configure(focus / 状态变化)尺寸没变。空尺寸(0)不发(`cells_from_surface_px` clamp ≥1,
+    /// 防御性兜底)。
+    fn set_dims(&mut self, cols: u16, rows: u16) {
+        if cols == 0 || rows == 0 || self.last_dims == Some((cols, rows)) {
+            return;
+        }
+        self.last_dims = Some((cols, rows));
+        let payload = encode_dims(cols, rows);
+        let (ws, tab) = (self.focus_ws, self.focus_tab);
+        self.push_frame(FrameKind::Dims, ws, tab, &payload);
     }
 
     /// encode 一帧进复用 buffer,append 到出站队列并尝试 drain(背压见 [`enqueue_and_drain`])。
@@ -1381,7 +1403,9 @@ fn propagate_resize_if_dirty(data: &mut LoopData) {
         schedule_resize_followup_timer(data, now);
         return;
     }
-    let LoopData { state, .. } = &mut *data;
+    // A′ 增量1:也借 `share`(与 state 是 disjoint LoopData 字段)→ resize 末尾把桌面尺寸
+    // 发给共享子(set_dims 自带去重 + 未武装 None no-op,默认零回归)。
+    let LoopData { state, share, .. } = &mut *data;
 
     let width = state.core.width;
     let height = state.core.height;
@@ -1389,6 +1413,8 @@ fn propagate_resize_if_dirty(data: &mut LoopData) {
     // 多 tab 仍 titlebar + tab_bar 双层. tab_count 走 state.tabs (启动期保证非空).
     let tab_count = state.tabs.as_ref().map(|t| t.len()).unwrap_or(1);
     let (cols, rows) = cells_from_surface_px(width, height, tab_count);
+    let cols_u16 = u16::try_from(cols).unwrap_or(u16::MAX);
+    let rows_u16 = u16::try_from(rows).unwrap_or(u16::MAX);
 
     if let Some(r) = state.renderer.as_mut() {
         r.resize(width, height);
@@ -1399,8 +1425,6 @@ fn propagate_resize_if_dirty(data: &mut LoopData) {
     // 实战 N ≤ 10 不慢.
     for tab in state.tabs_unchecked_mut().iter_mut() {
         tab.term_mut().resize(cols, rows);
-        let cols_u16 = u16::try_from(cols).unwrap_or(u16::MAX);
-        let rows_u16 = u16::try_from(rows).unwrap_or(u16::MAX);
         if let Err(err) = tab.pty().resize(cols_u16, rows_u16) {
             tracing::warn!(
                 ?err,
@@ -1419,6 +1443,13 @@ fn propagate_resize_if_dirty(data: &mut LoopData) {
     // 用最新值. cells_from_surface_px 已减 titlebar, 与 PointerState 内部
     // px → cell 的 titlebar 偏移一致.
     state.pointer_state.set_cell_grid(cols, rows);
+
+    // A′ 增量1:把桌面 PTY 新尺寸发给共享子(`--share` 未武装 = None → no-op,默认零回归;
+    // set_dims 自带去重,尺寸没真变不发帧)。子转 `ServerMsg::Dims` 广播 → 客户端 term.resize
+    // 到桌面宽,忠实镜像与桌面像素对齐、宽度不匹配的折行 artifact 消失。
+    if let Some(sh) = share.as_mut() {
+        sh.set_dims(cols_u16, rows_u16);
+    }
 
     state.core.resize_dirty = false;
     // T-0802 In #B: 记本次 propagate 时刻, 下次 should_throttle_propagate 据此判.
@@ -3410,6 +3441,17 @@ pub fn run_window(initial_cwd: Option<std::path::PathBuf>, share: bool) -> Resul
         match ShareChild::spawn(&loop_handle, SHARE_DESKTOP_WS_ID, initial_tab_id.raw()) {
             Ok(mut sh) => {
                 sh.set_focus(SHARE_DESKTOP_WS_ID, initial_tab_id.raw());
+                // A′ 增量1:把当前桌面 PTY 尺寸发给子(连上早于首个 resize 的客户端也拿到桌面
+                // 宽)。真尺寸由首个 configure 的 propagate_resize_if_dirty 紧接覆盖(去重生效)。
+                let (init_cols, init_rows) = state
+                    .tabs
+                    .as_ref()
+                    .map(|t| t.active().term().dimensions())
+                    .unwrap_or((80, 24));
+                sh.set_dims(
+                    u16::try_from(init_cols).unwrap_or(u16::MAX),
+                    u16::try_from(init_rows).unwrap_or(u16::MAX),
+                );
                 tracing::info!(
                     tab = initial_tab_id.raw(),
                     "E′ 共享子进程已 spawn(--share 武装即起);焦点 tab 输出 tee 给手机"

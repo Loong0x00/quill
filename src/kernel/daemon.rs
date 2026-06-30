@@ -63,7 +63,9 @@ use tungstenite::handshake::server::{NoCallback, ServerHandshake};
 use tungstenite::handshake::MidHandshake;
 use tungstenite::{Bytes, Error as WsError, HandshakeError, Message, WebSocket};
 
-use crate::kernel::feed::{encode_into, FeedDecoder, FeedFrame, FrameKind, FEED_HEADER_LEN};
+use crate::kernel::feed::{
+    decode_dims, encode_into, FeedDecoder, FeedFrame, FrameKind, FEED_HEADER_LEN,
+};
 use crate::kernel::proto::{ClientMsg, ServerMsg, Snapshot, WorkspaceList, WorkspaceMeta};
 use crate::kernel::session::{Lifecycle, Session};
 use crate::tab::{TabInstance, TabList};
@@ -412,6 +414,11 @@ pub fn run(config: DaemonConfig) -> Result<()> {
         loop_signal,
         tab_id,
         workspace_id,
+        // A′ 增量1:Local own PTY → 启动尺寸已知;Fed 子不 own PTY,尺寸等父 Dims 帧(None)。
+        dims: match &config.source {
+            SourceConfig::Local => Some((config.cols, config.rows)),
+            SourceConfig::Fed { .. } => None,
+        },
         ring: ByteRing::new(BYTE_RING_CAP),
         clients: HashMap::new(),
         next_client_id: 1,
@@ -576,6 +583,11 @@ struct DaemonData {
     /// 字节流 [`ServerMsg::StreamFocus`] 标它;client X 关闭 / 断线只动 holder,anchor 在
     /// 故它【不被销毁】(砖0 daemon 字节泵注册的就是它的 PTY fd,绝不能被 refcount 销毁掉)。
     workspace_id: u64,
+    /// 桌面 PTY 当前尺寸 `(cols, rows)`(A′ 增量1)。**Local**:= 启动尺寸(`config.cols/rows`),
+    /// 客户端 [`ClientMsg::Resize`] 改 PTY 时同步更新;**Fed**:`None` 直到父发首个
+    /// [`FrameKind::Dims`] 帧(桌面 resize / spawn 时)。连上引导帧([`build_control_text`])与
+    /// 实时广播([`broadcast_dims`])据此发 [`ServerMsg::Dims`],客户端 `term.resize` 到桌面宽。
+    dims: Option<(u16, u16)>,
     /// PTY 原始字节环缓冲(连上重放重建当前屏)。单线程,直接 fan-out 进各连接出站队列。
     ring: ByteRing,
     /// 在册 WS 连接(Peeking / Handshaking / Live)。key = 自增连接 id。
@@ -930,6 +942,19 @@ fn route_fed_frame(data: &mut DaemonData, frame: FeedFrame) {
             data.tab_id = frame.tab_id;
             broadcast_stream_focus(data);
         }
+        FrameKind::Dims => {
+            // A′ 增量1:父发桌面 PTY 尺寸 → 记录 + 广播 ServerMsg::Dims,客户端 term.resize 到桌面宽。
+            match decode_dims(&frame.payload) {
+                Some((cols, rows)) => {
+                    data.dims = Some((cols, rows));
+                    broadcast_dims(data, cols, rows);
+                }
+                None => tracing::warn!(
+                    len = frame.payload.len(),
+                    "Fed 收到 Dims 帧 payload 长度非法,忽略"
+                ),
+            }
+        }
         FrameKind::WorkspaceAdd | FrameKind::WorkspaceRemove => {
             tracing::debug!(
                 ws_id = frame.ws_id,
@@ -942,17 +967,14 @@ fn route_fed_frame(data: &mut DaemonData, frame: FeedFrame) {
     }
 }
 
-/// 向所有 live WS 客户端推一条 [`ServerMsg::StreamFocus`] 控制帧(Text),声明此后 Binary 字节
-/// 属于哪个 (workspace, active tab)。Fed 焦点切换(父发 [`FrameKind::FocusChange`])后调。
-fn broadcast_stream_focus(data: &mut DaemonData) {
-    let msg = ServerMsg::StreamFocus {
-        workspace_id: data.workspace_id,
-        tab_id: data.tab_id,
-    };
-    let text = match serde_json::to_string(&msg) {
+/// 向所有 live WS 客户端推一条 [`ServerMsg`] 控制帧(Text)。序列化失败仅 warn 跳过(控制面
+/// 非幂等丢一条不致命,客户端有忠实字节流兜底)。Peeking/Handshaking 阶段连接不入队 —— 它们
+/// 转 Live 时会先收 [`build_control_text`] 引导帧拿到当前状态。
+fn broadcast_control(data: &mut DaemonData, msg: &ServerMsg) {
+    let text = match serde_json::to_string(msg) {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!(?e, "序列化 StreamFocus 控制帧失败,跳过");
+            tracing::warn!(?e, "序列化控制帧失败,跳过广播");
             return;
         }
     };
@@ -970,6 +992,24 @@ fn broadcast_stream_focus(data: &mut DaemonData) {
             arm_write(data, id);
         }
     }
+}
+
+/// 向所有 live WS 客户端推一条 [`ServerMsg::StreamFocus`] 控制帧(Text),声明此后 Binary 字节
+/// 属于哪个 (workspace, active tab)。Fed 焦点切换(父发 [`FrameKind::FocusChange`])后调。
+fn broadcast_stream_focus(data: &mut DaemonData) {
+    broadcast_control(
+        data,
+        &ServerMsg::StreamFocus {
+            workspace_id: data.workspace_id,
+            tab_id: data.tab_id,
+        },
+    );
+}
+
+/// 向所有 live WS 客户端推一条 [`ServerMsg::Dims`] 控制帧(A′ 增量1),客户端据此 `term.resize`
+/// 到桌面宽。桌面 resize(父发 [`FrameKind::Dims`])后调。
+fn broadcast_dims(data: &mut DaemonData, cols: u16, rows: u16) {
+    broadcast_control(data, &ServerMsg::Dims { cols, rows });
 }
 
 /// 把 WS 客户端输入字节路由到 input sink(块C —— 在 `on_input` 调用点岔开两条数据流):
@@ -1426,11 +1466,17 @@ fn ws_go_live(
 /// 连上时下发的控制面引导帧。按拓扑分发:**Local** 用真 [`Session`] 元数据
 /// ([`build_control_text_local`]);**Fed** 用父喂的焦点合成最小引导 ([`build_control_text_fed`])。
 fn build_control_text(data: &DaemonData, ws_id: u64) -> Vec<String> {
-    match (&data.session, &data.fed) {
+    let mut out = match (&data.session, &data.fed) {
         (Some(session), _) => build_control_text_local(session, ws_id),
         (None, Some(_)) => build_control_text_fed(data, ws_id),
         (None, None) => Vec::new(),
+    };
+    // A′ 增量1:已知桌面尺寸 → 末尾追一条 ServerMsg::Dims,客户端 term.resize 到桌面宽渲染。
+    // Local 启动即知;Fed 等首个 Dims 帧后才有(未到则此连接靠后续 broadcast_dims 补)。
+    if let Some((cols, rows)) = data.dims {
+        push_server_json(&mut out, &ServerMsg::Dims { cols, rows });
     }
+    out
 }
 
 /// Fed 拓扑连上引导帧(块B):砖1a 子无 Session,控制面工作区元数据(tab 明细)接线在砖1b
@@ -1598,6 +1644,10 @@ fn handle_client_msg(data: &mut DaemonData, id: u64, text: &str) -> Option<PostA
             if let Some(session) = data.session.as_mut() {
                 if let Err(e) = session.resize(workspace_id, cols, rows) {
                     tracing::warn!(?e, workspace_id, "WS resize 失败");
+                } else {
+                    // A′ 增量1:Local PTY 尺寸变了 → 同步 dims + 广播给其它客户端(同尺寸渲染)。
+                    data.dims = Some((cols, rows));
+                    broadcast_dims(data, cols, rows);
                 }
             } else {
                 // Fed:resize 须回灌父(父 own PTY)。砖1a 帧集不含 Resize 帧,留砖1b。
