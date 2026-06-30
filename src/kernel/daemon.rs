@@ -10,9 +10,13 @@
 //! **WS 子系统(片1 字节流直播 + 片2 输入回灌,全 calloop 化,ADR-0016 Alt 3)**:
 //! - **listener**:`TcpListener` 注册成 `Generic` READ 源;可读→`accept` 排空→每个
 //!   新连接设非阻塞 + 注册成它自己的 `Generic` READ 源。
-//! - **同口 HTTP / WS 分流**:连接 READ 源首次可读时 `peek`(MSG_PEEK 非破坏)出请求
-//!   头:带 `Upgrade: websocket` 走 WS 握手,否则当普通 HTTP(serve 内嵌 xterm.js 页 /
-//!   vendored 资产 / 404),响应排进一个非阻塞写源写完即关。
+//! - **同口 HTTP / WS 分流**:连接 READ 源可读时把请求头**消费**(`read`,非 `peek`)进
+//!   per-conn 累积缓冲,头收全后分流:带 `Upgrade: websocket` 走 WS 握手(已消费的请求
+//!   字节经 [`PrefixStream`] "退还"给 tungstenite 从头读完整握手),否则当普通 HTTP
+//!   (serve 内嵌 xterm.js 页 / vendored 资产 / 404),响应排进一个非阻塞写源写完即关。
+//!   **为何消费而非 peek**:READ 源是 `Mode::Level`,`peek`(MSG_PEEK)不排空内核缓冲 →
+//!   半截头时 fd 恒可读 → calloop 每轮 ~0 超时重派 → 烧满一个核(实测 99.3%);消费式
+//!   读把 fd 排空,Level 不再恒触发,半截头静默等下次新字节(不忙等、不 sleep)。
 //! - **非阻塞握手**:`tungstenite` 的 `MidHandshake` 状态机 —— fd 再可读时
 //!   `.handshake()` 续做,直到 `Ok(WebSocket)`(不阻塞 loop)。
 //! - **输出(PTY → 浏览器)**:`pty_readable` 读到的裸字节既喂 [`Session::on_pty_output`]
@@ -27,22 +31,28 @@
 //!   它重连从环缓冲重放恢复)。
 //! - **死客户端回收**:对端关闭 → 该连接 READ 源拿到 EOF/Close → 立即回收(单线程下
 //!   无需"空闲也轮询剪除",结构性消灭了线程版的死 tx 泄漏)。
+//! - **卡握手 / 半开连接收割**:一个周期 [`Timer`] 源(`reap_stale_clients`)扫描所有连接,
+//!   回收卡在 Peeking/Handshaking 阶段超 `handshake_deadline`(自 accept 起的绝对期限,
+//!   robust against slowloris 蚂蚁搬家)的连接;**live 连接不在收割列**(健康空闲会被误杀),
+//!   其网络静默掉线(无 FIN/RST)的半开态靠 accept 时设的 `SO_KEEPALIVE` 探活 → 内核报错 →
+//!   READ 源走既有 EOF/错误回收路径。
 //!
-//! **仍留后续 ticket**:多 tab 动态增删 + 输入按 tab 寻址 + resize 协商(T6);WS
-//! 握手/半截连接的超时收割、SO_KEEPALIVE 探活(硬化)。
+//! **仍留后续 ticket**:多 tab 动态增删 + 输入按 tab 寻址 + resize 协商(T6)。
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::os::fd::BorrowedFd;
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use calloop::generic::Generic;
 use calloop::signals::{Signal, Signals};
+use calloop::timer::{TimeoutAction, Timer};
 use calloop::{EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction, RegistrationToken};
 use tungstenite::handshake::server::{NoCallback, ServerHandshake};
 use tungstenite::handshake::MidHandshake;
@@ -95,8 +105,16 @@ const WS_CLIENT_OUT_CAP: usize = 1 << 20;
 /// 一份,daily-drive tab 数个位数,内存预算可忽略(对照 term scrollback 100K 行)。
 const BYTE_RING_CAP: usize = 256 * 1024;
 
-/// 同口分流时 peek HTTP 请求头的上限(防超长头吃内存;正常请求头远小于此)。
+/// 同口分流时累积 HTTP 请求头的上限(防超长头吃内存;正常请求头远小于此)。到顶仍未
+/// 收全则按已收字节强制分流(多半非合法 upgrade → 当 HTTP 处理后关闭)。
 const HTTP_PEEK_MAX: usize = 8192;
+
+/// 握手收割 Timer 的扫描周期。
+const REAP_INTERVAL_MS: u64 = 5_000;
+
+/// 连接从 accept 起必须在此期限内完成握手(转 Live),否则被收割。绝对期限(非"距上次
+/// 活动"),故 slowloris 蚂蚁搬家式逐字节拖延也逃不掉。正常握手 ms 级,10s 极宽松。
+const HANDSHAKE_DEADLINE_MS: u64 = 10_000;
 
 /// daemon 启动参数。
 pub struct DaemonConfig {
@@ -201,6 +219,11 @@ pub fn run(config: DaemonConfig) -> Result<()> {
         .set_nonblocking(true)
         .context("UnixListener 设非阻塞失败")?;
 
+    // 收割参数:默认生产值,可经 env 覆盖(调参 / 测试用,无新依赖、不改 CLI)。
+    let reap_interval = duration_from_env("QUILL_WS_REAP_MS", REAP_INTERVAL_MS);
+    let handshake_deadline =
+        duration_from_env("QUILL_WS_HANDSHAKE_DEADLINE_MS", HANDSHAKE_DEADLINE_MS);
+
     let mut data = DaemonData {
         session,
         loop_handle: loop_handle.clone(),
@@ -209,6 +232,7 @@ pub fn run(config: DaemonConfig) -> Result<()> {
         ring: ByteRing::new(BYTE_RING_CAP),
         clients: HashMap::new(),
         next_client_id: 1,
+        handshake_deadline,
     };
 
     // Source 2:PTY master fd。
@@ -246,6 +270,21 @@ pub fn run(config: DaemonConfig) -> Result<()> {
             |_readiness, meta, data: &mut DaemonData| ws_accept_ready(meta.as_ref(), data),
         )
         .map_err(|e| anyhow!("calloop insert_source(ws listener) 失败: {e}"))?;
+
+    // Source 5:握手收割 Timer。周期扫描,回收卡在 Peeking/Handshaking 阶段超
+    // `handshake_deadline` 的连接(防半截头/卡握手长占 `clients` 槽 + slowloris)。live
+    // 连接不在此列(健康空闲会被误杀)——其半开靠 accept 时设的 SO_KEEPALIVE 探活回收。
+    // 收割时只 `loop_handle.remove` 别的源(连接的 READ/WRITE 源),不 remove 本 Timer
+    // 自己(返 `ToDuration` 让 calloop 自动重排,calloop 禁止回调内 remove 自身源)。
+    loop_handle
+        .insert_source(
+            Timer::from_duration(reap_interval),
+            move |_deadline, _meta, data: &mut DaemonData| {
+                reap_stale_clients(data);
+                TimeoutAction::ToDuration(reap_interval)
+            },
+        )
+        .map_err(|e| anyhow!("calloop insert_source(reap timer) 失败: {e}"))?;
 
     tracing::info!(
         socket = %config.socket_path.display(),
@@ -287,6 +326,8 @@ struct DaemonData {
     clients: HashMap<u64, WsClient>,
     /// WS 连接 id 自增源。
     next_client_id: u64,
+    /// 连接从 accept 起到完成握手的绝对期限;超期且未转 Live 的连接被收割 Timer 回收。
+    handshake_deadline: Duration,
 }
 
 /// 一个 unix 客户端连接待写出的快照字节 + 已写偏移(非阻塞 write 可能分多次)。
@@ -299,9 +340,11 @@ struct WritePending {
 /// 一条 WS 连接的全部 per-client 状态(**全在 calloop 线程,无 `Send` 要求**)。
 struct WsClient {
     stage: WsStage,
-    /// 本连接 READ 源 token(可读:peek 分流 / 续握手 / 收输入)。源 owns 一份 TcpStream
-    /// (accept 出来的"original"),纯当可读信号 + peek 句柄;真正的 WS IO 走 [`WsStage`]
-    /// 内 `WebSocket` 持有的那一份 dup。
+    /// 连接 accept 时刻;收割 Timer 用它判握手是否超 `handshake_deadline`(绝对期限)。
+    created_at: Instant,
+    /// 本连接 READ 源 token(可读:读头分流 / 续握手 / 收输入)。源 owns 一份 TcpStream
+    /// (accept 出来的"original"),纯当可读信号 + 读头句柄(消费式累积请求头);真正的 WS
+    /// IO 走 [`WsStage`] 内 `WebSocket` 持有的那一份 dup。
     read_token: RegistrationToken,
     /// 本连接 WRITE 源(只在 Live 阶段存在)。出站队列空时 disable(退回只 READ,不忙等),
     /// 有积压时 enable。源 owns 另一份 dup,纯当可写信号。
@@ -321,13 +364,65 @@ struct WriteReg {
 
 /// 一条 WS 连接的握手/直播阶段。
 enum WsStage {
-    /// 刚 accept,尚未分流:READ 源可读时 `peek` 请求头判 HTTP / WS。
-    Peeking,
+    /// 刚 accept,尚未分流:READ 源可读时把请求头**消费**进内含 `Vec`(累积缓冲),收全后
+    /// 判 HTTP / WS。消费(非 peek)→ 排空内核缓冲 → `Mode::Level` 半截头不再恒触发(消灭
+    /// 忙等)。
+    Peeking(Vec<u8>),
     /// WS 握手中:非阻塞 `MidHandshake`,fd 再可读时 `.handshake()` 续做。`Option` 是为
     /// 了 `take()` 出来调 `handshake(self)`(按值消费),`Interrupted` 时把推进后的存回。
-    Handshaking(Option<MidHandshake<ServerHandshake<TcpStream, NoCallback>>>),
-    /// 握手完成,长命直播:`WebSocket` 持有 IO 用的那份 dup stream。
-    Live(WebSocket<TcpStream>),
+    /// 流是 [`PrefixStream`](已消费的请求字节 + socket dup),tungstenite 从头读完整握手。
+    Handshaking(Option<MidHandshake<ServerHandshake<PrefixStream, NoCallback>>>),
+    /// 握手完成,长命直播:`WebSocket` 持有 [`PrefixStream`](握手后前缀已耗尽 ≈ 裸 dup)。
+    Live(WebSocket<PrefixStream>),
+}
+
+/// 同口分流时把**已消费进缓冲**的握手请求字节"退还"给 tungstenite 的链式流。
+///
+/// 忙等修复改成**消费式**读请求头(见 [`ws_read_head`]),WS 分支因此手里握着完整握手
+/// 请求的字节(已从内核缓冲取走);tungstenite 的 `ServerHandshake::start` 要从一个流里
+/// 读这些字节。`PrefixStream::read` 先吐 `prefix`(没吐完的请求字节)、耗尽后回落到底层
+/// `TcpStream`(同一 OFD 的 dup,握手后的 WS 帧从这读);`write` 全程直委托底层流(101
+/// 响应 + 之后的出站帧)。握手完成后 prefix 已耗尽,等价于裸 `TcpStream`(每次 read 仅多
+/// 一次游标比较),故可安全沿用为 Live 阶段的流类型。
+struct PrefixStream {
+    prefix: io::Cursor<Vec<u8>>,
+    stream: TcpStream,
+}
+
+impl PrefixStream {
+    fn new(prefix: Vec<u8>, stream: TcpStream) -> Self {
+        Self {
+            prefix: io::Cursor::new(prefix),
+            stream,
+        }
+    }
+
+    /// 底层 socket(WRITE 源建 dup / 取 fd 用)。
+    fn tcp(&self) -> &TcpStream {
+        &self.stream
+    }
+}
+
+impl io::Read for PrefixStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let pos = self.prefix.position();
+        let total = self.prefix.get_ref().len() as u64;
+        if pos < total {
+            // 前缀还没吐完:本次只从前缀读(不跨界到底层流,保持顺序简单)。
+            return self.prefix.read(buf);
+        }
+        self.stream.read(buf)
+    }
+}
+
+impl io::Write for PrefixStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.stream.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
 }
 
 /// PTY read 结果的纯决策(无副作用,可单测)。镜像 `wl::window::pty_readable_action`
@@ -470,8 +565,8 @@ fn ws_accept_ready(listener: &TcpListener, data: &mut DaemonData) -> io::Result<
     }
 }
 
-/// 接入一条新 WS/HTTP 连接:[`MAX_WS_CONNS`] 闸门 → 设非阻塞 → 注册成 READ 源(owns
-/// stream,纯当可读信号 + peek 句柄)→ 进 `clients` 登记为 Peeking。
+/// 接入一条新 WS/HTTP 连接:[`MAX_WS_CONNS`] 闸门 → 设非阻塞 + SO_KEEPALIVE → 注册成 READ
+/// 源(owns stream,纯当可读信号 + 读头句柄)→ 进 `clients` 登记为 Peeking。
 fn accept_ws_client(stream: TcpStream, data: &mut DaemonData) -> Result<()> {
     if data.clients.len() >= MAX_WS_CONNS {
         tracing::warn!(max = MAX_WS_CONNS, "WS 连接数达上限,拒绝新连接");
@@ -481,6 +576,10 @@ fn accept_ws_client(stream: TcpStream, data: &mut DaemonData) -> Result<()> {
     stream
         .set_nonblocking(true)
         .context("WS stream 设非阻塞失败")?;
+    // 半开探活硬化:网络静默掉线(无 FIN/RST)的 live 连接靠 TCP keepalive 让内核探测对端
+    // 死活 → 死则 socket 报错 → epoll 唤醒 READ 源走既有回收路径。比"按空闲超时收割 live"
+    // 安全(不误杀健康但安静的终端)。尽力而为,失败不影响主功能。
+    enable_keepalive(&stream);
     let id = data.next_client_id;
     data.next_client_id = data.next_client_id.wrapping_add(1);
     let token = data
@@ -495,7 +594,8 @@ fn accept_ws_client(stream: TcpStream, data: &mut DaemonData) -> Result<()> {
     data.clients.insert(
         id,
         WsClient {
-            stage: WsStage::Peeking,
+            stage: WsStage::Peeking(Vec::new()),
+            created_at: Instant::now(),
             read_token: token,
             write: None,
             outbound: VecDeque::new(),
@@ -505,14 +605,14 @@ fn accept_ws_client(stream: TcpStream, data: &mut DaemonData) -> Result<()> {
     Ok(())
 }
 
-/// WS 连接 READ 源可读:按阶段分发。`original` = 该 READ 源 own 的 TcpStream(peek 用)。
+/// WS 连接 READ 源可读:按阶段分发。`original` = 该 READ 源 own 的 TcpStream(读头/可读信号)。
 fn ws_client_readable(
     data: &mut DaemonData,
     id: u64,
     original: &TcpStream,
 ) -> io::Result<PostAction> {
     match data.clients.get(&id).map(stage_tag) {
-        Some(StageTag::Peeking) => ws_peek(data, id, original),
+        Some(StageTag::Peeking) => ws_read_head(data, id, original),
         Some(StageTag::Handshaking) => ws_drive_handshake(data, id),
         Some(StageTag::Live) => ws_live_read(data, id),
         None => Ok(PostAction::Remove),
@@ -529,35 +629,77 @@ enum StageTag {
 
 fn stage_tag(c: &WsClient) -> StageTag {
     match c.stage {
-        WsStage::Peeking => StageTag::Peeking,
+        WsStage::Peeking(_) => StageTag::Peeking,
         WsStage::Handshaking(_) => StageTag::Handshaking,
         WsStage::Live(_) => StageTag::Live,
     }
 }
 
-/// Peeking:非破坏 `peek` 请求头,头收全后分流。`peek` 不消费内核缓冲 → WS 分支把同一
-/// 未消费 stream(的 dup)交 tungstenite 从头完整读一遍(同口分流最不易出错的路径)。
-fn ws_peek(data: &mut DaemonData, id: u64, original: &TcpStream) -> io::Result<PostAction> {
-    let mut buf = [0u8; HTTP_PEEK_MAX];
-    let n = match original.peek(&mut buf) {
-        Ok(0) => return Ok(drop_client_read_self(data, id)), // 对端没发就关了
-        Ok(n) => n,
-        Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(PostAction::Continue),
-        Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(PostAction::Continue),
-        Err(e) => {
-            tracing::debug!(?e, "WS peek 请求头失败");
-            return Ok(drop_client_read_self(data, id));
+/// Peeking:把请求头**消费**(`read`)进 per-conn 累积缓冲(`WsStage::Peeking` 内的 `Vec`),
+/// 头收全后分流。**消费而非 peek 是忙等修复的关键**:READ 源 `Mode::Level` 下,`peek`
+/// (MSG_PEEK)不排空内核缓冲 → 半截头时 fd 恒可读 → calloop 每轮 ~0 超时重派本函数 →
+/// 烧满一个核;消费式读把 fd 读空,半截头时返 `WouldBlock` → `Continue` 静默等下次新字节
+/// (**不 sleep、不忙等**)。
+///
+/// WS 分支:已消费的完整握手请求字节经 [`PrefixStream`] "退还"给 tungstenite(它先读完
+/// 前缀再回落到 socket dup),从头读到完整握手 → 写 101 → 转 Live。
+fn ws_read_head(data: &mut DaemonData, id: u64, original: &TcpStream) -> io::Result<PostAction> {
+    let mut reader: &TcpStream = original;
+    loop {
+        let acc_len = match data.clients.get(&id) {
+            Some(WsClient {
+                stage: WsStage::Peeking(buf),
+                ..
+            }) => buf.len(),
+            // 阶段已变 / 连接已没(不该在本路径发生):交回 loop。
+            _ => return Ok(PostAction::Continue),
+        };
+        if acc_len >= HTTP_PEEK_MAX {
+            // 头超长仍未收全:按已收字节强制分流(防超长头吃内存)。
+            break;
         }
-    };
-    let head = &buf[..n];
-    if !header_complete(head) && n < buf.len() {
-        // 头还没收全:peek 不消费,等下次可读(Level 模式)再 peek,**不 sleep**。
-        return Ok(PostAction::Continue);
+        let want = (HTTP_PEEK_MAX - acc_len).min(4096);
+        let mut chunk = [0u8; 4096];
+        match reader.read(&mut chunk[..want]) {
+            Ok(0) => return Ok(drop_client_read_self(data, id)), // 对端没发就关了
+            Ok(n) => {
+                let done = match data.clients.get_mut(&id) {
+                    Some(WsClient {
+                        stage: WsStage::Peeking(buf),
+                        ..
+                    }) => {
+                        buf.extend_from_slice(&chunk[..n]);
+                        header_complete(buf)
+                    }
+                    _ => return Ok(PostAction::Continue),
+                };
+                if done {
+                    break;
+                }
+                // 没收全:继续读(内核可能还有更多字节),直到收全 / WouldBlock / 超长。
+            }
+            // 半截头:已消费的字节进了缓冲,fd 排空 → Level 不再恒触发 → 静默等下次可读。
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(PostAction::Continue),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                tracing::debug!(?e, "WS 读请求头失败");
+                return Ok(drop_client_read_self(data, id));
+            }
+        }
     }
 
-    if request_is_ws_upgrade(head) {
-        // WS:转 Handshaking。tungstenite 需要 own 一个 stream → 给它 original 的 dup
-        // (同一 OFD,peek 没消费的请求字节还在内核缓冲,它会从头完整读)。
+    // 头收全(或超长强制):取出累积字节分流。
+    let head = match data.clients.get(&id) {
+        Some(WsClient {
+            stage: WsStage::Peeking(buf),
+            ..
+        }) => buf.clone(),
+        _ => return Ok(PostAction::Continue),
+    };
+
+    if request_is_ws_upgrade(&head) {
+        // WS:转 Handshaking。tungstenite 要 own 一个流 → 给它 [`PrefixStream`]:已消费的
+        // 请求字节(head)当前缀 + original 的 dup(同一 OFD,握手后的 WS 帧从这读)。
         let io_stream = match original.try_clone() {
             Ok(s) => s,
             Err(e) => {
@@ -565,17 +707,17 @@ fn ws_peek(data: &mut DaemonData, id: u64, original: &TcpStream) -> io::Result<P
                 return Ok(drop_client_read_self(data, id));
             }
         };
-        let mid = ServerHandshake::start(io_stream, NoCallback, None);
+        let mid = ServerHandshake::start(PrefixStream::new(head, io_stream), NoCallback, None);
         if let Some(c) = data.clients.get_mut(&id) {
             c.stage = WsStage::Handshaking(Some(mid));
         }
-        // 立即驱一轮握手(请求字节多半已就绪)。
+        // 立即驱一轮握手(请求字节已在前缀里,多半一轮完成)。
         ws_drive_handshake(data, id)
     } else {
         // HTTP:在 original 的 dup 上排响应写完即关;READ 源自删(关 original)。dup 与
         // original 是不同 fd 号,故同时注册不会 EPOLL_CTL_ADD EEXIST。
         match original.try_clone() {
-            Ok(http_stream) => serve_http_response(data, http_stream, head),
+            Ok(http_stream) => serve_http_response(data, http_stream, &head),
             Err(e) => tracing::debug!(?e, "HTTP clone stream 失败"),
         }
         // Peeking 阶段还没 WRITE 源,直接摘登记 + 自删 READ 源。
@@ -623,10 +765,14 @@ fn ws_drive_handshake(data: &mut DaemonData, id: u64) -> io::Result<PostAction> 
 /// **重放 + 订阅原子性**:单线程串行,本函数与 [`fan_out_bytes`] 绝不交错 —— `ring.snapshot()`
 /// 之后到达的字节都在本连接转 Live 之后由 fan-out 经出站送达(无丢);之前的都在重放里
 /// (无双发)。
-fn ws_go_live(data: &mut DaemonData, id: u64, ws: WebSocket<TcpStream>) -> io::Result<PostAction> {
+fn ws_go_live(
+    data: &mut DaemonData,
+    id: u64,
+    ws: WebSocket<PrefixStream>,
+) -> io::Result<PostAction> {
     // WRITE 源借另一份 dup(与 READ 源的 original、ws 的 IO dup 都不同 fd 号,避免同一 fd
-    // 在 epoll 里重复注册)。
-    let write_stream = match ws.get_ref().try_clone() {
+    // 在 epoll 里重复注册)。`get_ref()` 给 `&PrefixStream`,从中取底层 socket 再 dup。
+    let write_stream = match ws.get_ref().tcp().try_clone() {
         Ok(s) => s,
         Err(e) => {
             tracing::debug!(?e, "WS clone WRITE stream 失败,断开");
@@ -818,8 +964,8 @@ fn drop_client_write_self(data: &mut DaemonData, id: u64) -> PostAction {
     PostAction::Remove
 }
 
-/// 从**与该连接无关的** callback(如 pty_readable 背压断开)回收一条连接:两个源都经
-/// `loop_handle.remove` 注销 + 摘登记项。
+/// 从**与该连接无关的** callback(如 pty_readable 背压断开 / 收割 Timer)回收一条连接:
+/// 两个源都经 `loop_handle.remove` 注销 + 摘登记项。
 fn drop_client_external(data: &mut DaemonData, id: u64) {
     if let Some(conn) = data.clients.remove(&id) {
         data.loop_handle.remove(conn.read_token);
@@ -827,6 +973,61 @@ fn drop_client_external(data: &mut DaemonData, id: u64) {
             data.loop_handle.remove(w.token);
         }
     }
+}
+
+/// 收割 Timer 回调:回收卡在 Peeking/Handshaking 阶段超 `handshake_deadline`(自 accept 起
+/// 的绝对期限)的连接,防半截头/卡握手/slowloris 长占 `clients` 槽。**live 连接不收割**
+/// (健康但安静的终端无收发也属正常,按空闲超时会误杀)——其半开掉线靠 SO_KEEPALIVE。
+fn reap_stale_clients(data: &mut DaemonData) {
+    let now = Instant::now();
+    let deadline = data.handshake_deadline;
+    let stale: Vec<u64> = data
+        .clients
+        .iter()
+        .filter(|(_, c)| {
+            !matches!(c.stage, WsStage::Live(_)) && now.duration_since(c.created_at) > deadline
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    for id in stale {
+        tracing::debug!(id, "WS 连接握手未在期限内完成,收割(防卡握手/半截头占槽)");
+        drop_client_external(data, id);
+    }
+}
+
+/// 给一条接受进来的 TCP 连接打开内核 TCP keepalive 探活(尽力而为的半开硬化)。默认
+/// idle 7200s 太长,显式调短:idle 60s 后开始探,每 10s 探一次,3 次无应答判死。死后内核
+/// 让该 fd 报错 → epoll 唤醒 READ 源 → 走既有 EOF/错误回收路径。**比按空闲超时收割 live
+/// 连接安全**(不误杀健康但安静的会话)。失败容忍(老内核缺某 sockopt 不影响主功能)。
+#[allow(unsafe_code)]
+fn enable_keepalive(stream: &TcpStream) {
+    let fd = stream.as_raw_fd();
+    let set = |level: libc::c_int, name: libc::c_int, val: libc::c_int| {
+        // SAFETY: setsockopt 只读取我们栈上 c_int 的 size_of 字节(只读不写),fd 来自本函数
+        // 参数里活着的 TcpStream;返回值忽略(尽力而为,失败不影响主功能)。
+        unsafe {
+            libc::setsockopt(
+                fd,
+                level,
+                name,
+                std::ptr::addr_of!(val).cast::<libc::c_void>(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    };
+    set(libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1);
+    set(libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 60);
+    set(libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 10);
+    set(libc::IPPROTO_TCP, libc::TCP_KEEPCNT, 3);
+}
+
+/// 读 env 里的毫秒数(调参 / 测试用),解析失败或缺省落回 `default_ms`。
+fn duration_from_env(key: &str, default_ms: u64) -> Duration {
+    let ms = std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(default_ms);
+    Duration::from_millis(ms)
 }
 
 /// 普通 HTTP 请求:在给定 stream 上排响应(`GET /` / `/index.html` 返 xterm.js 页,

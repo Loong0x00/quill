@@ -69,6 +69,56 @@ fn write_spew_shell(path: &std::path::Path) {
     write_exec_script(path, &format!("#!/bin/sh\nexec yes '{line}'\n"));
 }
 
+/// 静默 shell:`exec cat` 读 PTY(无输入→阻塞,零输出→daemon 空闲基线 CPU≈0);daemon 关
+/// PTY 时 cat 收 EOF 自退(测试自清,不留孤儿)。用于忙等 / 收割测试(需要 daemon 真空闲)。
+fn write_quiet_shell(path: &std::path::Path) {
+    write_exec_script(path, "#!/bin/sh\nexec cat\n");
+}
+
+/// 子进程累计 CPU 时间(utime+stime,单位 jiffies)。读 `/proc/<pid>/stat` 第 14/15 字段;
+/// comm(第 2 字段)可能含空格/括号,故按【最后一个 ')'】切分后再数字段(其后第一个
+/// token 是字段 3=state,故 utime=tokens[11]、stime=tokens[12])。
+fn proc_cpu_jiffies(pid: u32) -> u64 {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+    let rparen = match stat.rfind(')') {
+        Some(i) => i,
+        None => return 0,
+    };
+    let toks: Vec<&str> = stat[rparen + 1..].split_whitespace().collect();
+    let utime = toks
+        .get(11)
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    let stime = toks
+        .get(12)
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    utime + stime
+}
+
+/// `sysconf(_SC_CLK_TCK)`(jiffies/秒,通常 100),用于把 jiffies 折算成毫秒。
+fn clk_tck() -> u64 {
+    // SAFETY: sysconf 只读系统常量,无内存安全问题。tests crate 无 deny(unsafe_code)。
+    let v = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if v <= 0 {
+        100
+    } else {
+        v as u64
+    }
+}
+
+/// 等 daemon 端口可连(起进程有延迟),返一条已连 TcpStream。
+fn connect_tcp(port: u16, timeout: Duration) -> Option<TcpStream> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(s) => return Some(s),
+            Err(_) => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+    None
+}
+
 fn spawn_daemon(sock: &std::path::Path, shell: &std::path::Path, port: u16) -> std::process::Child {
     std::process::Command::new(env!("CARGO_BIN_EXE_quill-kernel"))
         .arg(format!("--socket={}", sock.display()))
@@ -369,5 +419,129 @@ fn daemon_drops_slow_client_over_cap() {
     assert!(
         closed,
         "完全不读的慢客户端应在出站积压超 cap 后被 daemon 断开回收(读到连接关闭)"
+    );
+}
+
+/// 忙等回归(must-fix):发**半截 HTTP 头**后停住,daemon **不应忙等**。
+///
+/// 旧码用 `TcpStream::peek`(MSG_PEEK 不消费内核缓冲)+ `Mode::Level`:半截头令 fd 恒可读 →
+/// calloop 每轮 ~0 超时重派 `ws_peek` → 烧满一个核(实测 99.3%)。新码消费式读把 fd 排空 →
+/// Level 不再触发 → 静默等下次新字节。
+///
+/// **确定性判据**(非瞬时 CPU%):测 daemon 在固定 wall 窗口内**累计消耗的 CPU 时间**
+/// (`/proc/<pid>/stat` utime+stime jiffies)。忙等会在 2s 窗里吃满 ~2000ms CPU,健康
+/// daemon <~100ms;门设 500ms,两侧各 4x 余量,稳不 flaky。
+#[test]
+fn daemon_does_not_busy_spin_on_partial_header() {
+    let dir = std::env::temp_dir().join(format!("quill-spin-ws-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("建临时目录");
+    let sock = dir.join("kernel.sock");
+    let shell = dir.join("shell.sh");
+    write_quiet_shell(&shell); // 不产 PTY 输出 → daemon 空闲基线 CPU≈0
+    let port = free_port();
+    let mut child = spawn_daemon(&sock, &shell, port);
+    let pid = child.id();
+
+    let cleanup = |child: &mut std::process::Child, dir: &std::path::Path| {
+        send_signal(child.id(), libc::SIGTERM);
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(dir);
+    };
+
+    let mut stream = match connect_tcp(port, Duration::from_secs(15)) {
+        Some(s) => s,
+        None => {
+            cleanup(&mut child, &dir);
+            panic!("15s 内无法连上 daemon");
+        }
+    };
+
+    // 发半截头(**无**结尾空行 \r\n\r\n)后停住不再发。
+    if stream.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n").is_err() {
+        cleanup(&mut child, &dir);
+        panic!("写半截头失败");
+    }
+    let _ = stream.flush();
+
+    // 让 daemon 处理半截头(消费→WouldBlock→Continue)进入稳定态,再开始测 CPU。
+    std::thread::sleep(Duration::from_millis(500));
+    let before = proc_cpu_jiffies(pid);
+    std::thread::sleep(Duration::from_secs(2));
+    let after = proc_cpu_jiffies(pid);
+
+    // stream 保活到测量结束(别提前 drop 触发回收改变行为)。
+    drop(stream);
+    cleanup(&mut child, &dir);
+
+    let cpu_ms = after.saturating_sub(before) * 1000 / clk_tck();
+    assert!(
+        cpu_ms < 500,
+        "半截 HTTP 头后 daemon 不应忙等:2s 窗内消耗 {cpu_ms}ms CPU(忙等会 ~2000ms)"
+    );
+}
+
+/// 收割回归(顺带修):卡握手连接超 `handshake_deadline` 被回收。
+///
+/// 发半截头后停住,该连接永远卡在 Peeking 阶段;收割 Timer 在 deadline 后 `loop_handle.remove`
+/// 其 READ 源(关 original fd)→ 客户端读到 EOF/RST。env 注入短超时(600ms deadline /
+/// 200ms 扫描)让测试快且确定:回收→client `read` 速返 EOF;若没回收(回归)→ client `read`
+/// 阻塞到 5s 读超时 = 失败。
+#[test]
+fn daemon_reaps_stuck_handshake_connection() {
+    let dir = std::env::temp_dir().join(format!("quill-reap-ws-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("建临时目录");
+    let sock = dir.join("kernel.sock");
+    let shell = dir.join("shell.sh");
+    write_quiet_shell(&shell);
+    let port = free_port();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_quill-kernel"))
+        .arg(format!("--socket={}", sock.display()))
+        .arg(format!("--ws-bind=127.0.0.1:{port}"))
+        .env("SHELL", &shell)
+        .env("RUST_LOG", "quill=warn")
+        .env("QUILL_WS_REAP_MS", "200")
+        .env("QUILL_WS_HANDSHAKE_DEADLINE_MS", "600")
+        .spawn()
+        .expect("spawn quill-kernel daemon");
+
+    let cleanup = |child: &mut std::process::Child, dir: &std::path::Path| {
+        send_signal(child.id(), libc::SIGTERM);
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(dir);
+    };
+
+    let mut stream = match connect_tcp(port, Duration::from_secs(15)) {
+        Some(s) => s,
+        None => {
+            cleanup(&mut child, &dir);
+            panic!("15s 内无法连上 daemon");
+        }
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+
+    // 发半截头后停住(不发结尾 \r\n\r\n)。
+    if stream.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n").is_err() {
+        cleanup(&mut child, &dir);
+        panic!("写半截头失败");
+    }
+    let _ = stream.flush();
+
+    // deadline 600ms + 扫描 200ms → 应在 ~1s 内被回收。read 阻塞直到对端关(Ok(0))/
+    // reset(Err 非超时)/ 5s 读超时(= 没回收 = 失败)。
+    let mut buf = [0u8; 64];
+    let r = stream.read(&mut buf);
+    cleanup(&mut child, &dir);
+
+    let reclaimed = match r {
+        Ok(0) => true,  // FIN:被回收
+        Ok(_) => false, // 半截头不该有响应
+        Err(ref e) => !matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ), // reset 等也算回收;唯独读超时 = 没回收
+    };
+    assert!(
+        reclaimed,
+        "卡握手连接应在 handshake_deadline 后被收割(读到 EOF/RST),实际 read={r:?}"
     );
 }
