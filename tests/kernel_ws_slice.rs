@@ -693,3 +693,192 @@ fn daemon_reaps_unread_http_response_writer() {
          若 body == Content-Length 说明没收割(写源恢复发完整响应 = slowloris-read 回归)"
     );
 }
+
+/// T6 砖0 块C/D:连上应收到**控制面 Text 帧**(工作区列表 + 字节流 (workspace,tab) 标签),
+/// 与数据面 Binary 字节分流。证 `ServerMsg::Workspaces/Workspace/StreamFocus` 真接线下发。
+#[test]
+fn daemon_sends_control_text_frames_on_connect() {
+    let dir = std::env::temp_dir().join(format!("quill-ctrl-ws-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("建临时目录");
+    let sock = dir.join("kernel.sock");
+    let shell = dir.join("shell.sh");
+    write_marker_shell(&shell);
+    let port = free_port();
+    let mut child = spawn_daemon(&sock, &shell, port);
+
+    let url = format!("ws://127.0.0.1:{port}/");
+    let cleanup = |child: &mut std::process::Child, dir: &std::path::Path| {
+        send_signal(child.id(), libc::SIGTERM);
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(dir);
+    };
+
+    let mut ws = match connect_ws(&url, Duration::from_secs(15)) {
+        Some(w) => w,
+        None => {
+            cleanup(&mut child, &dir);
+            panic!("15s 内未能连上 WS {url}");
+        }
+    };
+
+    // 读若干帧,收集**控制面 Text 帧**(数据面是 Binary,被忽略)。应见工作区列表 / 字节流标签。
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut saw_workspaces = false;
+    let mut saw_stream_focus = false;
+    while Instant::now() < deadline && !(saw_workspaces && saw_stream_focus) {
+        match ws.read() {
+            Ok(Message::Text(t)) => {
+                let s = t.as_str();
+                if s.contains("\"Workspaces\"") {
+                    saw_workspaces = true;
+                }
+                if s.contains("\"StreamFocus\"") && s.contains("workspace_id") {
+                    saw_stream_focus = true;
+                }
+            }
+            Ok(Message::Close(_)) => break,
+            Ok(_) => {}  // Binary 数据帧:忽略
+            Err(_) => {} // read timeout:继续读到 deadline
+        }
+    }
+
+    let _ = ws.close(None);
+    cleanup(&mut child, &dir);
+
+    assert!(
+        saw_workspaces,
+        "连上应收到控制面 ServerMsg::Workspaces(工作区列表)Text 帧"
+    );
+    assert!(
+        saw_stream_focus,
+        "连上应收到控制面 ServerMsg::StreamFocus(字节流 workspace/tab 标签)Text 帧"
+    );
+}
+
+/// T6 砖0 块C/D:**死客户端不泄漏 + anchor 在 → WS 全断不死**。远超 MAX_WS_CONNS(16)的
+/// 顺序「连上→收 MARKER→断线(drop,不发 Close)」循环:若死连接不回收(`clients` 泄漏),
+/// 第 17+ 次连接会被 daemon 满额拒绝 → connect 失败。全部成功 = 连接被回收(无泄漏)+ 工作区
+/// 因 anchor(daemon 自锚)在每次断线后都还在直播(断线 = 非事件,不销毁)。
+#[test]
+fn daemon_reaps_disconnected_clients_and_anchor_keeps_alive() {
+    let dir = std::env::temp_dir().join(format!("quill-churn-ws-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("建临时目录");
+    let sock = dir.join("kernel.sock");
+    let shell = dir.join("shell.sh");
+    write_marker_shell(&shell);
+    let port = free_port();
+    let mut child = spawn_daemon(&sock, &shell, port);
+
+    let url = format!("ws://127.0.0.1:{port}/");
+    let cleanup = |child: &mut std::process::Child, dir: &std::path::Path| {
+        send_signal(child.id(), libc::SIGTERM);
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(dir);
+    };
+
+    // 20 > MAX_WS_CONNS(16):每次连断都回收才可能 20 连全成功。
+    const CYCLES: usize = 20;
+    let mut ok = 0usize;
+    for _ in 0..CYCLES {
+        match connect_ws(&url, Duration::from_secs(8)) {
+            Some(mut ws) => {
+                if ws_recv_until(&mut ws, MARKER.as_bytes(), Duration::from_secs(8)) {
+                    ok += 1;
+                }
+                drop(ws); // 断线:drop TcpStream = FIN,无 WS Close 帧 → daemon 按断线(非事件)回收
+                std::thread::sleep(Duration::from_millis(30)); // 让 daemon 事件循环处理 FIN 回收
+            }
+            None => break, // 连不上(疑似满额 = 泄漏)→ 留给断言抓
+        }
+    }
+
+    cleanup(&mut child, &dir);
+    assert_eq!(
+        ok, CYCLES,
+        "20(>MAX_WS_CONNS 16)次连断循环每次都应连上并收到 MARKER:\
+         死连接被回收(无 clients/holder 泄漏)+ anchor 在工作区不死(断线非事件)"
+    );
+}
+
+/// T6 砖0 块C/D:**显式 X 关闭(Release)回收该连接,但 anchor 保活、工作区不销毁**。
+/// 发 `ClientMsg::Release` → daemon explicit 释放 holder(anchor 在 → 不归 0 → 不销毁)+ 回收
+/// 本连接 → client 读到连接关闭;随后新连接仍能收 MARKER(只关了那个 view)。
+#[test]
+fn daemon_release_closes_connection_but_keeps_workspace() {
+    let dir = std::env::temp_dir().join(format!("quill-release-ws-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("建临时目录");
+    let sock = dir.join("kernel.sock");
+    let shell = dir.join("shell.sh");
+    write_marker_shell(&shell);
+    let port = free_port();
+    let mut child = spawn_daemon(&sock, &shell, port);
+
+    let url = format!("ws://127.0.0.1:{port}/");
+    let cleanup = |child: &mut std::process::Child, dir: &std::path::Path| {
+        send_signal(child.id(), libc::SIGTERM);
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(dir);
+    };
+
+    let mut ws = match connect_ws(&url, Duration::from_secs(15)) {
+        Some(w) => w,
+        None => {
+            cleanup(&mut child, &dir);
+            panic!("15s 内未能连上 WS {url}");
+        }
+    };
+
+    // 显式 X 关闭:发 Release 控制帧(Text)。daemon 用连接 held_ws,消息里的 id 仅占位
+    //(daemon 首个工作区 id=1);anchor 在 → 不销毁,只回收本连接。
+    if ws
+        .send(Message::Text("{\"Release\":{\"workspace_id\":1}}".into()))
+        .is_err()
+    {
+        cleanup(&mut child, &dir);
+        panic!("发 Release 控制帧失败");
+    }
+    let _ = ws.flush();
+
+    // 该连接应被 daemon 回收 → client 读到关闭(Close / EOF / RST),排空缓冲 MARKER 后命中。
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut closed = false;
+    while Instant::now() < deadline {
+        match ws.read() {
+            Ok(Message::Close(_)) => {
+                closed = true;
+                break;
+            }
+            Ok(_) => continue, // 缓冲的 MARKER 数据帧 / 控制帧:排空
+            Err(WsError::ConnectionClosed) | Err(WsError::AlreadyClosed) => {
+                closed = true;
+                break;
+            }
+            Err(WsError::Io(e))
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue
+            }
+            Err(_) => {
+                closed = true; // RST 等也算回收
+                break;
+            }
+        }
+    }
+
+    // anchor 保活:新连接仍能收 MARKER(Release 只关了那个 view,工作区没死)。
+    let alive = match connect_ws(&url, Duration::from_secs(10)) {
+        Some(mut ws2) => ws_recv_until(&mut ws2, MARKER.as_bytes(), Duration::from_secs(8)),
+        None => false,
+    };
+
+    cleanup(&mut child, &dir);
+    assert!(
+        closed,
+        "收到 Release(显式 X 关闭)后 daemon 应回收该连接(client 读到关闭)"
+    );
+    assert!(
+        alive,
+        "Release 只关那个 view;anchor 保活 → 工作区不销毁,新连接仍能收 MARKER"
+    );
+}
