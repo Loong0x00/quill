@@ -886,18 +886,38 @@ fn share_back_channel_readable(data: &mut LoopData, fd: RawFd) -> std::io::Resul
     Ok(PostAction::Continue)
 }
 
-/// 路由一条子回灌的 `Input` 帧到本地 PTY(块ii 实装)。块i(只读镜像)先丢弃 —— 把 back-channel
-/// drain 掉(防 pipe 填满拖累子)但不回灌输入。
+/// 路由一条子回灌的 `Input` 帧到本地 PTY(块ii)。手机镜像桌面**焦点**(= active)tab,故回灌
+/// 输入目标 = 焦点 tab;按帧的 (ws, tab) 标签定位:命中当前 active tab → [`queue_or_write_pty`]
+/// 写进**该 tab 的 PTY**(**复用唯一写汇** = pending_pty_writes 队列 + 每 tick drain,与
+/// paste / keyboard 同背压路径,**不另开写路径**)。
+///
+/// 不命中(焦点 race:桌面已切 tab,但手机仍按旧焦点发了输入)→ 丢弃 —— 防把键写错 tab;手机
+/// 随后收 `FocusChange` 重同步。砖1b 单焦点;多 tab 寻址回灌(`tab_id` != active 时投对应后台
+/// tab)留后续。父 own PTY,子自己不写 PTY(ADR-0018)。
 fn route_share_input(data: &mut LoopData, frame: FeedFrame) {
-    // 块i 占位:只读镜像,不回灌输入(块ii 接 queue_or_write_pty,按 (ws, tab) 路由到对应 PTY)。
-    let _ = data;
-    tracing::trace!(
-        kind = ?frame.kind,
-        ws = frame.ws_id,
-        tab = frame.tab_id,
-        n = frame.payload.len(),
-        "E′ 共享子回灌帧(块i 只读,暂丢弃)"
-    );
+    // 只处理 Input 帧(子→父方向)。其它 kind(父→子方向)不该从 back-channel 来,忽略。
+    if frame.kind != FrameKind::Input {
+        tracing::debug!(kind = ?frame.kind, "E′ back-channel 收到非 Input 帧(方向应子→父),忽略");
+        return;
+    }
+    if frame.payload.is_empty() {
+        return;
+    }
+    let Some(tabs) = data.state.tabs.as_ref() else {
+        return;
+    };
+    let active_id = tabs.active().id().raw();
+    if frame.tab_id != active_id {
+        tracing::debug!(
+            frame_tab = frame.tab_id,
+            active = active_id,
+            n = frame.payload.len(),
+            "E′ 回灌输入目标非当前焦点 tab(焦点 race / 多 tab 未支持),丢弃"
+        );
+        return;
+    }
+    // 命中焦点 tab:复用唯一写汇(写进 active tab 的 PTY,背压排队 + tick drain)。
+    queue_or_write_pty(&mut data.state, &frame.payload, "share-input");
 }
 
 /// calloop Generic source 每次 readable 时跑一圈:循环 `pty.read` → 分派
