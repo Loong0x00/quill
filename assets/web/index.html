@@ -6,9 +6,14 @@
   窗口宽 reflow。不再传网格 Snapshot —— 连上先收环缓冲重放(重建当前屏),之后
   持续收 live 字节(连接保持)。
 
-  线缆体 = WebSocket **二进制帧**(原样 PTY 字节,非 JSON):
-    onmessage(ArrayBuffer) → term.write(Uint8Array)
-  输入回灌(键盘 → PTY)是下一片(T5),本片只读/只看。
+  线缆体 = WebSocket **二进制帧**(原样 PTY 字节,非 JSON),双向:
+    出站 onmessage(ArrayBuffer) → term.write(Uint8Array)   (PTY → 屏)
+    入站 term.onData/onBinary → ws.send(二进制帧)            (键盘 → PTY,片2)
+
+  片2(输入回灌 + 软键栏):xterm.js 已把键盘/方向键/粘贴/IME 编码成 VT 字节串
+  (Enter=\r, Ctrl-C=\x03, ↑=\x1b[A …),onData 原样回发即可,daemon 写 active tab
+  PTY。底部**软键栏**补手机软键盘没有的键(ESC / ESC ESC 撤回改 / Ctrl-C / Tab /
+  Shift-Tab / 方向键 / Ctrl-D),各发对应控制字节。
 
   自包含:xterm.js / css / fit addon 由 daemon 同口 HTTP serve(/vendor/*),
   零 CDN 依赖(手机经 WireGuard VPN 离线可用)。
@@ -37,6 +42,22 @@
   #status { margin-left: auto; opacity: .7; }
   /* xterm 容器吃满剩余高度;fit addon 据此算 cols/rows 做本地 reflow */
   #term { flex: 1 1 auto; min-height: 0; padding: .25rem; }
+  /* 软键栏:底部一排可点控制键(手机软键盘没 ESC/Ctrl/方向键)。横向可滚,
+     按钮够大可点(touch target)。占高度 → #term 变矮 → 本地 reflow,不回灌 daemon。 */
+  #keys {
+    flex: 0 0 auto; display: flex; gap: .3rem; align-items: stretch;
+    padding: .35rem .4rem; background: #161616; border-top: 1px solid #2a2a2a;
+    overflow-x: auto; -webkit-overflow-scrolling: touch;
+  }
+  #keys button {
+    flex: 0 0 auto; min-width: 2.6rem; min-height: 2.4rem; padding: 0 .6rem;
+    background: #262626; color: #e0e0e0; border: 1px solid #3a3a3a;
+    border-radius: .35rem; font-family: ui-monospace, "DejaVu Sans Mono", monospace;
+    font-size: .95rem; cursor: pointer; user-select: none; -webkit-user-select: none;
+    touch-action: manipulation;
+  }
+  #keys button:active { background: #3a3a3a; }
+  #keys button.wide { min-width: 4.2rem; }
 </style>
 </head>
 <body>
@@ -46,6 +67,8 @@
     <span id="status">连接中…</span>
   </div>
   <div id="term"></div>
+  <!-- 软键栏:按钮在 JS 里据 SOFTKEYS 表生成(避免在 HTML 属性里写转义字节) -->
+  <div id="keys"></div>
 
 <script src="/vendor/xterm.js"></script>
 <script src="/vendor/xterm-addon-fit.js"></script>
@@ -75,6 +98,60 @@ fit.fit();
 // 本地 reflow 对流式逻辑行(硬 \n)即正确,这是 R1「客户端各自按自己宽 reflow」。
 const refit = () => { try { fit.fit(); } catch (_) {} };
 window.addEventListener("resize", refit);
+
+// ── 输入回灌(片2):键盘/方向键/粘贴/IME → WS 二进制帧 → daemon → active tab PTY ──
+// 发原始字节(二进制帧),与片1 出站 Binary 对称;daemon 收到直接写 PTY。`ws` 是
+// 下面的 let 变量,重连会换实例 —— 这里读闭包里的当前 ws,不捕获旧实例。
+function sendBytes(u8) {
+  if (ws && ws.readyState === WebSocket.OPEN && u8 && u8.length) ws.send(u8);
+}
+// onData 给的是 UTF-8 文本(普通键 + Enter=\r + Ctrl-C=\x03 + 方向键=\x1b[A… 由
+// xterm 编码好,含粘贴/IME 上屏);TextEncoder 编 UTF-8 后发。
+const enc = new TextEncoder();
+function sendStr(s) { sendBytes(enc.encode(s)); }
+
+// xterm 把物理键/方向键/粘贴/IME 全汇流成 onData 的 VT 字节串,原样回发即可。
+term.onData((d) => sendStr(d));
+// onBinary 给的是 latin1「二进制串」(如鼠标上报含 >127 字节)→ 按字符码取字节,
+// 不能用 TextEncoder(会 UTF-8 膨胀破坏字节)。
+term.onBinary((s) => {
+  const u8 = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) u8[i] = s.charCodeAt(i) & 0xff;
+  sendBytes(u8);
+});
+
+// ── 软键栏:手机软键盘没有的键,各发对应控制字节(与桌面 wl/keyboard.rs 同款序列)──
+// label, 字节序列, 是否宽按钮
+const SOFTKEYS = [
+  ["Esc",     "\x1b",     false],
+  ["Esc·Esc", "\x1b\x1b", true ],  // CC 双击 ESC 撤回上一次修改
+  ["^C",      "\x03",     false],  // SIGINT
+  ["^D",      "\x04",     false],  // EOF
+  ["Tab",     "\x09",     false],
+  ["⇧Tab",    "\x1b[Z",   true ],  // BackTab (CSI Z)
+  ["←",       "\x1b[D",   false],
+  ["↑",       "\x1b[A",   false],
+  ["↓",       "\x1b[B",   false],
+  ["→",       "\x1b[C",   false],
+];
+(function buildSoftKeys() {
+  const keysEl = $("keys");
+  for (const [label, seq, wide] of SOFTKEYS) {
+    const b = document.createElement("button");
+    b.textContent = label;
+    if (wide) b.className = "wide";
+    // pointerdown + preventDefault:统一鼠标/触摸只触发一次,且**不抢焦点** ——
+    // 否则点按钮会 blur xterm 的隐藏 textarea,手机收起系统软键盘 / onData 失效。
+    b.addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      sendStr(seq);
+      term.focus();
+    });
+    keysEl.appendChild(b);
+  }
+  // 软键栏占了高度 → #term 变矮 → 据新尺寸本地重折。
+  refit();
+})();
 
 function setLive(live, text) {
   dotEl.classList.toggle("live", live);

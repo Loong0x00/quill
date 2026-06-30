@@ -1,15 +1,21 @@
-//! Phase 7 片1 WS **字节流** 传输垂直切片端到端验收 (ADR-0015 R1)。
+//! Phase 7 WS 传输垂直切片端到端验收(片1 字节流直播 + 片2 输入回灌,
+//! ADR-0015 R1 + ADR-0016 calloop 单线程化)。
 //!
-//! 起真 `quill-kernel` 子进程(同口 HTTP + WS 端点),验两条:
-//! 1. **同口 HTTP**:裸 TCP `GET /` 拿到 200 + 含 xterm.js 的页面(`/vendor/xterm.js`
-//!    引用 + WebSocket 接线),证「普通 GET 出网页、Upgrade 走 WS」同口分流。
-//! 2. **WS 字节流 + 连接保持**:让 daemon 的 tab(SHELL 覆写成循环 printf 已知
-//!    MARKER 的脚本)持续产出**已知字节**;tungstenite client 连上收**二进制帧**,
-//!    断言收到 MARKER(含连上重放 + 之后 live),且 **sleep 一段后仍能继续收到**
-//!    新 MARKER —— 证连接保持的持续直播(非 T3a「发一帧即关」)。
+//! 起真 `quill-kernel` 子进程(同口 HTTP + WS 端点,全 calloop 无线程),验四条:
+//! 1. **同口 HTTP**:裸 TCP `GET /` 拿到 200 + 含 xterm.js 的页面,证「普通 GET 出
+//!    网页、Upgrade 走 WS」同口分流。
+//! 2. **WS 字节流 + 连接保持**:tab(SHELL 覆写成循环 printf 已知 MARKER 的脚本)持续
+//!    产出已知字节;client 连上收**二进制帧**(连上重放 + 之后 live),歇一会儿仍能收到
+//!    新 MARKER —— 证连接保持的持续直播。
+//! 3. **输入往返(片2)**:SHELL 覆写成 read-echo 脚本;client 经 WS 发 `RUNDONE\n`,
+//!    daemon `on_input` 写 active tab PTY,脚本读到后 `printf GOT[...]`,client 收回 —
+//!    证浏览器 → daemon → PTY 的输入回灌闭环(无 channel、无线程)。
+//! 4. **慢客户端背压回收**:SHELL 覆写成高速 spew 脚本;client 连上后**完全不读**,
+//!    daemon 该连接出站积压超 cap → 断开回收;client 随后读到连接关闭(非无限流)—
+//!    单线程下 drop 同步发生在 fan-out,不依赖线程时序。
 //!
-//! 用 SHELL 覆写脚本注入确定性输出:不依赖输入回灌(T5),也不靠真 shell 的 rc /
-//! prompt(非确定)。tests/ 允许 `unwrap`/`expect`(CLAUDE.md 仅约束 src/)。
+//! 用 SHELL 覆写脚本注入确定性输入/输出。tests/ 允许 `unwrap`/`expect`(CLAUDE.md
+//! 仅约束 src/)。
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -17,7 +23,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, Instant};
 
 use tungstenite::stream::MaybeTlsStream;
-use tungstenite::{Message, WebSocket};
+use tungstenite::{Bytes, Error as WsError, Message, WebSocket};
 
 const MARKER: &str = "QUILL_BYTES_MARKER";
 
@@ -34,14 +40,33 @@ fn send_signal(pid: u32, sig: i32) {
     }
 }
 
-/// 写一个可执行 shell 脚本:循环 printf 已知 MARKER(并保持 PTY 打开,daemon 不退)。
-/// daemon 经 `$SHELL -li` spawn 它 → 确定性产出字节流,无需输入回灌。
-fn write_marker_shell(path: &std::path::Path) {
-    let script = format!("#!/bin/sh\nwhile :; do printf '{MARKER}\\n'; sleep 0.2; done\n");
-    std::fs::write(path, script).expect("写 marker shell 脚本");
+fn write_exec_script(path: &std::path::Path, body: &str) {
+    std::fs::write(path, body).expect("写 shell 脚本");
     let mut perm = std::fs::metadata(path).expect("stat 脚本").permissions();
     perm.set_mode(0o755);
     std::fs::set_permissions(path, perm).expect("chmod +x 脚本");
+}
+
+/// 循环 printf 已知 MARKER(并保持 PTY 打开,daemon 不退)。确定性产出字节流。
+fn write_marker_shell(path: &std::path::Path) {
+    write_exec_script(
+        path,
+        &format!("#!/bin/sh\nwhile :; do printf '{MARKER}\\n'; sleep 0.2; done\n"),
+    );
+}
+
+/// read-echo:逐行读 stdin(PTY),回 `GOT[<line>]`。验输入回灌往返。
+fn write_read_echo_shell(path: &std::path::Path) {
+    write_exec_script(
+        path,
+        "#!/bin/sh\nwhile IFS= read -r line; do printf 'GOT[%s]\\n' \"$line\"; done\n",
+    );
+}
+
+/// 高速 spew:`yes` 大行,尽快灌满出站。验慢客户端背压回收。
+fn write_spew_shell(path: &std::path::Path) {
+    let line = "A".repeat(200);
+    write_exec_script(path, &format!("#!/bin/sh\nexec yes '{line}'\n"));
 }
 
 fn spawn_daemon(sock: &std::path::Path, shell: &std::path::Path, port: u16) -> std::process::Child {
@@ -201,13 +226,12 @@ fn daemon_streams_known_pty_bytes_over_ws_and_keeps_alive() {
     let phase1 = ws_recv_until(&mut ws, MARKER.as_bytes(), Duration::from_secs(10));
 
     // 阶段 2:连接保持。歇一会儿让脚本继续产出新 MARKER,再读 —— 仍应收到。
-    // 这区分「持续直播(连接保持)」与 T3a「发一帧即关」(后者此处会收到 Close)。
     std::thread::sleep(Duration::from_millis(700));
     let phase2 = ws_recv_until(&mut ws, MARKER.as_bytes(), Duration::from_secs(10));
 
     let _ = ws.close(None);
 
-    // SIGTERM → daemon 停 loop + join WS 线程 + 清理 unix socket(优雅退出)。
+    // SIGTERM → daemon 停 loop + 清理 unix socket(优雅退出,无线程可 join)。
     send_signal(child.id(), libc::SIGTERM);
     let status = child.wait().expect("wait daemon");
     let mut gone = false;
@@ -233,5 +257,117 @@ fn daemon_streams_known_pty_bytes_over_ws_and_keeps_alive() {
     assert!(
         status.success() || status.code().is_some(),
         "daemon 应优雅退出 (非被信号杀死),实际: {status:?}"
+    );
+}
+
+/// 片2 输入回灌:WS → daemon `on_input` → PTY → read-echo 脚本 → WS 回程。
+#[test]
+fn daemon_round_trips_input_over_ws() {
+    let dir = std::env::temp_dir().join(format!("quill-input-ws-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("建临时目录");
+    let sock = dir.join("kernel.sock");
+    let shell = dir.join("shell.sh");
+    write_read_echo_shell(&shell);
+    let port = free_port();
+    let mut child = spawn_daemon(&sock, &shell, port);
+
+    let url = format!("ws://127.0.0.1:{port}/");
+    let cleanup = |child: &mut std::process::Child, dir: &std::path::Path| {
+        send_signal(child.id(), libc::SIGTERM);
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(dir);
+    };
+
+    let mut ws = match connect_ws(&url, Duration::from_secs(15)) {
+        Some(w) => w,
+        None => {
+            cleanup(&mut child, &dir);
+            panic!("15s 内未能连上 WS {url}");
+        }
+    };
+
+    // 经 WS 发一行输入(裸字节二进制帧,与浏览器 onData→ws.send 同形)。
+    if ws
+        .send(Message::Binary(Bytes::from_static(b"RUNDONE\n")))
+        .is_err()
+    {
+        cleanup(&mut child, &dir);
+        panic!("WS send 输入失败");
+    }
+    let _ = ws.flush();
+
+    // 脚本读到该行后回 `GOT[RUNDONE]`(经 PTY 回到 WS)。收到即证输入真写进了 PTY。
+    let got = ws_recv_until(&mut ws, b"GOT[RUNDONE]", Duration::from_secs(15));
+
+    let _ = ws.close(None);
+    cleanup(&mut child, &dir);
+
+    assert!(
+        got,
+        "经 WS 发的输入应写进 PTY,read-echo 脚本应回 GOT[RUNDONE](输入回灌往返)"
+    );
+}
+
+/// 慢客户端背压:连上后完全不读,daemon 出站积压超 cap → 断开回收;client 随后应
+/// 读到连接关闭(非无限流)。单线程下 drop 同步发生在 fan-out,确定性优于线程版。
+#[test]
+fn daemon_drops_slow_client_over_cap() {
+    let dir = std::env::temp_dir().join(format!("quill-slow-ws-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("建临时目录");
+    let sock = dir.join("kernel.sock");
+    let shell = dir.join("shell.sh");
+    write_spew_shell(&shell);
+    let port = free_port();
+    let mut child = spawn_daemon(&sock, &shell, port);
+
+    let url = format!("ws://127.0.0.1:{port}/");
+    let cleanup = |child: &mut std::process::Child, dir: &std::path::Path| {
+        send_signal(child.id(), libc::SIGTERM);
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(dir);
+    };
+
+    let mut ws = match connect_ws(&url, Duration::from_secs(15)) {
+        Some(w) => w,
+        None => {
+            cleanup(&mut child, &dir);
+            panic!("15s 内未能连上 WS {url}");
+        }
+    };
+
+    // 故意完全不读:daemon 高速 spew → 该连接出站积压撑过内核缓冲 + cap → 被断开。
+    // 给足时间让积压超 1 MiB(yes 经 PTY 数 MB/s,数秒足够)。
+    std::thread::sleep(Duration::from_secs(6));
+
+    // 现在开始读:先排空 client 端内核缓冲里已缓存的帧,随后应撞上 daemon 关闭的连接
+    //(FIN/RST → Err 或 Close 帧)。若 daemon **没**断开(回归),则会无限流到 deadline。
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut closed = false;
+    while Instant::now() < deadline {
+        match ws.read() {
+            Ok(Message::Close(_)) => {
+                closed = true;
+                break;
+            }
+            Ok(_) => continue, // 缓存的数据帧,排空它
+            Err(WsError::Io(e))
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                // read timeout:还有缓存或刚好没数据,继续等。
+                continue;
+            }
+            Err(_) => {
+                // ConnectionClosed / reset 等 → daemon 已断开回收本连接。
+                closed = true;
+                break;
+            }
+        }
+    }
+
+    cleanup(&mut child, &dir);
+    assert!(
+        closed,
+        "完全不读的慢客户端应在出站积压超 cap 后被 daemon 断开回收(读到连接关闭)"
     );
 }

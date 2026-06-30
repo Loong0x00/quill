@@ -83,8 +83,21 @@ impl Session {
 
     /// 客户端输入 (键盘 / 粘贴) 写到指定 tab 的 PTY。
     ///
-    /// 背压 (`WouldBlock`) 按 [`crate::pty::PtyHandle::write`] doc 的 daily-drive
-    /// 策略丢字节 + warn;其余 IO 错误上抛。未知 tab_id 报错。
+    /// **interim 部分写处理(片2 / bug1)**:[`crate::pty::PtyHandle::write`] 是单次
+    /// `libc::write`,非阻塞 PTY 缓冲未空时返 `Ok(n)`(`n < len`,部分写)。旧实现
+    /// `Ok(_) => Ok(())` 把部分计数吞掉 → 大粘贴尾字节**静默丢失**。这里改成**循环写
+    /// 剩余**:每次推进 `Ok(n)`,真 `WouldBlock`(内核 PTY 缓冲满)才按既有 daily-drive
+    /// 背压策略 warn + 丢剩余,`Ok(0)`(罕见,内核不再收)防死循环退出。把"一发就丢尾"
+    /// 改成"尽量写完、只在缓冲真满才丢" → keystroke / 中等粘贴不再丢字节。
+    ///
+    /// **完整解 deferred(app-wide 硬化)**:超 PTY 内核缓冲的超大粘贴,缓冲满后本调用
+    /// 仍会丢剩余。桌面 `wl/window.rs` 用 `queue_or_write_pty` + 每 tick
+    /// `drain_pending_pty_writes` 把剩余排队、PTY 可写时再 flush 来兜底;daemon 要等价
+    /// 兜底须在 calloop loop 里维护 per-tab pending 缓冲 + PTY WRITE readiness drain
+    /// (app-wide 数据流改动),不在本片做。
+    ///
+    /// `Interrupted`(EINTR)重试本次写;非 `WouldBlock` / `Ok(0)` / `Interrupted` 的
+    /// IO 错误上抛。未知 tab_id 报错。
     pub fn on_input(&mut self, tab_id: u64, bytes: &[u8]) -> Result<()> {
         let Some(idx) = self.idx_by_raw(tab_id) else {
             bail!("on_input: 未知 tab_id {tab_id}");
@@ -92,18 +105,37 @@ impl Session {
         let Some(tab) = self.tabs.get(idx) else {
             bail!("on_input: tab_id {tab_id} idx {idx} 失效");
         };
-        match tab.pty().write(bytes) {
-            Ok(_) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                tracing::warn!(
-                    tab_id,
-                    "PTY write 背压 (WouldBlock), 丢 {} 字节",
-                    bytes.len()
-                );
-                Ok(())
+        let pty = tab.pty();
+        let mut written = 0;
+        while written < bytes.len() {
+            match pty.write(&bytes[written..]) {
+                Ok(0) => {
+                    // 内核不再接受字节(非 WouldBlock 的零写,罕见)→ 防死循环退出,
+                    // 按背压策略丢剩余。
+                    tracing::warn!(
+                        tab_id,
+                        "PTY write 返回 0, 丢剩余 {} 字节",
+                        bytes.len() - written
+                    );
+                    break;
+                }
+                Ok(n) => written += n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    tracing::warn!(
+                        tab_id,
+                        "PTY write 背压 (WouldBlock), 已写 {written} / 丢剩余 {} 字节",
+                        bytes.len() - written
+                    );
+                    break;
+                }
+                // EINTR:被信号打断的部分/零写,非错误 → 重试本次写(不推进 written,
+                // 重新写剩余切片)。PtyHandle::write 内部通常已吞 EINTR(本层多半见不到),
+                // 防御性兜底,别把可重试的中断当致命错上抛。
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(anyhow::Error::new(e).context("on_input: PTY write 失败")),
             }
-            Err(e) => Err(anyhow::Error::new(e).context("on_input: PTY write 失败")),
         }
+        Ok(())
     }
 
     /// 应用一条 tab 工作区操作 (新建 / 关闭 / 切换 / 换序 / 重命名)。
