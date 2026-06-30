@@ -88,8 +88,14 @@ tty 时代单 stream 限制的产物, Wayland 窗口能开无数, 在 GUI 终端
 - **关键洞察(用户逼出)**:① 桌面定宽 + 手机客户端适配 = 把多宽冲突绕没;② 两段式(忠实保底 + 渐进增强、保底一键可回)= 让"反推不可靠"不再危险,变成纯上限增益。
 - **落地** = **A′**:daemon 发**逻辑行 + 属性**(alacritty 软折标记可还原逻辑行)→ 客户端 CSS 重排 + 表格 widget。第一段(xterm.js 忠实)已在 main;第二段是下一步渲染工作。
 
-**重排下一步(ticket 表见 ADR R1;片1+片2 已经 C 落地在单线程 daemon 上)**:**下一砖 = T6 引用计数生命周期**(holder = 连着的显示端;X 释放 / 断线非事件 / 归 0 销毁;桌面 quill 当 daemon 客户端 + 自动补窗当锚 + 同步全部工作区 —— 这才是"共享你真在用的工作区",目前 daemon 还是自己 spawn 一个独立 shell、没接桌面 quill)→ **T7** web"X 关闭"语义 / PWA 壳(+ 可选登录 token)→ **硬化**(真网格关键帧替代字节尾、连接数/带宽、bincode)。
-**⚠️ T6 起改的是连接生命周期 / 桌面 quill 接入(`wl/` 那 240 字段 State)—— 凡碰 render/wl 的 ticket,impl/审码 agent 必须自己读 `wl/render.rs`、`wl/window.rs`,别信摘要。**
+**T6 架构 = E′(2026-06-30 锁,见 ADR-0018)**:一个程序;**父 = 终端 own PTY 直接渲染(热路径零 IPC)**;**共享 = 懒启动的隔离子进程**(ADR-0017 的 WS-kernel,字节从父 tee 来;没手机=没子进程=零成本);子进程崩溃 OS 隔绝、终端无感。传输 pipe 现用 / shmem ring+eventfd 零拷贝升级备。
+
+**T6 分砖:**
+- 🚧 **砖0(kernel-only,E′-agnostic,在飞 `feat/t6-kernel` / workflow w0kcpvar0)**:冻 T6 协议(多 workspace + `Hold/Release/X-close` + tab 标签流 + 用起 `ServerMsg::Workspace/WorkspaceInfo/TabMeta`)+ Session 多 workspace + **引用计数生命周期**(anchor/holder、**关闭 vs 断线**、归 0 销毁)+ 收口死客户端泄漏 + web 真 X 发 close。**不碰 render/wl**。
+- **砖1+(单作者,碰 render/wl)**:父监管共享子进程 + tee PTY + 桌面接入。手术含住性好:**tab/pty 触点 127 处全在 `window.rs`,`render.rs`/键鼠/selection 零触点 → render.rs 不改**;State.tabs 改"本地 alacritty 镜像 + 子进程连接";藏运行期 `--share`/lazy flag 护 daily-driver;INV-001/008 drop 序须 cargo 编译实证。
+- **T7** web"X 关闭"语义 / PWA 壳(+ 登录 token)→ **硬化**(真网格关键帧替字节尾、bincode、带宽)。
+**⚠️ 凡碰 render/wl 的 ticket(砖1 起),impl/审码 agent 必须自己逐行读 `wl/render.rs`、`wl/window.rs` draw 路径,别信摘要。**
+**⏱️ CI:`ci.sh --fast`(fmt+clippy+build)≈17s 增量;全门 ≈12–25min(33 测里 28 个是 GPU/wl e2e、串行,有一个 e2e binary 单独 ~12min)。kernel 砖改动【不影响】那 28 个 → 可只跑快门 + kernel/pty/ws 测子集(<1min);加 `ci.sh --kernel` 模式是省时选项(暂未做)。**
 
 **协作环(本阶段在用)**:每砖一个 worktree(`git worktree add ../quill-impl-<x> -b feat/<x>`)→ 写码 **Opus xhigh**(改 render 必自己读 `wl/render.rs`,别信摘要)→ 自跑 `scripts/ci.sh` 调全绿 → **多视角对抗审 Opus xhigh** → Lead(user + 主 session)裁决合并(纯加法的 cohesive 单模块 commit 可超 300 行软线)。⚠️ workflow 每个 agent 显式写 `model:'opus' effort:'xhigh'`,别靠默认(`agentType` 自带便宜模型如 Explore=Haiku)。
 
