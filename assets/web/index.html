@@ -82,6 +82,13 @@
     vertical-align: top; text-align: left;
   }
   #reflow th { font-weight: bold; background: #161616; }
+  /* A′ ccchrome:全宽水平规则线(CC 输入框那条 ────)→ 一条 CSS 细线,不折成一摞 ─、不入表。 */
+  #reflow hr.rule { border: 0; border-top: 1px solid #444; height: 0; margin: .5em 0; }
+  /* A′ ccchrome:装饰方框(CC 输入框 chrome / banner)→ CSS 边框圆角块,内部内容正常 reflow。 */
+  #reflow .boxblk {
+    border: 1px solid #444; border-radius: .4rem;
+    padding: .12rem .55rem; margin: .35rem 0; max-width: 100%;
+  }
   /* 软键栏:底部一排可点控制键(手机软键盘没 ESC/Ctrl/方向键)。横向可滚,
      按钮够大可点(touch target)。占高度 → #term 变矮 → 本地 reflow,不回灌 daemon。 */
   #keys {
@@ -276,6 +283,23 @@ const JUNCT = new Set(["┼", "┿", "╪", "╋", "╬", "┤", "├", "┬", "
   "╔", "╗", "╚", "╝", "╠", "╣", "╦", "╩", "╭", "╮", "╯", "╰", "╞", "╡", "╥", "╨", "+"]);
 const BORDER = new Set([...VBAR, ...HBARISH, ...JUNCT]);
 
+// ── A′ ccchrome:框线 chrome(CC 输入框那条全宽 ──── / 圆角方框)优雅化 ──────────────
+// 全宽水平规则线 = 整行只由横线类(─━═…)+ 接点/端角(╭╮╰╯┌┐…)组成、且含足够多横线
+// (≥8)。pre-wrap 下它会被折成一摞短横线(很难看)→ 改渲成一条 CSS 细线(<hr>)。
+// 注:盒线 │/| 不算规则字符(含竖线的是表格/方框分隔,不是裸横线)。
+const RULECH = new Set([...HBARISH, ...JUNCT]);
+function isFullWidthRule(ll) {
+  const t = ll.text.trim();
+  if (t.length < 8) return false;
+  let hbar = 0;
+  for (const ch of t) {
+    if (ch === " ") continue;
+    if (!RULECH.has(ch)) return false;       // 任何非规则字符(字母/竖线…)→ 不是纯规则线
+    if (HBARISH.has(ch)) hbar++;
+  }
+  return hbar >= 8;
+}
+
 function isBlankLine(ll) {
   if (ll.cells.length === 0) return true;
   for (let c = 0; c < ll.text.length; c++) if (ll.text[c] !== " ") return false;
@@ -442,25 +466,70 @@ function buildUnborderedTable(lines, i, end, cols) {
   return wrapTable(tbl);
 }
 
+// 单逻辑行 → 节点:全宽规则线渲成一条 CSS 细线(<hr class=rule>,不折成一摞 ─);
+// 否则普通逐行重排 div。空行也走这(非规则 → 仍是 .lline 占位)。
+function reflowLineNode(ll) {
+  if (isFullWidthRule(ll)) { const hr = document.createElement("hr"); hr.className = "rule"; return hr; }
+  return reflowLineDiv(ll);
+}
+
+// 装饰方框判据:带框区域里【内容行最多 1 列】= 不是二维数据表,是给文字套了个框
+// (CC 输入框 chrome / banner)。真数据表(任一内容行 ≥2 列)→ false,仍走可横滑表 widget。
+function isDecorativeBox(lines, i, end) {
+  let maxCols = 0;
+  for (let k = i; k < end; k++) {
+    const ll = lines[k];
+    if (isSeparatorRow(ll.text) || !hasVBar(ll.text)) continue;
+    const n = vbarColumns(ll).length;
+    if (n > maxCols) maxCols = n;
+  }
+  return maxCols <= 1;
+}
+// 装饰方框 → CSS 边框块:剥掉框线(顶/底/内部横分隔)、内部内容当普通逻辑行 reflow
+// (pre-wrap 按设备宽重折),外面套一个带边框圆角的块。绝不 cram 成 2D 滚表。
+function buildBoxBlock(lines, i, end) {
+  const blk = document.createElement("div");
+  blk.className = "boxblk";
+  for (let k = i; k < end; k++) {
+    const ll = lines[k];
+    if (isSeparatorRow(ll.text)) continue;   // 框线(┌──┐ / ╰──╯ / ├──┤)= 装饰,丢掉
+    const div = document.createElement("div");
+    div.className = "lline";
+    let first = true;
+    for (const [a, b] of vbarColumns(ll)) {  // 单列盒(maxCols=1)= 一段;剥掉外框竖线后的内文
+      if (!first) div.appendChild(document.createTextNode(" "));
+      appendTrimmedCell(div, ll, a, b);
+      first = false;
+    }
+    blk.appendChild(div);
+  }
+  return blk;
+}
+
 // 整屏重排:逐逻辑行流式发出 —— 空行 / 带框表格 / 无框对齐表格 / 退回逐行重排。
 function renderReflow() {
   const lines = buildLogicalLines();
   const frag = document.createDocumentFragment();
   let i = 0;
   while (i < lines.length) {
-    if (isBlankLine(lines[i])) { frag.appendChild(reflowLineDiv(lines[i])); i++; continue; }
-    const be = borderedTableEnd(lines, i);   // 带框表格优先(确定性)
-    if (be > i) { frag.appendChild(buildBorderedTable(lines, i, be)); i = be; continue; }
+    if (isBlankLine(lines[i])) { frag.appendChild(reflowLineNode(lines[i])); i++; continue; }
+    const be = borderedTableEnd(lines, i);   // 带框表格/装饰方框优先(确定性)
+    if (be > i) {
+      frag.appendChild(isDecorativeBox(lines, i, be) ? buildBoxBlock(lines, i, be) : buildBorderedTable(lines, i, be));
+      i = be; continue;
+    }
     let j = i;                               // 最大连续非空行段
     while (j < lines.length && !isBlankLine(lines[j])) j++;
     const cols = unborderedColumns(lines, i, j);
     if (cols) { frag.appendChild(buildUnborderedTable(lines, i, j, cols)); i = j; continue; }
-    // 段内可能含【散文后紧跟的带框表格】(无空行分隔)→ 逐行走,带框处再拦一次。
+    // 段内可能含【散文后紧跟的带框表格/方框】(无空行分隔)→ 逐行走,带框处再拦一次。
     let k = i;
     while (k < j) {
       const b2 = borderedTableEnd(lines, k);
-      if (b2 > k) { frag.appendChild(buildBorderedTable(lines, k, b2)); k = b2; }
-      else { frag.appendChild(reflowLineDiv(lines[k])); k++; }
+      if (b2 > k) {
+        frag.appendChild(isDecorativeBox(lines, k, b2) ? buildBoxBlock(lines, k, b2) : buildBorderedTable(lines, k, b2));
+        k = b2;
+      } else { frag.appendChild(reflowLineNode(lines[k])); k++; }
     }
     i = j;
   }
