@@ -282,6 +282,10 @@ function isBlankLine(ll) {
   return true;
 }
 function hasVBar(text) { for (let c = 0; c < text.length; c++) if (VBAR.has(text[c])) return true; return false; }
+// 盒绘竖线(不含 ASCII `|`)= 表格强信号。裸 `|` 太常见(git log --graph / shell 管道 a|b /
+// 代码),单凭它判表会把高频管道内容 cram 成乱码表(违反「增强永不比保底差」)。
+const STRONG_VBAR = new Set(["│", "║", "┃"]);
+function hasStrongVBar(text) { for (let c = 0; c < text.length; c++) if (STRONG_VBAR.has(text[c])) return true; return false; }
 // 分隔/规则行 SEPSET = 横线类 + 接点 + markdown 对齐冒号(竖线另算)。
 const SEPSET = new Set([...HBARISH, ...JUNCT, ":"]);
 // 分隔行:非空、非空白字符全是【竖线 或 SEPSET】、且含 ≥1 横线类字符、长度 ≥3。覆盖盒线
@@ -305,16 +309,19 @@ function isSeparatorRow(text) {
 // 内容行 + (≥2 内容行 或 ≥1 分隔行)。不满足返 -1。分隔行(含 ---|--- 这种带竖线的)算 rule
 // 不算 content。
 function borderedTableEnd(lines, i) {
-  let j = i, content = 0, rule = 0;
+  let j = i, content = 0, rule = 0, strong = false;
   while (j < lines.length) {
     if (isBlankLine(lines[j])) break;
     const t = lines[j].text;
     const sep = isSeparatorRow(t), vbar = hasVBar(t);
     if (!vbar && !sep) break;
     if (sep) rule++; else content++;
+    if (hasStrongVBar(t)) strong = true;
     j++;
   }
-  if (content >= 1 && (content >= 2 || rule >= 1)) return j;
+  // 强信号必须有:盒绘竖线 │ 或 分隔行(markdown ---|---)。裸 ASCII | 内容(git log --graph /
+  // shell 管道 / 代码)无强信号 → 不当表,退回逐行重排,保底永不被 cram 成乱码表。
+  if (content >= 1 && (content >= 2 || rule >= 1) && (strong || rule >= 1)) return j;
   return -1;
 }
 
