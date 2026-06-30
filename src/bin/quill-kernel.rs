@@ -10,6 +10,11 @@
 //!
 //! 用法:`quill-kernel [--socket=<path>] [--ws-bind=<addr:port>]`
 //! (默认 socket `$XDG_RUNTIME_DIR/quill-kernel.sock`,WS bind `0.0.0.0:7878`)。
+//!
+//! **E′ 共享子进程模式(ADR-0018,T6 砖1a)**:`--fed-in=<fd> --fed-out=<fd>` 让本 bin 当
+//! 父监管的隔离子进程跑 —— 字节从父 pipe(`--fed-in`)来、**不 spawn shell / 不开真 PTY**,
+//! WS 输入回灌父 back-channel(`--fed-out`)。父桌面接入(tee)是砖1b,本砖子可经合成喂料器
+//! (测试当"父")独立验。两 fd 须成对给;给了即覆盖默认 Local 拓扑。
 
 // ADR 0001:crate 根 deny,unsafe 须 `#[allow(unsafe_code)]` + `// SAFETY:` 显式豁免。
 // 本 bin 自身无 unsafe(BorrowedFd 注册在 lib 的 kernel::daemon 里),但保持一致。
@@ -34,6 +39,10 @@ fn main() -> Result<()> {
     let mut config = DaemonConfig::with_socket(socket_path);
     if let Some(addr) = daemon::parse_ws_bind_arg(&args)? {
         config.ws_bind = addr;
+    }
+    // E′ 子进程拓扑:给了 --fed-in/--fed-out 即从父 pipe 喂料(不 spawn shell / 不开真 PTY)。
+    if let Some(source) = daemon::parse_fed_source(&args)? {
+        config.source = source;
     }
 
     daemon::run(config)

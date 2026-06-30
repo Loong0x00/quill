@@ -48,7 +48,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -63,7 +63,8 @@ use tungstenite::handshake::server::{NoCallback, ServerHandshake};
 use tungstenite::handshake::MidHandshake;
 use tungstenite::{Bytes, Error as WsError, HandshakeError, Message, WebSocket};
 
-use crate::kernel::proto::{ClientMsg, ServerMsg, Snapshot};
+use crate::kernel::feed::{encode_into, FeedDecoder, FeedFrame, FrameKind, FEED_HEADER_LEN};
+use crate::kernel::proto::{ClientMsg, ServerMsg, Snapshot, WorkspaceList, WorkspaceMeta};
 use crate::kernel::session::{Lifecycle, Session};
 use crate::tab::{TabInstance, TabList};
 
@@ -139,25 +140,41 @@ const HTTP_WRITE_DEADLINE_MS: u64 = 10_000;
 /// 内核会把设定值翻倍并夹到 `SOCK_MIN_SNDBUF` 以上;16KiB 远小于最大资产 → 必触 `WouldBlock`。
 const HTTP_SEND_BUF_BYTES: libc::c_int = 16 * 1024;
 
+/// daemon 的字节来源拓扑 (ADR-0018 E′)。决定字节从哪来、输入往哪去、是否 own PTY。
+pub enum SourceConfig {
+    /// **Local**(standalone `quill-kernel`):自 spawn shell + own 真 PTY,[`Session`] 驱动
+    /// 一切(unix-dump 快照 + WS 直播 + 输入直写 PTY)。砖0 / 今天的 daemon。
+    Local,
+    /// **Fed**(E′ 共享子进程):字节从父 pipe 来、**不 spawn shell / 不开真 PTY / 不绑 unix
+    /// socket**;WS 输入回灌父 back-channel(子自己不写 PTY,父 own PTY)。`read_fd` = 父→子
+    /// (PtyOutput / FocusChange / WorkspaceAdd/Remove 帧),`write_fd` = 子→父(Input 帧)。
+    /// 两 fd 由父在 spawn 时经继承传入(见 [`parse_fed_source`]);砖1a 子复用砖0 的 ring +
+    /// fan_out + WS 子系统,仅把"字节从哪来 / 输入往哪去"两端换掉。
+    Fed { read_fd: RawFd, write_fd: RawFd },
+}
+
 /// daemon 启动参数。
 pub struct DaemonConfig {
-    /// `UnixListener` 绑定路径。
+    /// `UnixListener` 绑定路径(仅 [`SourceConfig::Local`] 用;Fed 不绑)。
     pub socket_path: PathBuf,
     /// WS (tungstenite) TCP 监听地址。默认 `0.0.0.0:7878` —— LAN 可达,手机经
     /// WireGuard VPN → 路由器 → `10.0.0.2:port` 连上;安全靠 VPN 把门 (ADR-0016)。
     pub ws_bind: SocketAddr,
     pub cols: u16,
     pub rows: u16,
+    /// 字节来源拓扑 (E′)。默认 [`SourceConfig::Local`](standalone)。
+    pub source: SourceConfig,
 }
 
 impl DaemonConfig {
-    /// 用给定 socket 路径 + 默认尺寸 + 默认 WS bind 建配置。
+    /// 用给定 socket 路径 + 默认尺寸 + 默认 WS bind 建配置(默认 Local 拓扑)。
     pub fn with_socket(socket_path: PathBuf) -> Self {
         Self {
             socket_path,
             ws_bind: SocketAddr::from(([0, 0, 0, 0], DEFAULT_WS_PORT)),
             cols: DEFAULT_COLS,
             rows: DEFAULT_ROWS,
+            source: SourceConfig::Local,
         }
     }
 }
@@ -193,6 +210,35 @@ pub fn parse_ws_bind_arg(args: &[String]) -> Result<Option<SocketAddr>> {
     }
 }
 
+/// 从 argv 抠 E′ 子进程的父↔子 pipe fd:`--fed-in=<fd>` (父→子) + `--fed-out=<fd>`
+/// (子→父)。父 spawn 子时把继承下来的 pipe fd 号经命令行传入。两者都给 → `Ok(Some(Fed))`;
+/// 都没给 → `Ok(None)`(调用方用 Local);**只给一个 / 解析失败 → `Err`**(早失败,别半配)。
+pub fn parse_fed_source(args: &[String]) -> Result<Option<SourceConfig>> {
+    let read = find_fd_arg(args, "--fed-in=")?;
+    let write = find_fd_arg(args, "--fed-out=")?;
+    match (read, write) {
+        (Some(read_fd), Some(write_fd)) => Ok(Some(SourceConfig::Fed { read_fd, write_fd })),
+        (None, None) => Ok(None),
+        _ => bail!("--fed-in 与 --fed-out 必须成对给出 (E′ 子进程父↔子双向 pipe)"),
+    }
+}
+
+/// 抠 `<prefix><fd>` 形式的非负 fd 整数。缺省返 `Ok(None)`;给了但非法返 `Err`。
+fn find_fd_arg(args: &[String], prefix: &str) -> Result<Option<RawFd>> {
+    match args.iter().skip(1).find_map(|a| a.strip_prefix(prefix)) {
+        Some(s) => {
+            let fd = s
+                .parse::<RawFd>()
+                .with_context(|| format!("解析 {prefix}{s} 失败 (需 fd 整数)"))?;
+            if fd < 0 {
+                bail!("{prefix}{s} 非法 (fd 须 >= 0)");
+            }
+            Ok(Some(fd))
+        }
+        None => Ok(None),
+    }
+}
+
 /// daemon 主循环。spawn shell tab、绑 socket、注册全部 fd 源、`run` 阻塞到收信号 /
 /// shell 退出,返回前清理 socket 文件。
 pub fn run(config: DaemonConfig) -> Result<()> {
@@ -218,20 +264,9 @@ pub fn run(config: DaemonConfig) -> Result<()> {
         })
         .map_err(|e| anyhow!("calloop insert_source(signals) 失败: {e}"))?;
 
-    // 信号已在主线程 block,现在才 spawn shell tab(其 worker 线程继承 block)。
-    let tab =
-        TabInstance::spawn(config.cols, config.rows).context("daemon 启动:spawn shell tab 失败")?;
-    let tab_id = tab.id().raw();
-    let mut session = Session::new(TabList::new(tab));
-    // standalone daemon = 自己是 anchor(谁 spawn 工作区谁是隐式锚,ADR-0018):anchor 在 →
-    // WS 客户端全断 / 全显式关闭工作区都【不死】(如今天的 daemon);只有子 shell PTY EOF 才退。
-    // E′ 里换成父进程是锚(子进程 WS-kernel 不自 anchor),那是砖1 的事,本砖 standalone。
-    let workspace_id = session.active_workspace_id();
-    session.set_anchor(workspace_id, true);
-
-    // 先绑 WS TCP listener(端口占用等错早退,此刻还没落 unix socket 文件,无残留可清),
-    // 再建 unix socket。WS 全程在本 calloop 线程,**无 channel / 无线程**(去掉了 ADR-0016
-    // 线程版的 mpsc + WsServer)。
+    // 先绑 WS TCP listener(两拓扑都 serve WS:Local = standalone,Fed = E′ 子即 WS-kernel)。
+    // 端口占用等错早退,此刻还没落 unix socket 文件,无残留可清。WS 全程在本 calloop 线程,
+    // **无 channel / 无线程**(去掉了 ADR-0016 线程版的 mpsc + WsServer)。
     let ws_listener = TcpListener::bind(config.ws_bind)
         .with_context(|| format!("WS TcpListener::bind {} 失败", config.ws_bind))?;
     // INV:Level 模式下阻塞 accept 会 stall 整个单线程 loop → 必须非阻塞 + accept 到
@@ -240,13 +275,6 @@ pub fn run(config: DaemonConfig) -> Result<()> {
         .set_nonblocking(true)
         .context("WS TcpListener 设非阻塞失败")?;
 
-    prepare_socket_path(&config.socket_path)?;
-    let listener = UnixListener::bind(&config.socket_path)
-        .with_context(|| format!("bind UnixListener {} 失败", config.socket_path.display()))?;
-    listener
-        .set_nonblocking(true)
-        .context("UnixListener 设非阻塞失败")?;
-
     // 收割参数:默认生产值,可经 env 覆盖(调参 / 测试用,无新依赖、不改 CLI)。
     let reap_interval = duration_from_env("QUILL_WS_REAP_MS", REAP_INTERVAL_MS);
     let handshake_deadline =
@@ -254,8 +282,89 @@ pub fn run(config: DaemonConfig) -> Result<()> {
     let http_write_deadline =
         duration_from_env("QUILL_WS_HTTP_WRITE_DEADLINE_MS", HTTP_WRITE_DEADLINE_MS);
 
+    // 按拓扑(ADR-0018 E′)建 字节来源 + 输入 sink,顺带注册各自专属的源:
+    // - **Local**:spawn shell + own 真 PTY(注册 PTY READ 源 + unix-dump listener),Session 在;
+    // - **Fed**:从父 pipe 读(注册父 pipe READ 源),不 spawn shell / 不开真 PTY / 不绑 unix
+    //   socket,Session 不在(子不 own term,见 [`DaemonData::session`] doc),输入回灌父
+    //   back-channel(块C)。
+    let (session, fed, tab_id, workspace_id, local_socket) = match &config.source {
+        SourceConfig::Local => {
+            // 信号已在主线程 block,现在才 spawn shell tab(其 worker 线程继承 block)。
+            let tab = TabInstance::spawn(config.cols, config.rows)
+                .context("daemon 启动:spawn shell tab 失败")?;
+            let tab_id = tab.id().raw();
+            let mut session = Session::new(TabList::new(tab));
+            // standalone daemon = 自己是 anchor(谁 spawn 工作区谁是隐式锚,ADR-0018):anchor 在 →
+            // WS 客户端全断 / 全显式关闭工作区都【不死】;只有子 shell PTY EOF 才退。E′ 里换成
+            // 父进程是锚(Fed 子不自 anchor,其工作区生命周期归父),那是砖1b 的事。
+            let workspace_id = session.active_workspace_id();
+            session.set_anchor(workspace_id, true);
+
+            // Source: PTY master fd(从 local session 取,move 进 data 前)。
+            let pty_fd = session.tabs().active().pty().raw_fd();
+            // SAFETY:
+            // - pty_fd 来自 `PtyHandle::raw_fd()`(构造时 `as_raw_fd().ok_or_else` 校验过一次),
+            //   PtyHandle 在 `data.session.tabs` 里(下方 move 进 data),`run()` scope 内全程活着。
+            // - drop 序:函数尾显式 `drop(event_loop)` 早于 `drop(data)`,即 Generic source 的
+            //   `EPOLL_CTL_DEL` 在 pty fd 仍打开时执行;即便顺序错,calloop 0.14 对已关 fd 的
+            //   `EPOLL_CTL_DEL` 返 EBADF 内部容忍(`wl/window.rs` 同源),非 UB。
+            // - `borrow_raw` 只取 int 不转移所有权;真正的 read 走 `PtyHandle::read` 自有的
+            //   dup reader,从不碰这个 BorrowedFd。
+            #[allow(unsafe_code)]
+            let pty_borrowed: BorrowedFd<'static> = unsafe { BorrowedFd::borrow_raw(pty_fd) };
+            loop_handle
+                .insert_source(
+                    Generic::new(pty_borrowed, Interest::READ, Mode::Level),
+                    |_readiness, _meta, data: &mut DaemonData| pty_readable(data),
+                )
+                .map_err(|e| anyhow!("calloop insert_source(pty master fd) 失败: {e}"))?;
+
+            // Source: UnixListener(quill-dump 调试路径,与 WS 字节流独立,Local 限定 ——
+            // Fed 子无 server term 可 dump)。owned 直接交给 Generic(实现 AsFd,source drop 时关)。
+            prepare_socket_path(&config.socket_path)?;
+            let listener = UnixListener::bind(&config.socket_path).with_context(|| {
+                format!("bind UnixListener {} 失败", config.socket_path.display())
+            })?;
+            listener
+                .set_nonblocking(true)
+                .context("UnixListener 设非阻塞失败")?;
+            loop_handle
+                .insert_source(
+                    Generic::new(listener, Interest::READ, Mode::Level),
+                    |_readiness, meta, data: &mut DaemonData| accept_ready(meta.as_ref(), data),
+                )
+                .map_err(|e| anyhow!("calloop insert_source(unix listener) 失败: {e}"))?;
+
+            (
+                Some(session),
+                None,
+                tab_id,
+                workspace_id,
+                Some(config.socket_path.clone()),
+            )
+        }
+        SourceConfig::Fed { read_fd, write_fd } => {
+            let link = FedLink::new(*read_fd, *write_fd).context("Fed 模式建父↔子 pipe 链失败")?;
+            // 父 pipe **读端** 注册成 calloop Generic READ 源(像 Local 的 PTY 源);闭包捕获
+            // raw fd(int Copy),源 own 的 `OwnedFd` 在 loop 生命期内不删 → fd 全程有效。
+            let read_raw = link.read_owned.as_raw_fd();
+            loop_handle
+                .insert_source(
+                    Generic::new(link.read_owned, Interest::READ, Mode::Level),
+                    move |_readiness, _meta, data: &mut DaemonData| {
+                        fed_pipe_readable(data, read_raw)
+                    },
+                )
+                .map_err(|e| anyhow!("calloop insert_source(fed pipe read) 失败: {e}"))?;
+
+            // Fed 焦点(workspace, tab)初始未知,等父发 FocusChange 帧填(块B)。
+            (None, Some(link.back), 0u64, 0u64, None)
+        }
+    };
+
     let mut data = DaemonData {
         session,
+        fed,
         loop_handle: loop_handle.clone(),
         loop_signal,
         tab_id,
@@ -269,35 +378,7 @@ pub fn run(config: DaemonConfig) -> Result<()> {
         http_write_deadline,
     };
 
-    // Source 2:PTY master fd。
-    let pty_fd = data.session.tabs().active().pty().raw_fd();
-    // SAFETY:
-    // - pty_fd 来自 `PtyHandle::raw_fd()`(构造时 `as_raw_fd().ok_or_else` 校验过一次),
-    //   PtyHandle 在 `data.session.tabs` 里,`run()` scope 内全程活着。
-    // - drop 序:函数尾显式 `drop(event_loop)` 早于 `drop(data)`,即 Generic source 的
-    //   `EPOLL_CTL_DEL` 在 pty fd 仍打开时执行;即便顺序错,calloop 0.14 对已关 fd 的
-    //   `EPOLL_CTL_DEL` 返 EBADF 内部容忍(`wl/window.rs` 同源),非 UB。
-    // - `borrow_raw` 只取 int 不转移所有权;真正的 read 走 `PtyHandle::read` 自有的
-    //   dup reader,从不碰这个 BorrowedFd。
-    #[allow(unsafe_code)]
-    let pty_borrowed: BorrowedFd<'static> = unsafe { BorrowedFd::borrow_raw(pty_fd) };
-    loop_handle
-        .insert_source(
-            Generic::new(pty_borrowed, Interest::READ, Mode::Level),
-            |_readiness, _meta, data: &mut DaemonData| pty_readable(data),
-        )
-        .map_err(|e| anyhow!("calloop insert_source(pty master fd) 失败: {e}"))?;
-
-    // Source 3:UnixListener(quill-dump 调试路径,与 WS 字节流独立)。owned 直接交给
-    // Generic —— UnixListener 实现 AsFd,calloop 持所有权并在 source drop 时关闭。
-    loop_handle
-        .insert_source(
-            Generic::new(listener, Interest::READ, Mode::Level),
-            |_readiness, meta, data: &mut DaemonData| accept_ready(meta.as_ref(), data),
-        )
-        .map_err(|e| anyhow!("calloop insert_source(unix listener) 失败: {e}"))?;
-
-    // Source 4:WS TCP listener。owned 交 Generic;可读→accept 新连接注册成各自的源。
+    // Source: WS TCP listener。owned 交 Generic;可读→accept 新连接注册成各自的源(两拓扑共享)。
     loop_handle
         .insert_source(
             Generic::new(ws_listener, Interest::READ, Mode::Level),
@@ -305,7 +386,7 @@ pub fn run(config: DaemonConfig) -> Result<()> {
         )
         .map_err(|e| anyhow!("calloop insert_source(ws listener) 失败: {e}"))?;
 
-    // Source 5:收割 Timer。周期扫描,回收 ① 卡在 Peeking/Handshaking 阶段超
+    // Source: 收割 Timer。周期扫描,回收 ① 卡在 Peeking/Handshaking 阶段超
     // `handshake_deadline` 的连接(防半截头/卡握手长占 `clients` 槽 + slowloris);② 超
     // `http_write_deadline` 仍没把响应写完(drain)的 HTTP 响应写源(防 slowloris-read:要了
     // 大页却永不读 → 写源恒 WouldBlock 挂着,不受 `MAX_WS_CONNS` 限、握手收割也扫不到)。live
@@ -323,38 +404,167 @@ pub fn run(config: DaemonConfig) -> Result<()> {
         .map_err(|e| anyhow!("calloop insert_source(reap timer) 失败: {e}"))?;
 
     tracing::info!(
-        socket = %config.socket_path.display(),
         ws_bind = %config.ws_bind,
         tab_id,
-        cols = config.cols,
-        rows = config.rows,
-        "quill-kernel daemon 就绪 (单线程 calloop:PTY + unix + WS 同一 loop)"
+        fed = data.fed.is_some(),
+        "quill-kernel daemon 就绪 (单线程 calloop:{} + WS 同一 loop)",
+        if data.fed.is_some() { "Fed 父 pipe" } else { "PTY + unix" }
     );
 
     let run_result = event_loop
         .run(None, &mut data, |_data| {})
         .context("calloop EventLoop::run 失败");
 
-    // 显式 drop 序:event_loop(持各 Generic source,含 WS 连接源 + PTY BorrowedFd 源)
-    // 先于 data(持 PtyHandle 的 fd / WS WebSocket 的 fd),让源的 EPOLL_CTL_DEL 在对应
-    // fd 仍打开时执行(见上 SAFETY)。WS 无线程可 join,drop 即收尾。
+    // 显式 drop 序:event_loop(持各 Generic source,含 WS 连接源 + PTY/父pipe 源)先于
+    // data(持 PtyHandle / FedState back-channel / WS WebSocket 的 fd),让源的 EPOLL_CTL_DEL
+    // 在对应 fd 仍打开时执行(见上 SAFETY)。WS 无线程可 join,drop 即收尾。
     drop(event_loop);
     drop(data);
 
-    remove_socket_quiet(&config.socket_path);
+    if let Some(path) = local_socket {
+        remove_socket_quiet(&path);
+    }
 
     run_result
+}
+
+/// E′ 子进程(Fed 模式)的父↔子链构造结果:**读端** [`OwnedFd`](交 calloop Generic 源
+/// own) + **写端** [`FedState`](back-channel,进 [`DaemonData::fed`])。`new` 取走父传入的
+/// 两 fd 所有权 + 设非阻塞;`read_fd == write_fd`(socketpair 单 fd 全双工)时 dup 写端,
+/// 避免两个 `OwnedFd` 重复 close 同一 fd。
+struct FedLink {
+    read_owned: OwnedFd,
+    back: FedState,
+}
+
+impl FedLink {
+    fn new(read_fd: RawFd, write_fd: RawFd) -> Result<Self> {
+        // socketpair 单 fd 全双工时,写端 dup 一份独立 fd(防两个 OwnedFd 双关同一 fd)。
+        let write_fd = if write_fd == read_fd {
+            // SAFETY: dup 复制 fd,失败返 -1;成功得独立 fd 由下方 OwnedFd 接管 close。
+            #[allow(unsafe_code)]
+            let d = unsafe { libc::dup(write_fd) };
+            if d < 0 {
+                return Err(
+                    anyhow::Error::new(io::Error::last_os_error()).context("dup Fed write fd 失败")
+                );
+            }
+            d
+        } else {
+            write_fd
+        };
+        set_fd_nonblocking(read_fd).context("Fed read fd 设非阻塞失败")?;
+        set_fd_nonblocking(write_fd).context("Fed write fd 设非阻塞失败")?;
+        // SAFETY: read_fd / write_fd 由父经 fork/exec 继承传入,子独占这两端;包成 OwnedFd
+        // 接管 close(drop 时关)。父在 spawn 后关其副本 → 父退出时子读端得 EOF(子据此察觉
+        // 父没了,ADR-0018)。
+        #[allow(unsafe_code)]
+        let read_owned = unsafe { OwnedFd::from_raw_fd(read_fd) };
+        #[allow(unsafe_code)]
+        let write_owned = unsafe { OwnedFd::from_raw_fd(write_fd) };
+        Ok(Self {
+            read_owned,
+            back: FedState {
+                decoder: FeedDecoder::new(),
+                back: write_owned,
+            },
+        })
+    }
+}
+
+/// E′ 子进程(Fed 模式)的父↔子链 **写侧** 状态(进 [`DaemonData::fed`])。父 pipe 读端由
+/// calloop Generic 源 own(见 [`FedLink`]),这里只持 back-channel **写端**(子→父 Input 帧)
+/// + 增量解码器(读端回调 [`fed_pipe_readable`] 用)。
+struct FedState {
+    decoder: FeedDecoder,
+    /// 子→父 back-channel 写端(Input 帧)。非阻塞:部分写循环 + WouldBlock 丢剩余。
+    back: OwnedFd,
+}
+
+impl FedState {
+    /// 非阻塞写一帧到 back-channel(子→父)。部分写循环推进;`WouldBlock`(父读端缓冲满)按
+    /// 背压丢剩余(输入人手速,极罕见,与 PTY 写背压策略一致);`Interrupted` 重试;`Ok(0)` /
+    /// 其它错误 warn 退出。**绝不阻塞 loop**(子→父满了丢得起,绝不拖累子的 WS 服务)。
+    fn write_frame(&self, frame: &[u8]) {
+        let fd = self.back.as_raw_fd();
+        let mut written = 0;
+        while written < frame.len() {
+            // SAFETY: fd 来自本结构持有的活 OwnedFd;libc::write 只调 syscall 不动 fd 所有权,
+            // frame 是调用方栈上活着的切片。
+            #[allow(unsafe_code)]
+            let n = unsafe {
+                libc::write(
+                    fd,
+                    frame[written..].as_ptr().cast::<libc::c_void>(),
+                    frame.len() - written,
+                )
+            };
+            if n > 0 {
+                written += n as usize;
+                continue;
+            }
+            if n == 0 {
+                tracing::warn!(
+                    "Fed back-channel write 返回 0, 丢剩余 {} 字节",
+                    frame.len() - written
+                );
+                break;
+            }
+            let err = io::Error::last_os_error();
+            match err.kind() {
+                io::ErrorKind::Interrupted => continue,
+                io::ErrorKind::WouldBlock => {
+                    tracing::warn!(
+                        "Fed back-channel 背压 (WouldBlock), 已写 {written} / 丢剩余 {} 字节",
+                        frame.len() - written
+                    );
+                    break;
+                }
+                _ => {
+                    tracing::warn!(?err, "Fed back-channel write 失败");
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// 把一个 raw fd 设 `O_NONBLOCK`(Fed 父↔子 pipe 两端,子侧自设防阻塞 loop)。
+#[allow(unsafe_code)]
+fn set_fd_nonblocking(fd: RawFd) -> io::Result<()> {
+    // SAFETY: `fcntl` F_GETFL/F_SETFL 只读写 OFD status flags(O_NONBLOCK),不动 fd 所有权;
+    // 对已关 fd 返 EBADF(非 UB)。两次返回值都按 `< 0` 判错并转 io::Error。
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 /// 单线程 daemon 的 calloop `Data`。callback 拿 `&mut DaemonData` 走字段 split
 /// borrow(与 `wl::window::LoopData` 同模式)。**WS 全在本线程,故 ring / clients
 /// 都是普通字段,无 Arc / 锁 / channel。**
 struct DaemonData {
-    session: Session,
+    /// **Local 拓扑**(standalone):own 多工作区 [`Session`](shell tab + 真 PTY)。**Fed
+    /// 拓扑**(E′ 子)= `None`:子不 own term/PTY(父 own),控制面元数据/焦点由父喂的帧维护
+    /// (砖1a 最小;砖1b 接 WorkspaceAdd 帧)。**为何不在 Fed 也用 Session**:`Session` 焊死在
+    /// `TabList<TabInstance>`,而 `TabInstance` 必持 `PtyHandle`(无 PTY 构造不出),违反 ADR-0018
+    /// "Fed 不开真 PTY";改 `pty` 为 Option 又破 `window.rs` 的 `pty()->&PtyHandle` 契约(本砖
+    /// 不碰 window.rs)→ 故 Fed 走轻量 [`DaemonData::fed`],复用 ring + fan_out + WS 子系统。
+    session: Option<Session>,
+    /// **Fed 拓扑**(E′ 子)的父↔子链写侧 + 解码器;`None` = Local。与 [`DaemonData::session`]
+    /// 恰好一个为 `Some`(拓扑二选一)。
+    fed: Option<FedState>,
     /// 运行期注册 / 注销源(WS 连接的 READ/WRITE 源、unix 客户端写源)用。
     loop_handle: LoopHandle<'static, DaemonData>,
     loop_signal: LoopSignal,
-    /// 本切片唯一 tab 的 raw id(协议层 `u64`,INV-010 不能从 `u64` 重建 TabId)。
+    /// 当前焦点 tab 的 raw id(字节流 [`ServerMsg::StreamFocus`] 标的那个)。Local:启动期
+    /// 唯一 tab;Fed:父发 [`FrameKind::FocusChange`] 帧更新。
     tab_id: u64,
     /// 本 daemon 的 active(且唯一,砖0)工作区 id。anchor 工作区 —— WS 连上即 hold 它、
     /// 字节流 [`ServerMsg::StreamFocus`] 标它;client X 关闭 / 断线只动 holder,anchor 在
@@ -546,16 +756,17 @@ fn pty_readable(data: &mut DaemonData) -> io::Result<PostAction> {
     let mut buf = [0u8; PTY_READ_BUF];
     let mut batch: Vec<u8> = Vec::new();
     loop {
-        let read = data
-            .session
-            .tabs_mut()
-            .active_mut()
-            .pty_mut()
-            .read(&mut buf);
+        // PTY 源仅 Local 拓扑注册 → session 必 Some;防御性 guard 不用 unwrap。
+        let read = match data.session.as_mut() {
+            Some(s) => s.tabs_mut().active_mut().pty_mut().read(&mut buf),
+            None => return Ok(PostAction::Remove),
+        };
         match classify_pty_read(&read) {
             PtyRead::Feed => {
                 if let Ok(n) = read {
-                    data.session.on_pty_output(tab_id, &buf[..n]);
+                    if let Some(s) = data.session.as_mut() {
+                        s.on_pty_output(tab_id, &buf[..n]);
+                    }
                     batch.extend_from_slice(&buf[..n]);
                 }
             }
@@ -571,7 +782,9 @@ fn pty_readable(data: &mut DaemonData) -> io::Result<PostAction> {
                 if !batch.is_empty() {
                     fan_out_bytes(data, batch);
                 }
-                let _ = data.session.tabs_mut().active_mut().pty_mut().try_wait();
+                if let Some(s) = data.session.as_mut() {
+                    let _ = s.tabs_mut().active_mut().pty_mut().try_wait();
+                }
                 data.loop_signal.stop();
                 return Ok(PostAction::Remove);
             }
@@ -624,6 +837,151 @@ fn fan_out_bytes(data: &mut DaemonData, batch: Vec<u8>) {
         } else if is_live {
             arm_write(data, id);
         }
+    }
+}
+
+/// 父 pipe 读端可读(Fed 拓扑,块B;镜像 [`pty_readable`] 的 drain 语义):drain 到 WouldBlock,
+/// 喂 [`FeedDecoder`] 解帧,逐帧 [`route_fed_frame`]。父 pipe **EOF** = 父进程退出 → 停子
+/// daemon(ADR-0018:子靠 EOF-on-pipe 察觉父没了);**流错位**(坏帧)= 致命同样停(不从错位
+/// 流猜帧边界)。
+///
+/// **drain-then-route**:先把本轮可读字节全 drain + 解出所有完整帧到本地 `frames`(其间只借
+/// `data.fed`),再逐帧路由(`route_fed_frame` 自由借 `data`)—— 规避"持 fed 借用又调 fan_out
+/// 借 data"的冲突。
+fn fed_pipe_readable(data: &mut DaemonData, fd: RawFd) -> io::Result<PostAction> {
+    let mut frames: Vec<FeedFrame> = Vec::new();
+    let mut buf = [0u8; PTY_READ_BUF];
+    let mut stop = false;
+    loop {
+        // SAFETY: fd 是 Fed read 源 own 的 OwnedFd 的 raw(run() 注册时活着,源在 loop 生命期
+        // 内不删);libc::read 只调 syscall 不动 fd 所有权,buf 是栈数组。
+        #[allow(unsafe_code)]
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+        if n > 0 {
+            let Some(fed) = data.fed.as_mut() else {
+                return Ok(PostAction::Remove); // 不该发生:Fed 源仅 Fed 拓扑注册
+            };
+            fed.decoder.push(&buf[..n as usize]);
+            loop {
+                match fed.decoder.next_frame() {
+                    Ok(Some(f)) => frames.push(f),
+                    Ok(None) => break,
+                    Err(e) => {
+                        tracing::error!(%e, "Fed 喂料流解码错位 (致命),停止子 daemon");
+                        stop = true;
+                        break;
+                    }
+                }
+            }
+            if stop {
+                break;
+            }
+            continue;
+        }
+        if n == 0 {
+            tracing::info!("Fed 父 pipe EOF:父进程退出,停止子 daemon");
+            stop = true;
+            break;
+        }
+        // n < 0
+        let err = io::Error::last_os_error();
+        match err.kind() {
+            io::ErrorKind::WouldBlock => break,     // 本轮排空
+            io::ErrorKind::Interrupted => continue, // EINTR 重试
+            _ => {
+                tracing::error!(?err, "Fed 父 pipe read 错误,停止子 daemon");
+                stop = true;
+                break;
+            }
+        }
+    }
+
+    for f in frames {
+        route_fed_frame(data, f);
+    }
+
+    if stop {
+        data.loop_signal.stop();
+        return Ok(PostAction::Remove);
+    }
+    Ok(PostAction::Continue)
+}
+
+/// 路由一条父喂来的帧(Fed 拓扑,块B):
+/// - `PtyOutput` → 焦点流字节,经砖0 [`fan_out_bytes`] 进 ring + 各 live WS 客户端(本地渲染)。
+/// - `FocusChange` → 更新焦点 (workspace, tab) + [`broadcast_stream_focus`] 给所有 live 客户端。
+/// - `WorkspaceAdd` / `WorkspaceRemove` → 砖1a 仅留接口(控制面工作区元数据接线在砖1b)。
+/// - `Input` → 子→父方向,父不该往子发,收到忽略(防协议误用)。
+fn route_fed_frame(data: &mut DaemonData, frame: FeedFrame) {
+    match frame.kind {
+        FrameKind::PtyOutput => {
+            if !frame.payload.is_empty() {
+                fan_out_bytes(data, frame.payload);
+            }
+        }
+        FrameKind::FocusChange => {
+            data.workspace_id = frame.ws_id;
+            data.tab_id = frame.tab_id;
+            broadcast_stream_focus(data);
+        }
+        FrameKind::WorkspaceAdd | FrameKind::WorkspaceRemove => {
+            tracing::debug!(
+                ws_id = frame.ws_id,
+                "Fed 收到 WorkspaceAdd/Remove 帧 (砖1a 预留接口,砖1b 接控制面元数据)"
+            );
+        }
+        FrameKind::Input => {
+            tracing::debug!("Fed 收到 Input 帧 (方向应为子→父),忽略");
+        }
+    }
+}
+
+/// 向所有 live WS 客户端推一条 [`ServerMsg::StreamFocus`] 控制帧(Text),声明此后 Binary 字节
+/// 属于哪个 (workspace, active tab)。Fed 焦点切换(父发 [`FrameKind::FocusChange`])后调。
+fn broadcast_stream_focus(data: &mut DaemonData) {
+    let msg = ServerMsg::StreamFocus {
+        workspace_id: data.workspace_id,
+        tab_id: data.tab_id,
+    };
+    let text = match serde_json::to_string(&msg) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(?e, "序列化 StreamFocus 控制帧失败,跳过");
+            return;
+        }
+    };
+    let ids: Vec<u64> = data.clients.keys().copied().collect();
+    for id in ids {
+        let mut armed = false;
+        if let Some(c) = data.clients.get_mut(&id) {
+            if matches!(c.stage, WsStage::Live(_)) {
+                c.outbound_len += text.len();
+                c.outbound.push_back(OutFrame::Text(text.clone()));
+                armed = true;
+            }
+        }
+        if armed {
+            arm_write(data, id);
+        }
+    }
+}
+
+/// 把 WS 客户端输入字节路由到 input sink(块C —— 在 `on_input` 调用点岔开两条数据流):
+/// - **Local**(`session` 在)= 直写 active tab 的 PTY([`Session::on_input`]);
+/// - **Fed**(`fed` 在)= encode 成 [`FrameKind::Input`] 帧写父 back-channel(子自己不写 PTY,
+///   父 own PTY,父据 (ws, tab) 写对应 PTY)。
+fn route_input(data: &mut DaemonData, tab_id: u64, bytes: &[u8]) {
+    if let Some(session) = data.session.as_mut() {
+        if let Err(e) = session.on_input(tab_id, bytes) {
+            tracing::warn!(?e, tab_id, "WS 输入写 PTY 失败");
+        }
+        return;
+    }
+    let ws_id = data.workspace_id;
+    if let Some(fed) = data.fed.as_ref() {
+        let mut frame = Vec::with_capacity(FEED_HEADER_LEN + bytes.len());
+        encode_into(&mut frame, FrameKind::Input, ws_id, tab_id, bytes);
+        fed.write_frame(&frame);
     }
 }
 
@@ -877,14 +1235,18 @@ fn ws_go_live(
     // 释放,无 holder 泄漏。anchor 在(daemon 自锚)故这不会让工作区"该死不死"。
     let ws_id = data.workspace_id;
     // 控制面连上引导帧:全部工作区列表 + 当前工作区结构 + 字节流 (workspace,tab) 标签。
-    let control = build_control_text(&data.session, ws_id);
+    let control = build_control_text(data, ws_id);
     let replay = data.ring.snapshot();
     if let Some(c) = data.clients.get_mut(&id) {
         c.stage = WsStage::Live(ws);
-        // 先确认连接在册再登记 holder + held_ws(二者一起设)→ 杜绝登记了 holder 却没记
-        // held_ws、回收时无从释放的孤立态。
-        data.session.hold(ws_id, id);
-        c.held_ws = Some(ws_id);
+        // holder 仅 Local(有 Session)登记:先确认连接在册再登记 holder + held_ws(二者一起
+        // 设)→ 杜绝登记了 holder 却没记 held_ws、回收时无从释放的孤立态。Fed 子的工作区生命
+        // 周期归父(refcount→父信号留砖1b),子只用 `clients` 表做 fan-out + 回收 → held_ws 留
+        // None,回收路径 [`release_holder`] 自然 no-op。
+        if let Some(session) = data.session.as_mut() {
+            session.hold(ws_id, id);
+            c.held_ws = Some(ws_id);
+        }
         // 刚 insert 即 enable 状态;有重放/控制帧就让它去排空,无则首次可写发现队空自 Disable。
         c.write = Some(WriteReg {
             token: write_token,
@@ -904,10 +1266,47 @@ fn ws_go_live(
     Ok(PostAction::Continue)
 }
 
-/// 连上时下发的控制面引导帧 (T6 块C,用起 `ServerMsg::Workspaces/Workspace/StreamFocus`):
+/// 连上时下发的控制面引导帧。按拓扑分发:**Local** 用真 [`Session`] 元数据
+/// ([`build_control_text_local`]);**Fed** 用父喂的焦点合成最小引导 ([`build_control_text_fed`])。
+fn build_control_text(data: &DaemonData, ws_id: u64) -> Vec<String> {
+    match (&data.session, &data.fed) {
+        (Some(session), _) => build_control_text_local(session, ws_id),
+        (None, Some(_)) => build_control_text_fed(data, ws_id),
+        (None, None) => Vec::new(),
+    }
+}
+
+/// Fed 拓扑连上引导帧(块B):砖1a 子无 Session,控制面工作区元数据(tab 明细)接线在砖1b
+/// (父经 `WorkspaceAdd` 帧喂)。当前最小引导 = 一条单工作区列表 + 字节流 (workspace, tab) 标签
+/// ([`ServerMsg::StreamFocus`]),让客户端先知道焦点;数据面忠实字节流兜底渲染。
+fn build_control_text_fed(data: &DaemonData, ws_id: u64) -> Vec<String> {
+    let mut out = Vec::new();
+    push_server_json(
+        &mut out,
+        &ServerMsg::Workspaces(WorkspaceList {
+            workspaces: vec![WorkspaceMeta {
+                id: ws_id,
+                title: String::new(),
+                tab_count: 1,
+                active: true,
+            }],
+            active: ws_id,
+        }),
+    );
+    push_server_json(
+        &mut out,
+        &ServerMsg::StreamFocus {
+            workspace_id: ws_id,
+            tab_id: data.tab_id,
+        },
+    );
+    out
+}
+
+/// Local 拓扑连上引导帧 (T6 块C,用起 `ServerMsg::Workspaces/Workspace/StreamFocus`):
 /// ① 全部工作区列表 ② 当前工作区结构 (tab 元数据) ③ 字节流标签 (此后 Binary 帧属于哪个
 /// (workspace, active tab))。各序列化成 JSON Text 帧;序列化失败的单条跳过 (不致命)。
-fn build_control_text(session: &Session, ws_id: u64) -> Vec<String> {
+fn build_control_text_local(session: &Session, ws_id: u64) -> Vec<String> {
     let mut out = Vec::new();
     push_server_json(&mut out, &ServerMsg::Workspaces(session.workspace_list()));
     if let Some(info) = session.workspace_info(ws_id) {
@@ -948,12 +1347,10 @@ fn ws_live_read(data: &mut DaemonData, id: u64) -> io::Result<PostAction> {
             None => return Ok(PostAction::Remove),
         };
         match res {
-            // 数据面:浏览器输入裸字节(WS Binary)→ 直接写当前焦点 tab 的 PTY(热路径,
-            // 无 channel)。焦点 tab = active 工作区 active tab(= StreamFocus 标的那个)。
+            // 数据面:浏览器输入裸字节(WS Binary)→ input sink(块C):Local 直写焦点 tab PTY,
+            // Fed encode Input 帧回灌父 back-channel(子自己不写 PTY)。焦点 tab = StreamFocus 标的。
             Ok(Message::Binary(b)) => {
-                if let Err(e) = data.session.on_input(tab, &b) {
-                    tracing::warn!(?e, "WS 输入写 PTY 失败");
-                }
+                route_input(data, tab, &b);
             }
             // 控制面:WS Text = JSON [`ClientMsg`](Hold / Release / 寻址 Input / Resize)。
             // 与数据面 Binary 分流(T6)。Release 触发显式关闭回收 → 返 drop action。
@@ -1003,12 +1400,15 @@ fn handle_client_msg(data: &mut DaemonData, id: u64, text: &str) -> Option<PostA
     };
     match msg {
         ClientMsg::Hold { workspace_id } => {
-            // 仅 hold 成功(工作区存在)才记 held_ws;否则会把已持有的真工作区记录覆盖成
-            // 无效 id → 原 holder 孤立、refcount 永不归 0(砖0 单工作区+恒 anchored 触发不到,
-            // 砖1 多 workspace 会咬)。held_ws 单槽的真·多持有语义留砖1 升 HashSet。
-            if data.session.hold(workspace_id, id) {
-                if let Some(c) = data.clients.get_mut(&id) {
-                    c.held_ws = Some(workspace_id);
+            // 仅 Local(有 Session)登记 holder;且仅 hold 成功(工作区存在)才记 held_ws,否则
+            // 会把已持有的真工作区记录覆盖成无效 id → 原 holder 孤立、refcount 永不归 0(砖0 单
+            // 工作区+恒 anchored 触发不到,砖1 多 workspace 会咬)。held_ws 单槽的真·多持有语义留
+            // 砖1 升 HashSet。Fed 子无 Session,工作区生命周期归父 → Hold no-op。
+            if let Some(session) = data.session.as_mut() {
+                if session.hold(workspace_id, id) {
+                    if let Some(c) = data.clients.get_mut(&id) {
+                        c.held_ws = Some(workspace_id);
+                    }
                 }
             }
             None
@@ -1020,9 +1420,8 @@ fn handle_client_msg(data: &mut DaemonData, id: u64, text: &str) -> Option<PostA
             Some(drop_client_read_self(data, id))
         }
         ClientMsg::Input { tab_id, bytes, .. } => {
-            if let Err(e) = data.session.on_input(tab_id, &bytes) {
-                tracing::warn!(?e, tab_id, "WS 寻址输入写 PTY 失败");
-            }
+            // 寻址输入走同一 input sink(块C):Local 写 PTY,Fed 回灌父 back-channel。
+            route_input(data, tab_id, &bytes);
             None
         }
         ClientMsg::Resize {
@@ -1030,8 +1429,13 @@ fn handle_client_msg(data: &mut DaemonData, id: u64, text: &str) -> Option<PostA
             cols,
             rows,
         } => {
-            if let Err(e) = data.session.resize(workspace_id, cols, rows) {
-                tracing::warn!(?e, workspace_id, "WS resize 失败");
+            if let Some(session) = data.session.as_mut() {
+                if let Err(e) = session.resize(workspace_id, cols, rows) {
+                    tracing::warn!(?e, workspace_id, "WS resize 失败");
+                }
+            } else {
+                // Fed:resize 须回灌父(父 own PTY)。砖1a 帧集不含 Resize 帧,留砖1b。
+                tracing::debug!(cols, rows, "Fed 拓扑 resize 暂不回灌父(砖1b)");
             }
             None
         }
@@ -1055,12 +1459,15 @@ fn release_holder(data: &mut DaemonData, id: u64, explicit: bool) {
         None => None,
     };
     if let Some(ws_id) = held {
-        if data.session.release(ws_id, id, explicit) == Lifecycle::Destroyed {
-            tracing::info!(
-                ws_id,
-                id,
-                "工作区引用计数归 0,已销毁(drop TabList → PTY SIGHUP)"
-            );
+        // 仅 Local 有 Session 可释放;Fed 子 held_ws 恒 None(见 ws_go_live),故走不到这里。
+        if let Some(session) = data.session.as_mut() {
+            if session.release(ws_id, id, explicit) == Lifecycle::Destroyed {
+                tracing::info!(
+                    ws_id,
+                    id,
+                    "工作区引用计数归 0,已销毁(drop TabList → PTY SIGHUP)"
+                );
+            }
         }
     }
 }
@@ -1422,7 +1829,11 @@ fn serve_snapshot(stream: UnixStream, data: &mut DaemonData) -> Result<()> {
     stream
         .set_nonblocking(true)
         .context("客户端 stream 设非阻塞失败")?;
-    let snap = data.session.snapshot_active();
+    // unix-dump 仅 Local 拓扑注册(Fed 子无 server term 可 dump)→ session 必 Some。
+    let snap = match data.session.as_ref() {
+        Some(s) => s.snapshot_active(),
+        None => bail!("Fed 拓扑无 server term,unix-dump 快照不可用"),
+    };
     let line = snapshot_line(&snap)?;
     let pending = Rc::new(RefCell::new(WritePending {
         buf: line,
