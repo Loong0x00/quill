@@ -34,7 +34,11 @@ fn main() -> Result<()> {
     if let Some(dir) = working_dir.as_ref() {
         tracing::info!(dir = %dir.display(), "初始工作目录由 --working-directory= 指定");
     }
-    quill::wl::run_window(working_dir)?;
+    let share = parse_share_arg(&args);
+    if share {
+        tracing::info!("--share 武装:启动后 spawn 受监管的隔离共享子进程(E′, ADR-0018)");
+    }
+    quill::wl::run_window(working_dir, share)?;
     tracing::info!("quill exited cleanly");
     Ok(())
 }
@@ -102,6 +106,18 @@ fn parse_working_directory_arg(args: &[String]) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// 扫 argv 找 `--share`(裸布尔开关,opt-in 共享;缺省 `false` = 今天的 quill,一字节不变)。
+///
+/// why ADR-0018 E′:命中 → `run_window` 武装 spawn 受监管的隔离 `quill-kernel` 子进程,把焦点
+/// tab 的 PTY 输出 tee 给它(子 fan-out 给手机),手机输入经子回灌写回 PTY。**默认关 = 没子
+/// 进程 = 零成本**(终端热路径零 IPC、≈ 今天的 quill);共享是加分项,绝不因它出错拖累终端。
+///
+/// 裸开关(非 `=` 形式):它不带值,与 `--headless-screenshot=` / `--working-directory=` 的
+/// 单值 `=` 形式区分。手写解析(派单硬约束:不引 clap)。
+fn parse_share_arg(args: &[String]) -> bool {
+    args.iter().skip(1).any(|a| a == "--share")
 }
 
 /// **T-0408 主路径**: 不开 Wayland 窗口, 跑 PtyHandle::spawn_shell + 等 prompt
@@ -267,5 +283,30 @@ mod tests {
         ];
         let r = parse_headless_screenshot_arg(&args).expect("unrelated flags should not error");
         assert!(r.is_none());
+    }
+
+    #[test]
+    fn parse_share_absent_is_false() {
+        // 默认(无 --share)= 今天的 quill,一字节不变(零回归)。
+        let args = vec!["quill".to_string()];
+        assert!(!parse_share_arg(&args));
+    }
+
+    #[test]
+    fn parse_share_present_is_true() {
+        let args = vec!["quill".to_string(), "--share".to_string()];
+        assert!(parse_share_arg(&args));
+    }
+
+    #[test]
+    fn parse_share_ignores_lookalikes_and_argv0() {
+        // argv[0](skip(1))、`=` 形式、子串都不算命中(裸开关精确匹配)。
+        let args = vec![
+            "--share".to_string(), // argv[0] 被 skip
+            "--share=1".to_string(),
+            "--shared".to_string(),
+            "--working-directory=/tmp".to_string(),
+        ];
+        assert!(!parse_share_arg(&args));
     }
 }

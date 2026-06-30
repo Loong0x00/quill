@@ -30,7 +30,7 @@
 //! - INV-009 master fd O_NONBLOCK
 
 use std::ffi::c_void;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -41,6 +41,7 @@ use calloop::{EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction, Reg
 
 use crate::composer::prompt_track::Segment;
 use crate::composer::state::{ComposerInput, ComposerOutcome};
+use crate::kernel::feed::{encode_into, FeedDecoder, FeedFrame, FrameKind, FEED_HEADER_LEN};
 use crate::tab::{TabInstance, TabList};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
@@ -371,6 +372,15 @@ struct LoopData {
     /// 主路径 (active tab 切换) **不**重新注册 — fd 一直挂着, callback 内
     /// 直接 read 字节; 切 active 仅改 state.tabs.active 索引, 不动 fd 注册.
     pty_tokens: Vec<(crate::tab::TabId, RegistrationToken)>,
+    /// E′(ADR-0018)共享支线:受监管的隔离 `quill-kernel` 子进程(含父↔子 pipe 两端、焦点、
+    /// 背压队列)。`None` = `--share` 未武装(默认 = 今天的 quill,**零开销、零子进程、零回归**)。
+    /// 武装时持子句柄;焦点 tab 的【原始】PTY 字节经 [`ShareChild::tee_pty_output`] tee 给子(子
+    /// fan-out 给手机),手机输入经子 back-channel 回灌(块ii)。子崩溃时 back-channel EOF 触发拆
+    /// 回 `None` 降级回纯终端(终端无感)。
+    ///
+    /// **位于 LoopData 尾**(`pty_tokens` 之后):不持 wgpu / wayland 句柄,与 INV-001 资源链
+    /// (renderer→window→conn,在 `State` 内)解耦,drop 序无 UB(见 [`ShareChild`] doc)。
+    share: Option<ShareChild>,
 }
 
 // T-0108 删除:`run_main_loop` / `StepResult` / `install_signal_handlers` /
@@ -466,6 +476,430 @@ pub(crate) fn pty_readable_action(result: &std::io::Result<usize>) -> PtyAction 
     }
 }
 
+/// E′(ADR-0018)父→子 data 端出站积压上限(背压)。超过即按【整帧】丢弃(绝不丢半帧 →
+/// 子 [`FeedDecoder`] framing 不会错位;丢的是整帧 `PtyOutput`,手机少一段输出、不乱码)。
+/// 与 kernel `WS_CLIENT_OUT_CAP` / `FED_BACK_OUT_CAP` 同量级。1 MiB 远超 KB/s 终端流正常排空
+/// 所需(队列常空),只有真跟不上的卡死子才触顶丢帧,绝不无界堆 + 绝不阻塞终端热路径。
+const SHARE_DATA_OUT_CAP: usize = 1 << 20;
+
+/// 桌面单工作区在 E′ 帧里的 workspace 标签。父侧(window.rs)暂无真多工作区概念(Session
+/// 多 workspace 是 kernel 侧),固定值即可:子据此广播 `StreamFocus`,并把它原样回灌进 `Input`
+/// 帧的 `ws_id`(见 daemon `route_input`),父端单工作区下主要按 `tab_id` 路由。
+const SHARE_DESKTOP_WS_ID: u64 = 1;
+
+/// 共享子进程 WS 监听地址(与 kernel `DEFAULT_WS_PORT` 一致;手机经 WireGuard VPN → 路由器
+/// → `10.0.0.2:7878` 可达,安全靠 VPN 把门)。可经 env `QUILL_SHARE_WS_BIND` 覆盖(调参 /
+/// 避端口冲突 / 测试)。
+const SHARE_WS_BIND_DEFAULT: &str = "0.0.0.0:7878";
+
+/// 设 fd 为非阻塞(父保留的 pipe 两端:tee 写**绝不阻塞**热路径;back-channel 读 drain 到
+/// WouldBlock)。
+#[allow(unsafe_code)]
+fn share_set_nonblocking(fd: RawFd) -> std::io::Result<()> {
+    // SAFETY: fcntl F_GETFL/F_SETFL 只读写 fd 的 OFD status flags(O_NONBLOCK),不动 fd
+    // 所有权;两次返回值都按 < 0 判错。
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// 设 fd 为 close-on-exec(父保留端不被子 fork/exec 继承 → 子持的同名 pipe 端唯一 → 父关其
+/// 保留端时子读端得 EOF;子写端关时父读端得 EOF,EOF 察觉语义成立,见 ADR-0018)。
+#[allow(unsafe_code)]
+fn share_set_cloexec(fd: RawFd) -> std::io::Result<()> {
+    // SAFETY: fcntl F_GETFD/F_SETFD 只读写 fd 的 FD_CLOEXEC flag,不动所有权;返回值按 < 0 判错。
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        if flags < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// 建匿名 pipe(无 CLOEXEC → 子经 fork/exec 继承;父保留端事后自设 CLOEXEC)。返
+/// `(read_fd, write_fd)`。照 `tests/kernel_feed_slice.rs` 父侧范式。
+#[allow(unsafe_code)]
+fn share_make_pipe() -> std::io::Result<(RawFd, RawFd)> {
+    let mut fds = [0 as RawFd; 2];
+    // SAFETY: pipe 写两个 fd 进栈上数组;返回值按 != 0 判错。
+    let r = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    if r != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((fds[0], fds[1]))
+}
+
+/// 关一个本进程持有的 raw fd(spawn 后父关子已继承的副本;或早失败清理路径)。
+#[allow(unsafe_code)]
+fn share_close_fd(fd: RawFd) {
+    if fd >= 0 {
+        // SAFETY: 关一个本进程持有的 fd;不涉内存安全。
+        unsafe {
+            libc::close(fd);
+        }
+    }
+}
+
+/// 非阻塞写一批字节到 raw fd(父→子 data 端)。返写出字节数;负值转 `io::Error`(WouldBlock /
+/// Interrupted / EPIPE 等由调用方按 `kind()` 分派)。
+#[allow(unsafe_code)]
+fn share_write_fd(fd: RawFd, bytes: &[u8]) -> std::io::Result<usize> {
+    // SAFETY: write 到父持有的非阻塞 pipe 写端;bytes 是活切片;返回值按 < 0 判错。Rust std
+    // 运行时把 SIGPIPE 设 SIG_IGN,故子读端已关时这里返 EPIPE 而非杀进程。
+    let n = unsafe { libc::write(fd, bytes.as_ptr().cast::<c_void>(), bytes.len()) };
+    if n < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(n as usize)
+    }
+}
+
+/// 共享子进程二进制路径:优先与当前 `quill` 同目录的 `quill-kernel`(cargo target / 安装目录
+/// 同放),否则回退到裸名 `quill-kernel`(`Command::new` 查 PATH)。
+fn share_kernel_path() -> std::path::PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let sibling = dir.join("quill-kernel");
+            if sibling.is_file() {
+                return sibling;
+            }
+        }
+    }
+    std::path::PathBuf::from("quill-kernel")
+}
+
+/// E′(ADR-0018)父监管的隔离共享【子进程】句柄 + 父↔子 pipe 两端 + 焦点 + 背压队列。
+///
+/// 仅 `--share` 武装时存在(默认 `None` = 今天的 quill,**零开销、零子进程、零回归**)。父
+/// own PTY 直接渲染(热路径零 IPC);本结构只在【共享支线】活动,**绝不阻塞渲染 / PTY 热路径**:
+/// - **tee**(父→子,[`tee_pty_output`]):焦点 tab 的【原始】PTY 字节 → `PtyOutput` 帧 →
+///   **非阻塞**写;写不完入 [`data_outbound`](背压),超 [`SHARE_DATA_OUT_CAP`] 丢【整帧】
+///   (framing 不错位)。
+/// - **focus**(父→子,[`set_focus`]):焦点 tab 变 → `FocusChange` 帧(子据此广播 StreamFocus
+///   + 过滤回灌 Input 帧标签)。
+/// - **input 回灌**(子→父):back-channel 读端(OwnedFd)由 calloop READ 源
+///   ([`share_back_channel_readable`])**直接 own**,子把手机输入 encode 成 `Input` 帧写来。
+/// - **监管 / 降级**:子崩溃 → back-channel EOF → 拆 share 降级回纯终端;[`Drop`] kill + reap 子
+///   (OS 进程边界隔离,**不用 catch_unwind** —— 它接不住 abort/UB/OOM,正是否决 E 的理由)。
+///
+/// **drop 序(INV-008)**:本结构挂 [`LoopData`] 尾(`pty_tokens` 之后),不持 wgpu / wayland
+/// 句柄,与 INV-001 链(renderer→window→conn,在 `State` 内)解耦。`LoopData` 先于
+/// `event_loop` drop → 本结构 drop(关 `data_write` OwnedFd + reap 子)→ 之后 `event_loop`
+/// drop 移除并关闭 back-channel Generic 源 own 的 back_read OwnedFd(源 own fd,EPOLL_CTL_DEL
+/// 在 fd 仍开时执行,无 EBADF)。
+struct ShareChild {
+    /// 受监管的 `quill-kernel`(Fed 模式)子进程。[`Drop`] kill + wait 收尸(只 wait 本 child,
+    /// 不抢 portable-pty 对 shell 子的 reap;不用 SIGCHLD)。
+    child: std::process::Child,
+    /// 父→子 data 写端(`PtyOutput` / `FocusChange` 帧),非阻塞。`OwnedFd` 持有 → drop 关闭
+    /// → 子 `--fed-in` 读端 EOF → 子退出(ADR-0018 子靠 EOF 察觉父没了)。
+    data_write: OwnedFd,
+    /// 写不完的字节尾(背压队列)。**只 append 整帧**(半帧仅来自整帧的【部分 write】,会被
+    /// 后续 drain 补完);积压超 cap 时丢【新整帧】(不 append、不截断已入队的)→ 子 decoder
+    /// 见到的恒是完整帧序列,framing 绝不错位。
+    data_outbound: std::collections::VecDeque<u8>,
+    /// 子→父 `Input` 帧增量解码器(半包 / 粘包,见 [`FeedDecoder`])。子→父 input 读端
+    /// (`back_read` OwnedFd)由 calloop Generic READ 源**直接 own**(见 [`ShareChild::spawn`],
+    /// 同 daemon Fed-read 范式)→ 源 remove / drop 时关闭 fd,本结构不再单独持有它。
+    back_decoder: FeedDecoder,
+    /// tee 热路径复用的 encode buffer(`clear` 后重填,零额外分配)。
+    frame_scratch: Vec<u8>,
+    /// 当前焦点 workspace 标签(发 `FocusChange` / tee 帧头用)。
+    focus_ws: u64,
+    /// 当前焦点 tab id(raw)。tee 只转 `focus_tab` 那个 tab 的字节(只读镜像焦点 tab)。
+    focus_tab: u64,
+    /// 背压期间丢弃的整帧计数(诊断;[`Drop`] 时若 > 0 打一行 debug)。
+    dropped_frames: u64,
+}
+
+impl ShareChild {
+    /// spawn 受监管的隔离 `quill-kernel`(Fed 模式)子进程 + 建父↔子双向 pipe + 注册 back-channel
+    /// READ 源。失败返 `Err`(调用方 log + 降级回纯终端,**绝不让共享出错拖累启动**)。
+    ///
+    /// fd 拓扑(照 `tests/kernel_feed_slice.rs` 父侧):pipe1 父→子 data(子继承读端经 `--fed-in`,
+    /// 父留写端);pipe2 子→父 input(子继承写端经 `--fed-out`,父留读端)。父保留端设 CLOEXEC
+    /// (不被子继承)+ 非阻塞;spawn 后父关子那两端(子已继承 → 父留端成唯一持有者,EOF 语义成立)。
+    fn spawn(
+        loop_handle: &LoopHandle<'static, LoopData>,
+        focus_ws: u64,
+        focus_tab: u64,
+    ) -> Result<ShareChild> {
+        let exe = share_kernel_path();
+        let ws_bind = std::env::var("QUILL_SHARE_WS_BIND")
+            .unwrap_or_else(|_| SHARE_WS_BIND_DEFAULT.to_string());
+        // Fed 模式不绑 unix socket,但 quill-kernel 仍解析 --socket(XDG 未设时报错)→ 给占位
+        // 路径(Fed 分支从不 bind / 创建它,见 daemon::run)。
+        let placeholder_socket =
+            std::env::temp_dir().join(format!("quill-share-{}.sock", std::process::id()));
+
+        // pipe1: 父→子 data。父写 p_write,子读 c_read(经 --fed-in)。
+        let (c_read, p_write) = share_make_pipe().context("建父→子 data pipe 失败")?;
+        // pipe2: 子→父 input。子写 c_write(经 --fed-out),父读 p_read。
+        let (p_read, c_write) = match share_make_pipe() {
+            Ok(p) => p,
+            Err(e) => {
+                share_close_fd(c_read);
+                share_close_fd(p_write);
+                return Err(anyhow::Error::new(e).context("建子→父 input pipe 失败"));
+            }
+        };
+
+        // 父保留端:CLOEXEC(不被子继承)+ 非阻塞。任一失败 → 清理全部 fd 后返错。
+        let setup = (|| -> std::io::Result<()> {
+            share_set_cloexec(p_write)?;
+            share_set_cloexec(p_read)?;
+            share_set_nonblocking(p_write)?;
+            share_set_nonblocking(p_read)?;
+            Ok(())
+        })();
+        if let Err(e) = setup {
+            for fd in [c_read, p_write, p_read, c_write] {
+                share_close_fd(fd);
+            }
+            return Err(anyhow::Error::new(e).context("配置父保留 pipe 端失败"));
+        }
+
+        let spawned = std::process::Command::new(&exe)
+            .arg(format!("--socket={}", placeholder_socket.display()))
+            .arg(format!("--ws-bind={ws_bind}"))
+            .arg(format!("--fed-in={c_read}"))
+            .arg(format!("--fed-out={c_write}"))
+            .spawn();
+        let child = match spawned {
+            Ok(c) => c,
+            Err(e) => {
+                for fd in [c_read, p_write, p_read, c_write] {
+                    share_close_fd(fd);
+                }
+                return Err(anyhow::Error::new(e)
+                    .context(format!("spawn 共享子进程 {} 失败", exe.display())));
+            }
+        };
+
+        // 父关子那两端(子已继承副本)→ 父留端成唯一持有者(EOF 察觉语义)。
+        share_close_fd(c_read);
+        share_close_fd(c_write);
+
+        // SAFETY: p_write / p_read 由父独占(子继承的 c_read / c_write 已关);包成 OwnedFd
+        // 接管 close。data_write 进 ShareChild(drain 写它);back_read 直接交给 calloop Generic
+        // 源 own(同 daemon Fed-read 范式)→ 源 remove / drop 时关闭 fd。
+        #[allow(unsafe_code)]
+        let data_write = unsafe { OwnedFd::from_raw_fd(p_write) };
+        #[allow(unsafe_code)]
+        let back_read = unsafe { OwnedFd::from_raw_fd(p_read) };
+
+        // 注册 back-channel READ 源(子→父 Input 帧)。Generic **own** back_read OwnedFd;闭包捕获
+        // raw(int Copy)给 libc::read 用,源在 loop 生命期内不删 → fd 全程有效。drop 序:本源
+        // (含 OwnedFd)随 event_loop drop 自关 fd(EPOLL_CTL_DEL 在 fd 仍开时执行,无 EBADF)。
+        let back_raw = back_read.as_raw_fd();
+        let register = loop_handle.insert_source(
+            Generic::new(back_read, Interest::READ, Mode::Level),
+            move |_readiness, _meta, data: &mut LoopData| {
+                share_back_channel_readable(data, back_raw)
+            },
+        );
+        if let Err(e) = register {
+            // 注册失败:InsertError 持回 Generic(含 back_read OwnedFd)→ 随 `e` drop 关闭;
+            // 这里显式 kill + reap 子 + 关 data_write。
+            let mut child = child;
+            let _ = child.kill();
+            let _ = child.wait();
+            drop(data_write);
+            return Err(anyhow!("注册 back-channel READ 源失败: {e}"));
+        }
+
+        Ok(ShareChild {
+            child,
+            data_write,
+            data_outbound: std::collections::VecDeque::new(),
+            back_decoder: FeedDecoder::new(),
+            frame_scratch: Vec::with_capacity(FEED_HEADER_LEN + PTY_READ_BUF),
+            focus_ws,
+            focus_tab,
+            dropped_frames: 0,
+        })
+    }
+
+    /// tee 焦点 tab 的【原始】PTY 字节给子(父→子 `PtyOutput` 帧)。**非阻塞、绝不阻塞热
+    /// 路径**:写不完入队,超 cap 丢整帧。空输入 no-op。
+    fn tee_pty_output(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let (ws, tab) = (self.focus_ws, self.focus_tab);
+        self.push_frame(FrameKind::PtyOutput, ws, tab, bytes);
+    }
+
+    /// 焦点 tab 变 → 更新本地焦点 + 发 `FocusChange` 帧(子据此广播 StreamFocus,且其后回灌的
+    /// `Input` 帧带这对 (ws, tab) 标签)。
+    fn set_focus(&mut self, ws: u64, tab: u64) {
+        self.focus_ws = ws;
+        self.focus_tab = tab;
+        self.push_frame(FrameKind::FocusChange, ws, tab, &[]);
+    }
+
+    /// encode 一帧进复用 buffer,append 到出站队列并尝试 drain(背压见 [`enqueue_and_drain`])。
+    fn push_frame(&mut self, kind: FrameKind, ws: u64, tab: u64, payload: &[u8]) {
+        // 取出复用 buffer(避免 `&self.frame_scratch` 与 `&mut self.enqueue_and_drain` 借用冲突)。
+        let mut scratch = std::mem::take(&mut self.frame_scratch);
+        scratch.clear();
+        encode_into(&mut scratch, kind, ws, tab, payload);
+        self.enqueue_and_drain(&scratch);
+        self.frame_scratch = scratch;
+    }
+
+    /// 先 drain 已积压(保序),再决定新整帧:仍积压且加上本帧超 cap → 丢【整帧】(不 append →
+    /// 子 decoder 永不见半帧);否则 append 整帧再 drain。
+    fn enqueue_and_drain(&mut self, frame: &[u8]) {
+        self.drain_outbound();
+        if !self.data_outbound.is_empty()
+            && self.data_outbound.len().saturating_add(frame.len()) > SHARE_DATA_OUT_CAP
+        {
+            self.dropped_frames = self.dropped_frames.saturating_add(1);
+            return;
+        }
+        self.data_outbound.extend(frame.iter().copied());
+        self.drain_outbound();
+    }
+
+    /// 非阻塞 drain 出站队列到 WouldBlock / 部分写。写多少剪多少;EINTR 重试;子断(EPIPE 等)
+    /// = 清空停写(**不在热路径拆 share** —— 权威降级走 back-channel EOF,见
+    /// [`share_back_channel_readable`])。
+    fn drain_outbound(&mut self) {
+        let fd = self.data_write.as_raw_fd();
+        while !self.data_outbound.is_empty() {
+            let (front_len, res) = {
+                let front = self.data_outbound.as_slices().0;
+                (front.len(), share_write_fd(fd, front))
+            };
+            match res {
+                Ok(0) => break,
+                Ok(n) => {
+                    self.data_outbound.drain(..n);
+                    if n < front_len {
+                        // 部分写:内核 pipe 缓冲将满 → 下次 tee / focus 时再试(不忙等)。
+                        break;
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => {
+                    // 子读端没了(EPIPE)等:停写、丢队列。降级由 back-channel EOF 兜。
+                    self.data_outbound.clear();
+                    break;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ShareChild {
+    fn drop(&mut self) {
+        // OS 进程边界隔离(不用 catch_unwind):kill + reap 受监管子。子也会因 data_write 关闭
+        // (本结构 OwnedFd 字段随后 drop)得 EOF 自退,kill 是 prompt + 兜底;wait 防僵尸
+        // (只 wait 本结构的 quill-kernel 子,不抢 portable-pty 对 shell 子的 reap)。
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if self.dropped_frames > 0 {
+            tracing::debug!(
+                dropped = self.dropped_frames,
+                "E′ 共享 tee 背压期间丢弃的整帧数(手机少了这些段输出,framing 未错位)"
+            );
+        }
+    }
+}
+
+/// E′ back-channel(子→父 `Input` 帧)READ 源回调:drain 到 WouldBlock,解 `Input` 帧 → 路由
+/// 到本地 PTY([`route_share_input`])。子 pipe **EOF**(子崩溃 / 退出)或**流错位**(坏帧)→ 拆
+/// share 降级回纯终端:`data.share = None`([`ShareChild::drop`] kill + reap 子 + 关父留 fd)+
+/// `PostAction::Remove`(calloop 移除本源;**不在回调内 `loop_handle.remove` 自身源**)。**绝不
+/// 上抛错到终端热路径**(共享支线全 Result / 丢弃)。
+fn share_back_channel_readable(data: &mut LoopData, fd: RawFd) -> std::io::Result<PostAction> {
+    let mut frames: Vec<FeedFrame> = Vec::new();
+    let mut buf = [0u8; PTY_READ_BUF];
+    let mut down = false;
+    loop {
+        // SAFETY: fd = ShareChild.back_read(OwnedFd)的 raw,源注册期间该 OwnedFd 在 data.share
+        // 里活;libc::read 只读字节进栈 buf,不动 fd 所有权。
+        #[allow(unsafe_code)]
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<c_void>(), buf.len()) };
+        if n > 0 {
+            let Some(sh) = data.share.as_mut() else {
+                return Ok(PostAction::Remove); // 不该发生:本源仅 share 武装时注册
+            };
+            sh.back_decoder.push(&buf[..n as usize]);
+            loop {
+                match sh.back_decoder.next_frame() {
+                    Ok(Some(f)) => frames.push(f),
+                    Ok(None) => break,
+                    Err(e) => {
+                        tracing::error!(%e, "E′ 共享子 back-channel 流解码错位(致命),降级回纯终端");
+                        down = true;
+                        break;
+                    }
+                }
+            }
+            if down {
+                break;
+            }
+            continue;
+        }
+        if n == 0 {
+            tracing::info!("E′ 共享子 back-channel EOF:子进程退出 / 崩溃,降级回纯终端");
+            down = true;
+            break;
+        }
+        // n < 0
+        let err = std::io::Error::last_os_error();
+        match err.kind() {
+            std::io::ErrorKind::WouldBlock => break,
+            std::io::ErrorKind::Interrupted => continue,
+            _ => {
+                tracing::warn!(?err, "E′ 共享子 back-channel read 错误,降级回纯终端");
+                down = true;
+                break;
+            }
+        }
+    }
+
+    for f in frames {
+        route_share_input(data, f);
+    }
+
+    if down {
+        // 拆 share:ShareChild::drop kill + reap 子 + 关父留 fd;本源 PostAction::Remove
+        // (calloop 回调返回后才应用,故"删自身源"安全 —— 别在回调内手动 loop_handle.remove)。
+        let _ = data.share.take();
+        return Ok(PostAction::Remove);
+    }
+    Ok(PostAction::Continue)
+}
+
+/// 路由一条子回灌的 `Input` 帧到本地 PTY(块ii 实装)。块i(只读镜像)先丢弃 —— 把 back-channel
+/// drain 掉(防 pipe 填满拖累子)但不回灌输入。
+fn route_share_input(data: &mut LoopData, frame: FeedFrame) {
+    // 块i 占位:只读镜像,不回灌输入(块ii 接 queue_or_write_pty,按 (ws, tab) 路由到对应 PTY)。
+    let _ = data;
+    tracing::trace!(
+        kind = ?frame.kind,
+        ws = frame.ws_id,
+        tab = frame.tab_id,
+        n = frame.payload.len(),
+        "E′ 共享子回灌帧(块i 只读,暂丢弃)"
+    );
+}
+
 /// calloop Generic source 每次 readable 时跑一圈:循环 `pty.read` → 分派
 /// [`PtyAction`] → 处理。一个 tick 要么读尽(ReturnContinue)要么触发退出
 /// (RequestExit)。
@@ -489,6 +923,7 @@ fn pty_read_tick(
     state: &mut State,
     tab_id: crate::tab::TabId,
     loop_signal: &LoopSignal,
+    share: Option<&mut ShareChild>,
 ) -> std::io::Result<PostAction> {
     // T-0809 / ADR 0012 split-borrow: state.tabs 与 state.selection_state 是
     // disjoint fields, 必须通过字段 path 取 &mut 才能共存. tabs_unchecked_mut()
@@ -519,7 +954,10 @@ fn pty_read_tick(
     } else {
         None
     };
-    pty_read_tick_inner(tab, selection_for_inner, loop_signal)
+    // E′ tee:`share` 原样穿进 inner(像 selection_state 那样 Option 穿透)。tee 仅对【焦点】
+    // tab 生效(inner 内 `sh.focus_tab == tab.id()` 过滤),故所有 tab 的读回调都可安全传入,
+    // 非焦点 tab 自然不 tee。share 未武装(None)= inner 整段 tee no-op(默认零回归)。
+    pty_read_tick_inner(tab, selection_for_inner, loop_signal, share)
 }
 
 /// T-0608 inner impl: 真 read PTY + advance term. 与原 pty_read_tick 同, 抽出
@@ -540,6 +978,7 @@ fn pty_read_tick_inner(
     tab: &mut TabInstance,
     mut selection_state: Option<&mut super::selection::SelectionState>,
     loop_signal: &LoopSignal,
+    mut share: Option<&mut ShareChild>,
 ) -> std::io::Result<PostAction> {
     // INV-009 sanity check:master fd 必须 O_NONBLOCK。由 T-0201 的 `spawn_program`
     // 在构造时 fcntl 一次设好,本 ticket **不重复** F_SETFL(会覆盖其它 flag 破
@@ -577,6 +1016,17 @@ fn pty_read_tick_inner(
                         bytes = %preview,
                         "pty bytes"
                     );
+                    // E′(ADR-0018)tee:把【焦点】tab 的【原始】PTY 字节(`buf[..n]`,**不是**下面
+                    // 被 composer 剥了 OSC-133 的 `term_bytes` —— 手机要完整流)转给共享子。
+                    // - 单一 null-check:`share` 未武装(`None`)→ 整个 `if let` 不进 → **默认零回归**
+                    //   (父 own PTY 直接渲染,热路径零 IPC、≈ 今天的 quill);
+                    // - 仅焦点 tab(`sh.focus_tab == tab.id()`):非焦点 tab 的后台输出不转给手机;
+                    // - 非阻塞 + 背压丢整帧,**绝不阻塞渲染 / PTY 热路径**(见 [`ShareChild::tee_pty_output`])。
+                    if let Some(sh) = share.as_deref_mut() {
+                        if sh.focus_tab == tab.id().raw() {
+                            sh.tee_pty_output(&buf[..n]);
+                        }
+                    }
                     // T5b:先让composer扫描OSC 133,marker只改composer内部提示态,
                     // 普通字节才继续交给终端状态机。
                     let history_before = tab.term().scrollback_size();
@@ -2114,9 +2564,12 @@ fn apply_tab_op(data: &mut LoopData) {
                 Generic::new(new_pty_borrowed, Interest::READ, Mode::Level),
                 move |_readiness, _fd, data: &mut LoopData| {
                     let LoopData {
-                        state, loop_signal, ..
+                        state,
+                        loop_signal,
+                        share,
+                        ..
                     } = &mut *data;
-                    pty_read_tick(state, new_id, loop_signal)
+                    pty_read_tick(state, new_id, loop_signal, share.as_mut())
                 },
             );
             let token = match token_result {
@@ -2269,6 +2722,14 @@ fn on_active_tab_changed(data: &mut LoopData) {
         t.active_mut().term_mut().mark_dirty();
     }
     data.state.presentation_dirty = true;
+
+    // E′(ADR-0018):焦点 tab 变 → 告知共享子(更新 `focus_tab` → tee 改转新焦点 tab 的字节;
+    // 发 `FocusChange` 帧 → 子广播 StreamFocus + 其后回灌 Input 帧带新 (ws, tab) 标签)。share
+    // 未武装 = no-op。先取 active id(释放 state.tabs 借用)再借 data.share(disjoint 字段)。
+    let active_id_for_share = data.state.tabs.as_ref().map(|t| t.active().id().raw());
+    if let (Some(active_id), Some(sh)) = (active_id_for_share, data.share.as_mut()) {
+        sh.set_focus(SHARE_DESKTOP_WS_ID, active_id);
+    }
 }
 
 /// T-0607: 异步 paste 读取的中间状态. fd 通过 OwnedFd 持有控制 close 时机
@@ -2513,7 +2974,7 @@ fn drive_wayland(data: &mut LoopData) -> std::io::Result<PostAction> {
 /// 退出后按 INV-001 声明顺序(renderer → window → conn)正向 drop,保证 wgpu
 /// surface 先放掉 wl_surface 裸指针再关连接,不给 compositor 留 "client didn't
 /// release surface" 告警。
-pub fn run_window(initial_cwd: Option<std::path::PathBuf>) -> Result<()> {
+pub fn run_window(initial_cwd: Option<std::path::PathBuf>, share: bool) -> Result<()> {
     let conn = Connection::connect_to_env()
         .context("连接 Wayland compositor 失败(是否在 Wayland session 下?)")?;
     let (globals, event_queue) =
@@ -2872,9 +3333,12 @@ pub fn run_window(initial_cwd: Option<std::path::PathBuf>) -> Result<()> {
             Generic::new(pty_borrowed, Interest::READ, Mode::Level),
             move |_readiness, _fd, data: &mut LoopData| {
                 let LoopData {
-                    state, loop_signal, ..
+                    state,
+                    loop_signal,
+                    share,
+                    ..
                 } = &mut *data;
-                pty_read_tick(state, initial_tab_id, loop_signal)
+                pty_read_tick(state, initial_tab_id, loop_signal, share.as_mut())
             },
         )
         .map_err(|e| anyhow!("calloop insert_source(pty master fd) 失败: {e}"))?;
@@ -2901,6 +3365,32 @@ pub fn run_window(initial_cwd: Option<std::path::PathBuf>) -> Result<()> {
             );
             None
         }
+    };
+
+    // E′(ADR-0018)共享子进程:**opt-in 武装即起**(`--share`)。默认(`share == false`)→
+    // 根本不 spawn 子 → 终端就是今天的 quill(零开销、零子进程、零回归)。spawn 失败 → log +
+    // 降级回纯终端(`None`),**绝不让共享出错拖累 daily-driver 启动**。spawn 成功后立刻 set_focus
+    // 把初始焦点告知子(子据此广播 StreamFocus;tee 已按 `focus_tab` 过滤)。
+    let share_child: Option<ShareChild> = if share {
+        match ShareChild::spawn(&loop_handle, SHARE_DESKTOP_WS_ID, initial_tab_id.raw()) {
+            Ok(mut sh) => {
+                sh.set_focus(SHARE_DESKTOP_WS_ID, initial_tab_id.raw());
+                tracing::info!(
+                    tab = initial_tab_id.raw(),
+                    "E′ 共享子进程已 spawn(--share 武装即起);焦点 tab 输出 tee 给手机"
+                );
+                Some(sh)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    ?e,
+                    "E′ 共享子进程 spawn 失败,降级回纯终端(本次 --share 无效,终端不受影响)"
+                );
+                None
+            }
+        }
+    } else {
+        None
     };
 
     let mut loop_data = LoopData {
@@ -2933,6 +3423,9 @@ pub fn run_window(initial_cwd: Option<std::path::PathBuf>) -> Result<()> {
         // T-0608: 启动后第一个 tab 的 PTY fd 已在上方 insert_source, 把
         // (tab_id, token) push 进 token 表 — close tab 时按 id 找 token + remove.
         pty_tokens: vec![(initial_tab_id, initial_token)],
+        // E′(ADR-0018):`--share` 武装时持共享子进程句柄,默认 None(零回归)。back-channel
+        // READ 源已在 ShareChild::spawn 内注册(若 Some)。
+        share: share_child,
     };
     event_loop
         .run(None, &mut loop_data, |data| {
@@ -5390,13 +5883,13 @@ mod tests {
     use super::*;
 
     /// Smoke test:窗口模块只对外导出 [`run_window`],签名固定为
-    /// `fn(Option<PathBuf>) -> Result<()>`(`Option<PathBuf>` = 启动期初始工作目录,
-    /// 给 `--working-directory=` / 右键"在此打开"用)。这里通过函数指针绑定把
-    /// contract 固化在编译期,防止后续重构误改签名。实际 Wayland 连接的 runtime
-    /// 行为依赖 compositor,留给集成测试与 soak。
+    /// `fn(Option<PathBuf>, bool) -> Result<()>`(`Option<PathBuf>` = 启动期初始工作目录,
+    /// 给 `--working-directory=` / 右键"在此打开"用;`bool` = E′ 共享 opt-in `--share`,
+    /// ADR-0018)。这里通过函数指针绑定把 contract 固化在编译期,防止后续重构误改签名。
+    /// 实际 Wayland 连接的 runtime 行为依赖 compositor,留给集成测试与 soak。
     #[test]
     fn smoke_run_window_signature_is_stable() {
-        let f: fn(Option<std::path::PathBuf>) -> Result<()> = run_window;
+        let f: fn(Option<std::path::PathBuf>, bool) -> Result<()> = run_window;
         // 仅保留引用,避免 dead_code;不调用 f(会阻塞事件循环)。
         let _ = &f;
     }
