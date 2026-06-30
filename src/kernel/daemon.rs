@@ -876,12 +876,14 @@ fn ws_go_live(
     // 不发 ClientMsg::Hold(如旧 web / 测试)也登记为 holder → 断线/关闭都经统一回收路径
     // 释放,无 holder 泄漏。anchor 在(daemon 自锚)故这不会让工作区"该死不死"。
     let ws_id = data.workspace_id;
-    data.session.hold(ws_id, id);
     // 控制面连上引导帧:全部工作区列表 + 当前工作区结构 + 字节流 (workspace,tab) 标签。
     let control = build_control_text(&data.session, ws_id);
     let replay = data.ring.snapshot();
     if let Some(c) = data.clients.get_mut(&id) {
         c.stage = WsStage::Live(ws);
+        // 先确认连接在册再登记 holder + held_ws(二者一起设)→ 杜绝登记了 holder 却没记
+        // held_ws、回收时无从释放的孤立态。
+        data.session.hold(ws_id, id);
         c.held_ws = Some(ws_id);
         // 刚 insert 即 enable 状态;有重放/控制帧就让它去排空,无则首次可写发现队空自 Disable。
         c.write = Some(WriteReg {
@@ -1001,9 +1003,13 @@ fn handle_client_msg(data: &mut DaemonData, id: u64, text: &str) -> Option<PostA
     };
     match msg {
         ClientMsg::Hold { workspace_id } => {
-            data.session.hold(workspace_id, id);
-            if let Some(c) = data.clients.get_mut(&id) {
-                c.held_ws = Some(workspace_id);
+            // 仅 hold 成功(工作区存在)才记 held_ws;否则会把已持有的真工作区记录覆盖成
+            // 无效 id → 原 holder 孤立、refcount 永不归 0(砖0 单工作区+恒 anchored 触发不到,
+            // 砖1 多 workspace 会咬)。held_ws 单槽的真·多持有语义留砖1 升 HashSet。
+            if data.session.hold(workspace_id, id) {
+                if let Some(c) = data.clients.get_mut(&id) {
+                    c.held_ws = Some(workspace_id);
+                }
             }
             None
         }
