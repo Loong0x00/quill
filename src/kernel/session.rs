@@ -19,6 +19,8 @@
 //! (`window.rs:539`) 去掉 selection rebase + composer OSC133 + Wayland 重绘后的
 //! 纯内核子集;`on_input` 是 `Dispatch<WlKeyboard>` 写 PTY 那一步的纯子集。
 
+use std::collections::HashSet;
+
 use anyhow::{bail, Context, Result};
 
 use crate::kernel::proto::{
@@ -28,10 +30,36 @@ use crate::tab::{TabInstance, TabList};
 
 pub use crate::kernel::proto::TabOp;
 
-/// 一个工作区:单调递增 id + 自己的 [`TabList`]。多个工作区组成一个 [`Session`]。
+/// 引用计数生命周期操作 (set_anchor / release) 的结果 (块C, ADR-0015 R1 / ADR-0018)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lifecycle {
+    /// 工作区仍在 (refcount > 0,或本次是"断线"非 explicit 不触发销毁)。
+    Alive,
+    /// refcount (anchor + holders) 归 0 → 工作区已销毁 (移出 Session → drop TabList
+    /// → PTY SIGHUP)。
+    Destroyed,
+    /// 未知 workspace_id,无操作。
+    Unknown,
+}
+
+/// 一个工作区:单调递增 id + 自己的 [`TabList`] + 引用计数生命周期状态。多个工作区
+/// 组成一个 [`Session`]。
+///
+/// **引用计数 (块C, ADR-0015 R1 / ADR-0018)**:`refcount = anchored as usize +
+/// holders.len()`。
+/// - **anchor(锚)holder** = spawn 工作区者(standalone daemon = daemon 自己;E′ =
+///   父终端进程)。anchor 在 → 工作区**不因 WS 全断而死**(如今天的 daemon)。
+/// - **holders** = 当前连着的显示端 (WS 连接 id)。**X 显式关闭 (Release/Close) 释放**;
+///   **断线 (网络抖 / 后台 / WS 掉) = 非事件**:移除该连接 holder(防泄漏)但**绝不
+///   触发销毁**(靠 anchor 保活)。
+/// - refcount 归 0 (仅 explicit 释放 / 清 anchor 时检查) → 销毁工作区。
 struct Workspace {
     id: u64,
     tabs: TabList,
+    /// anchor holder 是否在 (见类型 doc)。
+    anchored: bool,
+    /// 连接显示端 holder 集合 (WS 连接 id)。`HashSet` → Hold 幂等、断线移除幂等。
+    holders: HashSet<u64>,
 }
 
 /// 无头会话内核。边界 = `State.tabs` (ADR-0015):内核 own 多个工作区 ([`TabList`]),
@@ -58,7 +86,12 @@ impl Session {
             next_ws_id: 1,
         };
         let id = s.alloc_ws_id();
-        s.workspaces.push(Workspace { id, tabs });
+        s.workspaces.push(Workspace {
+            id,
+            tabs,
+            anchored: false,
+            holders: HashSet::new(),
+        });
         s
     }
 
@@ -113,6 +146,8 @@ impl Session {
         self.workspaces.push(Workspace {
             id,
             tabs: TabList::new(tab),
+            anchored: false,
+            holders: HashSet::new(),
         });
         Ok(id)
     }
@@ -323,6 +358,86 @@ impl Session {
         WorkspaceList {
             workspaces,
             active: active_id,
+        }
+    }
+
+    // ── 引用计数生命周期 (块C, ADR-0015 R1 / ADR-0018) ──────────────────────────
+
+    /// 设/清工作区的 **anchor** holder (见 [`Workspace`] doc)。standalone daemon 启动
+    /// 后给自己唯一工作区 `set_anchor(id, true)` → WS 全断不死。**清 anchor**
+    /// (`anchored=false`) 是显式生命周期事件:若清后 refcount 归 0 则销毁工作区并返
+    /// [`Lifecycle::Destroyed`]。未知 id 返 [`Lifecycle::Unknown`]。
+    pub fn set_anchor(&mut self, ws_id: u64, anchored: bool) -> Lifecycle {
+        let Some(wi) = self.ws_idx(ws_id) else {
+            return Lifecycle::Unknown;
+        };
+        self.workspaces[wi].anchored = anchored;
+        if !anchored && self.refcount_at(wi) == 0 {
+            self.destroy_at(wi);
+            Lifecycle::Destroyed
+        } else {
+            Lifecycle::Alive
+        }
+    }
+
+    /// 登记一个连接显示端 holder (WS 连上 → 成为 holder,引用计数 +1)。`holder` = 连接
+    /// id。幂等 (同 id 重复 Hold 不重复计)。未知 `ws_id` 返 `false`。
+    pub fn hold(&mut self, ws_id: u64, holder: u64) -> bool {
+        let Some(wi) = self.ws_idx(ws_id) else {
+            return false;
+        };
+        self.workspaces[wi].holders.insert(holder);
+        true
+    }
+
+    /// 释放一个 holder。
+    ///
+    /// - **`explicit = true`(X 显式关闭:收到 `Release` / WS `Close`)**:移除 holder
+    ///   后若 refcount 归 0 → 销毁工作区,返 [`Lifecycle::Destroyed`]。
+    /// - **`explicit = false`(断线:网络抖 / 后台 / WS 掉 / 收割 / cap 断开)= 非事件**:
+    ///   移除该连接 holder(防泄漏,连接已死、其 id 不会再用,重连是新 id 重新 Hold),
+    ///   但**绝不触发销毁**(靠 anchor 保活)。恒返 [`Lifecycle::Alive`]。
+    ///
+    /// **区分关闭 vs 断线是关键**(ADR-0015 R1):正因断线不销毁、anchor 构造上恒在
+    /// (PTY⟺桌面窗口原子耦合),手机后台/锁屏/断网杀不掉会话。未知 `ws_id` 返
+    /// [`Lifecycle::Unknown`]。
+    pub fn release(&mut self, ws_id: u64, holder: u64, explicit: bool) -> Lifecycle {
+        let Some(wi) = self.ws_idx(ws_id) else {
+            return Lifecycle::Unknown;
+        };
+        self.workspaces[wi].holders.remove(&holder);
+        if explicit && self.refcount_at(wi) == 0 {
+            self.destroy_at(wi);
+            Lifecycle::Destroyed
+        } else {
+            Lifecycle::Alive
+        }
+    }
+
+    /// 工作区当前 refcount (`anchored + holders`)。未知 `ws_id` 返 `None`。
+    pub fn refcount(&self, ws_id: u64) -> Option<usize> {
+        self.ws_idx(ws_id).map(|wi| self.refcount_at(wi))
+    }
+
+    fn refcount_at(&self, wi: usize) -> usize {
+        let w = &self.workspaces[wi];
+        w.anchored as usize + w.holders.len()
+    }
+
+    /// 销毁下标 `wi` 的工作区:移出 `workspaces`(drop → drop TabList → 各 PTY SIGHUP)
+    /// 并调整 `active` 下标。
+    ///
+    /// **active 调整**:删 `wi` 后,> `wi` 的下标左移 1 → active 在 `wi` 之后则 −1;
+    /// active 正是 `wi`(其工作区被销毁)则 clamp 到剩余范围(选邻近)。空 Session 时
+    /// active 归 0(daemon 单工作区因 anchor 恒在不会走到这;见类型非空不变式注解)。
+    fn destroy_at(&mut self, wi: usize) {
+        self.workspaces.remove(wi);
+        if self.workspaces.is_empty() {
+            self.active = 0;
+        } else if wi < self.active {
+            self.active -= 1;
+        } else if wi == self.active {
+            self.active = self.active.min(self.workspaces.len() - 1);
         }
     }
 
@@ -582,5 +697,103 @@ mod tests {
 
         // 未知工作区切换返 false。
         assert!(!s.set_active_workspace(7_777_777));
+    }
+
+    /// 引用计数:anchor 在 → WS holder 全(断线)掉不销毁;显式关闭 + 清 anchor → 归 0
+    /// 销毁。确定性、纯逻辑。
+    #[test]
+    fn refcount_anchor_keeps_alive_then_destroys_at_zero() {
+        let mut s = session_one_tab();
+        let ws1 = s.active_workspace_id();
+        // 第二个工作区用来销毁,避免清空 Session (active 单工作区因 anchor 不会被销毁)。
+        let ws2 = s.new_workspace(80, 24).expect("new ws");
+
+        // ws2:anchor(模拟 standalone daemon)+ 两个 WS holder。
+        assert_eq!(s.set_anchor(ws2, true), Lifecycle::Alive);
+        assert!(s.hold(ws2, 100));
+        assert!(s.hold(ws2, 101));
+        assert_eq!(s.refcount(ws2), Some(3), "anchor + 2 holders");
+        // Hold 幂等。
+        assert!(s.hold(ws2, 100));
+        assert_eq!(s.refcount(ws2), Some(3));
+
+        // 断线 (非 explicit) 两个 holder 全掉 → 不销毁 (anchor 保活)。
+        assert_eq!(s.release(ws2, 100, false), Lifecycle::Alive);
+        assert_eq!(s.release(ws2, 101, false), Lifecycle::Alive);
+        assert_eq!(s.refcount(ws2), Some(1), "只剩 anchor");
+        assert!(
+            s.workspace_ids().contains(&ws2),
+            "anchor 在 → WS 全断工作区不死 (如今天)"
+        );
+
+        // 加 holder 再显式 X 关闭:anchor 仍在 → refcount 不为 0 → 不销毁。
+        assert!(s.hold(ws2, 102));
+        assert_eq!(
+            s.release(ws2, 102, true),
+            Lifecycle::Alive,
+            "anchor 在 → 显式关闭一个 holder 只关那个 view"
+        );
+        assert_eq!(s.refcount(ws2), Some(1));
+
+        // 清 anchor(显式生命周期事件)→ refcount 归 0 → 销毁。
+        assert_eq!(s.set_anchor(ws2, false), Lifecycle::Destroyed);
+        assert!(!s.workspace_ids().contains(&ws2), "归 0 应销毁工作区");
+        assert_eq!(s.workspace_count(), 1);
+        // ws1 仍在,Session 非空,snapshot_active 不 panic。
+        assert!(s.workspace_ids().contains(&ws1));
+        let _ = s.snapshot_active();
+
+        // 未知 workspace。
+        assert_eq!(s.refcount(999), None);
+        assert_eq!(s.set_anchor(999, false), Lifecycle::Unknown);
+        assert_eq!(s.release(999, 1, true), Lifecycle::Unknown);
+        assert!(!s.hold(999, 1));
+    }
+
+    /// 无 anchor 时:显式关闭最后一个 holder → 归 0 销毁;而**断线**(非 explicit)即便
+    /// 归 0 也**不**销毁(断线非事件)。
+    #[test]
+    fn refcount_explicit_destroys_disconnect_does_not() {
+        let mut s = session_one_tab();
+        let ws2 = s.new_workspace(80, 24).expect("new ws");
+
+        // 断线归 0 不销毁 (非事件)。
+        assert!(s.hold(ws2, 300));
+        assert_eq!(s.release(ws2, 300, false), Lifecycle::Alive);
+        assert_eq!(s.refcount(ws2), Some(0));
+        assert!(
+            s.workspace_ids().contains(&ws2),
+            "断线即便归 0 也不销毁 (非事件)"
+        );
+
+        // 重连 (新 holder id) → 显式 X 关闭 → 归 0 → 销毁。
+        assert!(s.hold(ws2, 301));
+        assert_eq!(s.release(ws2, 301, true), Lifecycle::Destroyed);
+        assert!(!s.workspace_ids().contains(&ws2));
+        assert_eq!(s.workspace_count(), 1);
+    }
+
+    /// 销毁工作区时 active 下标正确调整 (删 active 之前 → 左移;删 active 自身 → 选邻近)。
+    #[test]
+    fn destroy_adjusts_active_index() {
+        let mut s = session_one_tab();
+        let ws1 = s.active_workspace_id();
+        let ws2 = s.new_workspace(80, 24).expect("ws2");
+        let ws3 = s.new_workspace(80, 24).expect("ws3");
+        // workspaces = [ws1, ws2, ws3], active = ws1 (idx0)。删 ws2 (idx1) → active 仍 ws1。
+        assert!(s.hold(ws2, 1));
+        assert_eq!(s.release(ws2, 1, true), Lifecycle::Destroyed);
+        assert_eq!(s.active_workspace_id(), ws1);
+
+        // workspaces = [ws1, ws3];切 active 到 ws3 (idx1),删 ws1 (idx0) → active 左移到 ws3。
+        assert!(s.set_active_workspace(ws3));
+        assert!(s.hold(ws1, 1));
+        assert_eq!(s.release(ws1, 1, true), Lifecycle::Destroyed);
+        assert_eq!(
+            s.active_workspace_id(),
+            ws3,
+            "删 active 之前的工作区 → active 左移仍指原 ws"
+        );
+        assert_eq!(s.workspace_count(), 1);
     }
 }

@@ -63,8 +63,8 @@ use tungstenite::handshake::server::{NoCallback, ServerHandshake};
 use tungstenite::handshake::MidHandshake;
 use tungstenite::{Bytes, Error as WsError, HandshakeError, Message, WebSocket};
 
-use crate::kernel::proto::Snapshot;
-use crate::kernel::session::Session;
+use crate::kernel::proto::{ClientMsg, ServerMsg, Snapshot};
+use crate::kernel::session::{Lifecycle, Session};
 use crate::tab::{TabInstance, TabList};
 
 /// 内嵌的浏览器镜像页与 vendored xterm.js 资产(`include_str!` 路径相对**本源文件**
@@ -222,7 +222,12 @@ pub fn run(config: DaemonConfig) -> Result<()> {
     let tab =
         TabInstance::spawn(config.cols, config.rows).context("daemon 启动:spawn shell tab 失败")?;
     let tab_id = tab.id().raw();
-    let session = Session::new(TabList::new(tab));
+    let mut session = Session::new(TabList::new(tab));
+    // standalone daemon = 自己是 anchor(谁 spawn 工作区谁是隐式锚,ADR-0018):anchor 在 →
+    // WS 客户端全断 / 全显式关闭工作区都【不死】(如今天的 daemon);只有子 shell PTY EOF 才退。
+    // E′ 里换成父进程是锚(子进程 WS-kernel 不自 anchor),那是砖1 的事,本砖 standalone。
+    let workspace_id = session.active_workspace_id();
+    session.set_anchor(workspace_id, true);
 
     // 先绑 WS TCP listener(端口占用等错早退,此刻还没落 unix socket 文件,无残留可清),
     // 再建 unix socket。WS 全程在本 calloop 线程,**无 channel / 无线程**(去掉了 ADR-0016
@@ -254,6 +259,7 @@ pub fn run(config: DaemonConfig) -> Result<()> {
         loop_handle: loop_handle.clone(),
         loop_signal,
         tab_id,
+        workspace_id,
         ring: ByteRing::new(BYTE_RING_CAP),
         clients: HashMap::new(),
         next_client_id: 1,
@@ -350,6 +356,10 @@ struct DaemonData {
     loop_signal: LoopSignal,
     /// 本切片唯一 tab 的 raw id(协议层 `u64`,INV-010 不能从 `u64` 重建 TabId)。
     tab_id: u64,
+    /// 本 daemon 的 active(且唯一,砖0)工作区 id。anchor 工作区 —— WS 连上即 hold 它、
+    /// 字节流 [`ServerMsg::StreamFocus`] 标它;client X 关闭 / 断线只动 holder,anchor 在
+    /// 故它【不被销毁】(砖0 daemon 字节泵注册的就是它的 PTY fd,绝不能被 refcount 销毁掉)。
+    workspace_id: u64,
     /// PTY 原始字节环缓冲(连上重放重建当前屏)。单线程,直接 fan-out 进各连接出站队列。
     ring: ByteRing,
     /// 在册 WS 连接(Peeking / Handshaking / Live)。key = 自增连接 id。
@@ -384,6 +394,26 @@ struct WritePending {
     written: usize,
 }
 
+/// 一条 WS 连接的出站帧(两平面,T6):**数据面** PTY 原始字节(发 WS Binary 帧)/
+/// **控制面** JSON `ServerMsg`(发 WS Text 帧,如工作区列表 / 字节流标签)。同一出站
+/// 队列里按 push 顺序穿插,可写时各按其类型写出。
+enum OutFrame {
+    /// PTY 原始字节(数据面;`Bytes` 多客户端共享同一帧不拷贝)。
+    Bytes(Bytes),
+    /// 控制面 JSON(`ServerMsg` 序列化后的文本)。
+    Text(String),
+}
+
+impl OutFrame {
+    /// 背压 cap 计字节用(`outbound_len` 累计)。
+    fn len(&self) -> usize {
+        match self {
+            OutFrame::Bytes(b) => b.len(),
+            OutFrame::Text(s) => s.len(),
+        }
+    }
+}
+
 /// 一条 WS 连接的全部 per-client 状态(**全在 calloop 线程,无 `Send` 要求**)。
 struct WsClient {
     stage: WsStage,
@@ -396,9 +426,13 @@ struct WsClient {
     /// 本连接 WRITE 源(只在 Live 阶段存在)。出站队列空时 disable(退回只 READ,不忙等),
     /// 有积压时 enable。源 owns 另一份 dup,纯当可写信号。
     write: Option<WriteReg>,
-    /// 待写出的 PTY 字节(`Bytes` 多客户端共享同一帧不拷贝)。
-    outbound: VecDeque<Bytes>,
-    /// `outbound` 当前总字节(背压 cap 判定;`Bytes::len` 求和的缓存)。
+    /// 本连接持有的工作区 id(引用计数 holder,T6 块C)。转 Live 时 = active 工作区
+    /// (隐式 Hold);收 [`ClientMsg::Hold`] 可改。X 显式关闭(`Release`/`Close`)= explicit
+    /// 释放;断线 = 非事件释放(都经 [`release_holder`] 消费此字段,`take` 后幂等)。
+    held_ws: Option<u64>,
+    /// 待写出的帧(数据面字节 + 控制面 JSON,见 [`OutFrame`])。
+    outbound: VecDeque<OutFrame>,
+    /// `outbound` 当前总字节(背压 cap 判定;各帧 `len` 求和的缓存)。
     outbound_len: usize,
 }
 
@@ -575,8 +609,8 @@ fn fan_out_bytes(data: &mut DaemonData, batch: Vec<u8>) {
         if let Some(c) = data.clients.get_mut(&id) {
             if matches!(c.stage, WsStage::Live(_)) {
                 is_live = true;
-                c.outbound.push_back(frame.clone());
                 c.outbound_len += frame.len();
+                c.outbound.push_back(OutFrame::Bytes(frame.clone()));
                 over_cap = c.outbound_len > WS_CLIENT_OUT_CAP;
             }
         }
@@ -645,6 +679,7 @@ fn accept_ws_client(stream: TcpStream, data: &mut DaemonData) -> Result<()> {
             created_at: Instant::now(),
             read_token: token,
             write: None,
+            held_ws: None,
             outbound: VecDeque::new(),
             outbound_len: 0,
         },
@@ -837,21 +872,65 @@ fn ws_go_live(
         }
     };
 
+    // 转 Live = 隐式 Hold 本 daemon 的 active 工作区(引用计数 +1,T6 块C)。即便客户端
+    // 不发 ClientMsg::Hold(如旧 web / 测试)也登记为 holder → 断线/关闭都经统一回收路径
+    // 释放,无 holder 泄漏。anchor 在(daemon 自锚)故这不会让工作区"该死不死"。
+    let ws_id = data.workspace_id;
+    data.session.hold(ws_id, id);
+    // 控制面连上引导帧:全部工作区列表 + 当前工作区结构 + 字节流 (workspace,tab) 标签。
+    let control = build_control_text(&data.session, ws_id);
     let replay = data.ring.snapshot();
     if let Some(c) = data.clients.get_mut(&id) {
         c.stage = WsStage::Live(ws);
-        // 刚 insert 即 enable 状态;有重放就让它去排空,无重放则它首次可写发现队空自 Disable。
+        c.held_ws = Some(ws_id);
+        // 刚 insert 即 enable 状态;有重放/控制帧就让它去排空,无则首次可写发现队空自 Disable。
         c.write = Some(WriteReg {
             token: write_token,
             armed: true,
         });
+        // 控制面 (Text 帧) 先于数据面字节排出:客户端先知道工作区/焦点再收字节流。
+        for s in control {
+            c.outbound_len += s.len();
+            c.outbound.push_back(OutFrame::Text(s));
+        }
+        // 数据面:环缓冲重放重建当前屏 (Binary 帧)。
         if !replay.is_empty() {
-            let len = replay.len();
-            c.outbound.push_back(Bytes::from(replay));
-            c.outbound_len += len;
+            c.outbound_len += replay.len();
+            c.outbound.push_back(OutFrame::Bytes(Bytes::from(replay)));
         }
     }
     Ok(PostAction::Continue)
+}
+
+/// 连上时下发的控制面引导帧 (T6 块C,用起 `ServerMsg::Workspaces/Workspace/StreamFocus`):
+/// ① 全部工作区列表 ② 当前工作区结构 (tab 元数据) ③ 字节流标签 (此后 Binary 帧属于哪个
+/// (workspace, active tab))。各序列化成 JSON Text 帧;序列化失败的单条跳过 (不致命)。
+fn build_control_text(session: &Session, ws_id: u64) -> Vec<String> {
+    let mut out = Vec::new();
+    push_server_json(&mut out, &ServerMsg::Workspaces(session.workspace_list()));
+    if let Some(info) = session.workspace_info(ws_id) {
+        let focus_tab = info.tabs.get(info.active).map(|t| t.tab_id);
+        push_server_json(&mut out, &ServerMsg::Workspace(info));
+        if let Some(tab_id) = focus_tab {
+            push_server_json(
+                &mut out,
+                &ServerMsg::StreamFocus {
+                    workspace_id: ws_id,
+                    tab_id,
+                },
+            );
+        }
+    }
+    out
+}
+
+/// 序列化一条 [`ServerMsg`] 进控制帧文本列表;失败仅 warn 跳过 (控制面非幂等丢一条
+/// 不致命,客户端有忠实字节流兜底)。
+fn push_server_json(out: &mut Vec<String>, msg: &ServerMsg) {
+    match serde_json::to_string(msg) {
+        Ok(s) => out.push(s),
+        Err(e) => tracing::warn!(?e, "序列化 ServerMsg 控制帧失败,跳过"),
+    }
 }
 
 /// Live READ 可读:`ws.read()` 排空到 WouldBlock,每条数据帧字节直接 [`Session::on_input`]
@@ -867,18 +946,27 @@ fn ws_live_read(data: &mut DaemonData, id: u64) -> io::Result<PostAction> {
             None => return Ok(PostAction::Remove),
         };
         match res {
+            // 数据面:浏览器输入裸字节(WS Binary)→ 直接写当前焦点 tab 的 PTY(热路径,
+            // 无 channel)。焦点 tab = active 工作区 active tab(= StreamFocus 标的那个)。
             Ok(Message::Binary(b)) => {
                 if let Err(e) = data.session.on_input(tab, &b) {
                     tracing::warn!(?e, "WS 输入写 PTY 失败");
                 }
             }
-            // 浏览器发的是 Binary(裸字节);Text 是防御性兜底(按 UTF-8 字节投递)。
+            // 控制面:WS Text = JSON [`ClientMsg`](Hold / Release / 寻址 Input / Resize)。
+            // 与数据面 Binary 分流(T6)。Release 触发显式关闭回收 → 返 drop action。
             Ok(Message::Text(t)) => {
-                if let Err(e) = data.session.on_input(tab, t.as_str().as_bytes()) {
-                    tracing::warn!(?e, "WS 输入写 PTY 失败");
+                if let Some(action) = handle_client_msg(data, id, t.as_str()) {
+                    return Ok(action);
                 }
             }
-            Ok(Message::Close(_)) => return Ok(drop_client_read_self(data, id)),
+            // WS Close 帧 = 对端优雅关闭(浏览器关 tab / 导航离开)= **显式关闭** → explicit
+            // 释放 holder(anchor 在则不销毁,只关这个 view)→ 回收连接。区别于**断线**
+            // (RST / 超时,无 Close 帧 → 走下面错误分支 = 非事件释放)。
+            Ok(Message::Close(_)) => {
+                release_holder(data, id, true);
+                return Ok(drop_client_read_self(data, id));
+            }
             // Ping → tungstenite 已排队 Pong,需要 flush 才发出 → 打开 WRITE 兴趣。
             Ok(_) => arm_write(data, id),
             Err(WsError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -891,6 +979,82 @@ fn ws_live_read(data: &mut DaemonData, id: u64) -> io::Result<PostAction> {
                 tracing::debug!(?e, "WS read 错误,断开客户端");
                 return Ok(drop_client_read_self(data, id));
             }
+        }
+    }
+}
+
+/// 处理一条控制面 [`ClientMsg`](WS Text 帧的 JSON)。返回 `Some(action)` 表示该连接应
+/// 按此 `PostAction` 回收(仅 `Release` 走此路),`None` 表示继续。解析失败仅 debug 跳过
+/// (控制面坏消息不该拖垮连接)。
+///
+/// **生命周期(T6 块C)**:`Hold` = 登记 holder;`Release` = **显式 X 关闭** → explicit
+/// 释放该连接所持工作区的 holder(anchor 在则不销毁,只关这个 view)+ 回收连接。寻址
+/// `Input` / `Resize` 直接落 Session。`TabOp` 砖0 不接线(daemon 字节泵单 tab,tab 增删的
+/// PTY 路由是砖1 tee/多泵的事)。
+fn handle_client_msg(data: &mut DaemonData, id: u64, text: &str) -> Option<PostAction> {
+    let msg: ClientMsg = match serde_json::from_str(text) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::debug!(?e, "WS 收到无法解析的控制消息,忽略");
+            return None;
+        }
+    };
+    match msg {
+        ClientMsg::Hold { workspace_id } => {
+            data.session.hold(workspace_id, id);
+            if let Some(c) = data.clients.get_mut(&id) {
+                c.held_ws = Some(workspace_id);
+            }
+            None
+        }
+        ClientMsg::Release { .. } => {
+            // 显式 X 关闭:释放本连接所持工作区的 holder(explicit;anchor 在则不销毁),
+            // 然后回收连接。用连接实际持有的 held_ws(而非消息里的 id),砖0 单工作区两者一致。
+            release_holder(data, id, true);
+            Some(drop_client_read_self(data, id))
+        }
+        ClientMsg::Input { tab_id, bytes, .. } => {
+            if let Err(e) = data.session.on_input(tab_id, &bytes) {
+                tracing::warn!(?e, tab_id, "WS 寻址输入写 PTY 失败");
+            }
+            None
+        }
+        ClientMsg::Resize {
+            workspace_id,
+            cols,
+            rows,
+        } => {
+            if let Err(e) = data.session.resize(workspace_id, cols, rows) {
+                tracing::warn!(?e, workspace_id, "WS resize 失败");
+            }
+            None
+        }
+        ClientMsg::TabOp { .. } => {
+            tracing::debug!("收到 TabOp 控制消息:砖0 daemon 单 tab 字节泵不接线(砖1 多 tab 泵)");
+            None
+        }
+    }
+}
+
+/// 释放一条连接持有的工作区 holder(引用计数 −1,T6 块C)。`explicit` = 是否显式关闭
+/// (`Release`/`Close` 为 `true` → 归 0 销毁工作区;断线为 `false` → 非事件,绝不销毁)。
+///
+/// 用 `held_ws.take()` 消费连接持有记录:① 幂等(显式关闭路径先调一次、紧跟的 drop 路径
+/// 再调一次 → 第二次 `take()` 得 `None` 无操作);② 防 holder 泄漏(每条断开路径都经此释放)。
+/// 销毁(仅当无 anchor + 无其它 holder)记 info 日志。daemon 自锚的工作区 refcount 恒 ≥ 1,
+/// 故其 PTY(字节泵注册的 fd)绝不会被本路径销毁。
+fn release_holder(data: &mut DaemonData, id: u64, explicit: bool) {
+    let held = match data.clients.get_mut(&id) {
+        Some(c) => c.held_ws.take(),
+        None => None,
+    };
+    if let Some(ws_id) = held {
+        if data.session.release(ws_id, id, explicit) == Lifecycle::Destroyed {
+            tracing::info!(
+                ws_id,
+                id,
+                "工作区引用计数归 0,已销毁(drop TabList → PTY SIGHUP)"
+            );
         }
     }
 }
@@ -941,10 +1105,13 @@ fn ws_client_writable(data: &mut DaemonData, id: u64) -> io::Result<PostAction> 
             },
             None => return Ok(PostAction::Remove),
         };
-        // 3. 灌进 ws(回到循环顶 flush 它)。
+        // 3. 灌进 ws(回到循环顶 flush 它)。数据面字节走 Binary 帧、控制面 JSON 走 Text 帧。
         let write_res = match data.clients.get_mut(&id) {
             Some(c) => match &mut c.stage {
-                WsStage::Live(ws) => ws.write(Message::Binary(frame)),
+                WsStage::Live(ws) => match frame {
+                    OutFrame::Bytes(b) => ws.write(Message::Binary(b)),
+                    OutFrame::Text(s) => ws.write(Message::Text(s.into())),
+                },
                 _ => return Ok(PostAction::Remove),
             },
             None => return Ok(PostAction::Remove),
@@ -993,6 +1160,9 @@ fn arm_write(data: &mut DaemonData, id: u64) {
 /// 回收一条连接,其中**READ 源是当前 callback 的源**:摘掉(另一个)WRITE 源 + 登记项,
 /// 返 `Remove` 让 loop 在本 callback 返回后注销 READ 源(此刻其 fd 仍开 → 干净 DEL)。
 fn drop_client_read_self(data: &mut DaemonData, id: u64) -> PostAction {
+    // 释放 holder(非 explicit = 断线语义,绝不销毁;显式关闭路径已先 explicit 释放过、
+    // held_ws 被 take 空,这里 no-op)→ 防 holder 泄漏(T6 块C)。
+    release_holder(data, id, false);
     if let Some(conn) = data.clients.remove(&id) {
         if let Some(w) = conn.write {
             data.loop_handle.remove(w.token); // WRITE 源:DEL + 关其 dup
@@ -1005,6 +1175,7 @@ fn drop_client_read_self(data: &mut DaemonData, id: u64) -> PostAction {
 /// 回收一条连接,其中**WRITE 源是当前 callback 的源**:摘掉(另一个)READ 源 + 登记项,
 /// 返 `Remove` 让 loop 注销 WRITE 源。
 fn drop_client_write_self(data: &mut DaemonData, id: u64) -> PostAction {
+    release_holder(data, id, false); // 断线语义释放 holder,防泄漏(见 read_self 同注)
     if let Some(conn) = data.clients.remove(&id) {
         data.loop_handle.remove(conn.read_token); // READ 源:DEL + 关 original
     }
@@ -1014,6 +1185,7 @@ fn drop_client_write_self(data: &mut DaemonData, id: u64) -> PostAction {
 /// 从**与该连接无关的** callback(如 pty_readable 背压断开 / 收割 Timer)回收一条连接:
 /// 两个源都经 `loop_handle.remove` 注销 + 摘登记项。
 fn drop_client_external(data: &mut DaemonData, id: u64) {
+    release_holder(data, id, false); // 断线语义释放 holder(cap 断开 / 收割都算断线,非 X)
     if let Some(conn) = data.clients.remove(&id) {
         data.loop_handle.remove(conn.read_token);
         if let Some(w) = conn.write {

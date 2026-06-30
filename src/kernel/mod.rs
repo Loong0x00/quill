@@ -24,4 +24,4 @@ pub use proto::{
     CellWire, ClientMsg, ColorWire, CursorShapeWire, CursorWire, ServerMsg, Snapshot, TabMeta,
     TabOp, WorkspaceInfo, WorkspaceList, WorkspaceMeta,
 };
-pub use session::Session;
+pub use session::{Lifecycle, Session};

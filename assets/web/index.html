@@ -158,6 +158,33 @@ function setLive(live, text) {
   statusEl.textContent = text;
 }
 
+// ── 控制面(T6 块C):WS **Text** 帧 = JSON;数据面(PTY 字节)走 **Binary**,两者分离。
+//    出站 = ClientMsg(Hold / Release);入站 = ServerMsg(工作区列表 / 字节流标签 →
+//    从中学到 active workspace id,Release 时回带)。──────────────────────────────────
+let activeWorkspaceId = null;  // 由入站 ServerMsg 学得
+let held = false;              // 是否已对本连接发过 Hold(每次新连接重置)
+// 控制消息走 Text 帧(ws.send(string));与输入字节(sendBytes → Binary)区分。
+function sendControl(obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
+// 学到 active workspace id 后显式 Hold 一次(成为 holder;daemon 转 Live 也隐式 hold,
+// HashSet 幂等,不重复计)。
+function holdOnce() {
+  if (!held && activeWorkspaceId !== null) {
+    sendControl({ Hold: { workspace_id: activeWorkspaceId } });
+    held = true;
+  }
+}
+// 入站控制帧:externally-tagged ServerMsg。砖0 web 只需从中学到 active workspace id。
+function handleServerControl(text) {
+  let msg;
+  try { msg = JSON.parse(text); } catch (_) { return; }
+  if (msg.StreamFocus) activeWorkspaceId = msg.StreamFocus.workspace_id;
+  else if (msg.Workspaces) activeWorkspaceId = msg.Workspaces.active;
+  else if (msg.Workspace) activeWorkspaceId = msg.Workspace.workspace_id;
+  holdOnce();
+}
+
 // 同源:页面由 daemon 同口 serve,WS 直接连同 host:port。file:// 兜底到 10.0.0.2。
 function wsUrl() {
   if (location.host) {
@@ -187,10 +214,12 @@ function connect() {
     // why: 每次(重)连先 reset,否则 daemon 的重放缓冲会叠加到 xterm 已有内容 →
     // 屏幕重复。断线重连是手机高频路径(后台/锁屏/弱网),不 reset 每次都重复一屏。
     term.reset();
+    held = false; // 新连接 → 等学到 workspace id 后重新 Hold
     setLive(true, "已连接(直播)");
   };
   ws.onmessage = (ev) => {
-    if (typeof ev.data === "string") return; // 本片不发文本帧;忽略防御
+    // 控制面 Text 帧(JSON ServerMsg)与数据面 Binary 帧(PTY 字节)分流(T6 块C)。
+    if (typeof ev.data === "string") { handleServerControl(ev.data); return; }
     term.write(new Uint8Array(ev.data));     // xterm 本地模拟 VT + 本地 reflow
   };
   ws.onclose = () => { setLive(false, "连接已断,重连中…"); scheduleReconnect(); };
@@ -207,6 +236,17 @@ function scheduleReconnect() {
 
 // OSC 标题(xterm 解析 \x1b]0;…\x07)→ 顶栏标题。
 term.onTitleChange((t) => { titleEl.textContent = t && t.length ? t : "quill"; });
+
+// ── 真 X 关闭 vs 断线(T6 块C, ADR-0015 R1)──────────────────────────────────────
+// "真 X" = 用户关 tab / 导航离开(pagehide 且非 bfcache 持久态)→ 发 **Release**(显式
+// 释放本 holder;daemon explicit 释放,anchor 在则只关这个 view 不销毁会话)。
+// **后台 / 锁屏 / 网络抖 = 断线 = 非事件**:故意不在 visibilitychange 上发任何东西 ——
+// 连接保持或自然断开,daemon 按断线语义只动 holder,anchor 在故工作区不死、回来自动重连重放。
+// (浏览器关 tab 时还会自动发 WS Close 帧,daemon 同样按显式关闭处理,Release 是双保险。)
+window.addEventListener("pagehide", (e) => {
+  if (e.persisted) return; // 进 bfcache(页面可能复活)→ 视作后台,不发 Release
+  if (activeWorkspaceId !== null) sendControl({ Release: { workspace_id: activeWorkspaceId } });
+});
 
 connect();
 </script>
