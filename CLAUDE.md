@@ -64,13 +64,9 @@ tty 时代单 stream 限制的产物, Wayland 窗口能开无数, 在 GUI 终端
 - ⏸️ **T3b**(搁置,分支 `feat/kernel-ws-live` 不合并):做了"网格直播 + 同口 HTTP",对抗审查逮到背压 **drop-newest 阻断 bug**(慢客户端卡陈帧);修复时 agent 遇 API 529 中断成半截。**更关键:架构 R1 修订后"每帧广播网格"整体作废**(改传字节流本地渲染),故 T3b 搁置。
 - ✅ **片1(T3c'+T4)** `e04f909`+`2ea1a68`:WS 载荷从网格 **pivot 成 PTY 字节流** + 浏览器 **xterm.js 本地渲染 + 本地 reflow** + **同口 HTTP**(`http://host:7878/` 一个 URL;xterm.js/css/fit vendor 进 `assets/web/vendor/`,零 CDN)。daemon 每 tab 有界字节环缓冲:连上重放重建屏 + 之后 live 字节(`Message::Binary`);背压 = 慢客户端 cap→断开重连(**不丢字节**,非网格的 drop-newest)。Lead 收口两 bug:① shell 退出 flush 尾字节;② web 重连先 `term.reset()` 防屏幕重复。**只读**(输入=片2)。
   - ⚠️ 遗留(非阻断,硬化跟进):① **死客户端 tx 泄漏** —— 空闲 PTY 时 fan_out 不跑→不剪除,弱网手机每 ~10s 重连堆积 `clients` Vec(同 T3b 清理缺口,干净修法有 shutdown 死锁张力,需小心);② **"关键帧"用近期字节尾**(非真网格快照)→ 环缓冲若从转义序列中段起,重建屏可能不完整(代码注释"最近字节完整=可见屏恒完整"是 overstatement;真关键帧应发当前屏的 ANSI/Snapshot)。
-- ⏸️ **片2(T5 输入/控制)= 暂挂 `feat/kernel-input`(未合并)**:做了 xterm.js `onData`→WS→`calloop::channel`→PTY 写回 + 软键栏(ESC / **ESC ESC 撤回改** / Ctrl-C / Tab / Shift-Tab / 方向键)+ 双向同步 WS loop。**这块 sync 双向 WS 背压/生命周期 = impl + 3 轮修**:① 忙等+无界内存(修);② 双向重构慢客户端无界缓冲(修);③ 永久不读连接线程/槽不回收 = DoS 回归 → 加 `STALL_DEADLINE=30s` 收割(**生产代码复审判正确、不误杀 idle、槽回收对**)。**卡点:核心 DoS 修复的回归测试【假绿】**(实际走 broadcaster 剪除路径,没真 exercise stall;真测到 stall 需 fiddly 操控 daemon 侧 SO_SNDBUF)→ 核心修复零回归覆盖,**故不夜合**。其余非阻断:入站每轮 cap(缓解非根除,`input_tx` 仍 unbounded calloop::channel)、SO_KEEPALIVE(弱、没调 idle)、on_input EINTR continue。
+- ✅ **C(WS 去线程 + 片2 输入)** `7cb3567`+`4a5589c`+`859ed7f`(+ ADR-0017):**把 WS 从独立线程重构成注册进单一 calloop EventLoop 的 fd 源 = 彻底单线程**。`daemon.rs` 零 `std::thread`/`mpsc`/`channel`/`Arc`/`Mutex`/`Atomic`(grep+审查实证)→ 跨线程 / `Rc` 非 Send / 手搓双向轮询(忙等 / 无界缓冲 / 卡死收割那【一整类 bug】)**从架构上消失**。顺带把**片2 输入**(xterm.js `onData`→WS 源可读→直接 `on_input` 写 PTY,**无 channel 桥**)+ **软键栏**(ESC / ESC ESC 撤回改 / Ctrl-C / Tab / 方向键)落到这干净地基。reaper Timer 收卡握手 / 半开 / slowloris-read 写源 + SO_KEEPALIVE 探死;ws_peek 改消费式读(PrefixStream 退还完整握手)灭 level+MSG_PEEK 忙等。**线程版片1/片2 已被 C 取代,旧分支 `feat/kernel-input` / `feat/kernel-ws-live` 已删。**
 
-**⚠️⚠️ 待 Lead 决策(2026-06-30 晨;卡住 Phase 7 剩余全部)—— sync WS vs tokio:**
-这块 sync 手搓非阻塞双向 WS 生命周期已 **4 轮**出微妙 bug(背压/收割/可测性),即便现在生产代码对了、核心修复仍难写出真覆盖的回归测试 = sync 双向轮询的固有复杂度症状。两条路:
-- **A(继续 sync)**:补一条真 exercise stall 路径的测试(压小 daemon 侧 `SO_SNDBUF` 让 flush 恒 Pending)→ 合并片2;T6/T7 继续手搓 sync 连接生命周期。零新依赖(守 ADR-0016),但这层持续脆弱、难测。
-- **B(换 `tokio-tungstenite`)**:async read/write + `select!` + `tokio::time::timeout` 让双向/背压/stall 收割/超时**天然干净且好测**,灭掉这一整类 bug;代价 = 加 tokio 大依赖、改 ADR-0016(当初为省依赖才选 sync)。
-- **主 session 倾向**:先 **A** 补测合并(片2 生产已对,别浪费 4 轮成果),把 **B** 当"若 T6/T7 再被 sync 连接生命周期咬"的触发器 —— 但加 tokio 是你的 dep/架构权,你定。**Phase 7 剩余(T6 引用计数生命周期 / T7 / 硬化)全压在这个 WS 连接层,等你拍 A/B 再续。**
+**✅ 决策已定(2026-06-30):sync WS vs tokio → 选了第三条「C:去线程进 calloop」。** 既不继续手搓 sync 线程(A 的反复脆弱),也不引 tokio 大依赖(B);用项目本来的单线程 calloop 模型(回归 INV-001「绝不起 thread pool 做 IO」)把整类 bug 从根上消掉,**零新依赖**。这条是用户"为什么不塞回主线程"的直觉逼出来的,完整见 **ADR-0017**。
 
 **⭐ 模型修订 R1(2026-06-29,与用户对齐;完整见 ADR-0015「修订 R1」)—— 取代下面旧链与部分 Decision:**
 - **真终端 ≠ ssh**:会话是常驻一等实体、设备是窗口;但也 ≠ tty(不是关机才死)。
@@ -79,7 +75,8 @@ tty 时代单 stream 限制的产物, Wayland 窗口能开无数, 在 GUI 终端
 - **⭐ 会话是反馈环,PTY ⟺ 桌面窗口【原子耦合】(关键,且治"反复找脆弱态"的病)**:一次 spawn 里 `PTY(源)→ {quill 桌面窗口, 手机}` 一起出生 —— PTY 是电脑进程、由 quill 管,**它一存在桌面就有窗口**。所以**"手机持有、桌面看不到"这个态根本构造不出来**(不是靠"事后自动补窗救援",是耦合让它不存在;"自动补窗"不是独立兜底步骤,是 spawn 的固有部分)。⟹ **桌面窗口靠构造永远是锚,手机永不会是唯一 holder** → 这才是"无租约"能成立、且手机后台/锁屏杀不掉会话的**真正原因**(不是因为补窗救了它,是脆弱态不存在)。
 - **客户端矩阵**:Linux 原生 quill;手机/Mac/其它 = web(xterm.js,通用)。**不为跨平台移植原生 quill**(Mac 本地用 ghostty,要连家里走 web)。"任意位置"+ 安全 = WireGuard VPN 把门(以后可加 token 当登录)。
 
-**重排下一步(ticket 表见 ADR R1;T3c'+T4 = 片1 ✅ 已合并)**:**片2 = T5 输入/控制(核心,碾压 app)** —— xterm.js `onData` → WS → daemon → PTY 写回(`Session::on_input`,需 WS 反向收 + `calloop::channel` 唤醒单线程 loop)+ **软键栏**(`ESC` / `ESC ESC` 撤回改 / `Ctrl-C` / `Tab`·`Shift-Tab` / 方向键,手机软键盘没这些键)→ **T6** 引用计数生命周期 + 桌面自动补窗 + 同步全部工作区 → **T7** web"X 关闭"语义 / PWA 壳(+ 可选登录 token)→ **硬化**(死客户端清理、真网格关键帧、连接数上限)。
+**重排下一步(ticket 表见 ADR R1;片1+片2 已经 C 落地在单线程 daemon 上)**:**下一砖 = T6 引用计数生命周期**(holder = 连着的显示端;X 释放 / 断线非事件 / 归 0 销毁;桌面 quill 当 daemon 客户端 + 自动补窗当锚 + 同步全部工作区 —— 这才是"共享你真在用的工作区",目前 daemon 还是自己 spawn 一个独立 shell、没接桌面 quill)→ **T7** web"X 关闭"语义 / PWA 壳(+ 可选登录 token)→ **硬化**(真网格关键帧替代字节尾、连接数/带宽、bincode)。
+**⚠️ T6 起改的是连接生命周期 / 桌面 quill 接入(`wl/` 那 240 字段 State)—— 凡碰 render/wl 的 ticket,impl/审码 agent 必须自己读 `wl/render.rs`、`wl/window.rs`,别信摘要。**
 
 **协作环(本阶段在用)**:每砖一个 worktree(`git worktree add ../quill-impl-<x> -b feat/<x>`)→ 写码 **Opus xhigh**(改 render 必自己读 `wl/render.rs`,别信摘要)→ 自跑 `scripts/ci.sh` 调全绿 → **多视角对抗审 Opus xhigh** → Lead(user + 主 session)裁决合并(纯加法的 cohesive 单模块 commit 可超 300 行软线)。⚠️ workflow 每个 agent 显式写 `model:'opus' effort:'xhigh'`,别靠默认(`agentType` 自带便宜模型如 Explore=Haiku)。
 
