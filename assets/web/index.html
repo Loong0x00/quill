@@ -41,11 +41,47 @@
   #dot { width: .6rem; height: .6rem; border-radius: 50%; background: #844; }
   #dot.live { background: #2a4; }
   #title { font-weight: 600; opacity: .9; }
-  #status { margin-left: auto; opacity: .7; }
+  /* A′ 增量2:忠实↔重排切换按钮(顶栏)。margin-left:auto 把它+状态推到右侧。 */
+  #modebtn {
+    margin-left: auto; flex: 0 0 auto;
+    background: #262626; color: #e0e0e0; border: 1px solid #3a3a3a;
+    border-radius: .3rem; padding: .15rem .55rem; font: inherit; cursor: pointer;
+    user-select: none; -webkit-user-select: none; touch-action: manipulation;
+  }
+  #modebtn:active { background: #3a3a3a; }
+  #status { margin-left: .6rem; opacity: .7; }
   /* xterm 容器吃满剩余高度。A′ 增量1:忠实视图按【桌面宽】渲染(term.resize 到桌面 cols/rows,
      不再 fit 到浏览器)→ 与桌面像素对齐、宽度不匹配的折行 artifact 消失。桌面宽通常比手机宽 →
-     这里 overflow:auto 给横/纵滑动(忠实保底"大不了缩放/横滑")。响应式重排是增量2 的事。 */
+     这里 overflow:auto 给横/纵滑动(忠实保底"大不了缩放/横滑")。 */
   #term { flex: 1 1 auto; min-height: 0; padding: .25rem; overflow: auto; }
+  /* A′ 增量2:重排视图。忠实视图(#term)是保底,重排是叠加 —— 切到重排时把 #term 移到屏外
+     (position:absolute,不 display:none → xterm 的隐藏 textarea 仍可聚焦,重排下也能打字),
+     重排不可用随时一键切回忠实核对。重排内容由 JS 从 xterm.js buffer 还原逻辑行(软折接回)
+     渲成 <span>(颜色/粗体)+ white-space:pre-wrap,浏览器按设备宽**原生重折**。 */
+  #term.offscreen {
+    position: absolute !important; left: -99999px !important; top: 0 !important;
+    width: 1px !important; height: 1px !important; overflow: hidden !important;
+  }
+  #reflow {
+    flex: 1 1 auto; min-height: 0; overflow: auto; padding: .35rem .5rem;
+    -webkit-overflow-scrolling: touch;
+    font-family: "DejaVu Sans Mono", "Noto Sans Mono CJK SC", monospace;
+    font-size: 14px; line-height: 1.3; color: #fff; background: #000;
+  }
+  #reflow .lline {
+    white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word;
+    min-height: 1.3em;
+  }
+  /* A′ 增量3:表格 widget —— 列对齐保留、表格内横向滚动,**绝不 cram-reflow**。 */
+  #reflow .tbl-wrap {
+    overflow-x: auto; -webkit-overflow-scrolling: touch; margin: .25rem 0; max-width: 100%;
+  }
+  #reflow table { border-collapse: collapse; font: inherit; }
+  #reflow td, #reflow th {
+    border: 1px solid #333; padding: 0 .45rem; white-space: pre;
+    vertical-align: top; text-align: left;
+  }
+  #reflow th { font-weight: bold; background: #161616; }
   /* 软键栏:底部一排可点控制键(手机软键盘没 ESC/Ctrl/方向键)。横向可滚,
      按钮够大可点(touch target)。占高度 → #term 变矮 → 本地 reflow,不回灌 daemon。 */
   #keys {
@@ -68,9 +104,13 @@
   <div id="bar">
     <span id="dot"></span>
     <span id="title">quill</span>
+    <button id="modebtn" type="button">重排视图</button>
     <span id="status">连接中…</span>
   </div>
   <div id="term"></div>
+  <!-- A′ 增量2/3:重排视图(从 xterm.js buffer 还原逻辑行 → CSS 重排 + 表格 widget)。
+       默认隐藏(忠实视图保底),点顶栏按钮切换。 -->
+  <div id="reflow" style="display:none"></div>
   <!-- 软键栏:按钮在 JS 里据 SOFTKEYS 表生成(避免在 HTML 属性里写转义字节) -->
   <div id="keys"></div>
 
@@ -102,7 +142,167 @@ function applyDims(cols, rows) {
   if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols < 1 || rows < 1) return;
   if (term.cols === cols && term.rows === rows) return;
   try { term.resize(cols, rows); } catch (_) {}
+  scheduleReflowRender();  // 桌面宽变 → xterm 重排 buffer → 重排视图也得重画(若在重排模式)
 }
+
+// ── A′ 增量2:逻辑行 CSS 重排视图 ─────────────────────────────────────────────────
+// 忠实视图(xterm.js #term)是【永远正确的保底】;重排是【纯增益叠加】(坏了一键切回忠实)。
+// 做法:从 xterm.js `term.buffer.active` 还原**逻辑行 + 每格属性** —— 把 isWrapped 的软折
+// 连续行接回整条逻辑行,逐格取字符 + fg/bg/bold/italic/下划线/删除线/反显/暗/隐藏,RLE 成
+// <span>(颜色/粗体…)→ 容器 white-space:pre-wrap;overflow-wrap:anywhere → 浏览器按**设备宽
+// 原生重折**(字面意义的响应式网页),不焊死桌面宽。表格走增量3 的可横滑 widget。
+const termEl = $("term"), reflowEl = $("reflow"), modeBtn = $("modebtn");
+const REFLOW_MAX_ROWS = 6000;   // 重排只回溯最近这么多 buffer 行(忠实视图仍有全量滚回)
+const REFLOW_THROTTLE_MS = 90;  // live 写入节流(coalesce 一拍重画,避免每帧重建 DOM)
+
+// xterm.js 默认 ANSI 16(Tango)+ 6×6×6 cube + 24 级灰 = 256 色板(与忠实视图配色一致)。
+const PALETTE = (function buildPalette() {
+  const p = new Array(256);
+  const base = [
+    "#2e3436", "#cc0000", "#4e9a06", "#c4a000", "#3465a4", "#75507b", "#06989a", "#d3d7cf",
+    "#555753", "#ef2929", "#8ae234", "#fce94f", "#729fcf", "#ad7fa8", "#34e2e2", "#eeeeec",
+  ];
+  for (let i = 0; i < 16; i++) p[i] = base[i];
+  const h2 = (v) => v.toString(16).padStart(2, "0");
+  const lv = [0, 95, 135, 175, 215, 255];
+  for (let i = 0; i < 216; i++) {
+    p[16 + i] = "#" + h2(lv[Math.floor(i / 36) % 6]) + h2(lv[Math.floor(i / 6) % 6]) + h2(lv[i % 6]);
+  }
+  for (let i = 0; i < 24; i++) { const v = 8 + i * 10; p[232 + i] = "#" + h2(v) + h2(v) + h2(v); }
+  return p;
+})();
+// xterm.js 默认前/背景(主题只覆盖了 background=#000000,前景保持 xterm 默认白)。
+const DEFAULT_FG = "#ffffff", DEFAULT_BG = "#000000";
+
+function resolveColor(isDefault, isRGB, isPalette, raw, dflt) {
+  if (isDefault) return dflt;
+  if (isRGB) return "#" + (raw & 0xffffff).toString(16).padStart(6, "0");
+  if (isPalette) return PALETTE[raw & 0xff] || dflt;
+  return dflt;
+}
+
+// 把一个 xterm.js cell 的视觉属性编成内联 CSS 串(空串 = 纯默认,渲成裸文本节点不包 span)。
+// 同款 CSS 串的连续 cell 会被 RLE 合成一个 span(见 appendRuns)。CSS 串本身即 RLE 比较键。
+function cellCss(cell) {
+  let fg = resolveColor(cell.isFgDefault(), cell.isFgRGB(), cell.isFgPalette(), cell.getFgColor(), DEFAULT_FG);
+  let bg = resolveColor(cell.isBgDefault(), cell.isBgRGB(), cell.isBgPalette(), cell.getBgColor(), DEFAULT_BG);
+  let emitBg = !cell.isBgDefault();
+  const bold = !!cell.isBold();
+  // bold 把暗色 ANSI(0-7)提亮成 bright(8-15)—— 对齐 xterm.js drawBoldTextInBrightColors 默认。
+  if (bold && cell.isFgPalette()) {
+    const idx = cell.getFgColor() & 0xff;
+    if (idx < 8) fg = PALETTE[idx + 8] || fg;
+  }
+  if (cell.isInverse()) { const t = fg; fg = bg; bg = t; emitBg = true; }
+  const parts = [];
+  if (fg !== DEFAULT_FG) parts.push("color:" + fg);
+  if (emitBg) parts.push("background:" + bg);
+  if (bold) parts.push("font-weight:bold");
+  if (cell.isItalic()) parts.push("font-style:italic");
+  const deco = [];
+  if (cell.isUnderline()) deco.push("underline");
+  if (cell.isStrikethrough()) deco.push("line-through");
+  if (deco.length) parts.push("text-decoration:" + deco.join(" "));
+  if (cell.isDim()) parts.push("opacity:.6");
+  if (cell.isInvisible()) parts.push("visibility:hidden");
+  return parts.join(";");
+}
+
+// 从 xterm.js buffer 还原逻辑行数组。每条 = { cells:[{ch,css}], cols:[单字符], text }:
+// cells 给渲染(原字符,含组合字符/宽字符);cols/text 给探测+切列(每 cell 恰好 1 个代表
+// 字符 → text 下标 ↔ cell 下标严格对齐,表格切列才能按字符位置切回带属性的 cell)。
+function buildLogicalLines() {
+  const buf = term.buffer.active;
+  const total = buf.length;
+  const start = Math.max(0, total - REFLOW_MAX_ROWS);
+  const out = [];
+  let cur = null, cell;
+  for (let y = start; y < total; y++) {
+    const line = buf.getLine(y);
+    if (!line) continue;
+    if (cur === null || !line.isWrapped) { cur = { cells: [], cols: [] }; out.push(cur); }
+    const w = line.length;
+    for (let x = 0; x < w; x++) {
+      cell = line.getCell(x, cell);
+      if (!cell) continue;
+      if (cell.getWidth() === 0) continue;     // 宽字符的后半格占位,跳过
+      let ch = cell.getChars();
+      if (ch === "") ch = " ";
+      cur.cells.push({ ch, css: cellCss(cell) });
+      cur.cols.push(ch.length === 1 ? ch : (ch[0] || " "));
+    }
+  }
+  for (const ll of out) {
+    // 裁掉行尾的【纯默认空格】(网格右侧 padding)→ 重排不被尾随空白撑乱;带背景色的色条
+    // (css 非空)保留。
+    let n = ll.cells.length;
+    while (n > 0) { const c = ll.cells[n - 1]; if ((c.ch === " " || c.ch === "") && c.css === "") n--; else break; }
+    if (n !== ll.cells.length) { ll.cells.length = n; ll.cols.length = n; }
+    ll.text = ll.cols.join("");
+  }
+  return out;
+}
+
+// 把 cells[a,b) 按 CSS 串 RLE 成 span/文本节点 append 进 parent。
+function appendRuns(parent, cells, a, b) {
+  let i = a;
+  while (i < b) {
+    const css = cells[i].css;
+    let j = i + 1;
+    while (j < b && cells[j].css === css) j++;
+    let txt = "";
+    for (let k = i; k < j; k++) txt += cells[k].ch;
+    if (css === "") { parent.appendChild(document.createTextNode(txt)); }
+    else { const sp = document.createElement("span"); sp.style.cssText = css; sp.textContent = txt; parent.appendChild(sp); }
+    i = j;
+  }
+}
+
+// 一条逻辑行 → 一个重排 <div>(pre-wrap 容器,浏览器按设备宽重折)。
+function reflowLineDiv(ll) {
+  const div = document.createElement("div");
+  div.className = "lline";
+  appendRuns(div, ll.cells, 0, ll.cells.length);
+  return div;
+}
+
+// 整屏重排:逻辑行 → DOM 片段 → 一次性换入 #reflow(增量3 会在此插入表格探测)。
+function renderReflow() {
+  const lines = buildLogicalLines();
+  const frag = document.createDocumentFragment();
+  for (let i = 0; i < lines.length; i++) frag.appendChild(reflowLineDiv(lines[i]));
+  swapReflow(frag);
+}
+
+// 换入新内容,保「贴底跟随」:换前若已滚到底,换后继续贴底(像终端 tail)。
+function swapReflow(frag) {
+  const el = reflowEl;
+  const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 8;
+  el.replaceChildren(frag);
+  if (atBottom) el.scrollTop = el.scrollHeight;
+}
+
+let viewMode = "faithful";   // 'faithful'(保底)| 'reflow'(增益)
+let reflowPending = false;
+function scheduleReflowRender() {
+  if (viewMode !== "reflow" || reflowPending) return;
+  reflowPending = true;
+  setTimeout(() => { reflowPending = false; if (viewMode === "reflow") { try { renderReflow(); } catch (_) {} } }, REFLOW_THROTTLE_MS);
+}
+function setViewMode(m) {
+  viewMode = m;
+  const reflow = (m === "reflow");
+  termEl.classList.toggle("offscreen", reflow);  // 不 display:none → textarea 仍可聚焦打字
+  reflowEl.style.display = reflow ? "" : "none";
+  modeBtn.textContent = reflow ? "忠实视图" : "重排视图";
+  if (reflow) { try { renderReflow(); } catch (_) {} }
+  else { try { term.refresh(0, term.rows - 1); } catch (_) {} }  // 切回忠实强制重绘核对
+}
+modeBtn.addEventListener("click", () => setViewMode(viewMode === "reflow" ? "faithful" : "reflow"));
+// 重排模式下点内容区 → 聚焦 xterm 隐藏 textarea(手机弹软键盘,重排下也能打字;软键栏始终可用)。
+reflowEl.addEventListener("pointerup", () => { if (viewMode === "reflow") { try { term.focus(); } catch (_) {} } });
+// live 字节解析完 → 重排视图节流重画(忠实视图 xterm 自己已经画了)。
+term.onWriteParsed(() => scheduleReflowRender());
 
 // ── 输入回灌(片2):键盘/方向键/粘贴/IME → WS 二进制帧 → daemon → active tab PTY ──
 // 发原始字节(二进制帧),与片1 出站 Binary 对称;daemon 收到直接写 PTY。`ws` 是
@@ -219,6 +419,7 @@ function connect() {
     // 屏幕重复。断线重连是手机高频路径(后台/锁屏/弱网),不 reset 每次都重复一屏。
     term.reset();
     held = false; // 新连接 → 等学到 workspace id 后重新 Hold
+    scheduleReflowRender(); // reset 清空 buffer → 重排视图(若在用)同步清屏,等重放字节重建
     setLive(true, "已连接(直播)");
   };
   ws.onmessage = (ev) => {
