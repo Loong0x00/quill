@@ -317,6 +317,12 @@ pub enum KeyboardAction {
     /// T-0608: Ctrl+1..=9 → 跳到第 N 个 tab (alacritty / kitty 同款热键).
     /// `idx` 是 0-based (Ctrl+1 → 0, Ctrl+9 → 8).
     SwitchToTab(usize),
+    /// E′(ADR-0018): Ctrl+Shift+S → 运行期翻转共享开关 (spawn / kill 隔离
+    /// quill-kernel 子). 调用方 (`Dispatch<WlKeyboard>`) 置
+    /// `state.pending_share_toggle = true`, `drive_wayland` step 3.8.5 的
+    /// `apply_share_toggle` 真 `toggle_share` (与 tab 热键同 deferred-side-effect
+    /// 套路 — Dispatch 拿不到 `LoopHandle`).
+    ToggleShare,
 }
 
 /// 接 wl_keyboard 协议事件 → 算 [`KeyboardAction`]。
@@ -599,6 +605,13 @@ fn key_press_action(
         // XK_Tab (0xff09); 双接.
         if raw == 0xfe20 || raw == 0xff09 {
             return KeyboardAction::PrevTab;
+        }
+        // E′(ADR-0018): Ctrl+Shift+S → ToggleShare (运行期开/关共享). XK_S = 0x53,
+        // XK_s = 0x73; Shift active 时 keysym 多为大写, 极端 keymap (Caps Lock 差异)
+        // 也接小写 (与 Ctrl+Shift+C/V 同双接). 劫持 Ctrl+Shift+S; Ctrl+S 单独仍走
+        // utf8 给 \x13 (XOFF), 不动.
+        if raw == 0x53 || raw == 0x73 {
+            return KeyboardAction::ToggleShare;
         }
     }
     // T-0608: 单 Ctrl (无 Shift) 热键 — Ctrl+T / Ctrl+W / Ctrl+Tab / Ctrl+1..9.

@@ -5611,6 +5611,17 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
             KeyboardAction::SwitchToTab(idx) => {
                 state.pending_tab_op = Some(TabOp::Switch(idx));
             }
+            // E′(ADR-0018): Ctrl+Shift+S → 置 pending, drive_wayland step 3.8.5
+            // apply_share_toggle 真 toggle_share (spawn / kill 隔离 quill-kernel
+            // 子). 与 tab 热键 / 标题栏共享按钮点击同 deferred-side-effect 套路
+            // (Dispatch 仅 &mut State, 拿不到 LoopHandle).
+            KeyboardAction::ToggleShare => {
+                state.pending_share_toggle = true;
+                tracing::debug!(
+                    target: "quill::keyboard",
+                    "Ctrl+Shift+S → toggle_share queued"
+                );
+            }
         }
     }
 }
