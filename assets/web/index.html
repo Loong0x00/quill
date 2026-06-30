@@ -53,7 +53,21 @@
   /* xterm 容器吃满剩余高度。A′ 增量1:忠实视图按【桌面宽】渲染(term.resize 到桌面 cols/rows,
      不再 fit 到浏览器)→ 与桌面像素对齐、宽度不匹配的折行 artifact 消失。桌面宽通常比手机宽 →
      这里 overflow:auto 给横/纵滑动(忠实保底"大不了缩放/横滑")。 */
-  #term { flex: 1 1 auto; min-height: 0; padding: .25rem; overflow: auto; }
+  #term {
+    flex: 1 1 auto; min-height: 0; padding: .25rem;
+    overflow: auto; -webkit-overflow-scrolling: touch;
+    touch-action: pan-x pan-y; overscroll-behavior: contain;
+  }
+  /* A′ ccchrome 忠实视图滚动修复:xterm.js 自带的 .xterm-viewport(绝对定位铺满、
+     overflow-y:scroll)是个内层纵向滚动容器,会抢走触摸/滚轮去滚它的 scrollback ——
+     纵向【逐行步进】(ydisp 按整行重画 = 卡顿)、且抢走手势时外层 #term 的 2D 横向
+     就动不了(= 上下卡住时左右也滚不动)。xterm 无任何 touch 事件监听(只靠这个原生
+     overflow 滚动)→ 给 viewport 加 pointer-events:none,触摸/滚轮直接穿透到外层 #term,
+     由 #term 独占平滑 2D 平移(X+Y 互不阻塞、纯本地 DOM、与网络无关)。
+     focus(mousedown 在 .xterm 根上)/ selection(在 .xterm-screen 上)走事件冒泡仍工作;
+     live 跟随是程序性 scrollTop,不受 pointer-events 影响。代价:忠实视图在手机上不再能
+     拖动 xterm scrollback(看历史用重排视图);忠实保底像素仍 1:1。 */
+  #term .xterm-viewport { pointer-events: none !important; }
   /* A′ 增量2:重排视图。忠实视图(#term)是保底,重排是叠加 —— 切到重排时把 #term 移到屏外
      (position:absolute,不 display:none → xterm 的隐藏 textarea 仍可聚焦,重排下也能打字),
      重排不可用随时一键切回忠实核对。重排内容由 JS 从 xterm.js buffer 还原逻辑行(软折接回)
