@@ -104,6 +104,19 @@ const MAX_WS_CONNS: usize = 16;
 /// 被断,不无界堆内存、不拖累别的客户端。
 const WS_CLIENT_OUT_CAP: usize = 1 << 20;
 
+/// Fed back-channel(子→父 Input 帧)出站字节队列上限。WS 客户端输入字节是**长度前缀成帧
+/// 流**(非 PTY 无帧字节流)→ 丢半帧会让父侧 [`FeedDecoder`] framing 错位级联(读 len=N 只
+/// 收 M<N → 吃下一帧字节凑数 → `InvalidKind` 杀子),故**绝不丢半帧**:写不完入队。队列积压
+/// 超此上限 = 父长期不读 back-channel → **断子降级**(停子 daemon,父读 EOF 重建干净子),
+/// 既不无界堆内存、又不丢半帧污染流。1 MiB 远超人手速输入排空所需(正常队列常空)。
+const FED_BACK_OUT_CAP: usize = 1 << 20;
+
+/// Fed `Input` 帧分帧上界。单条 WS 输入(粘贴)payload 可超 `MAX_FEED_PAYLOAD`(16 MiB)甚至
+/// 理论上 `u32` 截断 → 切成 ≤ 此大小的多个 `Input` 帧(各带同 (ws,tab) 标签),保证没有任何
+/// `Input` 帧 payload 超 feed 协议上限,父侧逐帧重组回完整输入。64 KiB 远低于上限、又够大到
+/// 正常键入/小粘贴单帧装下。
+const FED_INPUT_CHUNK: usize = 64 * 1024;
+
 /// 每个 PTY 字节流环缓冲容量。新客户端连上重放此环重建当前屏 + 一段近期 scrollback。
 ///
 /// 256 KiB:远超「重建当前屏」所需(80×24 文本 ~2KB,带 VT 转义放大也就几十 KB),
@@ -344,7 +357,8 @@ pub fn run(config: DaemonConfig) -> Result<()> {
             )
         }
         SourceConfig::Fed { read_fd, write_fd } => {
-            let link = FedLink::new(*read_fd, *write_fd).context("Fed 模式建父↔子 pipe 链失败")?;
+            let mut link =
+                FedLink::new(*read_fd, *write_fd).context("Fed 模式建父↔子 pipe 链失败")?;
             // 父 pipe **读端** 注册成 calloop Generic READ 源(像 Local 的 PTY 源);闭包捕获
             // raw fd(int Copy),源 own 的 `OwnedFd` 在 loop 生命期内不删 → fd 全程有效。
             let read_raw = link.read_owned.as_raw_fd();
@@ -356,6 +370,35 @@ pub fn run(config: DaemonConfig) -> Result<()> {
                     },
                 )
                 .map_err(|e| anyhow!("calloop insert_source(fed pipe read) 失败: {e}"))?;
+
+            // back-channel **写端** 注册成 WRITE 源(初始 disable —— 启动无待写,有积压才 arm,
+            // drain 空再 disarm,不忙等)。**绝不丢半帧**:[`fed_send_frame`] 队空时尽量直写,
+            // WouldBlock 写不完的剩余字节入队 + arm,可写时 [`fed_back_writable`] drain(子→父是
+            // 长度前缀成帧流,半帧 → 父 FeedDecoder framing 错位杀子,见 [`FED_BACK_OUT_CAP`])。
+            // fd 由 `FedState.back`(OwnedFd)own,这里只借 raw(像 PTY 源借 BorrowedFd)。
+            let back_raw = link.back.back.as_raw_fd();
+            // SAFETY: back_raw 来自 `link.back.back`(OwnedFd,下方 move 进 `data.fed`,run() scope
+            // 全程活);`borrow_raw` 只取 int 不转移所有权;真正的 write 走 `FedState.back` 自身的
+            // raw,从不碰这个 BorrowedFd。drop 序:函数尾 `drop(event_loop)` 早于 `drop(data)`,
+            // 即 WRITE 源的 EPOLL_CTL_DEL 在 back fd 仍开时执行(即便错序,calloop 对已关 fd 的
+            // DEL 返 EBADF 内部容忍,非 UB;同 PTY 源 SAFETY)。
+            #[allow(unsafe_code)]
+            let back_borrowed: BorrowedFd<'static> = unsafe { BorrowedFd::borrow_raw(back_raw) };
+            let write_token = loop_handle
+                .insert_source(
+                    Generic::new(back_borrowed, Interest::WRITE, Mode::Level),
+                    move |_readiness, _meta, data: &mut DaemonData| fed_back_writable(data),
+                )
+                .map_err(|e| anyhow!("calloop insert_source(fed back-channel write) 失败: {e}"))?;
+            // 初始无待写 → disable,使 `armed=false` 与 epoll 实态一致(否则 WRITE+Level 源在
+            // 空闲可写 fd 上恒触发烧核;且 arm 时对"实已 enable"的源再 enable 有风险)。
+            loop_handle
+                .disable(&write_token)
+                .map_err(|e| anyhow!("disable Fed back-channel WRITE 源失败: {e}"))?;
+            link.back.write = Some(WriteReg {
+                token: write_token,
+                armed: false,
+            });
 
             // Fed 焦点(workspace, tab)初始未知,等父发 FocusChange 帧填(块B)。
             (None, Some(link.back), 0u64, 0u64, None)
@@ -467,66 +510,29 @@ impl FedLink {
             back: FedState {
                 decoder: FeedDecoder::new(),
                 back: write_owned,
+                outbound: VecDeque::new(),
+                write: None,
             },
         })
     }
 }
 
 /// E′ 子进程(Fed 模式)的父↔子链 **写侧** 状态(进 [`DaemonData::fed`])。父 pipe 读端由
-/// calloop Generic 源 own(见 [`FedLink`]),这里只持 back-channel **写端**(子→父 Input 帧)
-/// + 增量解码器(读端回调 [`fed_pipe_readable`] 用)。
+/// calloop Generic 源 own(见 [`FedLink`]);这里只持 back-channel **写端**(子→父 Input 帧)、
+/// 增量解码器(读端回调 [`fed_pipe_readable`] 用)、出站字节队列(写不完入队、绝不丢半帧,
+/// 见 [`fed_send_frame`] / [`fed_back_writable`])。
 struct FedState {
     decoder: FeedDecoder,
-    /// 子→父 back-channel 写端(Input 帧)。非阻塞:部分写循环 + WouldBlock 丢剩余。
+    /// 子→父 back-channel 写端(Input 帧)。非阻塞:[`fed_send_frame`] 直写不完的剩余字节入
+    /// [`FedState::outbound`],可写时 [`fed_back_writable`] drain(绝不丢半帧)。
     back: OwnedFd,
-}
-
-impl FedState {
-    /// 非阻塞写一帧到 back-channel(子→父)。部分写循环推进;`WouldBlock`(父读端缓冲满)按
-    /// 背压丢剩余(输入人手速,极罕见,与 PTY 写背压策略一致);`Interrupted` 重试;`Ok(0)` /
-    /// 其它错误 warn 退出。**绝不阻塞 loop**(子→父满了丢得起,绝不拖累子的 WS 服务)。
-    fn write_frame(&self, frame: &[u8]) {
-        let fd = self.back.as_raw_fd();
-        let mut written = 0;
-        while written < frame.len() {
-            // SAFETY: fd 来自本结构持有的活 OwnedFd;libc::write 只调 syscall 不动 fd 所有权,
-            // frame 是调用方栈上活着的切片。
-            #[allow(unsafe_code)]
-            let n = unsafe {
-                libc::write(
-                    fd,
-                    frame[written..].as_ptr().cast::<libc::c_void>(),
-                    frame.len() - written,
-                )
-            };
-            if n > 0 {
-                written += n as usize;
-                continue;
-            }
-            if n == 0 {
-                tracing::warn!(
-                    "Fed back-channel write 返回 0, 丢剩余 {} 字节",
-                    frame.len() - written
-                );
-                break;
-            }
-            let err = io::Error::last_os_error();
-            match err.kind() {
-                io::ErrorKind::Interrupted => continue,
-                io::ErrorKind::WouldBlock => {
-                    tracing::warn!(
-                        "Fed back-channel 背压 (WouldBlock), 已写 {written} / 丢剩余 {} 字节",
-                        frame.len() - written
-                    );
-                    break;
-                }
-                _ => {
-                    tracing::warn!(?err, "Fed back-channel write 失败");
-                    break;
-                }
-            }
-        }
-    }
+    /// 待写出的字节队列(子→父成帧流)。WouldBlock 写不完的尾部入此,保序;积压超
+    /// [`FED_BACK_OUT_CAP`] = 父长期不读 → 断子降级(停子 daemon)。**绝不丢半帧**(半帧 →
+    /// 父 [`FeedDecoder`] framing 错位级联杀子)。
+    outbound: VecDeque<u8>,
+    /// back-channel WRITE 源(`armed` = 当前是否 enable;有积压 arm、drain 空 disarm,不忙等)。
+    /// `None` 仅存在于构造到 `run()` 注册之间的瞬态;`run()` 内恒 `Some`。
+    write: Option<WriteReg>,
 }
 
 /// 把一个 raw fd 设 `O_NONBLOCK`(Fed 父↔子 pipe 两端,子侧自设防阻塞 loop)。
@@ -968,20 +974,171 @@ fn broadcast_stream_focus(data: &mut DaemonData) {
 
 /// 把 WS 客户端输入字节路由到 input sink(块C —— 在 `on_input` 调用点岔开两条数据流):
 /// - **Local**(`session` 在)= 直写 active tab 的 PTY([`Session::on_input`]);
-/// - **Fed**(`fed` 在)= encode 成 [`FrameKind::Input`] 帧写父 back-channel(子自己不写 PTY,
-///   父 own PTY,父据 (ws, tab) 写对应 PTY)。
-fn route_input(data: &mut DaemonData, tab_id: u64, bytes: &[u8]) {
+/// - **Fed**(`fed` 在)= **分帧**成 ≤ [`FED_INPUT_CHUNK`] 的多个 [`FrameKind::Input`] 帧(各带
+///   同 (`ws_id`, `tab_id`) 标签)写父 back-channel(子自己不写 PTY,父 own PTY,父据 (ws, tab)
+///   写对应 PTY)。分帧防单条大输入(粘贴)超 feed 协议 payload 上限 / `u32` 截断(Bug2)。
+///
+/// `ws_id`:**热路径 Binary** 用焦点 ws(无显式寻址);**寻址 [`ClientMsg::Input`]** 用消息里的
+/// `workspace_id`(Bug3 —— 让 Input 帧 ws 标签填对值,而非一律焦点 ws)。Local 的 `on_input` 按
+/// `tab_id` 寻址、不使用 `ws_id`。
+fn route_input(data: &mut DaemonData, ws_id: u64, tab_id: u64, bytes: &[u8]) {
     if let Some(session) = data.session.as_mut() {
         if let Err(e) = session.on_input(tab_id, bytes) {
             tracing::warn!(?e, tab_id, "WS 输入写 PTY 失败");
         }
         return;
     }
-    let ws_id = data.workspace_id;
-    if let Some(fed) = data.fed.as_ref() {
-        let mut frame = Vec::with_capacity(FEED_HEADER_LEN + bytes.len());
-        encode_into(&mut frame, FrameKind::Input, ws_id, tab_id, bytes);
-        fed.write_frame(&frame);
+    if data.fed.is_none() {
+        return;
+    }
+    // Fed:分帧 + 逐帧经 back-channel 队列保序回灌父(空输入 → chunks 无项 → 不发帧)。复用
+    // 同一 `frame` buffer(clear 后重填)减分配。
+    let mut frame = Vec::with_capacity(FEED_HEADER_LEN + bytes.len().min(FED_INPUT_CHUNK));
+    for chunk in bytes.chunks(FED_INPUT_CHUNK) {
+        frame.clear();
+        encode_into(&mut frame, FrameKind::Input, ws_id, tab_id, chunk);
+        fed_send_frame(data, &frame);
+    }
+}
+
+/// 把一帧 encode 好的字节经 back-channel 写父(子→父 Input 帧)。**绝不丢半帧**:队空时尽量
+/// 直写(WouldBlock 写不完的剩余字节入队),队非空时直接追加(保序,不直写以免乱序);有积压
+/// 则 arm WRITE 源,可写时 [`fed_back_writable`] drain。出站积压超 [`FED_BACK_OUT_CAP`] = 父长期
+/// 不读 → **断子降级**(停子 daemon,父读 EOF 重建干净子),绝不无界堆 + 绝不丢半帧污染流。
+/// **绝不阻塞 loop**(WouldBlock 即入队返回,不自旋等父读)。
+fn fed_send_frame(data: &mut DaemonData, frame: &[u8]) {
+    let mut fatal = false;
+    let mut over_cap = false;
+    let mut need_arm = false;
+    if let Some(fed) = data.fed.as_mut() {
+        let fd = fed.back.as_raw_fd();
+        let mut start = 0;
+        // 仅队空时直写(队非空直写会与待 drain 的字节乱序);写不完的入队。
+        if fed.outbound.is_empty() {
+            while start < frame.len() {
+                // SAFETY: fd 来自本结构持有的活 OwnedFd;libc::write 只调 syscall 不动 fd 所有权,
+                // frame 是调用方栈上活着的切片。
+                #[allow(unsafe_code)]
+                let n = unsafe {
+                    libc::write(
+                        fd,
+                        frame[start..].as_ptr().cast::<libc::c_void>(),
+                        frame.len() - start,
+                    )
+                };
+                if n > 0 {
+                    start += n as usize;
+                    continue;
+                }
+                if n == 0 {
+                    tracing::warn!("Fed back-channel 直写返回 0,停止子 daemon");
+                    fatal = true;
+                    break;
+                }
+                let err = io::Error::last_os_error();
+                match err.kind() {
+                    io::ErrorKind::Interrupted => continue,
+                    io::ErrorKind::WouldBlock => break, // 写不完的入队
+                    _ => {
+                        tracing::warn!(?err, "Fed back-channel 直写失败,停止子 daemon");
+                        fatal = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if !fatal && start < frame.len() {
+            fed.outbound.extend(&frame[start..]);
+            over_cap = fed.outbound.len() > FED_BACK_OUT_CAP;
+            need_arm = !over_cap;
+        }
+    }
+    if fatal || over_cap {
+        if over_cap {
+            tracing::error!(
+                cap = FED_BACK_OUT_CAP,
+                "Fed back-channel 出站积压超上限 (父长期不读),停止子 daemon 降级"
+            );
+        }
+        data.loop_signal.stop();
+        return;
+    }
+    if need_arm {
+        fed_arm_write(data);
+    }
+}
+
+/// 打开 Fed back-channel WRITE 兴趣(出站有积压时)。已 armed 则跳过(防对已 enable 的源重复
+/// enable)。从**非该 WRITE 源自身**的 callback 调([`fed_send_frame`],经 input sink),故
+/// `enable` 立即生效。镜像 [`arm_write`](WS 客户端版)。
+fn fed_arm_write(data: &mut DaemonData) {
+    let token = match data.fed.as_ref().and_then(|f| f.write.as_ref()) {
+        Some(w) if !w.armed => w.token,
+        _ => return, // 无 WRITE 源(瞬态)/ 已 armed
+    };
+    if let Err(e) = data.loop_handle.enable(&token) {
+        tracing::warn!(?e, "enable Fed back-channel WRITE 源失败");
+        return;
+    }
+    if let Some(w) = data.fed.as_mut().and_then(|f| f.write.as_mut()) {
+        w.armed = true;
+    }
+}
+
+/// Fed back-channel WRITE 源可写:drain 出站字节队列到父 pipe。每次写当前 front 连续切片,
+/// 推进游标;`WouldBlock` → 保留 WRITE 兴趣(`Continue`)下次再来;**队列排空 → 关 WRITE 兴趣
+/// 退回不轮询(`Disable`,不忙等)**;写 0 / 其它错误(父读端没了)→ 停子 daemon(与父 pipe
+/// EOF 察觉同义)。**绝不丢字节**(半帧致父 framing 错位)。
+fn fed_back_writable(data: &mut DaemonData) -> io::Result<PostAction> {
+    enum Outcome {
+        Disable,
+        Continue,
+        Stop,
+    }
+    let outcome = {
+        let Some(fed) = data.fed.as_mut() else {
+            return Ok(PostAction::Remove); // 不该发生:WRITE 源仅 Fed 拓扑注册
+        };
+        let fd = fed.back.as_raw_fd();
+        loop {
+            // VecDeque 非空时 `as_slices().0`(front 连续段)必非空;空则 drain 完毕。
+            let front = fed.outbound.as_slices().0;
+            if front.is_empty() {
+                if let Some(w) = fed.write.as_mut() {
+                    w.armed = false;
+                }
+                break Outcome::Disable;
+            }
+            // SAFETY: fd 来自本结构持有的活 OwnedFd;front 是 `outbound` 当前内容的活切片;
+            // libc::write 只调 syscall 不动 fd 所有权。
+            #[allow(unsafe_code)]
+            let n = unsafe { libc::write(fd, front.as_ptr().cast::<libc::c_void>(), front.len()) };
+            if n > 0 {
+                fed.outbound.drain(..n as usize);
+                continue;
+            }
+            if n == 0 {
+                tracing::warn!("Fed back-channel write 返回 0,停止子 daemon");
+                break Outcome::Stop;
+            }
+            let err = io::Error::last_os_error();
+            match err.kind() {
+                io::ErrorKind::Interrupted => continue,
+                io::ErrorKind::WouldBlock => break Outcome::Continue,
+                _ => {
+                    tracing::warn!(?err, "Fed back-channel write 失败,停止子 daemon");
+                    break Outcome::Stop;
+                }
+            }
+        }
+    };
+    match outcome {
+        Outcome::Disable => Ok(PostAction::Disable),
+        Outcome::Continue => Ok(PostAction::Continue),
+        Outcome::Stop => {
+            data.loop_signal.stop();
+            Ok(PostAction::Remove)
+        }
     }
 }
 
@@ -1338,6 +1495,9 @@ fn push_server_json(out: &mut Vec<String>, msg: &ServerMsg) {
 /// 写 active tab PTY(同线程,无 channel)。Close / 致命错 → 断开。
 fn ws_live_read(data: &mut DaemonData, id: u64) -> io::Result<PostAction> {
     let tab = data.tab_id;
+    // 热路径 Binary 无显式寻址 → 用焦点 (workspace, tab)(Bug3:仅带 workspace_id 字段的
+    // ClientMsg::Input 才用消息字段,见 handle_client_msg)。
+    let ws = data.workspace_id;
     loop {
         let res = match data.clients.get_mut(&id) {
             Some(c) => match &mut c.stage {
@@ -1350,7 +1510,7 @@ fn ws_live_read(data: &mut DaemonData, id: u64) -> io::Result<PostAction> {
             // 数据面:浏览器输入裸字节(WS Binary)→ input sink(块C):Local 直写焦点 tab PTY,
             // Fed encode Input 帧回灌父 back-channel(子自己不写 PTY)。焦点 tab = StreamFocus 标的。
             Ok(Message::Binary(b)) => {
-                route_input(data, tab, &b);
+                route_input(data, ws, tab, &b);
             }
             // 控制面:WS Text = JSON [`ClientMsg`](Hold / Release / 寻址 Input / Resize)。
             // 与数据面 Binary 分流(T6)。Release 触发显式关闭回收 → 返 drop action。
@@ -1419,9 +1579,15 @@ fn handle_client_msg(data: &mut DaemonData, id: u64, text: &str) -> Option<PostA
             release_holder(data, id, true);
             Some(drop_client_read_self(data, id))
         }
-        ClientMsg::Input { tab_id, bytes, .. } => {
+        ClientMsg::Input {
+            workspace_id,
+            tab_id,
+            bytes,
+            ..
+        } => {
             // 寻址输入走同一 input sink(块C):Local 写 PTY,Fed 回灌父 back-channel。
-            route_input(data, tab_id, &bytes);
+            // 用消息里的 workspace_id(Bug3:寻址路径让 Input 帧 ws 标签填对值,而非一律焦点 ws)。
+            route_input(data, workspace_id, tab_id, &bytes);
             None
         }
         ClientMsg::Resize {

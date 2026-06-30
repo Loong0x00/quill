@@ -306,6 +306,65 @@ fn fed_child_round_trips_input_to_back_channel() {
     assert_eq!(frame.tab_id, 7, "Input 帧应带焦点 tab 标签");
 }
 
+/// 块D-5(Lead 补,验 Bug1 修复):大输入(> 默认 pipe 缓冲 64KiB)经 back-channel 回灌父,
+/// 强制子端【分帧 + 出站队列 + 可写时 drain】。父侧逐帧重组须【逐字节完整、无错位】——
+/// 证 write_frame 背压下绝不丢半帧(若丢,recv_frame 会撞解码错位 panic 或重组短/不等)。
+#[test]
+fn fed_child_back_channel_survives_large_input_backpressure() {
+    const N: usize = 256 * 1024; // > 默认 pipe 缓冲(64KiB),且分成 4 个 64KiB Input 帧
+
+    let port = free_port();
+    let fc = FedChild::spawn(port);
+
+    let mut ws = match connect_ws(port, Duration::from_secs(15)) {
+        Some(w) => w,
+        None => {
+            fc.cleanup();
+            panic!("15s 内未能连上 Fed 子进程 WS");
+        }
+    };
+
+    fc.feed(&FeedFrame {
+        kind: FrameKind::FocusChange,
+        ws_id: 5,
+        tab_id: 7,
+        payload: Vec::new(),
+    });
+    std::thread::sleep(Duration::from_millis(300));
+
+    // 位置相关图样:任何丢字节 / 错位 / 乱序都会让重组不等。
+    let sent: Vec<u8> = (0..N).map(|i| (i % 251) as u8).collect();
+    ws.send(Message::Binary(Bytes::from(sent.clone())))
+        .expect("WS send 大输入");
+    let _ = ws.flush();
+
+    // 父循环收齐:子把 256KiB 分成 ≤64KiB Input 帧,pipe 满 → 入队 → 可写时 drain。
+    let mut dec = FeedDecoder::new();
+    let mut got: Vec<u8> = Vec::with_capacity(N);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while got.len() < N && Instant::now() < deadline {
+        match fc.recv_frame(&mut dec, Duration::from_secs(10)) {
+            Some(f) => {
+                assert_eq!(f.kind, FrameKind::Input, "回灌帧 kind 应为 Input");
+                assert_eq!(f.ws_id, 5, "Input 帧应带焦点 workspace 标签");
+                assert_eq!(f.tab_id, 7, "Input 帧应带焦点 tab 标签");
+                got.extend_from_slice(&f.payload);
+            }
+            None => break,
+        }
+    }
+
+    let _ = ws.close(None);
+    fc.cleanup();
+
+    assert_eq!(
+        got.len(),
+        N,
+        "应从 back-channel 收齐全部输入字节(无丢半帧 / 截断)"
+    );
+    assert!(got == sent, "重组字节须与发送逐字节相等(无错位 / 乱序)");
+}
+
 /// 块D-3:半包 —— 一帧拆多块跨 header/payload 边界分次灌,子 decoder 不丢/不错位。
 #[test]
 fn fed_child_handles_partial_framed_feed() {

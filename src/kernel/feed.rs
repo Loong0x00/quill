@@ -92,7 +92,16 @@ impl FeedFrame {
 /// 把一帧 **append** 进 `buf` (头 + payload)。tee 热路径复用同一块 `buf`(`clear` 后
 /// 重填)即零额外分配。`payload` 长度超 `u32` 会被 `len as u32` 截断 —— 实际 PTY chunk
 /// 远低于 4 GiB,调用方 (tee 单批 KB 级) 不会触及;[`MAX_FEED_PAYLOAD`] 在解码侧兜底。
+///
+/// 调用方**必须**保证 `payload.len() <= MAX_FEED_PAYLOAD`(解码侧会拒超限帧;子→父大输入由
+/// daemon 分帧保证)。`debug_assert` 防回归:任何把 > 16 MiB 单帧塞进来的新调用点(或忘了
+/// 分帧)在 debug build 立即炸,免得 `as u32` 静默截断 → 父侧 framing 错位。
 pub fn encode_into(buf: &mut Vec<u8>, kind: FrameKind, ws_id: u64, tab_id: u64, payload: &[u8]) {
+    debug_assert!(
+        payload.len() <= MAX_FEED_PAYLOAD,
+        "feed 帧 payload {} 超上限 {MAX_FEED_PAYLOAD}(调用方须分帧;否则 as u32 截断致 framing 错位)",
+        payload.len()
+    );
     buf.push(kind.to_u8());
     buf.extend_from_slice(&ws_id.to_le_bytes());
     buf.extend_from_slice(&tab_id.to_le_bytes());
