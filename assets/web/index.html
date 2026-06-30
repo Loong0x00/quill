@@ -282,31 +282,36 @@ function isBlankLine(ll) {
   return true;
 }
 function hasVBar(text) { for (let c = 0; c < text.length; c++) if (VBAR.has(text[c])) return true; return false; }
-// 横线/边框规则行:非空、非空白字符全在 BORDER 集、且含 ≥1 横线类字符(排除"纯竖线+空格"
-// 的空内容行被误判成规则行)+ ≥3 个边框字符(排除偶发单字符)。
-function isRuleRow(text) {
+// 分隔/规则行 SEPSET = 横线类 + 接点 + markdown 对齐冒号(竖线另算)。
+const SEPSET = new Set([...HBARISH, ...JUNCT, ":"]);
+// 分隔行:非空、非空白字符全是【竖线 或 SEPSET】、且含 ≥1 横线类字符、长度 ≥3。覆盖盒线
+// (├─┼─┤ / ┌─┬─┐)、ascii(+---+)、markdown(---|--- / :--:|---:)、纯横线(─────)。注意它
+// **可含竖线**(markdown 分隔行带 |),所以判别独立于 hasVBar —— 含竖线的分隔行仍是分隔行
+// 不是内容行(修 ---|--- 被误当数据行 + header 漏标)。
+function isSeparatorRow(text) {
   const t = text.trim();
   if (t.length < 3) return false;
-  let nb = 0, hbar = 0;
+  let hbar = 0;
   for (const ch of t) {
     if (ch === " ") continue;
-    if (!BORDER.has(ch)) return false;
-    nb++;
+    if (VBAR.has(ch)) continue;
+    if (!SEPSET.has(ch)) return false;
     if (HBARISH.has(ch)) hbar++;
   }
-  return nb >= 3 && hbar >= 1;
+  return hbar >= 1;
 }
 
-// 带框表格块:从 i 起最大连续"表格行"(含竖线 或 是规则行)的区间 [i, end);需 ≥1 含竖线的
-// 内容行 + (≥2 内容行 或 ≥1 规则行)。不满足返 -1。
+// 带框表格块:从 i 起最大连续"表格行"(含竖线 或 是分隔行)的区间 [i, end);需 ≥1 含竖线的
+// 内容行 + (≥2 内容行 或 ≥1 分隔行)。不满足返 -1。分隔行(含 ---|--- 这种带竖线的)算 rule
+// 不算 content。
 function borderedTableEnd(lines, i) {
   let j = i, content = 0, rule = 0;
   while (j < lines.length) {
     if (isBlankLine(lines[j])) break;
     const t = lines[j].text;
-    const vbar = hasVBar(t), rl = isRuleRow(t);
-    if (!vbar && !rl) break;
-    if (vbar) content++; else rule++;
+    const sep = isSeparatorRow(t), vbar = hasVBar(t);
+    if (!vbar && !sep) break;
+    if (sep) rule++; else content++;
     j++;
   }
   if (content >= 1 && (content >= 2 || rule >= 1)) return j;
@@ -393,17 +398,18 @@ function wrapTable(tbl) {
 }
 function buildBorderedTable(lines, i, end) {
   let headerRow = -1, c0 = -1;
-  for (let k = i; k < end; k++) if (hasVBar(lines[k].text)) { c0 = k; break; }
+  // 首个内容行(含竖线且不是分隔行)。分隔行(┌─┬┐ / ---|---)不算内容。
+  for (let k = i; k < end; k++) if (hasVBar(lines[k].text) && !isSeparatorRow(lines[k].text)) { c0 = k; break; }
   if (c0 >= 0) {
     for (let k = c0 + 1; k < end; k++) {
-      if (hasVBar(lines[k].text)) break;            // 先遇到内容行 → 无 header 规则线
-      if (isRuleRow(lines[k].text)) { headerRow = c0; break; }
+      if (isSeparatorRow(lines[k].text)) { headerRow = c0; break; }  // 首内容行后紧跟分隔行 → header
+      if (hasVBar(lines[k].text)) break;                             // 先遇到另一内容行 → 无 header
     }
   }
   const tbl = document.createElement("table");
   for (let k = i; k < end; k++) {
     const ll = lines[k];
-    if (isRuleRow(ll.text) && !hasVBar(ll.text)) continue;   // 跳过纯规则行
+    if (isSeparatorRow(ll.text)) continue;   // 跳过分隔/规则行(含 ---|--- 这种带竖线的)
     const tr = document.createElement("tr");
     for (const [a, b] of vbarColumns(ll)) {
       const td = document.createElement(k === headerRow ? "th" : "td");
