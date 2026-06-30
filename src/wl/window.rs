@@ -579,6 +579,23 @@ fn share_kernel_path() -> std::path::PathBuf {
     std::path::PathBuf::from("quill-kernel")
 }
 
+/// E′ 父→子 data 端背压决策(纯逻辑,可单测):**是否丢弃整帧**。
+///
+/// **framing 完整性不变式**:只在【已积压】(`outbound_len > 0`)且【加上本帧会超 cap】时丢,且
+/// 丢的是【整帧】(调用方不 append → 子 [`FeedDecoder`] 永远见不到半帧)。`outbound_len == 0`
+/// (队列空 = 帧对齐)时**永不丢**:即便单帧很大也整帧入队,子从帧边界起读,framing 不错位。
+/// 已入队的【部分帧尾】(来自整帧的部分 write)只会被后续 drain 补完,绝不被截断。
+fn share_should_drop_frame(outbound_len: usize, frame_len: usize, cap: usize) -> bool {
+    outbound_len > 0 && outbound_len.saturating_add(frame_len) > cap
+}
+
+/// E′ 回灌输入路由决策(纯逻辑,可单测):**帧目标是否当前焦点 tab**。手机镜像桌面焦点,命中
+/// 才回灌(写进 active PTY);不命中 = 焦点 race(桌面已切 tab、手机仍按旧焦点发),丢弃防写
+/// 错 tab。砖1b 单焦点;多 tab 寻址回灌留后续。
+fn share_input_targets_active(frame_tab: u64, active_tab: u64) -> bool {
+    frame_tab == active_tab
+}
+
 /// E′(ADR-0018)父监管的隔离共享【子进程】句柄 + 父↔子 pipe 两端 + 焦点 + 背压队列。
 ///
 /// 仅 `--share` 武装时存在(默认 `None` = 今天的 quill,**零开销、零子进程、零回归**)。父
@@ -763,9 +780,7 @@ impl ShareChild {
     /// 子 decoder 永不见半帧);否则 append 整帧再 drain。
     fn enqueue_and_drain(&mut self, frame: &[u8]) {
         self.drain_outbound();
-        if !self.data_outbound.is_empty()
-            && self.data_outbound.len().saturating_add(frame.len()) > SHARE_DATA_OUT_CAP
-        {
+        if share_should_drop_frame(self.data_outbound.len(), frame.len(), SHARE_DATA_OUT_CAP) {
             self.dropped_frames = self.dropped_frames.saturating_add(1);
             return;
         }
@@ -907,7 +922,7 @@ fn route_share_input(data: &mut LoopData, frame: FeedFrame) {
         return;
     };
     let active_id = tabs.active().id().raw();
-    if frame.tab_id != active_id {
+    if !share_input_targets_active(frame.tab_id, active_id) {
         tracing::debug!(
             frame_tab = frame.tab_id,
             active = active_id,
@@ -5912,6 +5927,35 @@ mod tests {
         let f: fn(Option<std::path::PathBuf>, bool) -> Result<()> = run_window;
         // 仅保留引用,避免 dead_code;不调用 f(会阻塞事件循环)。
         let _ = &f;
+    }
+
+    /// E′ 背压 framing 完整性不变式(砖1b):空队列(帧对齐)永不丢 —— 即便单帧超 cap 也整帧
+    /// 入队,子从帧边界起读,framing 不错位。
+    #[test]
+    fn share_empty_outbound_never_drops_even_oversized_frame() {
+        assert!(!share_should_drop_frame(0, 10, 4));
+        assert!(!share_should_drop_frame(0, 1_000_000, 8));
+    }
+
+    /// 已积压且加上本帧超 cap → 丢【整帧】(调用方不 append → 子永不见半帧);未超 cap → 不丢。
+    #[test]
+    fn share_drops_whole_frame_only_when_backed_up_over_cap() {
+        // 已积压 5,本帧 4,cap 8 → 5+4=9 > 8 → 丢整帧。
+        assert!(share_should_drop_frame(5, 4, 8));
+        // 已积压 5,本帧 2,cap 8 → 5+2=7 <= 8 → 不丢(append)。
+        assert!(!share_should_drop_frame(5, 2, 8));
+        // 恰好等于 cap → 不丢(只有严格超过才丢)。
+        assert!(!share_should_drop_frame(6, 2, 8));
+        // 加法溢出不 panic(saturating),仍判为超 cap → 丢。
+        assert!(share_should_drop_frame(usize::MAX, 1, 8));
+    }
+
+    /// E′ 回灌输入路由门:命中焦点 tab 才回灌;不命中(焦点 race / 多 tab)丢弃。
+    #[test]
+    fn share_input_routes_only_to_focused_tab() {
+        assert!(share_input_targets_active(7, 7));
+        assert!(!share_input_targets_active(7, 9));
+        assert!(!share_input_targets_active(0, 1));
     }
 
     #[test]
