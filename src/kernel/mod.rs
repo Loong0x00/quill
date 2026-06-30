@@ -6,6 +6,8 @@
 //!
 //! - [`proto`] —— 跨线程 / 跨进程线缆协议 (owned 可 serde 的 [`proto::Snapshot`]
 //!   / [`proto::CellWire`] / [`proto::ClientMsg`] / [`proto::ServerMsg`])。
+//! - [`feed`] —— 父 ↔ 子 (E′, ADR-0018) 共享子进程的轻量二进制喂料帧 codec
+//!   ([`feed::FeedFrame`] / [`feed::encode_into`] / 增量 [`feed::FeedDecoder`])。
 //! - [`session`] —— [`session::Session`]:tab 工作区 + 数据流入口
 //!   (`on_pty_output` / `on_input` / `apply_tab_op` / `snapshot`)。
 //! - [`daemon`] —— Phase 7 T2 单线程 calloop daemon 切片:注册 PTY fd +
@@ -17,9 +19,11 @@
 //! (ADR-0015 Phase 1 §5-6)。
 
 pub mod daemon;
+pub mod feed;
 pub mod proto;
 pub mod session;
 
+pub use feed::{FeedDecoder, FeedFrame, FrameKind};
 pub use proto::{
     CellWire, ClientMsg, ColorWire, CursorShapeWire, CursorWire, ServerMsg, Snapshot, TabMeta,
     TabOp, WorkspaceInfo, WorkspaceList, WorkspaceMeta,
