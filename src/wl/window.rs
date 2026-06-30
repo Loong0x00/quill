@@ -927,6 +927,8 @@ fn share_back_channel_readable(data: &mut LoopData, fd: RawFd) -> std::io::Resul
         // 拆 share:ShareChild::drop kill + reap 子 + 关父留 fd;本源 PostAction::Remove
         // (calloop 回调返回后才应用,故"删自身源"安全 —— 别在回调内手动 loop_handle.remove)。
         let _ = data.share.take();
+        // 子崩溃自动降级回纯终端 → 标题栏 share icon 须转灰,主动请求重画(同 toggle)。
+        data.state.presentation_dirty = true;
         return Ok(PostAction::Remove);
     }
     Ok(PostAction::Continue)
@@ -1053,6 +1055,9 @@ fn apply_share_toggle(data: &mut LoopData) {
         return;
     }
     data.toggle_share();
+    // toggle 不写 PTY,空闲终端 term 不 dirty → 主动请求重画,否则标题栏 share icon
+    // 的绿/灰不即时更新(要等鼠标动 / PTY 输出才刷)。兄弟路径 selection ops 同样置位。
+    data.state.presentation_dirty = true;
 }
 
 /// calloop Generic source 每次 readable 时跑一圈:循环 `pty.read` → 分派
