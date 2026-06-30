@@ -3606,6 +3606,9 @@ pub fn run_window(initial_cwd: Option<std::path::PathBuf>, share: bool) -> Resul
                 state,
                 frame_stats,
                 text_system,
+                // E′(ADR-0018):共享态(disjoint LoopData 字段)→ 每帧同步给 renderer 画
+                // titlebar 共享按钮(亮绿=开 / 暗灰=关)。`share.is_some()` 即"共享中"。
+                share,
                 ..
             } = &mut *data;
             // 字段级 split: tabs / renderer / pointer_state / ime_state /
@@ -3795,6 +3798,9 @@ pub fn run_window(initial_cwd: Option<std::path::PathBuf>, share: bool) -> Resul
                 return;
             };
             r.set_tab_state(tab_count, active_idx);
+            // E′(ADR-0018):把共享态镜像给 renderer(`share` 是 disjoint LoopData 字段,
+            // 与 `r`=state.renderer 不冲突)。默认 None → false → 暗灰"未共享"按钮(零回归)。
+            r.set_share_active(share.is_some());
             // T-0617: 同步 active tab 的 OSC title 到 renderer. listener 写
             // active_tab.title (Rc<RefCell<String>>), 这里 read snapshot;
             // active_title 空 → 走 DEFAULT_TITLE = "quill" (与 T-0702 默认 + 启动
@@ -5928,6 +5934,13 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 WindowButton::Close => {
                     tracing::info!(target: "quill::pointer", "click Close → exit");
                     let _ = handle_event(&mut state.core, WindowEvent::Close);
+                }
+                // E′(ADR-0018):共享开关按钮 → 置 pending,drive_wayland step 3.8.5 真
+                // toggle_share(spawn / kill 隔离 quill-kernel 子)。Dispatch 仅 &mut State
+                // 拿不到 LoopHandle,与 tab 热键同 deferred-side-effect 套路。
+                WindowButton::Share => {
+                    tracing::info!(target: "quill::pointer", "click Share → toggle_share queued");
+                    state.pending_share_toggle = true;
                 }
             },
             // T-0607 选区操作: SelectionStart/Update/End 走 selection_state 状态

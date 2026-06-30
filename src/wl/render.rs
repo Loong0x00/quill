@@ -199,6 +199,11 @@ pub struct Renderer {
     /// 通过 [`Self::set_tab_state`] 在每帧 draw_frame 之前同步.
     tab_count: usize,
     active_tab_idx: usize,
+    /// E′(ADR-0018): 共享是否开启(`LoopData.share.is_some()` 的镜像)。render 据此把
+    /// titlebar 共享开关 icon 画成亮绿(开)/ 暗灰(关)。POD bool 无 GPU 资源, drop 序无关
+    /// (与 `tab_count` / `active_tab_idx` 同 POD 组)。由调用方(window.rs idle callback)每帧
+    /// draw_frame 之前经 [`Self::set_share_active`] 同步;默认 false = 今天的 quill(零回归)。
+    share_active: bool,
     /// **T-0610 part 2: live alpha** (CLEAR_ALPHA_LIVE = 0.85 / Opaque fallback 1.0).
     /// `Renderer::new` 据 alpha_mode 决定一次后锁住; `Renderer::resize` 走 update
     /// uniform 时复用本字段, 不需重查 adapter caps. POD f32 顺序无关, 与
@@ -553,6 +558,22 @@ const BUTTON_ICON: crate::term::Color = crate::term::Color {
     r: 0xd3,
     g: 0xd3,
     b: 0xd3,
+};
+
+/// **E′(ADR-0018)共享开关 icon — 未共享态** (暗灰 #6a6a6a, 比 [`BUTTON_ICON`] 暗,
+/// 视觉读作"关/休眠"; 信号条画成暗灰 = 共享未开). 仍 ≥ #2c titlebar bg 对比可见.
+const SHARE_ICON_OFF: crate::term::Color = crate::term::Color {
+    r: 0x6a,
+    g: 0x6a,
+    b: 0x6a,
+};
+
+/// **E′(ADR-0018)共享开关 icon — 共享中** (亮绿 #3fb950, "on-air / live" 指示色,
+/// 与 GitHub 在线绿同系). 信号条变亮绿 = 正在共享(手机可连), 一眼可辨开关态.
+const SHARE_ICON_ON: crate::term::Color = crate::term::Color {
+    r: 0x3f,
+    g: 0xb9,
+    b: 0x50,
 };
 
 // T-0617: 删 `BORDER_PX` / `BORDER_COLOR` const + `append_border_vertices` fn
@@ -1501,6 +1522,9 @@ fn append_titlebar_vertices(
     surface_h: f32,
     is_srgb: bool,
     hover: super::pointer::HoverRegion,
+    // E′(ADR-0018): 共享是否开启 → 决定 titlebar 共享按钮 icon 亮绿(开)/ 暗灰(关)。
+    // 默认 false = 灰 icon(零回归); 不开共享时仍画一个暗灰"未共享"按钮(常驻可见可点)。
+    share_active: bool,
 ) {
     use crate::wl::pointer::{HoverRegion, WindowButton};
 
@@ -1544,6 +1568,10 @@ fn append_titlebar_vertices(
     let max_x_max = close_x_min;
     let min_x_min = max_x_min - btn_w;
     let min_x_max = max_x_min;
+    // E′(ADR-0018): 共享开关按钮在 Minimize 左侧再一格(右簇最左)。与
+    // [`crate::wl::pointer::hit_test`] 的 `share_cx = min_cx - btn_w` 严格同源。
+    let share_x_min = min_x_min - btn_w;
+    let share_x_max = min_x_min;
 
     // T-0615: 按钮 bg 仅在 hover 时画 (圆形, rounded pipeline). 非 hover 时不画
     // — 用户视觉只看到 icon, hover 后才浮现圆形 bg (ghostty 风). icon 仍画
@@ -1584,6 +1612,23 @@ fn append_titlebar_vertices(
                 min_x_min,
                 btn_y_top,
                 min_x_max,
+                btn_y_bot,
+                surface_w,
+                surface_h,
+                bg,
+                btn_radius_phys,
+            );
+        }
+    }
+    // E′(ADR-0018): 共享开关 hover bg(与 Min/Max 同灰圆,绿/灰区分留给 icon 色)。
+    if let HoverRegion::Button(WindowButton::Share) = hover {
+        if share_x_min >= 0.0 {
+            let bg = color_for_vertex_with_srgb(BUTTON_BG_HOVER, is_srgb);
+            append_rounded_quad_px(
+                rounded_out,
+                share_x_min,
+                btn_y_top,
+                share_x_max,
                 btn_y_bot,
                 surface_w,
                 surface_h,
@@ -1680,6 +1725,47 @@ fn append_titlebar_vertices(
             icon_color,
             0.0,
         );
+    }
+
+    // 3.4 E′(ADR-0018)Share: 三根递增"信号条"(底对齐, 左矮右高), 读作 signal /
+    //     broadcast / streaming —— 与 +(plus)/ □(box)/ -(minus)/ ×(close)四个 icon
+    //     全不撞。色编码开关态: 共享中=亮绿 #3fb950(on-air), 未共享=暗灰 #6a6a6a。
+    //     只用轴对齐 stroke quad(走 rounded_out radius=0), 与其它 icon 同 pipeline。
+    if share_x_min >= 0.0 {
+        let share_icon_color = color_for_vertex_with_srgb(
+            if share_active {
+                SHARE_ICON_ON
+            } else {
+                SHARE_ICON_OFF
+            },
+            is_srgb,
+        );
+        let ix_min = share_x_min + icon_pad;
+        let ix_max = share_x_max - icon_pad;
+        let iy_min = btn_y_top + icon_pad;
+        let iy_max = btn_y_bot - icon_pad;
+        let icon_w = (ix_max - ix_min).max(0.0);
+        let icon_h = (iy_max - iy_min).max(0.0);
+        let bar_w = stroke_w;
+        // 3 条 + 2 间隙铺满 icon_w; 间隙非负兜底(极窄时退化为贴在一起)。
+        let gap = ((icon_w - 3.0 * bar_w) / 2.0).max(0.0);
+        // 递增高度比例(左矮右高), 底边都贴 iy_max。
+        let heights = [icon_h * 0.45, icon_h * 0.72, icon_h];
+        for (i, h) in heights.iter().enumerate() {
+            let x0 = ix_min + (i as f32) * (bar_w + gap);
+            let x1 = x0 + bar_w;
+            append_rounded_quad_px(
+                rounded_out,
+                x0,
+                iy_max - h,
+                x1,
+                iy_max,
+                surface_w,
+                surface_h,
+                share_icon_color,
+                0.0,
+            );
+        }
     }
 
     // 4. T-0618 follow-up: + 按钮在 titlebar 左侧 (ghostty 布局 [+ ⌃] center [- □ ×]).
@@ -2202,6 +2288,9 @@ impl Renderer {
             // 同步真实 tabs 数量 + active idx.
             tab_count: 1,
             active_tab_idx: 0,
+            // E′(ADR-0018): 默认未共享 (灰 icon), 上层 idle callback 每帧 draw_frame
+            // 之前调 [`Self::set_share_active`] 同步 LoopData.share.is_some().
+            share_active: false,
             // T-0610 part 2: corner mask GPU 资源 (持 device 引用, INV-002
             // 字段顺序: device 之前 drop). 17 → 20 字段 (含 alpha_live POD),
             // Lead follow-up sync docs/invariants.md.
@@ -2217,6 +2306,13 @@ impl Renderer {
     pub fn set_tab_state(&mut self, tab_count: usize, active_idx: usize) {
         self.tab_count = tab_count.max(1);
         self.active_tab_idx = active_idx.min(self.tab_count - 1);
+    }
+
+    /// E′(ADR-0018): 同步共享开关态到 renderer(idle callback 每帧 draw_frame 前调,
+    /// 与 [`Self::set_tab_state`] 同 set-once 套路)。`active = LoopData.share.is_some()`;
+    /// titlebar 共享按钮 icon 据此亮绿(开)/ 暗灰(关)。
+    pub fn set_share_active(&mut self, active: bool) {
+        self.share_active = active;
     }
 
     /// Wayland configure 后把新 surface 像素尺寸推给 wgpu —— 更新 `self.config`
@@ -2879,6 +2975,7 @@ impl Renderer {
             surface_h,
             self.surface_is_srgb,
             hover,
+            self.share_active,
         );
         // T-0608/T-0615: tab bar 顶点 (仅多 tab). bar bg / icon stroke / 底部 border
         // 走 cell pipeline; active tab 圆角 + close × hover 红圆 走 rounded pipeline.
@@ -4595,6 +4692,8 @@ pub fn render_headless(
         surface_h,
         is_srgb,
         hover_override,
+        // headless 截图路径无运行期共享态 → 恒画"未共享"(暗灰)按钮(零回归)。
+        false,
     );
     // T-0608: tab bar (默认 1 tab, active idx 0). 集成测试通过 thread-local
     // [`HEADLESS_TAB_OVERRIDE`] 注入真 tab_count + active_idx — 派单 In #J PNG
@@ -6960,6 +7059,7 @@ mod tests {
             surface_h,
             false,
             HoverRegion::Button(WindowButton::Close),
+            false,
         );
         // hover Close 时: rounded_out 含 close 圆形 bg (6 顶点) + Min/Max icon
         // strokes (4 边 max + 1 line min = 5 quad × 6 顶点 = 30) ≥ 36 顶点
@@ -6999,12 +7099,14 @@ mod tests {
             1200.0,
             false,
             HoverRegion::None,
+            false,
         );
         let n_verts = rounded_out.len() / ROUNDED_VERTEX_BYTES;
-        // icon strokes: Maximize 4 边 + Minimize 1 横 + T-0618 + button 横竖 2 条 = 7 quad × 6 = 42 顶点 (无圆形 bg)
+        // icon strokes: Maximize 4 边 + Minimize 1 横 + T-0618 + button 横竖 2 条 = 7 quad × 6 = 42 顶点;
+        // E′ 加共享按钮 3 根信号条 = 3 quad × 6 = 18 顶点 → 42 + 18 = 60 顶点 (无圆形 bg)。
         assert_eq!(
-            n_verts, 42,
-            "T-0618: 非 hover 时 rounded 含 Min/Max icon + 新加 + button icon strokes (7 quad × 6 = 42), got {n_verts}"
+            n_verts, 60,
+            "非 hover 时 rounded 含 Min/Max + 按钮 + 共享 3 信号条 icon strokes (10 quad × 6 = 60), got {n_verts}"
         );
         // 所有顶点 elem_radius == 0 (icon strokes 矩形)
         for i in 0..n_verts {

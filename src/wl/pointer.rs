@@ -81,6 +81,12 @@ pub enum WindowButton {
     /// 关闭按钮. 走 `WindowEvent::Close` 路径 (与 compositor 发 close request
     /// 同出口, INV statemachine 不变).
     Close,
+    /// E′(ADR-0018)共享开关按钮. **toggle 语义**:点击 → 运行期开 / 关共享(spawn /
+    /// kill 隔离 quill-kernel 子)。真状态由 `LoopData.share` 是否 `Some` 跟踪,本枚举仅
+    /// 指示按钮被点;调用方(`Dispatch<WlPointer>`)置 `state.pending_share_toggle`,
+    /// `drive_wayland` 真 `toggle_share`(与 Maximize 的 toggle 跟踪同套路)。位于
+    /// titlebar 右簇、Minimize 左侧,与现有三按钮命中区互不重叠。
+    Share,
 }
 
 /// T-0701: quill 自有的 8 边角枚举, 与 wayland xdg_toplevel `resize_edge`
@@ -1345,6 +1351,13 @@ pub fn hit_test(x: f64, y: f64, surface_w: u32, surface_h: u32) -> HoverRegion {
         // min_cx 可能 < 0 (极小 surface 装不下三按钮); 落到 TitleBar 兜底.
         if min_cx >= radius && circular_hit(x, y, min_cx, cy, radius) {
             return HoverRegion::Button(WindowButton::Minimize);
+        }
+        // E′(ADR-0018)共享开关按钮: Minimize 左侧再一格 (右簇最左). 与
+        // append_titlebar_vertices 同源 (share_cx = min_cx - btn_w). 极小 surface
+        // (share_cx < radius) 装不下时不命中, 落 TitleBar 兜底.
+        let share_cx = min_cx - btn_w;
+        if share_cx >= radius && circular_hit(x, y, share_cx, cy, radius) {
+            return HoverRegion::Button(WindowButton::Share);
         }
     }
 
