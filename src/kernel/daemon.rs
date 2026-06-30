@@ -1378,6 +1378,7 @@ mod tests {
     #[test]
     fn snapshot_line_is_json_plus_newline() {
         let snap = Snapshot {
+            workspace_id: 1,
             tab_id: 1,
             cols: 1,
             rows: 1,

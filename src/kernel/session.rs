@@ -1,46 +1,125 @@
-//! 无头会话内核的 [`Session`] —— 持有整个 tab 工作区 (多 PTY + 多 term),
-//! 不含任何 Wayland / GPU / selection 状态 (ADR-0015:selection 归客户端)。
+//! 无头会话内核的 [`Session`] —— 持有【多个工作区】(T6 砖0 块B),每个工作区
+//! 是一份独立的 tab 工作区 (多 PTY + 多 term),不含任何 Wayland / GPU / selection
+//! 状态 (ADR-0015:selection 归客户端)。
 //!
-//! Phase 7 T1 骨架:协议 ([`crate::kernel::proto`]) + `Session` 数据流入口
-//! (`on_pty_output` / `on_input` / `apply_tab_op` + `snapshot`)。daemon 的
-//! calloop 接线 (注册 PTY fd + `UnixListener`) 与 WS fan-out 是后续 ticket
-//! (ADR-0015 Phase 1 §4-6),本文件不碰。
+//! **多 workspace 维度 (T6, ADR-0015 R1 / ADR-0018)**:一个 Session 可持多个
+//! [`Workspace`](各含自己的 [`TabList`]);客户端连上默认同步【全部】工作区。每个
+//! 工作区有单调递增的 `workspace_id`,与协议层 [`crate::kernel::proto::WorkspaceMeta`]
+//! / [`Snapshot::workspace_id`] 对齐。
+//!
+//! **tab id 全局唯一**(`TabRegistry` 跨整个进程单调):故按 `tab_id` 寻址的方法
+//! (`on_pty_output` / `on_input` / `snapshot` / `clear_dirty`) **跨所有工作区线性扫**
+//! 定位即可,调用方无需先报 workspace —— daemon / 既有测试的 tab 寻址签名不变。按
+//! 工作区操作的方法 (`apply_tab_op` / `resize` / `workspace_info`) 显式带 `workspace_id`。
+//!
+//! **引用计数生命周期 (anchor / holder / 销毁) 是块C**,本文件块B 只做多 workspace
+//! 数据模型 + 协议 `workspace_id` 接入,不含 refcount。
 //!
 //! **与 `wl/window.rs` 路径的关系**:`on_pty_output` 是 `pty_read_tick_inner`
 //! (`window.rs:539`) 去掉 selection rebase + composer OSC133 + Wayland 重绘后的
 //! 纯内核子集;`on_input` 是 `Dispatch<WlKeyboard>` 写 PTY 那一步的纯子集。
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
-use crate::kernel::proto::{CellWire, CursorWire, Snapshot, TabMeta, WorkspaceInfo};
+use crate::kernel::proto::{
+    CellWire, CursorWire, Snapshot, TabMeta, WorkspaceInfo, WorkspaceList, WorkspaceMeta,
+};
 use crate::tab::{TabInstance, TabList};
 
 pub use crate::kernel::proto::TabOp;
 
-/// 无头会话内核。边界 = `State.tabs` (ADR-0015):内核 own [`TabList`],客户端
-/// 只持序列化快照镜像。
-pub struct Session {
+/// 一个工作区:单调递增 id + 自己的 [`TabList`]。多个工作区组成一个 [`Session`]。
+struct Workspace {
+    id: u64,
     tabs: TabList,
 }
 
+/// 无头会话内核。边界 = `State.tabs` (ADR-0015):内核 own 多个工作区 ([`TabList`]),
+/// 客户端只持序列化快照镜像。
+///
+/// **非空不变式**:`workspaces` 在块B 永远非空 ([`Self::new`] 建一个,`new_workspace`
+/// 只增)。块C 的引用计数销毁会移除工作区,届时 active 调整 + 空 Session 处理在块C。
+pub struct Session {
+    /// 所有工作区 (连上默认同步全部,ADR-0015 R1)。非空。
+    workspaces: Vec<Workspace>,
+    /// active 工作区下标 (`< workspaces.len()`)。
+    active: usize,
+    /// 工作区 id 自增源。单线程 (INV-005),无需 atomic。
+    next_ws_id: u64,
+}
+
 impl Session {
-    /// 用已有 [`TabList`] 建会话 (daemon 启动期建首个 tab 后传入)。
+    /// 用已有 [`TabList`] 建会话 (daemon 启动期建首个 tab 后传入):构造唯一的初始
+    /// 工作区,分配 id 1。
     pub fn new(tabs: TabList) -> Self {
-        Self { tabs }
+        let mut s = Self {
+            workspaces: Vec::new(),
+            active: 0,
+            next_ws_id: 1,
+        };
+        let id = s.alloc_ws_id();
+        s.workspaces.push(Workspace { id, tabs });
+        s
     }
 
-    /// 只读访问 tab 工作区 (calloop 注册 fd / 调试用)。
+    /// 分配下一个工作区 id (单调递增)。
+    fn alloc_ws_id(&mut self) -> u64 {
+        let id = self.next_ws_id;
+        self.next_ws_id = self.next_ws_id.wrapping_add(1);
+        id
+    }
+
+    /// 只读访问 **active 工作区**的 tab 列表 (calloop 注册 fd / 调试 / dump 用)。
+    /// 砖0 daemon 单工作区:即那唯一工作区。
     pub fn tabs(&self) -> &TabList {
-        &self.tabs
+        &self.active_ws().tabs
     }
 
-    /// 可变访问 tab 工作区。
+    /// 可变访问 **active 工作区**的 tab 列表。
     pub fn tabs_mut(&mut self) -> &mut TabList {
-        &mut self.tabs
+        &mut self.active_ws_mut().tabs
     }
 
-    /// PTY 吐出的字节喂进对应 tab 的终端状态机。返回喂入后该 tab 的终端是否
-    /// 处于 dirty 状态 (= 该重算快照下发);tab 不存在 (close race) 时返 `false`。
+    /// active 工作区 id。
+    pub fn active_workspace_id(&self) -> u64 {
+        self.active_ws().id
+    }
+
+    /// 全部工作区 id (连上下发列表 / 测试用,按当前顺序)。
+    pub fn workspace_ids(&self) -> Vec<u64> {
+        self.workspaces.iter().map(|w| w.id).collect()
+    }
+
+    /// 工作区数量。
+    pub fn workspace_count(&self) -> usize {
+        self.workspaces.len()
+    }
+
+    /// 切 active 工作区。未知 id 返 `false` (active 不变)。
+    pub fn set_active_workspace(&mut self, ws_id: u64) -> bool {
+        match self.ws_idx(ws_id) {
+            Some(i) => {
+                self.active = i;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 新建一个工作区 (spawn 一个 shell tab),返回新工作区 id。不改 active。
+    pub fn new_workspace(&mut self, cols: u16, rows: u16) -> Result<u64> {
+        let tab = TabInstance::spawn(cols, rows).context("new_workspace: spawn shell tab 失败")?;
+        let id = self.alloc_ws_id();
+        self.workspaces.push(Workspace {
+            id,
+            tabs: TabList::new(tab),
+        });
+        Ok(id)
+    }
+
+    /// PTY 吐出的字节喂进对应 tab 的终端状态机 (跨工作区按全局 `tab_id` 定位)。返回
+    /// 喂入后该 tab 的终端是否处于 dirty 状态 (= 该重算快照下发);tab 不存在 (close
+    /// race) 时返 `false`。
     ///
     /// **dirty 真相源 = [`crate::term::TermState`] 的 `dirty`**(经 `is_dirty` /
     /// `clear_dirty` 读写)。`advance` 无条件置脏 (空切片也置),所以对一个**存在
@@ -48,62 +127,53 @@ impl Session {
     /// "内容精确变了"的判定 (term 层不提供后者)。消费方下发快照后用
     /// [`Self::clear_dirty`] 复位,否则 dirty 信号长真、每 tick 重发。
     ///
-    /// **T1 审码记的双标志已收口**:不再写 [`crate::tab::TabInstance::mark_dirty`]。
-    /// `TabInstance.dirty` 是渲染客户端 (`wl/window.rs`) 的 per-tab 累积位;内核
-    /// 快照/下发只认 term 层 dirty,内核路径再写它纯属冗余、且制造"两个真相源"
-    /// 的错觉。**内核侧 dirty 只认 `TermState.dirty` 一个源。**
-    ///
-    /// **Phase 1 范围**:直接 `term.advance`,不做 composer OSC133 扫描
-    /// (inline 补全提示是客户端关注点) 也不做 selection scroll-rebase
-    /// (selection 归客户端,ADR-0015)。
+    /// **dirty 只认 `TermState.dirty` 一个源** (不写 `TabInstance.dirty`,那是渲染
+    /// 客户端 `wl/window.rs` 的 per-tab 累积位,内核路径写它制造"两个真相源"错觉)。
     pub fn on_pty_output(&mut self, tab_id: u64, bytes: &[u8]) -> bool {
-        let Some(idx) = self.idx_by_raw(tab_id) else {
+        let Some((wi, ti)) = self.locate(tab_id) else {
             return false;
         };
-        let Some(tab) = self.tabs.get_mut(idx) else {
+        let Some(tab) = self.workspaces[wi].tabs.get_mut(ti) else {
             return false;
         };
         tab.term_mut().advance(bytes);
         tab.term().is_dirty()
     }
 
-    /// 清掉指定 tab 的 (term 层) dirty 真相源。快照下发后调用,与
+    /// 清掉指定 tab 的 (term 层) dirty 真相源 (跨工作区定位)。快照下发后调用,与
     /// [`Self::on_pty_output`] 的"置脏"对称,防止 dirty 信号长真而重复全量下发。
     /// tab 不存在返 `false`。
     pub fn clear_dirty(&mut self, tab_id: u64) -> bool {
-        let Some(idx) = self.idx_by_raw(tab_id) else {
+        let Some((wi, ti)) = self.locate(tab_id) else {
             return false;
         };
-        let Some(tab) = self.tabs.get_mut(idx) else {
+        let Some(tab) = self.workspaces[wi].tabs.get_mut(ti) else {
             return false;
         };
         tab.term_mut().clear_dirty();
         true
     }
 
-    /// 客户端输入 (键盘 / 粘贴) 写到指定 tab 的 PTY。
+    /// 客户端输入 (键盘 / 粘贴) 写到指定 tab 的 PTY (跨工作区按全局 `tab_id` 定位)。
     ///
     /// **interim 部分写处理(片2 / bug1)**:[`crate::pty::PtyHandle::write`] 是单次
-    /// `libc::write`,非阻塞 PTY 缓冲未空时返 `Ok(n)`(`n < len`,部分写)。旧实现
-    /// `Ok(_) => Ok(())` 把部分计数吞掉 → 大粘贴尾字节**静默丢失**。这里改成**循环写
+    /// `libc::write`,非阻塞 PTY 缓冲未空时返 `Ok(n)`(`n < len`,部分写)。这里**循环写
     /// 剩余**:每次推进 `Ok(n)`,真 `WouldBlock`(内核 PTY 缓冲满)才按既有 daily-drive
     /// 背压策略 warn + 丢剩余,`Ok(0)`(罕见,内核不再收)防死循环退出。把"一发就丢尾"
     /// 改成"尽量写完、只在缓冲真满才丢" → keystroke / 中等粘贴不再丢字节。
     ///
     /// **完整解 deferred(app-wide 硬化)**:超 PTY 内核缓冲的超大粘贴,缓冲满后本调用
-    /// 仍会丢剩余。桌面 `wl/window.rs` 用 `queue_or_write_pty` + 每 tick
-    /// `drain_pending_pty_writes` 把剩余排队、PTY 可写时再 flush 来兜底;daemon 要等价
-    /// 兜底须在 calloop loop 里维护 per-tab pending 缓冲 + PTY WRITE readiness drain
-    /// (app-wide 数据流改动),不在本片做。
+    /// 仍会丢剩余。daemon 要等价兜底须在 calloop loop 里维护 per-tab pending 缓冲 + PTY
+    /// WRITE readiness drain (app-wide 数据流改动),不在本片做。
     ///
     /// `Interrupted`(EINTR)重试本次写;非 `WouldBlock` / `Ok(0)` / `Interrupted` 的
     /// IO 错误上抛。未知 tab_id 报错。
     pub fn on_input(&mut self, tab_id: u64, bytes: &[u8]) -> Result<()> {
-        let Some(idx) = self.idx_by_raw(tab_id) else {
+        let Some((wi, ti)) = self.locate(tab_id) else {
             bail!("on_input: 未知 tab_id {tab_id}");
         };
-        let Some(tab) = self.tabs.get(idx) else {
-            bail!("on_input: tab_id {tab_id} idx {idx} 失效");
+        let Some(tab) = self.workspaces[wi].tabs.get(ti) else {
+            bail!("on_input: tab_id {tab_id} 定位失效");
         };
         let pty = tab.pty();
         let mut written = 0;
@@ -138,46 +208,48 @@ impl Session {
         Ok(())
     }
 
-    /// 应用一条 tab 工作区操作 (新建 / 关闭 / 切换 / 换序 / 重命名)。
-    pub fn apply_tab_op(&mut self, op: TabOp) -> Result<()> {
+    /// 应用一条 tab 工作区操作 (新建 / 关闭 / 切换 / 换序 / 重命名) 到**指定工作区**。
+    /// 未知 `workspace_id` 报错。
+    pub fn apply_tab_op(&mut self, workspace_id: u64, op: TabOp) -> Result<()> {
+        let Some(wi) = self.ws_idx(workspace_id) else {
+            bail!("apply_tab_op: 未知 workspace_id {workspace_id}");
+        };
+        let tabs = &mut self.workspaces[wi].tabs;
         match op {
             TabOp::New => {
                 // 新 tab 跟随当前 active tab 的尺寸 (一个 PTY 一个尺寸,ADR-0015
                 // "主控端定尺寸")。
-                let (cols, rows) = self.tabs.active().term().dimensions();
+                let (cols, rows) = tabs.active().term().dimensions();
                 let tab = TabInstance::spawn(clamp_u16(cols), clamp_u16(rows))?;
-                self.tabs.push(tab);
+                tabs.push(tab);
                 Ok(())
             }
             TabOp::Close { tab_id } => {
-                let Some(idx) = self.idx_by_raw(tab_id) else {
-                    bail!("apply_tab_op Close: 未知 tab_id {tab_id}");
+                let Some(idx) = tabs.iter().position(|t| t.id().raw() == tab_id) else {
+                    bail!("apply_tab_op Close: workspace {workspace_id} 无 tab_id {tab_id}");
                 };
                 // remove 返回 Some(TabInstance),drop 触发 PTY SIGHUP + fd close。
-                self.tabs.remove(idx);
+                tabs.remove(idx);
                 Ok(())
             }
             TabOp::Select { idx } => {
-                if !self.tabs.set_active(idx) {
-                    bail!(
-                        "apply_tab_op Select: idx {idx} 越界 (len={})",
-                        self.tabs.len()
-                    );
+                if !tabs.set_active(idx) {
+                    bail!("apply_tab_op Select: idx {idx} 越界 (len={})", tabs.len());
                 }
                 Ok(())
             }
             TabOp::Reorder { origin, target } => {
-                if !self.tabs.swap_reorder(origin, target) {
+                if !tabs.swap_reorder(origin, target) {
                     bail!("apply_tab_op Reorder: ({origin},{target}) 非法");
                 }
                 Ok(())
             }
             TabOp::SetTitle { tab_id, title } => {
-                let Some(idx) = self.idx_by_raw(tab_id) else {
-                    bail!("apply_tab_op SetTitle: 未知 tab_id {tab_id}");
+                let Some(idx) = tabs.iter().position(|t| t.id().raw() == tab_id) else {
+                    bail!("apply_tab_op SetTitle: workspace {workspace_id} 无 tab_id {tab_id}");
                 };
-                let Some(tab) = self.tabs.get_mut(idx) else {
-                    bail!("apply_tab_op SetTitle: tab_id {tab_id} idx {idx} 失效");
+                let Some(tab) = tabs.get_mut(idx) else {
+                    bail!("apply_tab_op SetTitle: tab_id {tab_id} 定位失效");
                 };
                 tab.set_title(title);
                 Ok(())
@@ -185,31 +257,39 @@ impl Session {
         }
     }
 
-    /// 主控端改尺寸:所有 tab 的 term + PTY 同步 resize (一个工作区一个尺寸)。
-    pub fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
-        for tab in self.tabs.iter_mut() {
+    /// 改尺寸:**指定工作区**所有 tab 的 term + PTY 同步 resize (一个工作区一个尺寸)。
+    /// 未知 `workspace_id` 报错。
+    pub fn resize(&mut self, workspace_id: u64, cols: u16, rows: u16) -> Result<()> {
+        let Some(wi) = self.ws_idx(workspace_id) else {
+            bail!("resize: 未知 workspace_id {workspace_id}");
+        };
+        for tab in self.workspaces[wi].tabs.iter_mut() {
             tab.term_mut().resize(cols as usize, rows as usize);
             tab.pty().resize(cols, rows)?;
         }
         Ok(())
     }
 
-    /// 取指定 tab 的全量渲染快照。tab 不存在返 `None`。
+    /// 取指定 tab 的全量渲染快照 (跨工作区定位,快照带其 `workspace_id`)。tab 不存在返 `None`。
     pub fn snapshot(&self, tab_id: u64) -> Option<Snapshot> {
-        let idx = self.idx_by_raw(tab_id)?;
-        let tab = self.tabs.get(idx)?;
-        Some(snapshot_of(tab))
+        let (wi, ti) = self.locate(tab_id)?;
+        let ws = &self.workspaces[wi];
+        let tab = ws.tabs.get(ti)?;
+        Some(snapshot_of(ws.id, tab))
     }
 
-    /// 取当前 active tab 的全量渲染快照 (tabs 非空不变式保证总有一个)。
+    /// 取 **active 工作区的 active tab** 的全量渲染快照 (非空不变式保证总有一个)。
     pub fn snapshot_active(&self) -> Snapshot {
-        snapshot_of(self.tabs.active())
+        let ws = self.active_ws();
+        snapshot_of(ws.id, ws.tabs.active())
     }
 
-    /// 工作区结构 (tab 条 UI 用)。尺寸取 active tab 的 grid 尺寸。
-    pub fn workspace_info(&self) -> WorkspaceInfo {
-        let (cols, rows) = self.tabs.active().term().dimensions();
-        let tabs = self
+    /// 某工作区结构 (tab 条 UI 用)。尺寸取该工作区 active tab 的 grid 尺寸。未知
+    /// `workspace_id` 返 `None`。
+    pub fn workspace_info(&self, workspace_id: u64) -> Option<WorkspaceInfo> {
+        let ws = self.ws_by_id(workspace_id)?;
+        let (cols, rows) = ws.tabs.active().term().dimensions();
+        let tabs = ws
             .tabs
             .iter()
             .map(|t| TabMeta {
@@ -217,25 +297,70 @@ impl Session {
                 title: t.title(),
             })
             .collect();
-        WorkspaceInfo {
+        Some(WorkspaceInfo {
+            workspace_id: ws.id,
             tabs,
-            active: self.tabs.active_idx(),
+            active: ws.tabs.active_idx(),
             cols,
             rows,
+        })
+    }
+
+    /// 全部工作区摘要列表 (连上下发 / 工作区增删 / 切 active 时再发)。每个工作区
+    /// 标题摘要取其 active tab 标题。
+    pub fn workspace_list(&self) -> WorkspaceList {
+        let active_id = self.active_ws().id;
+        let workspaces = self
+            .workspaces
+            .iter()
+            .map(|w| WorkspaceMeta {
+                id: w.id,
+                title: w.tabs.active().title(),
+                tab_count: w.tabs.len(),
+                active: w.id == active_id,
+            })
+            .collect();
+        WorkspaceList {
+            workspaces,
+            active: active_id,
         }
     }
 
-    /// raw `u64` → tab idx。`TabId` 字段私有 (INV-010) 不能从 `u64` 重建,
-    /// 故协议层 `u64` 入参靠线性扫 `id().raw()` 定位 (tab 数 daily-drive 个位数,
-    /// O(n) 无所谓)。
-    fn idx_by_raw(&self, tab_id: u64) -> Option<usize> {
-        self.tabs.iter().position(|t| t.id().raw() == tab_id)
+    /// active 工作区引用 (非空不变式)。
+    fn active_ws(&self) -> &Workspace {
+        &self.workspaces[self.active]
+    }
+
+    fn active_ws_mut(&mut self) -> &mut Workspace {
+        &mut self.workspaces[self.active]
+    }
+
+    /// workspace_id → workspaces 下标。
+    fn ws_idx(&self, ws_id: u64) -> Option<usize> {
+        self.workspaces.iter().position(|w| w.id == ws_id)
+    }
+
+    fn ws_by_id(&self, ws_id: u64) -> Option<&Workspace> {
+        self.ws_idx(ws_id).map(|i| &self.workspaces[i])
+    }
+
+    /// 全局 `tab_id` → `(工作区下标, tab 下标)`。`TabId` 字段私有 (INV-010) 不能从
+    /// `u64` 重建 + tab id 全局唯一,故跨工作区线性扫 `id().raw()` 定位 (工作区×tab
+    /// 数 daily-drive 都个位数,O(n) 无所谓)。
+    fn locate(&self, tab_id: u64) -> Option<(usize, usize)> {
+        for (wi, w) in self.workspaces.iter().enumerate() {
+            if let Some(ti) = w.tabs.iter().position(|t| t.id().raw() == tab_id) {
+                return Some((wi, ti));
+            }
+        }
+        None
     }
 }
 
-/// 把一个 tab 的当前终端状态拍成 [`Snapshot`]。`cells` / `row_texts` / `cursor`
-/// 直接对应 `render_headless` 入参 (`wl/render.rs:4310`),客户端拿到即可独立渲染。
-fn snapshot_of(tab: &TabInstance) -> Snapshot {
+/// 把一个 tab 的当前终端状态拍成 [`Snapshot`](带其所属 `workspace_id`)。`cells` /
+/// `row_texts` / `cursor` 直接对应 `render_headless` 入参 (`wl/render.rs:4310`),
+/// 客户端拿到即可独立渲染。
+fn snapshot_of(workspace_id: u64, tab: &TabInstance) -> Snapshot {
     let term = tab.term();
     let (cols, rows) = term.dimensions();
     let cells: Vec<CellWire> = term.cells_iter().map(CellWire::from).collect();
@@ -248,6 +373,7 @@ fn snapshot_of(tab: &TabInstance) -> Snapshot {
         shape: term.cursor_shape().into(),
     };
     Snapshot {
+        workspace_id,
         tab_id: tab.id().raw(),
         cols,
         rows,
@@ -270,23 +396,25 @@ mod tests {
     use super::*;
     use crate::tab::TabRegistry;
 
-    /// 建一个含单个 for_test tab 的 Session (不 spawn 真 shell,纯内核逻辑)。
+    /// 建一个含单个 for_test tab 的单工作区 Session (不 spawn 真 shell,纯内核逻辑)。
     fn session_one_tab() -> Session {
         TabRegistry::reset_for_test();
         let tab = TabInstance::for_test("shell");
         Session::new(TabList::new(tab))
     }
 
-    /// `on_pty_output` 把字节喂进 term,快照能读回内容,且返回 dirty。
+    /// `on_pty_output` 把字节喂进 term,快照能读回内容,且返回 dirty。快照带 workspace_id。
     #[test]
     fn on_pty_output_feeds_term_and_snapshot_reflects() {
         let mut s = session_one_tab();
+        let ws_id = s.active_workspace_id();
         let id = s.tabs().active().id().raw();
         let dirty = s.on_pty_output(id, b"hi");
         assert!(dirty, "advance 后 tab 应 dirty");
 
         let snap = s.snapshot(id).expect("snapshot of known tab");
         assert_eq!(snap.tab_id, id);
+        assert_eq!(snap.workspace_id, ws_id, "快照应带所属工作区 id");
         // (0,0) / (0,1) cell 应是 'h' / 'i'
         let c00 = snap
             .cells
@@ -316,59 +444,73 @@ mod tests {
         assert!(s.on_input(9999, b"x").is_err());
     }
 
-    /// apply_tab_op:New 增 tab,Select 切 active,Reorder 换序,Close 减 tab。
+    /// apply_tab_op:New 增 tab,Select 切 active,Reorder 换序,Close 减 tab (寻址到工作区)。
     #[test]
     fn apply_tab_op_new_select_reorder_close() {
         let mut s = session_one_tab();
+        let ws = s.active_workspace_id();
         let first = s.tabs().active().id().raw();
         assert_eq!(s.tabs().len(), 1);
 
         // New (spawn 真 shell — CI 环境必备,同既有 tab 测试)
-        s.apply_tab_op(TabOp::New).expect("New");
+        s.apply_tab_op(ws, TabOp::New).expect("New");
         assert_eq!(s.tabs().len(), 2);
         let second = s.tabs().iter().nth(1).expect("2nd tab").id().raw();
         assert_ne!(first, second);
 
         // Select idx 1
-        s.apply_tab_op(TabOp::Select { idx: 1 }).expect("Select");
+        s.apply_tab_op(ws, TabOp::Select { idx: 1 })
+            .expect("Select");
         assert_eq!(s.tabs().active_idx(), 1);
         // 越界 Select 报错
-        assert!(s.apply_tab_op(TabOp::Select { idx: 99 }).is_err());
+        assert!(s.apply_tab_op(ws, TabOp::Select { idx: 99 }).is_err());
 
         // Reorder 0<->1
-        s.apply_tab_op(TabOp::Reorder {
-            origin: 0,
-            target: 1,
-        })
+        s.apply_tab_op(
+            ws,
+            TabOp::Reorder {
+                origin: 0,
+                target: 1,
+            },
+        )
         .expect("Reorder");
         // active 跟随 id 锁定 (换序后仍指向原 active tab)
         assert_eq!(s.tabs().active().id().raw(), second);
 
         // Close first
-        s.apply_tab_op(TabOp::Close { tab_id: first })
+        s.apply_tab_op(ws, TabOp::Close { tab_id: first })
             .expect("Close");
         assert_eq!(s.tabs().len(), 1);
-        assert!(s.apply_tab_op(TabOp::Close { tab_id: 4242 }).is_err());
+        assert!(s.apply_tab_op(ws, TabOp::Close { tab_id: 4242 }).is_err());
+
+        // 未知 workspace 报错
+        assert!(s.apply_tab_op(999_999, TabOp::New).is_err());
     }
 
-    /// SetTitle 改标题,workspace_info 反映。
+    /// SetTitle 改标题,workspace_info 反映;workspace_info 带 workspace_id。
     #[test]
     fn set_title_and_workspace_info() {
         let mut s = session_one_tab();
+        let ws_id = s.active_workspace_id();
         let id = s.tabs().active().id().raw();
-        s.apply_tab_op(TabOp::SetTitle {
-            tab_id: id,
-            title: "renamed".to_string(),
-        })
+        s.apply_tab_op(
+            ws_id,
+            TabOp::SetTitle {
+                tab_id: id,
+                title: "renamed".to_string(),
+            },
+        )
         .expect("SetTitle");
-        let ws = s.workspace_info();
+        let ws = s.workspace_info(ws_id).expect("workspace_info");
+        assert_eq!(ws.workspace_id, ws_id);
         assert_eq!(ws.tabs.len(), 1);
         assert_eq!(ws.tabs[0].title, "renamed");
         assert_eq!(ws.active, 0);
+        // 未知工作区返 None
+        assert!(s.workspace_info(424_242).is_none());
     }
 
-    /// dirty 真相源单一性 (T2 收口双标志):on_pty_output 置脏 → clear_dirty
-    /// 复位 → 再 advance 又置脏。内核侧 dirty 只有 term 层这一个源被读写。
+    /// dirty 真相源单一性:on_pty_output 置脏 → clear_dirty 复位 → 再 advance 又置脏。
     #[test]
     fn dirty_truth_source_set_and_clear() {
         let mut s = session_one_tab();
@@ -387,5 +529,58 @@ mod tests {
 
         // 未知 tab:clear 返 false。
         assert!(!s.clear_dirty(9999));
+    }
+
+    /// 多 workspace:new_workspace 增工作区、各持独立 tab;按全局 tab_id 跨工作区
+    /// 定位正确 (快照带各自 workspace_id);workspace_list 列出全部 + 标 active。
+    #[test]
+    fn multi_workspace_isolation_and_list() {
+        let mut s = session_one_tab();
+        let ws1 = s.active_workspace_id();
+        let tab1 = s.tabs().active().id().raw();
+        assert_eq!(s.workspace_count(), 1);
+
+        // 新建第二个工作区 (spawn 真 shell — CI 环境必备)。
+        let ws2 = s.new_workspace(80, 24).expect("new_workspace");
+        assert_ne!(ws1, ws2, "工作区 id 应唯一");
+        assert_eq!(s.workspace_count(), 2);
+        // new_workspace 不改 active
+        assert_eq!(s.active_workspace_id(), ws1);
+
+        // 第二个工作区的 tab id 与第一个不同;切过去取它的 tab。
+        assert!(s.set_active_workspace(ws2));
+        let tab2 = s.tabs().active().id().raw();
+        assert_ne!(tab1, tab2);
+
+        // 喂字节到各工作区的 tab,跨工作区按全局 tab_id 定位,快照带正确 workspace_id。
+        assert!(s.on_pty_output(tab1, b"in-ws1"));
+        assert!(s.on_pty_output(tab2, b"in-ws2"));
+        let snap1 = s.snapshot(tab1).expect("snap tab1");
+        let snap2 = s.snapshot(tab2).expect("snap tab2");
+        assert_eq!(snap1.workspace_id, ws1);
+        assert_eq!(snap2.workspace_id, ws2);
+        assert!(snap1.row_texts[0].starts_with("in-ws1"));
+        assert!(snap2.row_texts[0].starts_with("in-ws2"));
+
+        // workspace_list:两个工作区,active 标在当前 active (ws2)。
+        let list = s.workspace_list();
+        assert_eq!(list.workspaces.len(), 2);
+        assert_eq!(list.active, ws2);
+        let m2 = list
+            .workspaces
+            .iter()
+            .find(|m| m.id == ws2)
+            .expect("ws2 in list");
+        assert!(m2.active, "active 工作区应标 active");
+        let m1 = list
+            .workspaces
+            .iter()
+            .find(|m| m.id == ws1)
+            .expect("ws1 in list");
+        assert!(!m1.active);
+        assert_eq!(s.workspace_ids().len(), 2);
+
+        // 未知工作区切换返 false。
+        assert!(!s.set_active_workspace(7_777_777));
     }
 }

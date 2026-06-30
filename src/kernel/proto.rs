@@ -137,6 +137,9 @@ pub struct CursorWire {
 /// `title` 画标题栏。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
+    /// 所属工作区 id (T6 多 workspace:标识此快照属于哪个工作区,与
+    /// [`WorkspaceMeta::id`] / [`WorkspaceInfo::workspace_id`] 对齐)。
+    pub workspace_id: u64,
     /// 来源 tab 的 [`crate::tab::TabId::raw`] (协议层用 `u64`,不暴露 newtype)。
     pub tab_id: u64,
     pub cols: usize,
@@ -160,10 +163,13 @@ pub struct TabMeta {
 /// 工作区整体结构 (tab 列表 + active + 当前尺寸)。连接时与 tab 增删 / 换序 /
 /// 重命名时下发,让客户端画 tab 条。
 ///
-/// **T6 砖0 块B**: 将加 `workspace_id` 字段标识所属工作区 (与 [`WorkspaceMeta::id`]
-/// 对齐),随 Session 多 workspace 重构一起接入 (那时才有真 id 可填)。
+/// **`workspace_id`(T6 多 workspace 维度)**: 一个内核 [`crate::kernel::Session`]
+/// 持多个工作区,本结构描述**其中一个**;`workspace_id` 标识是哪一个,与
+/// [`WorkspaceMeta::id`] / [`Snapshot::workspace_id`] 对齐。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceInfo {
+    /// 所属工作区 id (T6:一个 Session 多工作区,标识是哪个)。
+    pub workspace_id: u64,
     pub tabs: Vec<TabMeta>,
     pub active: usize,
     pub cols: usize,
@@ -270,6 +276,7 @@ mod tests {
     #[test]
     fn snapshot_json_roundtrip_is_lossless() {
         let snap = Snapshot {
+            workspace_id: 1,
             tab_id: 7,
             cols: 3,
             rows: 2,
@@ -380,6 +387,7 @@ mod tests {
     fn server_messages_json_roundtrip() {
         let msgs = vec![
             ServerMsg::Workspace(WorkspaceInfo {
+                workspace_id: 3,
                 tabs: vec![TabMeta {
                     tab_id: 11,
                     title: "sh".to_string(),
