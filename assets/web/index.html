@@ -266,11 +266,191 @@ function reflowLineDiv(ll) {
   return div;
 }
 
-// 整屏重排:逻辑行 → DOM 片段 → 一次性换入 #reflow(增量3 会在此插入表格探测)。
+// ── A′ 增量3:表格 widget(可横滑、列对齐保留,**绝不 cram-reflow**)─────────────────
+// 在逻辑行上探测表格:① 带框(│─┼┌┐ 等)确定性解析;② 无框但多行列对齐的启发式(连续行
+// 在相同列位置有 ≥2 空格分隔)。命中 → <table> 包在 overflow-x:auto 容器(列对齐保留、表内
+// 横滑)。探不出结构的 2D → 退回逐行重排(忠实保底永远一键可回)。
+const VBAR = new Set(["│", "║", "┃", "|"]);
+const HBARISH = new Set(["─", "━", "═", "┄", "┅", "┈", "┉", "╌", "╍", "-", "="]);
+const JUNCT = new Set(["┼", "┿", "╪", "╋", "╬", "┤", "├", "┬", "┴", "┌", "┐", "└", "┘",
+  "╔", "╗", "╚", "╝", "╠", "╣", "╦", "╩", "╭", "╮", "╯", "╰", "╞", "╡", "╥", "╨", "+"]);
+const BORDER = new Set([...VBAR, ...HBARISH, ...JUNCT]);
+
+function isBlankLine(ll) {
+  if (ll.cells.length === 0) return true;
+  for (let c = 0; c < ll.text.length; c++) if (ll.text[c] !== " ") return false;
+  return true;
+}
+function hasVBar(text) { for (let c = 0; c < text.length; c++) if (VBAR.has(text[c])) return true; return false; }
+// 横线/边框规则行:非空、非空白字符全在 BORDER 集、且含 ≥1 横线类字符(排除"纯竖线+空格"
+// 的空内容行被误判成规则行)+ ≥3 个边框字符(排除偶发单字符)。
+function isRuleRow(text) {
+  const t = text.trim();
+  if (t.length < 3) return false;
+  let nb = 0, hbar = 0;
+  for (const ch of t) {
+    if (ch === " ") continue;
+    if (!BORDER.has(ch)) return false;
+    nb++;
+    if (HBARISH.has(ch)) hbar++;
+  }
+  return nb >= 3 && hbar >= 1;
+}
+
+// 带框表格块:从 i 起最大连续"表格行"(含竖线 或 是规则行)的区间 [i, end);需 ≥1 含竖线的
+// 内容行 + (≥2 内容行 或 ≥1 规则行)。不满足返 -1。
+function borderedTableEnd(lines, i) {
+  let j = i, content = 0, rule = 0;
+  while (j < lines.length) {
+    if (isBlankLine(lines[j])) break;
+    const t = lines[j].text;
+    const vbar = hasVBar(t), rl = isRuleRow(t);
+    if (!vbar && !rl) break;
+    if (vbar) content++; else rule++;
+    j++;
+  }
+  if (content >= 1 && (content >= 2 || rule >= 1)) return j;
+  return -1;
+}
+
+// 一行按竖线位置切出列范围 [start,end)(竖线本身不含);丢掉外框造成的首/尾空白段。
+function vbarColumns(ll) {
+  const text = ll.text;
+  const segs = [];
+  let prev = 0;
+  for (let c = 0; c < text.length; c++) {
+    if (VBAR.has(text[c])) { segs.push([prev, c]); prev = c + 1; }
+  }
+  segs.push([prev, text.length]);
+  const ws = (a, b) => { for (let c = a; c < b; c++) if ((ll.cols[c] || " ") !== " ") return false; return true; };
+  if (segs.length && ws(segs[0][0], segs[0][1])) segs.shift();
+  if (segs.length && ws(segs[segs.length - 1][0], segs[segs.length - 1][1])) segs.pop();
+  return segs.length ? segs : [[0, text.length]];
+}
+
+// 无框对齐表格启发式:[i,end) 是一段无空行的连续行;≥3 行、存在【所有行都是空白】的内部
+// 列(宽 ≥2 = 列分隔,区别于散文的单空格词距),且 ≥60% 行在 ≥2 列里有内容(真二维表,
+// 非偶合)。命中返列范围数组,否则 null。
+function unborderedColumns(lines, i, end) {
+  const rows = [];
+  for (let k = i; k < end; k++) rows.push(lines[k].text);
+  if (rows.length < 3) return null;
+  let maxW = 0;
+  for (const r of rows) if (r.length > maxW) maxW = r.length;
+  if (maxW < 3) return null;
+  const at = (r, c) => (c < r.length ? r[c] : " ");
+  const isGap = new Array(maxW);
+  for (let c = 0; c < maxW; c++) {
+    let g = true;
+    for (const r of rows) if (at(r, c) !== " ") { g = false; break; }
+    isGap[c] = g;
+  }
+  const seps = [];
+  let c = 0;
+  while (c < maxW) {
+    if (!isGap[c]) { c++; continue; }
+    const s = c;
+    while (c < maxW && isGap[c]) c++;
+    if (c - s >= 2) {
+      let before = false, after = false;
+      for (let k = 0; k < s; k++) if (!isGap[k]) { before = true; break; }
+      for (let k = c; k < maxW; k++) if (!isGap[k]) { after = true; break; }
+      if (before && after) seps.push([s, c]);
+    }
+  }
+  if (seps.length < 1) return null;
+  const cols = [];
+  let prev = 0;
+  for (const [s, e] of seps) { cols.push([prev, s]); prev = e; }
+  cols.push([prev, maxW]);
+  if (cols.length < 2) return null;
+  let good = 0;
+  for (const r of rows) {
+    let nonEmpty = 0;
+    for (const [s, e] of cols) {
+      let has = false;
+      for (let cc = s; cc < e; cc++) if (at(r, cc) !== " ") { has = true; break; }
+      if (has) nonEmpty++;
+    }
+    if (nonEmpty >= 2) good++;
+  }
+  return good >= Math.ceil(rows.length * 0.6) ? cols : null;
+}
+
+// 在 cells[a,b) 内去掉首尾空白后渲染进单元格(列对齐靠 <td> + white-space:pre,内部空格保留)。
+function appendTrimmedCell(parent, ll, a, b) {
+  let s = a, e = Math.min(b, ll.cells.length);
+  while (s < e && (ll.cols[s] || " ") === " ") s++;
+  while (e > s && (ll.cols[e - 1] || " ") === " ") e--;
+  if (s < e) appendRuns(parent, ll.cells, s, e);
+  else parent.appendChild(document.createTextNode(""));
+}
+function wrapTable(tbl) {
+  const wrap = document.createElement("div");
+  wrap.className = "tbl-wrap";
+  wrap.appendChild(tbl);
+  return wrap;
+}
+function buildBorderedTable(lines, i, end) {
+  let headerRow = -1, c0 = -1;
+  for (let k = i; k < end; k++) if (hasVBar(lines[k].text)) { c0 = k; break; }
+  if (c0 >= 0) {
+    for (let k = c0 + 1; k < end; k++) {
+      if (hasVBar(lines[k].text)) break;            // 先遇到内容行 → 无 header 规则线
+      if (isRuleRow(lines[k].text)) { headerRow = c0; break; }
+    }
+  }
+  const tbl = document.createElement("table");
+  for (let k = i; k < end; k++) {
+    const ll = lines[k];
+    if (isRuleRow(ll.text) && !hasVBar(ll.text)) continue;   // 跳过纯规则行
+    const tr = document.createElement("tr");
+    for (const [a, b] of vbarColumns(ll)) {
+      const td = document.createElement(k === headerRow ? "th" : "td");
+      appendTrimmedCell(td, ll, a, b);
+      tr.appendChild(td);
+    }
+    tbl.appendChild(tr);
+  }
+  return wrapTable(tbl);
+}
+function buildUnborderedTable(lines, i, end, cols) {
+  const tbl = document.createElement("table");
+  for (let k = i; k < end; k++) {
+    const ll = lines[k];
+    const tr = document.createElement("tr");
+    for (const [a, b] of cols) {
+      const td = document.createElement("td");
+      appendTrimmedCell(td, ll, a, b);
+      tr.appendChild(td);
+    }
+    tbl.appendChild(tr);
+  }
+  return wrapTable(tbl);
+}
+
+// 整屏重排:逐逻辑行流式发出 —— 空行 / 带框表格 / 无框对齐表格 / 退回逐行重排。
 function renderReflow() {
   const lines = buildLogicalLines();
   const frag = document.createDocumentFragment();
-  for (let i = 0; i < lines.length; i++) frag.appendChild(reflowLineDiv(lines[i]));
+  let i = 0;
+  while (i < lines.length) {
+    if (isBlankLine(lines[i])) { frag.appendChild(reflowLineDiv(lines[i])); i++; continue; }
+    const be = borderedTableEnd(lines, i);   // 带框表格优先(确定性)
+    if (be > i) { frag.appendChild(buildBorderedTable(lines, i, be)); i = be; continue; }
+    let j = i;                               // 最大连续非空行段
+    while (j < lines.length && !isBlankLine(lines[j])) j++;
+    const cols = unborderedColumns(lines, i, j);
+    if (cols) { frag.appendChild(buildUnborderedTable(lines, i, j, cols)); i = j; continue; }
+    // 段内可能含【散文后紧跟的带框表格】(无空行分隔)→ 逐行走,带框处再拦一次。
+    let k = i;
+    while (k < j) {
+      const b2 = borderedTableEnd(lines, k);
+      if (b2 > k) { frag.appendChild(buildBorderedTable(lines, k, b2)); k = b2; }
+      else { frag.appendChild(reflowLineDiv(lines[k])); k++; }
+    }
+    i = j;
+  }
   swapReflow(frag);
 }
 
