@@ -107,6 +107,8 @@ tty 时代单 stream 限制的产物, Wayland 窗口能开无数, 在 GUI 终端
   - **`/usr/local/bin/quill`(root,系统级)= 稳定日用** —— 桌面图标 Exec 指它;**只在某版【证实稳了】才 `sudo install` 提升上来**(图标传不了 `--share`,日用就是普通终端)。
   - **`~/.local/bin/quill`(用户级,shell `which quill`)= 测试** —— AI 每次重编装这里(**免 sudo**),shell 里 `quill` / `quill --share` 跑最新、不碰日用稳定版。
   - 测共享:shell 跑 `quill --share`(起隔离 `quill-kernel` 子绑 `0.0.0.0:7878`)→ 手机经 VPN `http://10.0.0.2:7878/`(本机 LAN=10.0.0.2,VPN 把门)。⚠️ `quill --share` 找 `quill-kernel` 是【同目录 sibling】→ 装 quill 必同时装 quill-kernel 到同一 bin 目录。
+- 🚧 **共享开关(运行期 toggle,在飞 `feat/share-toggle`)**:标题栏按钮 + `Ctrl+Shift+S` 运行期开/关共享(抽 ShareChild spawn/teardown 成 `toggle_share`),替代"第二个图标"那个烂招(合后删 `~/.local/share/applications/quill-share.desktop`)。碰 render.rs(标题栏)。
+- **砖2(待做):手机端 tab/工作区管理** —— 现手机只镜像+控焦点 tab,没法新建/关闭/切换。协议早备(砖0 的 `ClientMsg::TabOp` + `ServerMsg::Workspaces/WorkspaceInfo/TabMeta`)但端到端没接:① web 客户端没标签栏 UI(也没渲 Workspaces/TabMeta)② 父↔子 back-channel 只跑 Input 帧、缺 TabOp 帧 ③ 子 `handle_client_msg` TabOp 显式没接线 + **E′ 里 tab 归桌面父** → 链路须 `手机→WS→子→back-channel(新增 TabOp 帧)→父执行 TabOp→广播新 Workspaces→手机刷新`。= R1"连上同步全部工作区"那半。与共享开关同动 window.rs/web → **串行做**。
 - **T7** web"X 关闭"语义 / PWA 壳(+ 登录 token)→ **硬化**(真网格关键帧替字节尾、bincode、带宽)。
 **⚠️ 凡碰 render/wl 的 ticket(砖1 起),impl/审码 agent 必须自己逐行读 `wl/render.rs`、`wl/window.rs` draw 路径,别信摘要。**
 **⏱️ CI:`ci.sh --fast`(fmt+clippy+build)≈17s 增量;全门 ≈12–25min(33 测里 28 个是 GPU/wl e2e、串行,有一个 e2e binary 单独 ~12min)。kernel 砖改动【不影响】那 28 个 → 可只跑快门 + kernel/pty/ws 测子集(<1min);加 `ci.sh --kernel` 模式是省时选项(暂未做)。**
