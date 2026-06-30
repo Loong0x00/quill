@@ -19,6 +19,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, Instant};
 
@@ -543,5 +544,152 @@ fn daemon_reaps_stuck_handshake_connection() {
     assert!(
         reclaimed,
         "卡握手连接应在 handshake_deadline 后被收割(读到 EOF/RST),实际 read={r:?}"
+    );
+}
+
+/// 在已连 socket 上设极小 SO_RCVBUF:节流 TCP 接收窗口(令在飞字节远小于资产大小,使
+/// "永不读 → 写源 WouldBlock 挂住"确定性成立),同时忠实复刻 slowloris-read 的小窗口手法。
+fn set_rcvbuf(stream: &TcpStream, bytes: i32) {
+    let fd = stream.as_raw_fd();
+    let val = bytes;
+    // SAFETY: setsockopt 只读栈上一个 c_int 的 size_of 字节(只读不写),fd 来自活着的 TcpStream;
+    // 返回值忽略(尽力而为,clamp 到内核下限也无妨)。tests crate 无 deny(unsafe_code)。
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            std::ptr::addr_of!(val).cast::<libc::c_void>(),
+            std::mem::size_of::<i32>() as libc::socklen_t,
+        );
+    }
+}
+
+/// 拆 HTTP 响应:返回 (Content-Length 头声明值, 实际收到的 body 字节数)。在**原始字节**上
+/// 找 `\r\n\r\n`(body 长度不受 UTF-8 lossy 影响),头部按 ASCII 解析 Content-Length。
+fn split_http(resp: &[u8]) -> (usize, usize) {
+    let sep = match resp.windows(4).position(|w| w == b"\r\n\r\n") {
+        Some(i) => i,
+        None => return (0, 0),
+    };
+    let body_len = resp.len() - (sep + 4);
+    let headers = String::from_utf8_lossy(&resp[..sep]);
+    let content_length = headers
+        .lines()
+        .find_map(|l| {
+            let l = l.trim();
+            if l.to_ascii_lowercase().starts_with("content-length:") {
+                l.split(':')
+                    .nth(1)
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+    (content_length, body_len)
+}
+
+/// HTTP 响应写源超时收割(must-fix):客户端发**完整** GET 请求(大资产 `/vendor/xterm.js`
+/// ~283KB,远超内核收发缓冲)却**通告极小 TCP 窗口 + 永不读响应**(slowloris-read)。daemon
+/// 在 dup fd 上建了非阻塞写源发响应,写满内核 send 缓冲后恒 `WouldBlock` 挂着 —— 该写源在
+/// 分流时已被摘出 `clients`(不受 `MAX_WS_CONNS` 限、握手收割也扫不到),且 `WouldBlock` 时
+/// 回调不再被派发(fd 不可写 → Level 不触发),只能靠收割 Timer 兜底。
+///
+/// **确定性判据**:env 注入短 deadline(600ms)+ 短扫描(200ms);客户端设极小 SO_RCVBUF
+/// 节流(令在飞字节 << 283KB)且在 deadline 窗口内**完全不读**;窗口过后再排空整条连接到
+/// 关闭,断言收到的 body **短于 Content-Length**(被收割截断)。若没收割(回归):客户端排空
+/// 时 daemon 写源恢复 → 发完整 283KB → body == Content-Length(断言失败,逮住回归)。
+#[test]
+fn daemon_reaps_unread_http_response_writer() {
+    let dir = std::env::temp_dir().join(format!("quill-http-reap-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("建临时目录");
+    let sock = dir.join("kernel.sock");
+    let shell = dir.join("shell.sh");
+    write_quiet_shell(&shell); // daemon 空闲,不干扰
+    let port = free_port();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_quill-kernel"))
+        .arg(format!("--socket={}", sock.display()))
+        .arg(format!("--ws-bind=127.0.0.1:{port}"))
+        .env("SHELL", &shell)
+        .env("RUST_LOG", "quill=warn")
+        .env("QUILL_WS_REAP_MS", "200")
+        .env("QUILL_WS_HTTP_WRITE_DEADLINE_MS", "600")
+        .spawn()
+        .expect("spawn quill-kernel daemon");
+
+    let cleanup = |child: &mut std::process::Child, dir: &std::path::Path| {
+        send_signal(child.id(), libc::SIGTERM);
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(dir);
+    };
+
+    let mut stream = match connect_tcp(port, Duration::from_secs(15)) {
+        Some(s) => s,
+        None => {
+            cleanup(&mut child, &dir);
+            panic!("15s 内无法连上 daemon");
+        }
+    };
+    // 极小接收窗口:节流传输 → 在飞字节 << 283KB(确定性 partial)+ 复刻 slowloris-read 小窗口。
+    set_rcvbuf(&stream, 4096);
+
+    // 发完整请求(含结尾 \r\n\r\n),请求大资产 xterm.js(283KB > 内核 send 缓冲 → 必 WouldBlock)。
+    if stream
+        .write_all(b"GET /vendor/xterm.js HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .is_err()
+    {
+        cleanup(&mut child, &dir);
+        panic!("写 GET 请求失败");
+    }
+    let _ = stream.flush();
+
+    // deadline 窗口内完全不读:daemon 写满内核缓冲后写源恒 WouldBlock 挂着。
+    // deadline 600ms + 扫描 200ms → ~1s 内被收割;睡 1.5s 留足余量。
+    std::thread::sleep(Duration::from_millis(1500));
+
+    // 现在排空整条连接到关闭(短读超时反复读直到 EOF/RST 或总 deadline)。
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+    let mut resp: Vec<u8> = Vec::new();
+    let mut closed = false;
+    let overall = Instant::now() + Duration::from_secs(15);
+    let mut buf = [0u8; 8192];
+    while Instant::now() < overall {
+        match stream.read(&mut buf) {
+            Ok(0) => {
+                closed = true; // FIN:被收割(或回归路径发完整后正常关)
+                break;
+            }
+            Ok(n) => resp.extend_from_slice(&buf[..n]),
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue; // 暂无新数据:继续等到关闭 / deadline
+            }
+            Err(_) => {
+                closed = true; // RST 等也算关闭
+                break;
+            }
+        }
+    }
+
+    cleanup(&mut child, &dir);
+
+    let (content_length, body_len) = split_http(&resp);
+    assert!(
+        content_length > 0,
+        "应收到含 Content-Length 的响应头;实际收到 {} 字节",
+        resp.len()
+    );
+    assert!(
+        closed,
+        "永不读的 HTTP 客户端最终应被 daemon 关闭(收割写源 + 关 dup fd)"
+    );
+    assert!(
+        body_len < content_length,
+        "HTTP 写源应在 http_write_deadline 后被收割 → 响应被截断 \
+         (收到 body {body_len} < Content-Length {content_length});\
+         若 body == Content-Length 说明没收割(写源恢复发完整响应 = slowloris-read 回归)"
     );
 }

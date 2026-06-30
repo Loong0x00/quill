@@ -36,6 +36,11 @@
 //!   robust against slowloris 蚂蚁搬家)的连接;**live 连接不在收割列**(健康空闲会被误杀),
 //!   其网络静默掉线(无 FIN/RST)的半开态靠 accept 时设的 `SO_KEEPALIVE` 探活 → 内核报错 →
 //!   READ 源走既有 EOF/错误回收路径。
+//! - **卡死 HTTP 响应写源收割**:同一个 [`Timer`] 还扫 [`DaemonData::http_writers`],回收超
+//!   `http_write_deadline` 仍没把响应写完(drain)的 HTTP 写源。HTTP 分支建写源前已把连接摘出
+//!   `clients`(写源既不受 [`MAX_WS_CONNS`] 限、上面那支握手收割也扫不到),且写源 `WouldBlock`
+//!   时回调不再被派发(fd 不可写 → Level 不触发,无法靠写回调自查超时)→ **必须** Timer 兜底,
+//!   否则 slowloris-read(要了大页却永不读 / 通告极小窗口)的写源 + dup fd 永挂 → 堆爆。
 //!
 //! **仍留后续 ticket**:多 tab 动态增删 + 输入按 tab 寻址 + resize 协商(T6)。
 
@@ -115,6 +120,24 @@ const REAP_INTERVAL_MS: u64 = 5_000;
 /// 连接从 accept 起必须在此期限内完成握手(转 Live),否则被收割。绝对期限(非"距上次
 /// 活动"),故 slowloris 蚂蚁搬家式逐字节拖延也逃不掉。正常握手 ms 级,10s 极宽松。
 const HANDSHAKE_DEADLINE_MS: u64 = 10_000;
+
+/// HTTP 响应写源从建立起必须在此期限内把响应写完(drain),否则被收割 Timer 回收。绝对
+/// 期限(非"距上次写进度"),故 slowloris-read(要了大页却永不读响应 / 通告极小 TCP 窗口)
+/// 让写源恒 `WouldBlock` 挂着也逃不掉。正常浏览器 ms 级读完即 drain 自删,10s 极宽松,只杀
+/// 真卡死的。**为何也要它**:HTTP 分支在建写源前已把连接从 `clients` 摘掉 → 写源既不受
+/// `MAX_WS_CONNS` 限、握手收割也扫不到;且写源 `WouldBlock` 时回调根本不再被派发(fd 不可写
+/// → Level 不触发),无法靠"写回调里自查超时"兜底,必须靠独立 Timer 扫。
+const HTTP_WRITE_DEADLINE_MS: u64 = 10_000;
+
+/// HTTP 响应 socket 的 send 缓冲上限(`setsockopt SO_SNDBUF`)。**双重作用**:① 把单条慢/恶意
+/// HTTP 客户端能钉住的内核 send 内存从默认自动调优上限(`net.ipv4.tcp_wmem` max,常达数 MB)
+/// 压到几十 KB;② 让大响应(如 ~283KB 的 xterm.js)发给"永不读"的客户端时 `write` 真的撞
+/// `WouldBlock` 滞留 —— 否则整页一次性灌进内核的大 send 缓冲 → 写源立刻 drain 自删,反把上面
+/// 那个写超时收割**绕过**(资源转移到内核滞留 socket,收割 Timer 看不见)。压小后写源真卡住 →
+/// 可见 → 被 `http_write_deadline` 收割回收 fd + 内核缓冲。**只影响一次性静态页下发**(WS
+/// 字节流直播走各连接自己的 socket,不受此限),localhost/VPN 下 283KB 页仍亚秒级加载,无感。
+/// 内核会把设定值翻倍并夹到 `SOCK_MIN_SNDBUF` 以上;16KiB 远小于最大资产 → 必触 `WouldBlock`。
+const HTTP_SEND_BUF_BYTES: libc::c_int = 16 * 1024;
 
 /// daemon 启动参数。
 pub struct DaemonConfig {
@@ -223,6 +246,8 @@ pub fn run(config: DaemonConfig) -> Result<()> {
     let reap_interval = duration_from_env("QUILL_WS_REAP_MS", REAP_INTERVAL_MS);
     let handshake_deadline =
         duration_from_env("QUILL_WS_HANDSHAKE_DEADLINE_MS", HANDSHAKE_DEADLINE_MS);
+    let http_write_deadline =
+        duration_from_env("QUILL_WS_HTTP_WRITE_DEADLINE_MS", HTTP_WRITE_DEADLINE_MS);
 
     let mut data = DaemonData {
         session,
@@ -233,6 +258,9 @@ pub fn run(config: DaemonConfig) -> Result<()> {
         clients: HashMap::new(),
         next_client_id: 1,
         handshake_deadline,
+        http_writers: HashMap::new(),
+        next_http_writer_id: 1,
+        http_write_deadline,
     };
 
     // Source 2:PTY master fd。
@@ -271,11 +299,13 @@ pub fn run(config: DaemonConfig) -> Result<()> {
         )
         .map_err(|e| anyhow!("calloop insert_source(ws listener) 失败: {e}"))?;
 
-    // Source 5:握手收割 Timer。周期扫描,回收卡在 Peeking/Handshaking 阶段超
-    // `handshake_deadline` 的连接(防半截头/卡握手长占 `clients` 槽 + slowloris)。live
+    // Source 5:收割 Timer。周期扫描,回收 ① 卡在 Peeking/Handshaking 阶段超
+    // `handshake_deadline` 的连接(防半截头/卡握手长占 `clients` 槽 + slowloris);② 超
+    // `http_write_deadline` 仍没把响应写完(drain)的 HTTP 响应写源(防 slowloris-read:要了
+    // 大页却永不读 → 写源恒 WouldBlock 挂着,不受 `MAX_WS_CONNS` 限、握手收割也扫不到)。live
     // 连接不在此列(健康空闲会被误杀)——其半开靠 accept 时设的 SO_KEEPALIVE 探活回收。
-    // 收割时只 `loop_handle.remove` 别的源(连接的 READ/WRITE 源),不 remove 本 Timer
-    // 自己(返 `ToDuration` 让 calloop 自动重排,calloop 禁止回调内 remove 自身源)。
+    // 收割时只 `loop_handle.remove` 别的源(连接的 READ/WRITE 源、HTTP 写源),不 remove 本
+    // Timer 自己(返 `ToDuration` 让 calloop 自动重排,calloop 禁止回调内 remove 自身源)。
     loop_handle
         .insert_source(
             Timer::from_duration(reap_interval),
@@ -328,6 +358,23 @@ struct DaemonData {
     next_client_id: u64,
     /// 连接从 accept 起到完成握手的绝对期限;超期且未转 Live 的连接被收割 Timer 回收。
     handshake_deadline: Duration,
+    /// 在飞的 HTTP 响应写源(同口 HTTP 分支建的非阻塞写源)。key = 自增 id。写完(drain)
+    /// 即在 [`http_write_pending`] 里摘除;没 drain 完且超 `http_write_deadline` 的由收割
+    /// Timer [`reap_stale_clients`] `loop_handle.remove` 回收(关其 dup fd)。**独立于
+    /// `clients`**:HTTP 分支建写源前已把连接摘出 `clients`,故必须单独登记 + 单独扫,否则
+    /// slowloris-read 写源永不超时堆爆(must-fix)。
+    http_writers: HashMap<u64, HttpWriter>,
+    /// HTTP 响应写源 id 自增源。
+    next_http_writer_id: u64,
+    /// HTTP 响应写源从建立起把响应写完的绝对期限;超期未 drain 的被收割 Timer 回收。
+    http_write_deadline: Duration,
+}
+
+/// 一个在飞 HTTP 响应写源的登记项(收割 Timer 用):源 token(回收时 `loop_handle.remove`)
+/// + 建立时刻(判是否超 `http_write_deadline`,绝对期限,故 slowloris-read 逃不掉)。
+struct HttpWriter {
+    token: RegistrationToken,
+    created_at: Instant,
 }
 
 /// 一个 unix 客户端连接待写出的快照字节 + 已写偏移(非阻塞 write 可能分多次)。
@@ -975,9 +1022,12 @@ fn drop_client_external(data: &mut DaemonData, id: u64) {
     }
 }
 
-/// 收割 Timer 回调:回收卡在 Peeking/Handshaking 阶段超 `handshake_deadline`(自 accept 起
-/// 的绝对期限)的连接,防半截头/卡握手/slowloris 长占 `clients` 槽。**live 连接不收割**
-/// (健康但安静的终端无收发也属正常,按空闲超时会误杀)——其半开掉线靠 SO_KEEPALIVE。
+/// 收割 Timer 回调:回收 ① 卡在 Peeking/Handshaking 阶段超 `handshake_deadline`(自 accept
+/// 起的绝对期限)的连接,防半截头/卡握手/slowloris 长占 `clients` 槽;② 超 `http_write_deadline`
+/// 仍没把响应写完(drain)的 HTTP 响应写源,防 slowloris-read(要了大页却永不读 → 写源恒
+/// WouldBlock 挂着 + dup fd 不回收,不受 `MAX_WS_CONNS` 限、①那支也扫不到)。两者皆**绝对
+/// 期限**(非"距上次活动"),蚂蚁搬家/极小窗口都逃不掉。**live 连接不收割**(健康但安静的
+/// 终端无收发也属正常,按空闲超时会误杀)——其半开掉线靠 SO_KEEPALIVE。
 fn reap_stale_clients(data: &mut DaemonData) {
     let now = Instant::now();
     let deadline = data.handshake_deadline;
@@ -992,6 +1042,25 @@ fn reap_stale_clients(data: &mut DaemonData) {
     for id in stale {
         tracing::debug!(id, "WS 连接握手未在期限内完成,收割(防卡握手/半截头占槽)");
         drop_client_external(data, id);
+    }
+
+    // ② HTTP 响应写源:超期未 drain 的 → remove 写源(关其 dup fd)+ 摘登记。正常响应早已在
+    // http_write_pending drain 时自删,扫到的都是真卡死的(slowloris-read)。先收集再删,避免
+    // 借 http_writers 的同时改它;remove 对已失效 token 是 no-op(calloop 内部容忍)。
+    let http_deadline = data.http_write_deadline;
+    let stale_http: Vec<(u64, RegistrationToken)> = data
+        .http_writers
+        .iter()
+        .filter(|(_, w)| now.duration_since(w.created_at) > http_deadline)
+        .map(|(id, w)| (*id, w.token))
+        .collect();
+    for (id, token) in stale_http {
+        tracing::debug!(
+            id,
+            "HTTP 响应写源未在期限内写完,收割(防 slowloris-read 堆积)"
+        );
+        data.loop_handle.remove(token);
+        data.http_writers.remove(&id);
     }
 }
 
@@ -1021,6 +1090,26 @@ fn enable_keepalive(stream: &TcpStream) {
     set(libc::IPPROTO_TCP, libc::TCP_KEEPCNT, 3);
 }
 
+/// 给 HTTP 响应 socket 设 `SO_SNDBUF` 上限(见 [`HTTP_SEND_BUF_BYTES`]:封顶单连接内核 send
+/// 内存 + 让大响应发给"永不读"客户端时真撞 `WouldBlock`,从而写超时收割能见到并回收它)。
+/// 尽力而为,失败容忍(老内核/受限环境拒绝也不影响主功能,只是退回内核默认 send 缓冲)。
+#[allow(unsafe_code)]
+fn cap_http_send_buffer(stream: &TcpStream) {
+    let fd = stream.as_raw_fd();
+    let val = HTTP_SEND_BUF_BYTES;
+    // SAFETY: setsockopt 只读取栈上一个 c_int 的 size_of 字节(只读不写),fd 来自本函数参数里
+    // 活着的 TcpStream;返回值忽略(尽力而为)。
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            std::ptr::addr_of!(val).cast::<libc::c_void>(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+}
+
 /// 读 env 里的毫秒数(调参 / 测试用),解析失败或缺省落回 `default_ms`。
 fn duration_from_env(key: &str, default_ms: u64) -> Duration {
     let ms = std::env::var(key)
@@ -1033,8 +1122,14 @@ fn duration_from_env(key: &str, default_ms: u64) -> Duration {
 /// 普通 HTTP 请求:在给定 stream 上排响应(`GET /` / `/index.html` 返 xterm.js 页,
 /// `/vendor/*` 返 vendored 资产,其余 404)写完即关。非阻塞写源(分次写完 →
 /// `PostAction::Remove` 自动注销 + 关连接,即"推完即关")。
+///
+/// 写源登记进 [`DaemonData::http_writers`](带建立时刻),让收割 Timer 能扫到并回收**永不
+/// drain** 的写源(slowloris-read:要了大页却不读 / 通告极小窗口 → 写源恒 WouldBlock 挂着);
+/// drain 完即在 [`http_write_pending`] 里摘登记。**没这条登记 + 扫描,该写源不受
+/// `MAX_WS_CONNS` 限、握手收割也扫不到(分流时已 `clients.remove`),会被 slowloris-read 堆爆。**
 fn serve_http_response(data: &mut DaemonData, stream: TcpStream, head: &[u8]) {
     let _ = stream.set_nonblocking(true); // dup 已继承 original 的非阻塞,稳妥再设一次
+    cap_http_send_buffer(&stream); // 见 HTTP_SEND_BUF_BYTES:封顶内核 send 内存 + 让卡死写源可见可收割
     let path = request_path(head).unwrap_or_default();
     let (status, ctype, body) = http_response_parts(&path);
     let header = format!(
@@ -1049,12 +1144,41 @@ fn serve_http_response(data: &mut DaemonData, stream: TcpStream, head: &[u8]) {
         buf: full,
         written: 0,
     }));
-    if let Err(e) = data.loop_handle.insert_source(
+    let id = data.next_http_writer_id;
+    data.next_http_writer_id = data.next_http_writer_id.wrapping_add(1);
+    match data.loop_handle.insert_source(
         Generic::new(stream, Interest::WRITE, Mode::Level),
-        move |_readiness, meta, _data: &mut DaemonData| write_pending(meta.as_ref(), &pending),
+        move |_readiness, meta, data: &mut DaemonData| {
+            http_write_pending(data, id, meta.as_ref(), &pending)
+        },
     ) {
-        tracing::warn!(?e, "注册 HTTP 响应写源失败");
+        Ok(token) => {
+            data.http_writers.insert(
+                id,
+                HttpWriter {
+                    token,
+                    created_at: Instant::now(),
+                },
+            );
+        }
+        Err(e) => tracing::warn!(?e, "注册 HTTP 响应写源失败"),
     }
+}
+
+/// HTTP 响应写源回调:复用 [`write_pending`] 写字节,但在它返 `Remove`(全部写完 / 出错)
+/// 时**顺手摘掉 `http_writers` 登记**——这样 drain 完的正常响应不会被收割 Timer 再扫到
+/// (源已自删,token 失效),收割只剩真卡死的写源。
+fn http_write_pending(
+    data: &mut DaemonData,
+    id: u64,
+    stream: &TcpStream,
+    pending: &Rc<RefCell<WritePending>>,
+) -> io::Result<PostAction> {
+    let action = write_pending(stream, pending)?;
+    if matches!(action, PostAction::Remove) {
+        data.http_writers.remove(&id);
+    }
+    Ok(action)
 }
 
 /// path → (status line, content-type, body)。纯函数,便于单测。
