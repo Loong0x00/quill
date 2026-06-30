@@ -281,9 +281,11 @@ pub fn run(config: DaemonConfig) -> Result<()> {
 
     // 先绑 WS TCP listener(两拓扑都 serve WS:Local = standalone,Fed = E′ 子即 WS-kernel)。
     // 端口占用等错早退,此刻还没落 unix socket 文件,无残留可清。WS 全程在本 calloop 线程,
-    // **无 channel / 无线程**(去掉了 ADR-0016 线程版的 mpsc + WsServer)。
-    let ws_listener = TcpListener::bind(config.ws_bind)
-        .with_context(|| format!("WS TcpListener::bind {} 失败", config.ws_bind))?;
+    // **无 channel / 无线程**(去掉了 ADR-0016 线程版的 mpsc + WsServer)。listener bind 前设
+    // `SO_REUSEADDR`(见 [`bind_ws_listener`]):运行期共享开关 toggle-off→on 重绑同口时,放行
+    // 仍在 TIME-WAIT 的旧 established 连接占着的本地 (addr,port),否则 ~60s 内新子撞 EADDRINUSE。
+    let ws_listener = bind_ws_listener(config.ws_bind)
+        .with_context(|| format!("WS TcpListener bind {} 失败", config.ws_bind))?;
     // INV:Level 模式下阻塞 accept 会 stall 整个单线程 loop → 必须非阻塞 + accept 到
     // WouldBlock 排空。
     ws_listener
@@ -1865,6 +1867,121 @@ fn reap_stale_clients(data: &mut DaemonData) {
     }
 }
 
+/// WS listener 的 `listen(2)` backlog。与 Rust `std::net::TcpListener::bind` 的默认值一致
+/// (128),保持替换前后行为等价;单用户 + WireGuard VPN 把门,远够用。
+const WS_LISTEN_BACKLOG: libc::c_int = 128;
+
+/// 建 WS TCP listener,**bind 前设 `SO_REUSEADDR`**(std 的 `TcpListener::bind` 在 Linux 上
+/// 不设此选项,这是本函数存在的唯一理由)。
+///
+/// **为何需要**:运行期共享开关 toggle-off 杀子进程时,手机那些 established 连接进 TIME-WAIT
+/// (本地 `(addr, 7878)`),~60s 内 toggle-on 的新子若用裸 `bind` 会撞 `EADDRINUSE` → 子退出 →
+/// 父读 back-channel EOF → 静默拆 share(icon 闪绿即回灰)。`SO_REUSEADDR` 是服务器重启重绑的
+/// 标准解:**只放行被 TIME-WAIT 占着的 (addr,port),不破坏正常独占**(同地址有 active listener
+/// 仍 `EADDRINUSE`,见单测)。对 server listener 普适有益,两拓扑(Local / Fed)一致生效,无需 gate。
+///
+/// **为何手搓 libc 而非引 socket2**:契合本文件既有 libc/unsafe 风格(`enable_keepalive` /
+/// `cap_http_send_buffer` 同款 setsockopt;`FedLink` 同款 socket fd 手管),零新依赖、零 ADR。
+///
+/// **fd 不泄漏**:`socket(2)` 成功后立刻包成 [`OwnedFd`] —— 之后任何一步(setsockopt / bind /
+/// listen)失败 `?`/`return` 时 `OwnedFd` 析构即 `close(2)`,不漏 fd;全部成功才 `OwnedFd` →
+/// [`TcpListener`](所有权转移,后续由 `TcpListener` 关闭)。返回的 listener 仍是阻塞的,调用方
+/// 照旧 `set_nonblocking(true)`(Level 模式下阻塞 accept 会 stall 单线程 loop)。
+fn bind_ws_listener(addr: SocketAddr) -> Result<TcpListener> {
+    let domain = match addr {
+        SocketAddr::V4(_) => libc::AF_INET,
+        SocketAddr::V6(_) => libc::AF_INET6,
+    };
+    // SAFETY: socket(2) 用合法 domain + SOCK_STREAM 建新 fd,失败返 -1。SOCK_CLOEXEC 与 std
+    // 一致(防 listener fd 泄漏进随后 spawn 的 shell / Fed 子进程)。
+    #[allow(unsafe_code)]
+    let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(anyhow::Error::new(io::Error::last_os_error()).context("WS socket(2) 创建失败"));
+    }
+    // SAFETY: fd 是本函数刚建、独占的合法 socket fd;立刻交 OwnedFd 接管 close —— 下面任何
+    // 失败路径 return 时析构即关,不漏 fd。raw `fd`(int,Copy)在 owned 存活期间一直有效,
+    // 仅用于下面几个 syscall;成功路径末尾 owned move 进 TcpListener(不 double-close)。
+    #[allow(unsafe_code)]
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+
+    let reuse: libc::c_int = 1;
+    // SAFETY: setsockopt 只读栈上一个 c_int(`size_of` 字节,只读不写),fd 为上面活着的 socket。
+    #[allow(unsafe_code)]
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            std::ptr::addr_of!(reuse).cast::<libc::c_void>(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        return Err(anyhow::Error::new(io::Error::last_os_error())
+            .context("WS setsockopt(SO_REUSEADDR) 失败"));
+    }
+
+    // 构 sockaddr 并 bind。端口走 `to_be()`(htons:内存按网络序大端);地址 octets 已是网络序
+    // (`Ipv4Addr/Ipv6Addr::octets`),V4 用 `from_ne_bytes` 让 s_addr 内存字节恰等于 octets、
+    // V6 直接拷 16 字节。`zeroed()` 把 sin_zero / 任何 padding 清零(POD,全零是合法初值)。
+    let bind_rc = match addr {
+        SocketAddr::V4(v4) => {
+            // SAFETY: sockaddr_in 是 POD,全零是合法初值(且为清 sin_zero 的惯用法)。
+            #[allow(unsafe_code)]
+            let mut sa: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            sa.sin_family = libc::AF_INET as libc::sa_family_t;
+            sa.sin_port = v4.port().to_be();
+            sa.sin_addr.s_addr = u32::from_ne_bytes(v4.ip().octets());
+            // SAFETY: bind 只读 sa 的 size_of::<sockaddr_in> 字节(不写),sa 此刻栈上活着;
+            // fd 为上面活着的 socket。
+            #[allow(unsafe_code)]
+            unsafe {
+                libc::bind(
+                    fd,
+                    std::ptr::addr_of!(sa).cast::<libc::sockaddr>(),
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            }
+        }
+        SocketAddr::V6(v6) => {
+            // SAFETY: sockaddr_in6 是 POD,全零是合法初值。
+            #[allow(unsafe_code)]
+            let mut sa: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+            sa.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            sa.sin6_port = v6.port().to_be();
+            sa.sin6_flowinfo = v6.flowinfo();
+            sa.sin6_addr.s6_addr = v6.ip().octets();
+            sa.sin6_scope_id = v6.scope_id();
+            // SAFETY: bind 只读 sa 的 size_of::<sockaddr_in6> 字节(不写),sa 此刻栈上活着;
+            // fd 为上面活着的 socket。
+            #[allow(unsafe_code)]
+            unsafe {
+                libc::bind(
+                    fd,
+                    std::ptr::addr_of!(sa).cast::<libc::sockaddr>(),
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                )
+            }
+        }
+    };
+    if bind_rc < 0 {
+        return Err(anyhow::Error::new(io::Error::last_os_error())
+            .context(format!("WS bind {addr} 失败(端口占用?)")));
+    }
+
+    // SAFETY: listen 只对上面活着的 socket fd 操作,失败返 -1。
+    #[allow(unsafe_code)]
+    let listen_rc = unsafe { libc::listen(fd, WS_LISTEN_BACKLOG) };
+    if listen_rc < 0 {
+        return Err(anyhow::Error::new(io::Error::last_os_error())
+            .context(format!("WS listen {addr} 失败")));
+    }
+
+    // 全部成功:OwnedFd → TcpListener(所有权转移,无 double-close)。
+    Ok(TcpListener::from(owned))
+}
+
 /// 给一条接受进来的 TCP 连接打开内核 TCP keepalive 探活(尽力而为的半开硬化)。默认
 /// idle 7200s 太长,显式调短:idle 60s 后开始探,每 10s 探一次,3 次无应答判死。死后内核
 /// 让该 fd 报错 → epoll 唤醒 READ 源 → 走既有 EOF/错误回收路径。**比按空闲超时收割 live
@@ -2304,5 +2421,57 @@ mod tests {
         let (status, _ctype, body) = http_response_parts("/nope");
         assert!(status.starts_with("404"));
         assert_eq!(body, b"not found\n");
+    }
+
+    /// 读一个 fd 的 `SO_REUSEADDR` 当前值(测试辅助)。
+    fn so_reuseaddr(l: &TcpListener) -> libc::c_int {
+        let fd = l.as_raw_fd();
+        let mut val: libc::c_int = -1;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: getsockopt 往栈上活着的 c_int `val` 写至多 `len` 字节并回填 `len`;fd 为
+        // 参数里活着的 TcpListener。tests 部分仍受 crate `deny(unsafe_code)` 约束,故显式 allow。
+        #[allow(unsafe_code)]
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_REUSEADDR,
+                std::ptr::addr_of_mut!(val).cast::<libc::c_void>(),
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0, "getsockopt(SO_REUSEADDR) 应成功");
+        val
+    }
+
+    /// `bind_ws_listener` 绑临时端口成功,且 `SO_REUSEADDR` 真被设上(getsockopt 返非 0)。
+    #[test]
+    fn bind_ws_listener_sets_reuseaddr() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().expect("解析回环临时地址");
+        let listener = bind_ws_listener(addr).expect("bind_ws_listener 应成功");
+        let bound = listener.local_addr().expect("local_addr");
+        assert_ne!(bound.port(), 0, "OS 应分配了真实端口");
+        assert!(bound.ip().is_loopback(), "应绑回环地址");
+        assert_ne!(
+            so_reuseaddr(&listener),
+            0,
+            "SO_REUSEADDR 应已设上(getsockopt 返非 0)"
+        );
+    }
+
+    /// SO_REUSEADDR **不破坏正常独占**:同地址端口上已有 active listener 时,再 bind 仍须失败
+    /// (SO_REUSEADDR 只放行 TIME-WAIT,不放行同地址 active 监听 —— 也证用的是 REUSEADDR 而非
+    /// REUSEPORT)。不依赖真 TIME-WAIT 计时,确定性、不 flaky。
+    #[test]
+    fn bind_ws_listener_still_excludes_active_listener() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().expect("解析回环临时地址");
+        let first = bind_ws_listener(addr).expect("首个 bind 应成功");
+        let bound = first.local_addr().expect("local_addr");
+        // 第一个仍 open 监听中,占同 (addr,port) 再 bind 必须失败。
+        let second = bind_ws_listener(bound);
+        assert!(
+            second.is_err(),
+            "active listener 占用时再 bind 应失败(SO_REUSEADDR 不放行同地址 active 监听)"
+        );
     }
 }
