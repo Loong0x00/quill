@@ -644,6 +644,12 @@ struct ShareChild {
     last_dims: Option<(u16, u16)>,
     /// 背压期间丢弃的整帧计数(诊断;[`Drop`] 时若 > 0 打一行 debug)。
     dropped_frames: u64,
+    /// back-channel(子→父 `Input` 帧)READ 源的 calloop 句柄。**运行期拆 share** 时
+    /// ([`LoopData::stop_share`])用它 `loop_handle.remove` 移除该源(→ drop Generic<OwnedFd> 关
+    /// `back_read` fd);子崩溃自发的 EOF 拆除走 [`share_back_channel_readable`] 的 `PostAction::Remove`
+    /// (本结构被 `take` 掉,本字段随之 drop = no-op,RegistrationToken 是 Copy/POD),两条拆路互不
+    /// 重复(parent-initiated 用本字段、self-remove 用 PostAction)。
+    back_token: RegistrationToken,
 }
 
 impl ShareChild {
@@ -726,21 +732,23 @@ impl ShareChild {
         // raw(int Copy)给 libc::read 用,源在 loop 生命期内不删 → fd 全程有效。drop 序:本源
         // (含 OwnedFd)随 event_loop drop 自关 fd(EPOLL_CTL_DEL 在 fd 仍开时执行,无 EBADF)。
         let back_raw = back_read.as_raw_fd();
-        let register = loop_handle.insert_source(
+        let back_token = match loop_handle.insert_source(
             Generic::new(back_read, Interest::READ, Mode::Level),
             move |_readiness, _meta, data: &mut LoopData| {
                 share_back_channel_readable(data, back_raw)
             },
-        );
-        if let Err(e) = register {
-            // 注册失败:InsertError 持回 Generic(含 back_read OwnedFd)→ 随 `e` drop 关闭;
-            // 这里显式 kill + reap 子 + 关 data_write。
-            let mut child = child;
-            let _ = child.kill();
-            let _ = child.wait();
-            drop(data_write);
-            return Err(anyhow!("注册 back-channel READ 源失败: {e}"));
-        }
+        ) {
+            Ok(tok) => tok,
+            Err(e) => {
+                // 注册失败:InsertError 持回 Generic(含 back_read OwnedFd)→ 随 `e` drop 关闭;
+                // 这里显式 kill + reap 子 + 关 data_write。
+                let mut child = child;
+                let _ = child.kill();
+                let _ = child.wait();
+                drop(data_write);
+                return Err(anyhow!("注册 back-channel READ 源失败: {e}"));
+            }
+        };
 
         Ok(ShareChild {
             child,
@@ -752,6 +760,7 @@ impl ShareChild {
             focus_tab,
             last_dims: None,
             dropped_frames: 0,
+            back_token,
         })
     }
 
@@ -955,6 +964,95 @@ fn route_share_input(data: &mut LoopData, frame: FeedFrame) {
     }
     // 命中焦点 tab:复用唯一写汇(写进 active tab 的 PTY,背压排队 + tick drain)。
     queue_or_write_pty(&mut data.state, &frame.payload, "share-input");
+}
+
+impl LoopData {
+    /// E′(ADR-0018)运行期【开共享】:spawn 受监管的隔离 `quill-kernel` 子(Fed 模式)+ 注册
+    /// back-channel 源 + 发初始 `FocusChange` / `Dims` 帧。**幂等**:已武装(`share.is_some()`)直接
+    /// 返回(不重复 spawn / 不再绑第二个 7878)。失败 → log + 维持纯终端(`share` 留 `None`),
+    /// **绝不让共享出错拖累终端**(daily-driver 优先)。
+    ///
+    /// 由三处触发同一抽取路径:① `--share` 启动([`run_window`]);② 标题栏共享按钮点击;
+    /// ③ `Ctrl+Shift+S`。后两者经 `pending_share_toggle` → [`apply_share_toggle`] → [`Self::toggle_share`]。
+    fn start_share(&mut self) {
+        if self.share.is_some() {
+            tracing::debug!("start_share:已在共享(幂等),跳过");
+            return;
+        }
+        let Some(focus_tab) = self.state.tabs.as_ref().map(|t| t.active().id().raw()) else {
+            tracing::warn!("start_share:无 active tab(启动期 race),跳过");
+            return;
+        };
+        match ShareChild::spawn(&self.loop_handle, SHARE_DESKTOP_WS_ID, focus_tab) {
+            Ok(mut sh) => {
+                sh.set_focus(SHARE_DESKTOP_WS_ID, focus_tab);
+                // 把当前桌面 PTY 尺寸发给子(连上早于首个 resize 的客户端也拿到桌面宽);真尺寸由
+                // 下个 configure 的 propagate_resize_if_dirty 紧接覆盖(set_dims 去重生效)。
+                let (cols, rows) = self
+                    .state
+                    .tabs
+                    .as_ref()
+                    .map(|t| t.active().term().dimensions())
+                    .unwrap_or((80, 24));
+                sh.set_dims(
+                    u16::try_from(cols).unwrap_or(u16::MAX),
+                    u16::try_from(rows).unwrap_or(u16::MAX),
+                );
+                self.share = Some(sh);
+                tracing::info!(
+                    tab = focus_tab,
+                    "E′ 共享已开启(--share / 标题栏 toggle / Ctrl+Shift+S);焦点 tab 输出 tee 给手机"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    ?e,
+                    "E′ 共享 spawn 失败,维持纯终端(本次开共享无效,终端不受影响)"
+                );
+            }
+        }
+    }
+
+    /// E′ 运行期【关共享】:remove back-channel calloop 源(→ drop Generic<OwnedFd> 关 `back_read`
+    /// fd)+ drop [`ShareChild`](kill + reap 子 + 关 `data_write`)→ 干净降级回纯终端。**幂等**:
+    /// 未武装(`share` 为 `None`)直接返回。
+    ///
+    /// **顺序**:先 `take` 出 ShareChild 拿到 `back_token`(Copy),`drop(sh)` 先 reap 子(`wait` 阻塞
+    /// 到子真死 → 子持的 `0.0.0.0:7878` listener fd 被 OS 关闭、端口释放 → 第二次 start_share 能干净
+    /// 重绑),再 `loop_handle.remove(back_token)` 移除源。本方法**不在 back-channel 源自身回调内
+    /// 调用**(那条路走 `PostAction::Remove`,见 [`share_back_channel_readable`]),故 `remove` 移除的
+    /// 是【别的】源,calloop 允许。
+    fn stop_share(&mut self) {
+        let Some(sh) = self.share.take() else {
+            tracing::debug!("stop_share:本就没共享(幂等),跳过");
+            return;
+        };
+        let token = sh.back_token;
+        drop(sh);
+        self.loop_handle.remove(token);
+        tracing::info!("E′ 共享已关闭(标题栏 toggle / Ctrl+Shift+S);回纯终端");
+    }
+
+    /// E′ 运行期【翻转】共享开关:已开 → [`Self::stop_share`];未开 → [`Self::start_share`]。
+    /// 可反复开关、第二次开能干净重起(stop 路径已 reap 子 + 释放端口)。
+    fn toggle_share(&mut self) {
+        if self.share.is_some() {
+            self.stop_share();
+        } else {
+            self.start_share();
+        }
+    }
+}
+
+/// E′ 运行期共享开关消费点(`drive_wayland` step 3.8.5):标题栏按钮点击 / `Ctrl+Shift+S` 在
+/// `Dispatch` 路径只置 `state.pending_share_toggle`(那里仅 `&mut State`,拿不到 `LoopHandle`),
+/// 这里(`&mut LoopData`)真 `toggle_share`(spawn / kill 子 + insert / remove calloop 源)。与
+/// `apply_tab_op` / `apply_selection_op` 同套路。
+fn apply_share_toggle(data: &mut LoopData) {
+    if !std::mem::take(&mut data.state.pending_share_toggle) {
+        return;
+    }
+    data.toggle_share();
 }
 
 /// calloop Generic source 每次 readable 时跑一圈:循环 `pty.read` → 分派
@@ -3017,6 +3115,12 @@ fn drive_wayland(data: &mut LoopData) -> std::io::Result<PostAction> {
     // 这里真 spawn 子 shell + insert/remove calloop source + 切 active.
     apply_tab_op(data);
 
+    // Step 3.8.5 (E′, ADR-0018):运行期共享开关消费 — Dispatch 路径(Ctrl+Shift+S /
+    // 标题栏共享按钮点击)只置 state.pending_share_toggle,这里真 toggle_share
+    // (spawn / kill 隔离 quill-kernel 子 + insert / remove back-channel calloop 源)。
+    // 与 tab / selection / repeat 同 deferred-side-effect 套路(Dispatch 拿不到 LoopHandle)。
+    apply_share_toggle(data);
+
     // Step 4:把 ack_configure / surface commit 这些响应真推给 compositor。
     if let Err(e) = data.state.conn.flush() {
         return Err(std::io::Error::other(format!("wayland flush: {e}")));
@@ -3298,6 +3402,8 @@ pub fn run_window(initial_cwd: Option<std::path::PathBuf>, share: bool) -> Resul
         // T-0608: tabs 启动后立即被 spawn 真 shell 注入 (下方几行).
         tabs: None,
         pending_tab_op: None,
+        // E′(ADR-0018):运行期共享开关请求标志,默认 false(无 pending,零回归)。
+        pending_share_toggle: false,
         last_tab_drag_x: 0.0,
         // T-0611: DnD 状态全空起步. compositor 在拖入时发 DataOffer + Enter,
         // 我们填充; Leave / Drop 后清.
@@ -3433,43 +3539,6 @@ pub fn run_window(initial_cwd: Option<std::path::PathBuf>, share: bool) -> Resul
         }
     };
 
-    // E′(ADR-0018)共享子进程:**opt-in 武装即起**(`--share`)。默认(`share == false`)→
-    // 根本不 spawn 子 → 终端就是今天的 quill(零开销、零子进程、零回归)。spawn 失败 → log +
-    // 降级回纯终端(`None`),**绝不让共享出错拖累 daily-driver 启动**。spawn 成功后立刻 set_focus
-    // 把初始焦点告知子(子据此广播 StreamFocus;tee 已按 `focus_tab` 过滤)。
-    let share_child: Option<ShareChild> = if share {
-        match ShareChild::spawn(&loop_handle, SHARE_DESKTOP_WS_ID, initial_tab_id.raw()) {
-            Ok(mut sh) => {
-                sh.set_focus(SHARE_DESKTOP_WS_ID, initial_tab_id.raw());
-                // A′ 增量1:把当前桌面 PTY 尺寸发给子(连上早于首个 resize 的客户端也拿到桌面
-                // 宽)。真尺寸由首个 configure 的 propagate_resize_if_dirty 紧接覆盖(去重生效)。
-                let (init_cols, init_rows) = state
-                    .tabs
-                    .as_ref()
-                    .map(|t| t.active().term().dimensions())
-                    .unwrap_or((80, 24));
-                sh.set_dims(
-                    u16::try_from(init_cols).unwrap_or(u16::MAX),
-                    u16::try_from(init_rows).unwrap_or(u16::MAX),
-                );
-                tracing::info!(
-                    tab = initial_tab_id.raw(),
-                    "E′ 共享子进程已 spawn(--share 武装即起);焦点 tab 输出 tee 给手机"
-                );
-                Some(sh)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    ?e,
-                    "E′ 共享子进程 spawn 失败,降级回纯终端(本次 --share 无效,终端不受影响)"
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-
     let mut loop_data = LoopData {
         event_queue,
         state,
@@ -3500,10 +3569,20 @@ pub fn run_window(initial_cwd: Option<std::path::PathBuf>, share: bool) -> Resul
         // T-0608: 启动后第一个 tab 的 PTY fd 已在上方 insert_source, 把
         // (tab_id, token) push 进 token 表 — close tab 时按 id 找 token + remove.
         pty_tokens: vec![(initial_tab_id, initial_token)],
-        // E′(ADR-0018):`--share` 武装时持共享子进程句柄,默认 None(零回归)。back-channel
-        // READ 源已在 ShareChild::spawn 内注册(若 Some)。
-        share: share_child,
+        // E′(ADR-0018):共享子进程句柄起步恒 None。`--share` 启动 → 下方 start_share() 武装;
+        // 运行期标题栏 toggle / Ctrl+Shift+S 也走同一 start_share/stop_share 抽取路径。
+        // 默认(无 --share、不点按钮)= 零子进程、零回归。
+        share: None,
     };
+
+    // E′(ADR-0018):`--share` opt-in 启动 → 运行期 start_share 一次(spawn 受监管隔离子 + 注册
+    // back-channel 源 + 初始 focus/dims 帧),与标题栏共享按钮 / Ctrl+Shift+S 完全同一路径。默认
+    // (`share == false`)不调 → 根本不 spawn 子 = 今天的 quill(零开销、零回归);spawn 失败由
+    // start_share 内部 log + 维持纯终端,绝不拖累 daily-driver 启动。
+    if share {
+        loop_data.start_share();
+    }
+
     event_loop
         .run(None, &mut loop_data, |data| {
             if data.state.core.exit {
@@ -4152,6 +4231,13 @@ struct State {
     /// T-0608: 待处理 tab 操作. Dispatch 路径写, drive_wayland step 3.8 消费
     /// (与 pending_selection_op / pending_repeat 同套路).
     pub(crate) pending_tab_op: Option<TabOp>,
+    /// E′(ADR-0018)运行期共享开关请求标志。`Dispatch<WlKeyboard>` (Ctrl+Shift+S) /
+    /// `Dispatch<WlPointer>` (标题栏共享按钮点击) 置 `true`(那里仅 `&mut State`,拿不到
+    /// `LoopHandle`),`drive_wayland` step 3.8.5 的 [`apply_share_toggle`] take + 真
+    /// [`LoopData::toggle_share`](spawn / kill 子 + insert / remove calloop 源)。与
+    /// `pending_tab_op` / `pending_selection_op` / `pending_repeat` 同 deferred-side-effect 套路。
+    /// **POD bool,drop 序无关**(放 pending_* 组内)。
+    pub(crate) pending_share_toggle: bool,
     /// T-0608: tab drag 期间最后一次 motion 的 logical x. EndTabDrag 时按此 x
     /// 算 target_idx (派单 In #F).
     pub(crate) last_tab_drag_x: f64,
