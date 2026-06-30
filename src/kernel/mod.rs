@@ -22,6 +22,6 @@ pub mod session;
 
 pub use proto::{
     CellWire, ClientMsg, ColorWire, CursorShapeWire, CursorWire, ServerMsg, Snapshot, TabMeta,
-    TabOp, WorkspaceInfo,
+    TabOp, WorkspaceInfo, WorkspaceList, WorkspaceMeta,
 };
 pub use session::Session;

@@ -159,6 +159,9 @@ pub struct TabMeta {
 
 /// 工作区整体结构 (tab 列表 + active + 当前尺寸)。连接时与 tab 增删 / 换序 /
 /// 重命名时下发,让客户端画 tab 条。
+///
+/// **T6 砖0 块B**: 将加 `workspace_id` 字段标识所属工作区 (与 [`WorkspaceMeta::id`]
+/// 对齐),随 Session 多 workspace 重构一起接入 (那时才有真 id 可填)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceInfo {
     pub tabs: Vec<TabMeta>,
@@ -167,13 +170,48 @@ pub struct WorkspaceInfo {
     pub rows: usize,
 }
 
+/// 单个工作区在【工作区列表】里的摘要 (不含 tab 明细 / grid 内容)。客户端用它画
+/// "工作区切换器" UI;明细 (tab 条) 走 [`WorkspaceInfo`],grid 走 [`Snapshot`]。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceMeta {
+    pub id: u64,
+    /// 工作区标题摘要 (取其 active tab 标题;空则客户端 fallback)。
+    pub title: String,
+    pub tab_count: usize,
+    /// 是否为 Session 当前 active 工作区。
+    pub active: bool,
+}
+
+/// 工作区列表 (T6 多 workspace 维度):连接时下发,工作区增删 / 切换 active 时再发。
+/// 客户端默认同步桌面【全部】工作区 (ADR-0015 R1),用此画切换器。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceList {
+    pub workspaces: Vec<WorkspaceMeta>,
+    /// 当前 active 工作区 id (与某 [`WorkspaceMeta::id`] 对应;列表空时无意义)。
+    pub active: u64,
+}
+
 /// 内核 → 客户端消息。
+///
+/// **两个平面 (T6 冻结)**: 控制面走本枚举的 JSON (WS **Text** 帧),数据面走 PTY
+/// **原始字节** (WS **Binary** 帧)。数据面字节属于哪个 (workspace, tab) 由控制面
+/// [`ServerMsg::StreamFocus`] 标记 (连上 + 切换时发) —— 即"字节流帧打 tab/workspace
+/// 标签",标签走控制面而非每帧包头,热路径零额外拷贝/解析。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServerMsg {
-    /// 单 tab 全量快照 (连接时 + dirty 帧)。
+    /// 单 tab 全量快照 (连接时关键帧 + dirty 帧;字节流模型下降级为连上引导帧)。
     Snapshot(Snapshot),
-    /// 工作区结构变化 (tab 增删 / 换序 / 重命名 / active 切换)。
+    /// 单个工作区结构 (tab 增删 / 换序 / 重命名 / active 切换 → 全量重发该工作区)。
     Workspace(WorkspaceInfo),
+    /// 全部工作区列表 (连上即发;工作区增删 / 切 active 时再发)。
+    Workspaces(WorkspaceList),
+    /// tab 增量事件:某工作区新增一个 tab (连上发全量 [`ServerMsg::Workspace`],之后增量)。
+    TabAdded { workspace_id: u64, tab: TabMeta },
+    /// tab 增量事件:某工作区移除一个 tab。
+    TabRemoved { workspace_id: u64, tab_id: u64 },
+    /// **字节流标签**:声明此后 WS **Binary** 帧承载的 PTY 字节属于哪个
+    /// (workspace, tab)。连上发一次 (当前 active),active tab / workspace 切换时再发。
+    StreamFocus { workspace_id: u64, tab_id: u64 },
 }
 
 /// 客户端发起的 tab 工作区操作。
@@ -191,15 +229,35 @@ pub enum TabOp {
     SetTitle { tab_id: u64, title: String },
 }
 
-/// 客户端 → 内核消息。
+/// 客户端 → 内核消息 (控制面,WS **Text** 帧)。
+///
+/// **数据面对照**: 热路径键盘字节走 WS **Binary** 帧 (daemon 直接写 active tab PTY,
+/// 见 [`ServerMsg::StreamFocus`]),不经此枚举。[`ClientMsg::Input`] 用于**寻址到非
+/// 焦点 tab** 的输入 (带 `workspace_id` + `tab_id`),与热路径 Binary 并存。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientMsg {
-    /// 键盘 / 粘贴字节,写到指定 tab 的 PTY。
-    Input { tab_id: u64, bytes: Vec<u8> },
-    /// 主控端改尺寸 (cols/rows),内核 resize 所有 tab 的 PTY + term。
-    Resize { cols: u16, rows: u16 },
-    /// tab 工作区操作。
-    TabOp(TabOp),
+    /// 键盘 / 粘贴字节,写到指定 (workspace, tab) 的 PTY。
+    Input {
+        workspace_id: u64,
+        tab_id: u64,
+        bytes: Vec<u8>,
+    },
+    /// 改尺寸 (cols/rows):内核 resize 指定工作区所有 tab 的 PTY + term。
+    Resize {
+        workspace_id: u64,
+        cols: u16,
+        rows: u16,
+    },
+    /// tab 工作区操作 (寻址到指定工作区)。
+    TabOp { workspace_id: u64, op: TabOp },
+    /// **显式持有该工作区** —— 客户端连上即发,成为一个 holder (引用计数 +1)。
+    /// 区别于"断线后重连":重连再发一次 Hold 重新登记。
+    Hold { workspace_id: u64 },
+    /// **显式关闭 (X) = 释放该 holder** (引用计数 −1)。与**断线**严格区分:断线
+    /// (后台 / 锁屏 / 网络抖 / WS 掉) 是**非事件**、不发本消息、不释放;只有用户真
+    /// 点 X / 关闭视图才发。anchor + holders 归 0 → 内核销毁工作区 (ADR-0015 R1 /
+    /// ADR-0018)。
+    Release { workspace_id: u64 },
 }
 
 #[cfg(test)]
@@ -278,25 +336,94 @@ mod tests {
         assert_eq!(Color::from(w.bg), cr.bg);
     }
 
-    /// `ClientMsg` / `ServerMsg` enum 也能 JSON 往返 (externally tagged)。
+    /// `ClientMsg` JSON 往返 (含 T6 多 workspace 寻址 + Hold/Release 生命周期)。
     #[test]
-    fn messages_json_roundtrip() {
+    fn client_messages_json_roundtrip() {
         let msgs = vec![
             ClientMsg::Input {
+                workspace_id: 1,
                 tab_id: 1,
                 bytes: vec![0x1b, b'[', b'A'],
             },
-            ClientMsg::Resize { cols: 80, rows: 24 },
-            ClientMsg::TabOp(TabOp::New),
-            ClientMsg::TabOp(TabOp::Close { tab_id: 2 }),
-            ClientMsg::TabOp(TabOp::SetTitle {
-                tab_id: 3,
-                title: "x".to_string(),
-            }),
+            ClientMsg::Resize {
+                workspace_id: 1,
+                cols: 80,
+                rows: 24,
+            },
+            ClientMsg::TabOp {
+                workspace_id: 1,
+                op: TabOp::New,
+            },
+            ClientMsg::TabOp {
+                workspace_id: 2,
+                op: TabOp::Close { tab_id: 2 },
+            },
+            ClientMsg::TabOp {
+                workspace_id: 2,
+                op: TabOp::SetTitle {
+                    tab_id: 3,
+                    title: "x".to_string(),
+                },
+            },
+            ClientMsg::Hold { workspace_id: 7 },
+            ClientMsg::Release { workspace_id: 7 },
         ];
         for m in msgs {
             let j = serde_json::to_string(&m).expect("ser ClientMsg");
             let b: ClientMsg = serde_json::from_str(&j).expect("de ClientMsg");
+            assert_eq!(m, b);
+        }
+    }
+
+    /// `ServerMsg` 控制面消息 JSON 往返 (T6 多 workspace 列表 + tab 增删 + 字节流标签)。
+    #[test]
+    fn server_messages_json_roundtrip() {
+        let msgs = vec![
+            ServerMsg::Workspace(WorkspaceInfo {
+                tabs: vec![TabMeta {
+                    tab_id: 11,
+                    title: "sh".to_string(),
+                }],
+                active: 0,
+                cols: 80,
+                rows: 24,
+            }),
+            ServerMsg::Workspaces(WorkspaceList {
+                workspaces: vec![
+                    WorkspaceMeta {
+                        id: 3,
+                        title: "sh".to_string(),
+                        tab_count: 1,
+                        active: true,
+                    },
+                    WorkspaceMeta {
+                        id: 4,
+                        title: String::new(),
+                        tab_count: 2,
+                        active: false,
+                    },
+                ],
+                active: 3,
+            }),
+            ServerMsg::TabAdded {
+                workspace_id: 4,
+                tab: TabMeta {
+                    tab_id: 21,
+                    title: "new".to_string(),
+                },
+            },
+            ServerMsg::TabRemoved {
+                workspace_id: 4,
+                tab_id: 21,
+            },
+            ServerMsg::StreamFocus {
+                workspace_id: 3,
+                tab_id: 11,
+            },
+        ];
+        for m in msgs {
+            let j = serde_json::to_string(&m).expect("ser ServerMsg");
+            let b: ServerMsg = serde_json::from_str(&j).expect("de ServerMsg");
             assert_eq!(m, b);
         }
     }
