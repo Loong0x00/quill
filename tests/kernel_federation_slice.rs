@@ -1,0 +1,303 @@
+//! Phase 7 F1/F2/F2b 联邦内核垂直切片验收(ADR-0019 机器级单例 kernel + 多 feeder)。
+//!
+//! 测试**当会合窗口们**:起真 `quill-kernel --rendezvous=<sock>`(**不 --detach**,便于测试当
+//! 子进程管理),经会合 unix socket 接入 N 个 feeder(每个 = 一个 workspace),验:
+//! 1. **多 feeder 汇入多 workspace**:两 feeder 各声明不同 ws → WS 客户端连上收到【聚合】
+//!    Workspaces 列表(含两个 workspace 标题)。
+//! 2. **per-feeder 隔离 fan-out**:WS 客户端默认看锚(第一个接入的 feeder)workspace →只收锚的
+//!    PtyOutput,收不到另一个 feeder 的字节。
+//! 3. **feeder refcount 生命周期(F2b)**:断一个 feeder(非最后)→ kernel 存活;断最后一个
+//!    feeder → kernel 退出 + 清会合 socket 文件。
+//!
+//! F3(锚新 tab 落点)在 commit3 单独验。tests/ 允许 `unwrap`/`expect` + 裸 libc。
+
+use std::net::{TcpListener, TcpStream};
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
+use std::process::{Child, Command};
+use std::time::{Duration, Instant};
+
+use quill::kernel::feed::{encode_tab_list, FeedFrame, FrameKind};
+use tungstenite::stream::MaybeTlsStream;
+use tungstenite::{Message, WebSocket};
+
+fn free_port() -> u16 {
+    let l = TcpListener::bind("127.0.0.1:0").expect("bind 临时端口");
+    l.local_addr().expect("local_addr").port()
+}
+
+/// 会合 kernel 子进程 + 会合 socket 路径。
+struct FedKernel {
+    child: Child,
+    sock: PathBuf,
+    dir: PathBuf,
+}
+
+impl FedKernel {
+    fn spawn(port: u16) -> Self {
+        let dir = std::env::temp_dir().join(format!("quill-fed-{}-{}", std::process::id(), port));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let sock = dir.join("rendezvous.sock");
+        let child = Command::new(env!("CARGO_BIN_EXE_quill-kernel"))
+            .arg(format!("--rendezvous={}", sock.display()))
+            .arg(format!("--ws-bind=127.0.0.1:{port}"))
+            .env("RUST_LOG", "quill=warn")
+            // 关键:每 feeder 断都会触发"最后 feeder?"检查;若 kernel 启动即零 feeder 会等 grace。
+            // 测试里我们很快接入 feeder,不必等 grace;但把 grace 设长防误退。
+            .env("QUILL_FED_STARTUP_GRACE_MS", "60000")
+            .spawn()
+            .expect("spawn quill-kernel (Federated)");
+        // 等会合 socket 出现(kernel bind 完成)。
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !sock.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        FedKernel { child, sock, dir }
+    }
+
+    /// 连一个 feeder(会合 socket 上的全双工 unix 连接)。
+    fn connect_feeder(&self) -> UnixStream {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match UnixStream::connect(&self.sock) {
+                Ok(s) => {
+                    s.set_read_timeout(Some(Duration::from_millis(200))).ok();
+                    return s;
+                }
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(30))
+                }
+                Err(e) => panic!("连会合 socket 失败: {e}"),
+            }
+        }
+    }
+
+    fn cleanup(mut self) {
+        // SAFETY: kill 只对已知子进程 pid 发信号。
+        unsafe {
+            libc::kill(self.child.id() as i32, libc::SIGTERM);
+        }
+        let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// 往一个 feeder 写一帧(阻塞小帧)。
+fn feed(stream: &mut UnixStream, frame: &FeedFrame) {
+    use std::io::Write;
+    stream.write_all(&frame.encode()).expect("feeder 写帧");
+    stream.flush().ok();
+}
+
+/// 一个 feeder 声明自己:FocusChange + TabList(ws / active / tabs)。
+fn declare(stream: &mut UnixStream, ws: u64, focus_tab: u64, tabs: &[(u64, &str)]) {
+    let active = tabs
+        .iter()
+        .position(|(id, _)| *id == focus_tab)
+        .unwrap_or(0);
+    feed(
+        stream,
+        &FeedFrame {
+            kind: FrameKind::FocusChange,
+            ws_id: ws,
+            tab_id: focus_tab,
+            payload: Vec::new(),
+        },
+    );
+    feed(
+        stream,
+        &FeedFrame {
+            kind: FrameKind::TabList,
+            ws_id: ws,
+            tab_id: focus_tab,
+            payload: encode_tab_list(active, tabs),
+        },
+    );
+}
+
+fn connect_ws(port: u16, timeout: Duration) -> Option<WebSocket<MaybeTlsStream<TcpStream>>> {
+    let url = format!("ws://127.0.0.1:{port}/");
+    let deadline = Instant::now() + timeout;
+    loop {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        match tungstenite::connect(&url) {
+            Ok((ws, _resp)) => {
+                if let MaybeTlsStream::Plain(s) = ws.get_ref() {
+                    let _ = s.set_read_timeout(Some(Duration::from_millis(250)));
+                }
+                return Some(ws);
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+}
+
+fn ws_recv_binary_until(
+    ws: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    needle: &[u8],
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    let mut acc = Vec::new();
+    while Instant::now() < deadline {
+        match ws.read() {
+            Ok(Message::Binary(b)) => {
+                acc.extend_from_slice(&b);
+                if acc.windows(needle.len()).any(|w| w == needle) {
+                    return true;
+                }
+            }
+            Ok(Message::Close(_)) => return false,
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    false
+}
+
+fn ws_recv_text_until(
+    ws: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    needles: &[&str],
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match ws.read() {
+            Ok(Message::Text(t)) => {
+                if needles.iter().all(|n| t.as_str().contains(n)) {
+                    return true;
+                }
+            }
+            Ok(Message::Close(_)) => return false,
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    false
+}
+
+/// F1b/F2:两 feeder 各一 workspace → WS 客户端连上收到【聚合】Workspaces(含两标题);默认看锚
+/// (第一个接入的 feeder)→ 只收锚的 PtyOutput,收不到另一个 feeder 的字节(per-feeder 隔离)。
+#[test]
+fn federated_two_feeders_aggregate_and_isolate() {
+    let port = free_port();
+    let k = FedKernel::spawn(port);
+
+    // 锚 feeder A(先接入)= ws 100 "alpha"(tab 1);feeder B = ws 200 "beta"(tab 2)。
+    let mut fa = k.connect_feeder();
+    declare(&mut fa, 100, 1, &[(1, "alpha")]);
+    std::thread::sleep(Duration::from_millis(200)); // 确保 A 先被 accept = 锚。
+    let mut fb = k.connect_feeder();
+    declare(&mut fb, 200, 2, &[(2, "beta")]);
+    std::thread::sleep(Duration::from_millis(300)); // 让 kernel 处理完两 feeder 声明。
+
+    let mut ws = match connect_ws(port, Duration::from_secs(15)) {
+        Some(w) => w,
+        None => {
+            k.cleanup();
+            panic!("15s 内未能连上联邦 kernel WS");
+        }
+    };
+
+    // 连上引导帧:聚合 Workspaces 应含两 workspace 的标题(alpha + beta)。
+    let agg = ws_recv_text_until(
+        &mut ws,
+        &["\"Workspaces\"", "alpha", "beta"],
+        Duration::from_secs(10),
+    );
+    assert!(
+        agg,
+        "WS 客户端应收到聚合 Workspaces(含两 feeder 的 workspace)"
+    );
+
+    // 锚(A)PtyOutput → WS 客户端(默认看锚)应收到。
+    feed(
+        &mut fa,
+        &FeedFrame {
+            kind: FrameKind::PtyOutput,
+            ws_id: 100,
+            tab_id: 1,
+            payload: b"ANCHOR_ALPHA_DATA".to_vec(),
+        },
+    );
+    let got_anchor = ws_recv_binary_until(&mut ws, b"ANCHOR_ALPHA_DATA", Duration::from_secs(10));
+    assert!(got_anchor, "WS 客户端(看锚)应收到锚 feeder 的 PtyOutput");
+
+    // 非锚(B)PtyOutput → WS 客户端(看锚)不该收到(per-feeder 隔离)。
+    feed(
+        &mut fb,
+        &FeedFrame {
+            kind: FrameKind::PtyOutput,
+            ws_id: 200,
+            tab_id: 2,
+            payload: b"OTHER_BETA_DATA".to_vec(),
+        },
+    );
+    let leaked = ws_recv_binary_until(&mut ws, b"OTHER_BETA_DATA", Duration::from_secs(2));
+    assert!(
+        !leaked,
+        "看锚的客户端不该收到另一个 feeder(workspace)的字节"
+    );
+
+    let _ = ws.close(None);
+    drop(fa);
+    drop(fb);
+    k.cleanup();
+}
+
+/// F2b:断一个非最后 feeder → kernel 存活;断最后一个 feeder → kernel 退出 + 清会合 socket 文件。
+#[test]
+fn federated_last_feeder_disconnect_exits_and_cleans_socket() {
+    let port = free_port();
+    let mut k = FedKernel::spawn(port);
+
+    let mut fa = k.connect_feeder();
+    declare(&mut fa, 100, 1, &[(1, "alpha")]);
+    std::thread::sleep(Duration::from_millis(150));
+    let mut fb = k.connect_feeder();
+    declare(&mut fb, 200, 2, &[(2, "beta")]);
+    std::thread::sleep(Duration::from_millis(300));
+
+    // 断 B(非最后):kernel 应存活 → 仍能 connect 会合 socket + child 未退。
+    drop(fb);
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        matches!(k.child.try_wait(), Ok(None)),
+        "断非最后 feeder 后 kernel 应存活"
+    );
+    // 会合 socket 仍在、仍可连(证 kernel loop 在跑)。
+    let probe = UnixStream::connect(&k.sock);
+    assert!(probe.is_ok(), "非最后 feeder 断后会合 socket 仍应可连");
+    drop(probe); // 这条探测连接也是个 feeder(未声明 ws),随即断开。
+    std::thread::sleep(Duration::from_millis(300));
+
+    // 此刻剩 feeder A(探测连接已断)。断 A → 最后一个 → kernel 退出。
+    drop(fa);
+
+    // 等 kernel 退出 + 清 socket 文件。
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut exited = false;
+    while Instant::now() < deadline {
+        if let Ok(Some(_)) = k.child.try_wait() {
+            exited = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let sock_gone = !k.sock.exists();
+    let dir = k.dir.clone();
+    // 已 reap(try_wait 收了),直接清目录(cleanup 会再 wait,幂等)。
+    if !exited {
+        // SAFETY: kill 已知子进程。
+        unsafe {
+            libc::kill(k.child.id() as i32, libc::SIGKILL);
+        }
+    }
+    let _ = k.child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(exited, "断最后一个 feeder 后 kernel 应退出(F2b)");
+    assert!(sock_gone, "kernel 退出应清理会合 socket 文件(F2b)");
+}

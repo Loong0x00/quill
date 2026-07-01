@@ -23,14 +23,21 @@
 use anyhow::Result;
 use tracing_subscriber::EnvFilter;
 
-use quill::kernel::daemon::{self, DaemonConfig};
+use quill::kernel::daemon::{self, DaemonConfig, SourceConfig};
 
 fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+
+    // ADR-0019 F1a:`--detach` → **最早**(尚单线程,未 init tracing / 未起线程)双 fork daemonize,
+    // 脱离发起窗口(机器级单例 kernel,不随窗口退出而死、不再是窗口子进程)。见 [`daemon::daemonize`]。
+    if daemon::parse_detach_arg(&args) {
+        daemon::daemonize()?;
+    }
+
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("quill=debug"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
-    let args: Vec<String> = std::env::args().collect();
     let socket_path = match daemon::parse_socket_arg(&args) {
         Some(p) => p,
         None => daemon::default_socket_path()?,
@@ -40,8 +47,13 @@ fn main() -> Result<()> {
     if let Some(addr) = daemon::parse_ws_bind_arg(&args)? {
         config.ws_bind = addr;
     }
-    // E′ 子进程拓扑:给了 --fed-in/--fed-out 即从父 pipe 喂料(不 spawn shell / 不开真 PTY)。
-    if let Some(source) = daemon::parse_fed_source(&args)? {
+    // 拓扑优先级:`--rendezvous`(ADR-0019 Federated:会合 accept N feeder)> `--fed-in/--fed-out`
+    // (ADR-0018 Fed:单继承 pipe,测试用)> 默认 Local(standalone spawn shell)。
+    if let Some(path) = daemon::parse_rendezvous_arg(&args) {
+        config.source = SourceConfig::Federated {
+            rendezvous_path: path,
+        };
+    } else if let Some(source) = daemon::parse_fed_source(&args)? {
         config.source = source;
     }
 
