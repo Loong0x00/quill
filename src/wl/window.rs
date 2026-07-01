@@ -647,26 +647,27 @@ fn share_rendezvous_socket_path() -> Result<PathBuf> {
 
 /// spawn **detached** 的会合 kernel(ADR-0019 F1a owner 路径 / ADR-0020 §2):`--rendezvous` +
 /// `--detach`(kernel 自 daemonize 双 fork 脱离本窗口 = 机器级单例、不随窗口退出而死、不再是窗口
-/// 子进程)+ `--ws-bind`。`Command::spawn` 起的是即将 daemonize 的原进程(fork1 后 `_exit`)→
-/// `wait` 立即收尸(无僵尸),真 daemon 已被 init 收养。**这一步只 spawn + 立即 wait 原进程**(亚毫秒,
-/// 不阻塞);随后由 [`share_rendezvous_retry_tick`] 用 calloop Timer **异步**非阻塞 connect 到就绪。
+/// 子进程)+ `--ws-bind`。`Command::spawn` 起的是即将 daemonize 的原进程(fork1 后即 `_exit(0)`,真
+/// daemon 是被 init 收养的孙进程 → 不是本窗口的子)。**只 spawn、绝不同步 `wait`**(ADR-0020 §3 终端
+/// 永远优先):同步 `wait` 原进程 `_exit` 会阻塞 calloop 线程,冷缓存/高负载下是几帧卡顿,kernel 万一
+/// 早期卡死更会**永久冻终端**。返回原进程 `Child`,由调用方塞进 [`SharePending`],在
+/// [`share_rendezvous_retry_tick`] 里 **非阻塞** `try_wait()` 收尸(原进程 ms 级即 `_exit`,首个 40ms
+/// tick 通常即收);连上没交给事件循环每圈顺手查(calloop Timer 异步 connect,非同步轮询)。
 ///
 /// **无锁**(ADR-0020 §2):不占 flock、不做同步轮询。万一真并发双 spawn(手动 opt-in 几乎不可达),
 /// 靠 kernel bind 会合 socket / 7878 的原子性兜底 —— 输的 kernel 秒退,是普通错误处理(接 back-channel
 /// EOF 短窗 → 琥珀),不上锁。
-fn share_spawn_detached_kernel(sock: &Path) -> Result<()> {
+fn share_spawn_detached_kernel(sock: &Path) -> Result<std::process::Child> {
     let exe = share_kernel_path();
     let ws_bind =
         std::env::var("QUILL_SHARE_WS_BIND").unwrap_or_else(|_| SHARE_WS_BIND_DEFAULT.to_string());
-    let mut child = std::process::Command::new(&exe)
+    let child = std::process::Command::new(&exe)
         .arg(format!("--rendezvous={}", sock.display()))
         .arg(format!("--ws-bind={ws_bind}"))
         .arg("--detach")
         .spawn()
         .with_context(|| format!("spawn detached 会合 kernel {} 失败", exe.display()))?;
-    // 收原进程(fork1 后即 _exit(0),真 daemon 是被 init 收养的孙进程 → 不是本窗口的子)。
-    let _ = child.wait();
-    Ok(())
+    Ok(child)
 }
 
 /// **非阻塞** try-connect 会合 socket(ADR-0020 §2)。AF_UNIX SOCK_STREAM connect 对没在监听的
@@ -700,7 +701,9 @@ fn share_should_drop_frame(outbound_len: usize, frame_len: usize, cap: usize) ->
 
 /// ADR-0020 §2 无锁异步会合【进行中】态(见 [`LoopData::share_pending`]):本窗口拉起 detached
 /// kernel 后,用 calloop Timer 异步重试非阻塞 connect 会合 socket 直到连上 / deadline。**全程不阻塞
-/// calloop 线程**(重试是 Timer 不是 sleep)。POD 字段、drop 序清晰(retry_token 是 Copy)。
+/// calloop 线程**(重试是 Timer 不是 sleep;拉起的原进程用 [`std::process::Child::try_wait`] 非阻塞
+/// 收尸,见 `kernel` 字段)。字段无 wl/GPU/calloop 句柄,drop 序无关(`retry_token` 是 Copy;`kernel`
+/// 是普通 `std` 进程句柄,drop 不 kill / 不阻塞)。
 struct SharePending {
     /// 会合 socket 路径(重试 connect 用)。
     sock: PathBuf,
@@ -711,6 +714,12 @@ struct SharePending {
     /// 重试 Timer 的 calloop 句柄。[`LoopData::stop_share`] 用它 `loop_handle.remove` 取消进行中会合;
     /// self-complete(连上 / 超时)路径走 `TimeoutAction::Drop`,不用本字段。
     retry_token: RegistrationToken,
+    /// 刚拉起的 detached kernel 的**原进程**(fork1 后即 `_exit(0)`,真 daemon 是被 init 收养的孙进程)。
+    /// 持它仅为在 [`share_rendezvous_retry_tick`] 里**非阻塞** `try_wait()` 收尸,**绝不在 calloop 线程
+    /// 同步 `wait`**(ADR-0020 §3 终端永远优先)。会合终结(连上 / 超时 / [`LoopData::stop_share`] 取消)
+    /// 丢弃本 `Child` 即可(Rust `Child` drop 不 kill / 不 reap;原进程早已 `_exit`,极端未收顶多残一个
+    /// 瞬时 zombie 到本进程退,可接受)。
+    kernel: std::process::Child,
 }
 
 /// ADR-0019 联邦共享句柄:本窗口作为 **feeder** 接入机器级单例 `quill-kernel` 的会合连接 +
@@ -1256,16 +1265,19 @@ impl LoopData {
     }
 
     /// 会合"无 kernel"支路(ADR-0020 §2):拉起 detached kernel + 排 calloop Timer 异步重试 connect。
-    /// **不阻塞 calloop 线程**(spawn 亚毫秒 + 立即 wait fork1 原进程,连上没交给事件循环每圈顺手查,
-    /// 见 [`share_rendezvous_retry_tick`])。**不在此删残留 socket 文件**:kernel 启动的
-    /// `prepare_socket_path` 自己判(活跃 daemon → 拒绝覆盖 / 残留 → 删),避免窗口侧 TOCTOU 误删活
-    /// kernel 的 socket(ADR-0020 无锁:真并发交给 kernel bind 会合 socket / 7878 的原子性兜底)。
+    /// **不阻塞 calloop 线程**(只 spawn 不同步 wait 原进程;原进程由 [`share_rendezvous_retry_tick`]
+    /// 非阻塞 `try_wait` 收尸;连上没交给事件循环每圈顺手查)。**不在此删残留 socket 文件**:kernel
+    /// 启动的 `prepare_socket_path` 自己判(活跃 daemon → 拒绝覆盖 / 残留 → 删),避免窗口侧 TOCTOU 误删
+    /// 活 kernel 的 socket(ADR-0020 无锁:真并发交给 kernel bind 会合 socket / 7878 的原子性兜底)。
     fn begin_rendezvous_spawn(&mut self, sock: PathBuf, focus_tab: u64) {
-        if let Err(e) = share_spawn_detached_kernel(&sock) {
-            tracing::warn!(?e, "start_share:拉起 detached 会合 kernel 失败,维持纯终端");
-            self.state.share_error = true;
-            return;
-        }
+        let kernel = match share_spawn_detached_kernel(&sock) {
+            Ok(child) => child,
+            Err(e) => {
+                tracing::warn!(?e, "start_share:拉起 detached 会合 kernel 失败,维持纯终端");
+                self.state.share_error = true;
+                return;
+            }
+        };
         let deadline = Instant::now() + SHARE_RENDEZVOUS_CONNECT_TIMEOUT;
         let timer = Timer::from_duration(SHARE_RENDEZVOUS_RETRY_INTERVAL);
         match self
@@ -1279,6 +1291,7 @@ impl LoopData {
                     focus_tab,
                     deadline,
                     retry_token,
+                    kernel,
                 });
                 tracing::info!(
                     tab = focus_tab,
@@ -1305,8 +1318,10 @@ impl LoopData {
     /// back-channel 源自身回调内调用**(那条走 `PostAction::Remove`,见 [`share_back_channel_readable`]),
     /// 故 `remove` 移除的是【别的】源,calloop 允许。
     fn stop_share(&mut self) {
-        if let Some(pending) = self.share_pending.take() {
+        if let Some(mut pending) = self.share_pending.take() {
             self.loop_handle.remove(pending.retry_token);
+            // 非阻塞收尸原进程(可能尚未 _exit → 顶多残瞬时 zombie 到本进程退);**不同步 wait**。
+            let _ = pending.kernel.try_wait();
             tracing::info!("stop_share:取消进行中的会合连接(pending);回纯终端");
             return;
         }
@@ -1395,24 +1410,29 @@ fn finish_share_connect(data: &mut LoopData, stream: UnixStream, focus_tab: u64)
 
 /// ADR-0020 §2 会合异步重试 Timer 回调:每 [`SHARE_RENDEZVOUS_RETRY_INTERVAL`] 非阻塞 try-connect
 /// 一次会合 socket。**永不阻塞 calloop 线程 / 终端**(单次 connect 立即返回,连不上就下一 tick 再试,
-/// 是 Timer 不是 `thread::sleep`)。
+/// 是 Timer 不是 `thread::sleep`)。每 tick 顺手 **非阻塞** `try_wait` 收拉起的 detached kernel 原进程
+/// (fork1 后即 `_exit`;不同步 `wait`,ADR-0020 §3 终端优先)。
 /// - `share_pending` 已被清(用户 [`LoopData::stop_share`] 取消)/ `share` 已置 → `Drop`(停 Timer);
 /// - 连上 → [`finish_share_connect`] 建 feeder + 清 `share_pending` + 请求重画 → `Drop`;
 /// - deadline 到期仍连不上 → 置 `share_error` 琥珀态 + 清 `share_pending` + 请求重画 → `Drop`;
 /// - 否则(未连上、未到期)→ `ToDuration` 排下一 tick 再试(同一 Timer 源复用,token 不变)。
 fn share_rendezvous_retry_tick(data: &mut LoopData) -> TimeoutAction {
     // 取消(stop_share take 了 pending)→ 本 Timer 作废,停。
-    let Some(pending) = data.share_pending.as_ref() else {
+    let Some(pending) = data.share_pending.as_mut() else {
         return TimeoutAction::Drop;
     };
+    // 非阻塞收尸:拉起的 detached kernel 原进程(fork1 后即 _exit)。**绝不同步 wait**(ADR-0020 §3
+    // 终端优先);原进程 ms 级即退,首个 tick 通常即收,收不到就下 tick 再收。会合终结丢弃 pending
+    // 时若仍未收顶多残一个瞬时 zombie 到本进程退(可接受)。
+    let _ = pending.kernel.try_wait();
+    let sock = pending.sock.clone();
+    let focus_tab = pending.focus_tab;
+    let deadline = pending.deadline;
     // 防御性:已连上(不该发生,连上即清 pending)→ 清 pending 停 Timer。
     if data.share.is_some() {
         data.share_pending = None;
         return TimeoutAction::Drop;
     }
-    let sock = pending.sock.clone();
-    let focus_tab = pending.focus_tab;
-    let deadline = pending.deadline;
     match share_try_connect(&sock) {
         Ok(Some(stream)) => {
             data.share_pending = None; // 先清 pending(finish 置 share;两者互斥)。
