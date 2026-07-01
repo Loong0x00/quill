@@ -226,6 +226,68 @@ fn ws_recv_until(
     false
 }
 
+/// 读 WS **Text** 帧(控制面 JSON `ServerMsg`),直到某帧同时含所有 `needles` 或超时。
+fn ws_recv_text_until(
+    ws: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    needles: &[&str],
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match ws.read() {
+            Ok(Message::Text(t)) => {
+                if needles.iter().all(|n| t.as_str().contains(n)) {
+                    return true;
+                }
+            }
+            Ok(Message::Close(_)) => return false,
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    false
+}
+
+/// 砖2 B2:父灌 TabList 帧 → 子重建 WorkspaceInfo → 广播 `ServerMsg::Workspace`(含 tab 明细 +
+/// 标题)给 WS 客户端。手机据此画 tab 栏。
+#[test]
+fn fed_child_broadcasts_tab_list_metadata_to_ws() {
+    use quill::kernel::feed::encode_tab_list;
+
+    let port = free_port();
+    let fc = FedChild::spawn(port);
+
+    let mut ws = match connect_ws(port, Duration::from_secs(15)) {
+        Some(w) => w,
+        None => {
+            fc.cleanup();
+            panic!("15s 内未能连上 Fed 子进程 WS");
+        }
+    };
+
+    // 父发整份 tab 列表(active=1):两 tab id=7 "shell" / id=9 "vim-editor"。
+    let payload = encode_tab_list(1, &[(7, "shell"), (9, "vim-editor")]);
+    fc.feed(&FeedFrame {
+        kind: FrameKind::TabList,
+        ws_id: 1,
+        tab_id: 9,
+        payload,
+    });
+
+    // WS 应收到一条 Workspace 控制帧,含两 tab id + 标题。
+    let got = ws_recv_text_until(
+        &mut ws,
+        &["\"Workspace\"", "\"tab_id\":9", "vim-editor", "shell"],
+        Duration::from_secs(10),
+    );
+    let _ = ws.close(None);
+    fc.cleanup();
+    assert!(
+        got,
+        "父 TabList 帧应经子重建为 ServerMsg::Workspace(tab 明细 + 标题)广播到 WS"
+    );
+}
+
 /// 块D-1:父灌 PtyOutput 帧 → 浏览器(WS)收到那批 payload 字节。
 #[test]
 fn fed_child_streams_pty_output_frames_to_ws() {

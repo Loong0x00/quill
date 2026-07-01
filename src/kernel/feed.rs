@@ -50,6 +50,16 @@ pub enum FrameKind {
     WorkspaceAdd,
     /// 父→子:工作区移除 (同 [`FrameKind::WorkspaceAdd`],砖1a 仅留接口)。
     WorkspaceRemove,
+    /// 父→子 (砖2 B2):**整份 tab 列表**。`ws_id` = 工作区 id,`tab_id` = 桌面焦点 tab id
+    /// (冗余便利,权威在 payload 的 active_idx);`payload` = [`encode_tab_list`] 编码的
+    /// (active_idx + 每 tab 的 id/title)。任何 tab 增删 / 换序 / 焦点变时父【重发整份】(非增量)
+    /// → 子据此重建 [`crate::kernel::proto::WorkspaceInfo`] 广播给手机(tab 栏)。整份重发省掉一
+    /// 整类增量 desync bug(daily-drive tab 个位数,整份也就几十字节)。
+    TabList,
+    /// 子→父 (砖2 B4):手机发起的 tab 操作 (New / Close / Reorder) 经 back-channel 回灌父,父调既有
+    /// `apply_tab_op` 执行 (E′ 里 PTY/TabList 归父)。`payload` = [`encode_tab_op`] 编码的 op;
+    /// Select 是【子本地】切 viewed 不回父(见 daemon `handle_client_msg`),故不走本帧。
+    TabOp,
 }
 
 impl FrameKind {
@@ -64,6 +74,8 @@ impl FrameKind {
             // Dims=6:在 enum 里排在 WorkspaceAdd 前,但线缆字节显式延后到 6,保住既有
             // WorkspaceAdd=4 / WorkspaceRemove=5 的编号不变(线缆兼容)。
             FrameKind::Dims => 6,
+            FrameKind::TabList => 7,
+            FrameKind::TabOp => 8,
         }
     }
 
@@ -76,6 +88,8 @@ impl FrameKind {
             4 => Some(FrameKind::WorkspaceAdd),
             5 => Some(FrameKind::WorkspaceRemove),
             6 => Some(FrameKind::Dims),
+            7 => Some(FrameKind::TabList),
+            8 => Some(FrameKind::TabOp),
             _ => None,
         }
     }
@@ -140,6 +154,69 @@ pub fn decode_dims(payload: &[u8]) -> Option<(u16, u16)> {
     let cols = u16::from_le_bytes([payload[0], payload[1]]);
     let rows = u16::from_le_bytes([payload[2], payload[3]]);
     Some((cols, rows))
+}
+
+/// 编码 [`FrameKind::TabList`] 的 payload(砖2 B2):`active_idx:u32 LE` + `count:u32 LE`,随后
+/// `count` 个 tab 项,每项 `tab_id:u64 LE` + `title_len:u32 LE` + `title` UTF-8 字节。
+///
+/// 父(`window.rs`)每次 tab 增删 / 换序 / 焦点变时用它编整份列表 tee 给子;子 [`decode_tab_list`]
+/// 还原后重建 [`crate::kernel::proto::WorkspaceInfo`] 广播给手机 tab 栏。`active_idx` 越界(空列表
+/// 时给 0)由解码方按"无 active"处理(clamp)。
+pub fn encode_tab_list(active_idx: usize, tabs: &[(u64, &str)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + tabs.len() * 16);
+    out.extend_from_slice(&(active_idx as u32).to_le_bytes());
+    out.extend_from_slice(&(tabs.len() as u32).to_le_bytes());
+    for (id, title) in tabs {
+        out.extend_from_slice(&id.to_le_bytes());
+        let tb = title.as_bytes();
+        out.extend_from_slice(&(tb.len() as u32).to_le_bytes());
+        out.extend_from_slice(tb);
+    }
+    out
+}
+
+/// 解码 [`FrameKind::TabList`] 的 payload → `(active_idx, Vec<(tab_id, title)>)`。任何长度不足 /
+/// title 越界(流错位 / 协议不匹配)返 `None`,调用方**忽略该帧**(非致命:元数据丢一拍下次
+/// tab 变化补;不像坏 kind 那样是解码器级致命错)。非法 UTF-8 用 `from_utf8_lossy` 兜(title
+/// 仅供显示,不做进一步解析)。
+pub fn decode_tab_list(payload: &[u8]) -> Option<(usize, Vec<(u64, String)>)> {
+    let mut p = payload;
+    let active = u32_from(&mut p)? as usize;
+    let count = u32_from(&mut p)? as usize;
+    let mut tabs = Vec::with_capacity(count.min(1024)); // 防伪造巨 count 预分配
+    for _ in 0..count {
+        let id = u64_from(&mut p)?;
+        let title_len = u32_from(&mut p)? as usize;
+        if p.len() < title_len {
+            return None;
+        }
+        let (title_bytes, rest) = p.split_at(title_len);
+        p = rest;
+        tabs.push((id, String::from_utf8_lossy(title_bytes).into_owned()));
+    }
+    Some((active, tabs))
+}
+
+/// 从切片头部取一个小端 `u32` 并前移游标;不足 4 字节返 `None`。
+fn u32_from(p: &mut &[u8]) -> Option<u32> {
+    if p.len() < 4 {
+        return None;
+    }
+    let (head, rest) = p.split_at(4);
+    *p = rest;
+    Some(u32::from_le_bytes([head[0], head[1], head[2], head[3]]))
+}
+
+/// 从切片头部取一个小端 `u64` 并前移游标;不足 8 字节返 `None`。
+fn u64_from(p: &mut &[u8]) -> Option<u64> {
+    if p.len() < 8 {
+        return None;
+    }
+    let (head, rest) = p.split_at(8);
+    *p = rest;
+    let mut a = [0u8; 8];
+    a.copy_from_slice(head);
+    Some(u64::from_le_bytes(a))
 }
 
 /// 解码错误。流错位 (坏 kind / 天文 len) 在可信父链下不该发生,出现即视为致命 —— 调用方
@@ -289,6 +366,13 @@ mod tests {
             frame(FrameKind::Dims, 1, 7, &encode_dims(212, 56)),
             frame(FrameKind::WorkspaceAdd, 5, 0, b"meta"),
             frame(FrameKind::WorkspaceRemove, 5, 0, b""),
+            frame(
+                FrameKind::TabList,
+                1,
+                7,
+                &encode_tab_list(1, &[(7, "sh"), (9, "vim")]),
+            ),
+            frame(FrameKind::TabOp, 1, 0, b"\x01"),
         ];
         for f in cases {
             let mut dec = FeedDecoder::new();
@@ -396,6 +480,43 @@ mod tests {
             "缓冲应被压实,不随吞吐累计涨 (实际 {} 字节)",
             dec.buf.len()
         );
+    }
+
+    /// TabList payload 编解码往返(含空列表 / CJK 标题 / 越界 active),坏 payload 返 None。
+    #[test]
+    fn tab_list_payload_roundtrip_and_reject_bad() {
+        // 正常:两个 tab,active=1。
+        let tabs = [(7u64, "bash"), (9u64, "中文标题")];
+        let enc = encode_tab_list(1, &tabs);
+        let (active, got) = decode_tab_list(&enc).expect("decode ok");
+        assert_eq!(active, 1);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0], (7, "bash".to_string()));
+        assert_eq!(got[1], (9, "中文标题".to_string()));
+
+        // 空列表。
+        let empty = encode_tab_list(0, &[]);
+        let (a, g) = decode_tab_list(&empty).expect("empty decode");
+        assert_eq!(a, 0);
+        assert!(g.is_empty());
+
+        // 截断(声明 count=1 但无 tab 数据)→ None。
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&0u32.to_le_bytes()); // active
+        bad.extend_from_slice(&1u32.to_le_bytes()); // count=1
+        assert_eq!(decode_tab_list(&bad), None, "count 声明与数据不符应拒绝");
+
+        // title_len 越界 → None。
+        let mut bad2 = Vec::new();
+        bad2.extend_from_slice(&0u32.to_le_bytes()); // active
+        bad2.extend_from_slice(&1u32.to_le_bytes()); // count=1
+        bad2.extend_from_slice(&7u64.to_le_bytes()); // tab_id
+        bad2.extend_from_slice(&99u32.to_le_bytes()); // title_len=99 但无字节
+        assert_eq!(decode_tab_list(&bad2), None, "title_len 越界应拒绝");
+
+        // 头都不足 → None。
+        assert_eq!(decode_tab_list(&[]), None);
+        assert_eq!(decode_tab_list(&[1, 2, 3]), None);
     }
 
     /// Dims payload 编解码往返 + 长度错拒绝。

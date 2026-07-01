@@ -64,9 +64,11 @@ use tungstenite::handshake::MidHandshake;
 use tungstenite::{Bytes, Error as WsError, HandshakeError, Message, WebSocket};
 
 use crate::kernel::feed::{
-    decode_dims, encode_into, FeedDecoder, FeedFrame, FrameKind, FEED_HEADER_LEN,
+    decode_dims, decode_tab_list, encode_into, FeedDecoder, FeedFrame, FrameKind, FEED_HEADER_LEN,
 };
-use crate::kernel::proto::{ClientMsg, ServerMsg, Snapshot, WorkspaceList, WorkspaceMeta};
+use crate::kernel::proto::{
+    ClientMsg, ServerMsg, Snapshot, TabMeta, WorkspaceInfo, WorkspaceList, WorkspaceMeta,
+};
 use crate::kernel::session::{Lifecycle, Session};
 use crate::tab::{TabInstance, TabList};
 
@@ -421,6 +423,8 @@ pub fn run(config: DaemonConfig) -> Result<()> {
             SourceConfig::Local => Some((config.cols, config.rows)),
             SourceConfig::Fed { .. } => None,
         },
+        fed_tabs: Vec::new(),
+        fed_active: 0,
         ring: ByteRing::new(BYTE_RING_CAP),
         clients: HashMap::new(),
         next_client_id: 1,
@@ -590,6 +594,13 @@ struct DaemonData {
     /// [`FrameKind::Dims`] 帧(桌面 resize / spawn 时)。连上引导帧([`build_control_text`])与
     /// 实时广播([`broadcast_dims`])据此发 [`ServerMsg::Dims`],客户端 `term.resize` 到桌面宽。
     dims: Option<(u16, u16)>,
+    /// **Fed 拓扑**(E′ 子)当前工作区的 tab 列表(砖2 B2:父经 [`FrameKind::TabList`] 帧喂,整份
+    /// 重发)。子据此构 [`ServerMsg::Workspace`] / [`ServerMsg::Workspaces`] 广播给手机 tab 栏。
+    /// Local 拓扑不用(用真 [`Session`] 元数据),恒空。
+    fed_tabs: Vec<TabMeta>,
+    /// **Fed 拓扑**桌面焦点 tab 在 [`Self::fed_tabs`] 里的下标(TabList 帧的 active_idx;FocusChange
+    /// 帧也据焦点 tab id 更新)。构 `WorkspaceInfo.active`(手机据此标"哪个是桌面焦点")。
+    fed_active: usize,
     /// PTY 原始字节环缓冲(连上重放重建当前屏)。单线程,直接 fan-out 进各连接出站队列。
     ring: ByteRing,
     /// 在册 WS 连接(Peeking / Handshaking / Live)。key = 自增连接 id。
@@ -957,14 +968,32 @@ fn route_fed_frame(data: &mut DaemonData, frame: FeedFrame) {
                 ),
             }
         }
+        FrameKind::TabList => {
+            // 砖2 B2:父发整份 tab 列表 → 重建 fed_tabs + 广播 Workspaces/Workspace 给手机 tab 栏。
+            match decode_tab_list(&frame.payload) {
+                Some((active, tabs)) => {
+                    data.workspace_id = frame.ws_id;
+                    data.fed_tabs = tabs
+                        .into_iter()
+                        .map(|(id, title)| TabMeta { tab_id: id, title })
+                        .collect();
+                    data.fed_active = active.min(data.fed_tabs.len().saturating_sub(1));
+                    broadcast_fed_metadata(data);
+                }
+                None => tracing::warn!(
+                    len = frame.payload.len(),
+                    "Fed 收到 TabList 帧 payload 非法,忽略"
+                ),
+            }
+        }
         FrameKind::WorkspaceAdd | FrameKind::WorkspaceRemove => {
             tracing::debug!(
                 ws_id = frame.ws_id,
-                "Fed 收到 WorkspaceAdd/Remove 帧 (砖1a 预留接口,砖1b 接控制面元数据)"
+                "Fed 收到 WorkspaceAdd/Remove 帧 (工作区级元数据,单工作区 E′ 用 TabList 帧代之)"
             );
         }
-        FrameKind::Input => {
-            tracing::debug!("Fed 收到 Input 帧 (方向应为子→父),忽略");
+        FrameKind::Input | FrameKind::TabOp => {
+            tracing::debug!(kind = ?frame.kind, "Fed 收到子→父方向帧 (父不该往子发),忽略");
         }
     }
 }
@@ -1012,6 +1041,50 @@ fn broadcast_stream_focus(data: &mut DaemonData) {
 /// 到桌面宽。桌面 resize(父发 [`FrameKind::Dims`])后调。
 fn broadcast_dims(data: &mut DaemonData, cols: u16, rows: u16) {
     broadcast_control(data, &ServerMsg::Dims { cols, rows });
+}
+
+/// 构 **Fed 拓扑** 当前工作区的 [`WorkspaceInfo`](砖2 B2:tab 明细 + 桌面焦点 active + 尺寸)。
+/// 尺寸取 [`DaemonData::dims`](父发的桌面 PTY 尺寸;未到则默认)。
+fn fed_workspace_info(data: &DaemonData) -> WorkspaceInfo {
+    let (cols, rows) = data
+        .dims
+        .map(|(c, r)| (c as usize, r as usize))
+        .unwrap_or((DEFAULT_COLS as usize, DEFAULT_ROWS as usize));
+    WorkspaceInfo {
+        workspace_id: data.workspace_id,
+        tabs: data.fed_tabs.clone(),
+        active: data.fed_active,
+        cols,
+        rows,
+    }
+}
+
+/// 构 **Fed 拓扑** 的工作区列表(单工作区 E′:桌面那一个)。摘要标题取桌面焦点 tab 标题。
+fn fed_workspace_list(data: &DaemonData) -> WorkspaceList {
+    let title = data
+        .fed_tabs
+        .get(data.fed_active)
+        .map(|t| t.title.clone())
+        .unwrap_or_default();
+    WorkspaceList {
+        workspaces: vec![WorkspaceMeta {
+            id: data.workspace_id,
+            title,
+            tab_count: data.fed_tabs.len(),
+            active: true,
+        }],
+        active: data.workspace_id,
+    }
+}
+
+/// 向所有 live WS 客户端广播 **Fed 拓扑** 工作区元数据(砖2 B2):[`ServerMsg::Workspaces`]
+/// (工作区列表)+ [`ServerMsg::Workspace`](当前工作区 tab 明细)。tab 增删 / 换序 / 焦点变
+/// (父发 [`FrameKind::TabList`] / [`FrameKind::FocusChange`])后调,让手机 tab 栏刷新。
+fn broadcast_fed_metadata(data: &mut DaemonData) {
+    let list = fed_workspace_list(data);
+    let info = fed_workspace_info(data);
+    broadcast_control(data, &ServerMsg::Workspaces(list));
+    broadcast_control(data, &ServerMsg::Workspace(info));
 }
 
 /// 把 WS 客户端输入字节路由到 input sink(块C —— 在 `on_input` 调用点岔开两条数据流):
@@ -1470,7 +1543,8 @@ fn ws_go_live(
 fn build_control_text(data: &DaemonData, ws_id: u64) -> Vec<String> {
     let mut out = match (&data.session, &data.fed) {
         (Some(session), _) => build_control_text_local(session, ws_id),
-        (None, Some(_)) => build_control_text_fed(data, ws_id),
+        // 新连接初始 viewed = 桌面焦点 tab(data.tab_id);B3 后可经 Select 切离。
+        (None, Some(_)) => build_control_text_fed(data, ws_id, data.tab_id),
         (None, None) => Vec::new(),
     };
     // A′ 增量1:已知桌面尺寸 → 末尾追一条 ServerMsg::Dims,客户端 term.resize 到桌面宽渲染。
@@ -1481,28 +1555,19 @@ fn build_control_text(data: &DaemonData, ws_id: u64) -> Vec<String> {
     out
 }
 
-/// Fed 拓扑连上引导帧(块B):砖1a 子无 Session,控制面工作区元数据(tab 明细)接线在砖1b
-/// (父经 `WorkspaceAdd` 帧喂)。当前最小引导 = 一条单工作区列表 + 字节流 (workspace, tab) 标签
-/// ([`ServerMsg::StreamFocus`]),让客户端先知道焦点;数据面忠实字节流兜底渲染。
-fn build_control_text_fed(data: &DaemonData, ws_id: u64) -> Vec<String> {
+/// Fed 拓扑连上引导帧(砖2 B2):① 工作区列表 ② 当前工作区 tab 明细(父经 [`FrameKind::TabList`]
+/// 帧喂的 [`DaemonData::fed_tabs`],连上前未收到 TabList 则 tab 列表暂空、后续 TabList 补)③ 字节流
+/// (workspace, tab) 标签([`ServerMsg::StreamFocus`],= 此连接初始 viewed = 桌面焦点 tab)。数据面忠实
+/// 字节流兜底渲染。`tab_id` 传该连接初始 viewed(连上默认 = 桌面焦点),使标签与随后重放的环缓冲一致。
+fn build_control_text_fed(data: &DaemonData, ws_id: u64, viewed_tab: u64) -> Vec<String> {
     let mut out = Vec::new();
-    push_server_json(
-        &mut out,
-        &ServerMsg::Workspaces(WorkspaceList {
-            workspaces: vec![WorkspaceMeta {
-                id: ws_id,
-                title: String::new(),
-                tab_count: 1,
-                active: true,
-            }],
-            active: ws_id,
-        }),
-    );
+    push_server_json(&mut out, &ServerMsg::Workspaces(fed_workspace_list(data)));
+    push_server_json(&mut out, &ServerMsg::Workspace(fed_workspace_info(data)));
     push_server_json(
         &mut out,
         &ServerMsg::StreamFocus {
             workspace_id: ws_id,
-            tab_id: data.tab_id,
+            tab_id: viewed_tab,
         },
     );
     out

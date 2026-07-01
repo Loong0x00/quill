@@ -42,7 +42,7 @@ use calloop::{EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction, Reg
 use crate::composer::prompt_track::Segment;
 use crate::composer::state::{ComposerInput, ComposerOutcome};
 use crate::kernel::feed::{
-    encode_dims, encode_into, FeedDecoder, FeedFrame, FrameKind, FEED_HEADER_LEN,
+    encode_dims, encode_into, encode_tab_list, FeedDecoder, FeedFrame, FrameKind, FEED_HEADER_LEN,
 };
 use crate::tab::{TabInstance, TabList};
 use smithay_client_toolkit::{
@@ -801,6 +801,16 @@ impl ShareChild {
         self.push_frame(FrameKind::Dims, ws, tab, &payload);
     }
 
+    /// 发整份 tab 列表给子(砖2 B2:父→子 `TabList` 帧)。`active_idx` = 桌面焦点 tab 下标,
+    /// `tabs` = 按显示顺序的 (tab_id, title)。任何 tab 增删 / 换序 / 焦点变时父整份重发 → 子重建
+    /// [`WorkspaceInfo`] 广播给手机 tab 栏。帧头 `tab_id` 填桌面焦点 tab(冗余便利,权威在 payload)。
+    fn send_tab_list(&mut self, ws: u64, active_idx: usize, tabs: &[(u64, String)]) {
+        let refs: Vec<(u64, &str)> = tabs.iter().map(|(id, t)| (*id, t.as_str())).collect();
+        let payload = encode_tab_list(active_idx, &refs);
+        let active_tab = tabs.get(active_idx).map(|(id, _)| *id).unwrap_or(0);
+        self.push_frame(FrameKind::TabList, ws, active_tab, &payload);
+    }
+
     /// encode 一帧进复用 buffer,append 到出站队列并尝试 drain(背压见 [`enqueue_and_drain`])。
     fn push_frame(&mut self, kind: FrameKind, ws: u64, tab: u64, payload: &[u8]) {
         // 取出复用 buffer(避免 `&self.frame_scratch` 与 `&mut self.enqueue_and_drain` 借用冲突)。
@@ -1005,9 +1015,11 @@ impl LoopData {
                     u16::try_from(rows).unwrap_or(u16::MAX),
                 );
                 self.share = Some(sh);
+                // 砖2 B2:发初始 tab 列表给子(连上早于首个 tab 变化的客户端也拿到 tab 栏)。
+                sync_share_tab_list(self);
                 tracing::info!(
                     tab = focus_tab,
-                    "E′ 共享已开启(--share / 标题栏 toggle / Ctrl+Shift+S);焦点 tab 输出 tee 给手机"
+                    "E′ 共享已开启(--share / 标题栏 toggle / Ctrl+Shift+S);全部 tab 输出 tee 给手机"
                 );
             }
             Err(e) => {
@@ -2901,6 +2913,23 @@ fn on_active_tab_changed(data: &mut LoopData) {
     let active_id_for_share = data.state.tabs.as_ref().map(|t| t.active().id().raw());
     if let (Some(active_id), Some(sh)) = (active_id_for_share, data.share.as_mut()) {
         sh.set_focus(SHARE_DESKTOP_WS_ID, active_id);
+    }
+    // 砖2 B2:tab 集 / 换序 / 焦点变都经本函数 → 整份重发 tab 列表给子(子广播给手机 tab 栏)。
+    sync_share_tab_list(data);
+}
+
+/// 把当前桌面 tab 列表【整份】发给共享子(砖2 B2:父→子 `TabList` 帧)。`share` 未武装 = no-op
+/// (默认零回归)。先收集 owned `(tab_id, title)`(释放 `state.tabs` 不可变借用)再借 `data.share`
+/// (与 `state` 是 disjoint LoopData 字段),避免借用冲突。tab 增删 / 换序 / 焦点变时由
+/// [`on_active_tab_changed`] 调,共享启动时由 [`LoopData::start_share`] 调(发初始列表)。
+fn sync_share_tab_list(data: &mut LoopData) {
+    let Some(tabs) = data.state.tabs.as_ref() else {
+        return;
+    };
+    let active = tabs.active_idx();
+    let list: Vec<(u64, String)> = tabs.iter().map(|t| (t.id().raw(), t.title())).collect();
+    if let Some(sh) = data.share.as_mut() {
+        sh.send_tab_list(SHARE_DESKTOP_WS_ID, active, &list);
     }
 }
 
