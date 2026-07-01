@@ -122,6 +122,45 @@
   }
   #keys button:active { background: #3a3a3a; }
   #keys button.wide { min-width: 4.2rem; }
+  /* 砖2 W1:标签栏(手机端 tab 管理)。独立一行,置于顶栏下方、#stage 上方。横向可滚
+     (tab 多了不换行),触摸热区够大(min-height 2.2rem)。只有一个 tab 时整条隐藏
+     (.hidden)→ 单 tab 行为等价今天(不突兀);≥2 tab 才出现。标签栏是【叠加】,坏了
+     切回忠实单 tab 仍工作(faithful 保底)。 */
+  #tabbar {
+    flex: 0 0 auto; display: flex; gap: .25rem; align-items: stretch;
+    padding: .25rem .35rem; background: #101010;
+    border-bottom: 1px solid #2a2a2a;
+    overflow-x: auto; -webkit-overflow-scrolling: touch;
+  }
+  #tabbar.hidden { display: none; }
+  #tabbar .tab {
+    flex: 0 0 auto; display: inline-flex; align-items: center; gap: .35rem;
+    max-width: 11rem; min-height: 2.2rem; padding: 0 .25rem 0 .55rem;
+    background: #1e1e1e; color: #cfcfcf; border: 1px solid #333;
+    border-radius: .4rem; font-family: system-ui, sans-serif; font-size: .8rem;
+    cursor: pointer; user-select: none; -webkit-user-select: none;
+    touch-action: manipulation;
+  }
+  /* 本客户端【正在看】的 tab(据 StreamFocus 高亮,绿框呼应共享色 #3fb950)。 */
+  #tabbar .tab.viewed { background: #22331f; border-color: #3fb950; color: #f0f0f0; }
+  #tabbar .tab .label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* 桌面焦点 tab 的标记(琥珀点)—— 手机各看各的,这标记指"桌面屏前那个"。 */
+  #tabbar .tab .focusdot {
+    flex: 0 0 auto; width: .4rem; height: .4rem; border-radius: 50%; background: #e3b341;
+  }
+  #tabbar .tab .close {
+    flex: 0 0 auto; width: 1.5rem; height: 1.5rem; display: inline-flex;
+    align-items: center; justify-content: center; border-radius: .3rem;
+    color: #9a9a9a; font-size: 1.05rem; line-height: 1;
+  }
+  #tabbar .tab .close:active { background: #5a2020; color: #fff; }
+  #tabbar .newtab {
+    flex: 0 0 auto; min-width: 2.2rem; min-height: 2.2rem; display: inline-flex;
+    align-items: center; justify-content: center; background: #1e1e1e; color: #cfcfcf;
+    border: 1px solid #333; border-radius: .4rem; font-size: 1.15rem; line-height: 1;
+    cursor: pointer; user-select: none; -webkit-user-select: none; touch-action: manipulation;
+  }
+  #tabbar .newtab:active { background: #2a2a2a; }
 </style>
 </head>
 <body>
@@ -131,6 +170,9 @@
     <button id="modebtn" type="button">重排视图</button>
     <span id="status">连接中…</span>
   </div>
+  <!-- 砖2 W1:标签栏。内容由 JS 从 ServerMsg::Workspace(tab 列表)渲染,点 tab=Select、
+       + = New、× = Close。默认 hidden(单 tab 不显),≥2 tab 才出现。 -->
+  <div id="tabbar" class="hidden"></div>
   <!-- A′ toggle-scroll:#term 与 #reflow 同居一个 position:relative 的 #stage,各自
        absolute inset:0(同尺寸叠放)。切重排 = #reflow 不透明盖在 #term 上;#term 永远
        保持全尺寸(绝不缩成 1px)→ xterm 几何/滚动容器永不被扰动,往返切换后忠实滚动不退化。 -->
@@ -663,14 +705,115 @@ function holdOnce() {
     held = true;
   }
 }
-// 入站控制帧:externally-tagged ServerMsg。砖0 web 只需从中学到 active workspace id。
+// ── 砖2 W1:标签栏状态 + 渲染 + tab 操作 ─────────────────────────────────────────────
+// 数据来自 ServerMsg::Workspace(WorkspaceInfo){ workspace_id, tabs:[{tab_id,title}], active }。
+//   tabList        = tab 列表(顺序 = 后端 fed_tabs 顺序 → Select 用的 idx == 此数组下标)
+//   desktopFocusIdx = WorkspaceInfo.active(桌面屏前焦点 tab,标琥珀点)
+//   viewedTab      = 本客户端在看的 tab_id(据 StreamFocus,绿框高亮)
+// 手机各看各的 → viewedTab 与桌面焦点可不同。标签栏是【叠加】,坏了忠实单 tab 仍工作。
+const tabbarEl = $("tabbar");
+let curWs = null;
+let tabList = [];
+let desktopFocusIdx = -1;
+let viewedTab = null;
+
+// 发一条 TabOp 控制帧(externally-tagged:{"TabOp":{"workspace_id":W,"op":<op>}};
+// op:New="New" / Select={Select:{idx}} / Close={Close:{tab_id}})。
+function sendTabOp(op) {
+  if (curWs !== null) sendControl({ TabOp: { workspace_id: curWs, op } });
+}
+
+function renderTabBar() {
+  if (!tabList.length) { tabbarEl.classList.add("hidden"); tabbarEl.replaceChildren(); return; }
+  tabbarEl.classList.remove("hidden");
+  const frag = document.createDocumentFragment();
+  tabList.forEach((t, i) => {
+    const el = document.createElement("div");
+    el.className = t.tab_id === viewedTab ? "tab viewed" : "tab";
+    if (i === desktopFocusIdx) {          // 桌面焦点标记(琥珀点)
+      const dot = document.createElement("span");
+      dot.className = "focusdot";
+      dot.title = "桌面焦点";
+      el.appendChild(dot);
+    }
+    const label = document.createElement("span");
+    label.className = "label";
+    label.textContent = t.title && t.title.length ? t.title : "tab " + (i + 1);
+    el.appendChild(label);
+    // × 只在 ≥2 tab 时出现:防误触关掉最后一个 tab(= 关整个桌面 quill,后端诚实继承)。
+    if (tabList.length > 1) {
+      const x = document.createElement("span");
+      x.className = "close";
+      x.textContent = "×";
+      // click(非 pointerup):浏览器在滚动手势后抑制 click → 横滑标签栏不会误触 ×。
+      x.addEventListener("click", (e) => {
+        e.stopPropagation();
+        sendTabOp({ Close: { tab_id: t.tab_id } });
+      });
+      el.appendChild(x);
+    }
+    el.addEventListener("click", () => {
+      if (t.tab_id !== viewedTab) sendTabOp({ Select: { idx: i } });
+    });
+    frag.appendChild(el);
+  });
+  const plus = document.createElement("div");
+  plus.className = "newtab";
+  plus.textContent = "+";
+  plus.setAttribute("aria-label", "新建 tab");
+  plus.addEventListener("click", () => sendTabOp("New"));
+  frag.appendChild(plus);
+  tabbarEl.replaceChildren(frag);
+}
+
+// 收到 WorkspaceInfo → 刷新 tab 列表 + 桌面焦点标记 + 重画标签栏。
+function updateWorkspace(info) {
+  if (info && typeof info.workspace_id === "number") curWs = info.workspace_id;
+  tabList = Array.isArray(info && info.tabs) ? info.tabs.slice() : [];
+  desktopFocusIdx = Number.isInteger(info && info.active) ? info.active : -1;
+  renderTabBar();
+}
+
+// 收到 StreamFocus{tab_id} = 后端确认"此后字节流属于 tab_id"(连上 / Select 确认 / 跟随焦点)。
+// 切了 tab → 本客户端 viewed 更新 + 字节侧重建(见 switchViewedTab)+ 高亮刷新。
+function onStreamFocus(tabId) {
+  const changed = viewedTab !== tabId;
+  viewedTab = tabId;
+  if (changed) switchViewedTab(tabId);
+  renderTabBar();
+}
+
+// W1(单 term 实例):切 viewed tab → reset 终端,后端随即重放目标 tab 环缓冲重建当前屏
+// (代价:切换时一瞬重建闪烁)。W2 换成"每 tab 各留一个实例、保暖切换"替换此实现。
+function switchViewedTab(_tabId) {
+  try { term.reset(); } catch (_) {}
+  scheduleReflowRender();
+}
+
+// 入站控制帧:externally-tagged ServerMsg。学 active workspace id + 驱动标签栏 / viewed tab。
 function handleServerControl(text) {
   let msg;
   try { msg = JSON.parse(text); } catch (_) { return; }
-  if (msg.StreamFocus) activeWorkspaceId = msg.StreamFocus.workspace_id;
-  else if (msg.Workspaces) activeWorkspaceId = msg.Workspaces.active;
-  else if (msg.Workspace) activeWorkspaceId = msg.Workspace.workspace_id;
-  else if (msg.Dims) applyDims(msg.Dims.cols, msg.Dims.rows);  // A′ 增量1:按桌面宽渲染
+  if (msg.StreamFocus) {
+    activeWorkspaceId = msg.StreamFocus.workspace_id;
+    curWs = msg.StreamFocus.workspace_id;
+    onStreamFocus(msg.StreamFocus.tab_id);
+  } else if (msg.Workspaces) {
+    activeWorkspaceId = msg.Workspaces.active;
+    curWs = msg.Workspaces.active;
+  } else if (msg.Workspace) {
+    activeWorkspaceId = msg.Workspace.workspace_id;
+    updateWorkspace(msg.Workspace);
+  } else if (msg.TabAdded) {
+    // 后端 Fed 用整份 Workspace 广播(非增量),这里防御性并入(随后 Workspace 覆盖为权威)。
+    if (msg.TabAdded.tab && !tabList.some((t) => t.tab_id === msg.TabAdded.tab.tab_id)) {
+      tabList.push(msg.TabAdded.tab); renderTabBar();
+    }
+  } else if (msg.TabRemoved) {
+    tabList = tabList.filter((t) => t.tab_id !== msg.TabRemoved.tab_id); renderTabBar();
+  } else if (msg.Dims) {
+    applyDims(msg.Dims.cols, msg.Dims.rows);  // A′ 增量1:按桌面宽渲染
+  }
   holdOnce();
 }
 
@@ -704,6 +847,7 @@ function connect() {
     // 屏幕重复。断线重连是手机高频路径(后台/锁屏/弱网),不 reset 每次都重复一屏。
     term.reset();
     held = false; // 新连接 → 等学到 workspace id 后重新 Hold
+    viewedTab = null; // 新连接 → 首个 StreamFocus 视作初始 viewed(不额外 reset,onopen 已 reset)
     scheduleReflowRender(); // reset 清空 buffer → 重排视图(若在用)同步清屏,等重放字节重建
     setLive(true, "已连接(直播)");
   };
