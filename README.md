@@ -6,10 +6,23 @@
 
 ## 现状
 
-- ~30K LOC, 491 个测试通过
+- Phase 1-6 核心稳定, daily-drive 数月; **Phase 7(无头内核 + 多端镜像)进行中**
+- lib 540+ 测通过 + GPU/Wayland e2e
 - Wayland 客户端 (smithay-client-toolkit) + wgpu 渲染 + alacritty_terminal 状态机 + cosmic-text shaping
 - IME (text-input-v3) / OSC 133 / fcitx5 / CJK / 半透明 / 圆角 / 多 tab / 滚动选区都已实装
 - 内置 inline completion popup (不依赖 readline / fzf-tab / carapace), 见下
+- **多端镜像**: 把正在用的终端会话镜像到手机/浏览器 (`quill --share` 或标题栏开关), 见下
+
+## 多端镜像 (Phase 7, 进行中)
+
+把桌面正在用的终端会话镜像到手机/其它设备的浏览器 —— 在外面盯/控 Claude Code 之类的长任务, 不用 ssh+tmux 那套仪式.
+
+- **开启**: `quill --share`, 或运行时点标题栏开关 / `Ctrl+Shift+S`. 会起一个隔离的 `quill-kernel` 子进程绑 `0.0.0.0:7878`; 不开则零成本、就是普通终端.
+- **连接**: 同网络 / VPN 的设备浏览器开 `http://<host>:7878/` (纯 web 客户端, vendored xterm.js, 零 CDN). 看 + 回打字.
+- **自适应渲染**: 桌面按显示器宽跑, web 客户端本地把文本按设备宽**重折** (忠实 ↔ 重排一键切), 表格当**可横滑 widget** —— 不是缩放, 是响应式. (纯流式文本可靠; Claude Code 那种 `\r` 重绘 TUI 反推有天花板, 走忠实视图.)
+- **tab 管理**: 手机端标签栏可切 / 新建 / 关 tab, 每个客户端**独立**看不同 tab、不带动桌面焦点.
+- **架构 (E′)**: 一个程序; 父 = 终端 own PTY 直接渲染 (热路径零 IPC); 共享 = 懒启动、**OS 隔离**的子进程 (字节从父 tee 来), 子进程崩溃终端无感. 全程**单线程 calloop**, 无 thread pool / tokio. 详见 `docs/adr/0015`–`0018`.
+- **安全**: 目前靠网络边界 (LAN / WireGuard VPN) 把门, **无内置鉴权** (login token 是后续). 别把 `7878` 暴露到公网.
 
 ## inline completion
 
@@ -55,12 +68,14 @@ add-zsh-hook preexec _quill_osc133_preexec
 ## 开发
 
 ```bash
-cargo build --release
+cargo build --release --bin quill --bin quill-kernel
 cargo test
-cargo run --release   # NVIDIA 5090 自动选 Vulkan, 无需 env
+cargo run --release            # NVIDIA 5090 自动选 Vulkan, 无需 env
+quill --share                  # 起多端镜像 → http://<host>:7878/
+                               # (quill 找同目录的 quill-kernel sibling, 两个 bin 装同一目录)
 ```
 
-设计文档 `docs/notes/inline_completion_design.md`. ADR `docs/adr/0013-inline-completion-composer.md`.
+设计文档 `docs/notes/inline_completion_design.md`. ADR `docs/adr/`(inline completion=0013; 多端镜像=0015–0018).
 
 ## License
 
