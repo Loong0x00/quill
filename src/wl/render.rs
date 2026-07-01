@@ -457,10 +457,6 @@ pub const BUTTON_H_LOGICAL_PX: u32 = 24;
 /// 14-16pt 标题字 + close × icon), 太窄字会糊. 派单 In #C 字面 ~28.
 pub const TAB_BAR_H_LOGICAL_PX: u32 = 28;
 
-/// **T-0608: 标签条 "+" 按钮宽度** (logical px). 28 = 与高度同, 视觉为正方形
-/// 紧贴左上 (titlebar 之下).
-pub const TAB_PLUS_W_LOGICAL_PX: u32 = 28;
-
 /// **T-0608: 单 tab 最大宽度** (logical px). 派单 "上限 ~200 px" 字面.
 /// 多 tab 时 = surface_w / tab 数, clamp 到 [TAB_MIN_W, TAB_MAX_W].
 pub const TAB_MAX_W_LOGICAL_PX: u32 = 200;
@@ -1879,16 +1875,27 @@ const TAB_BAR_BORDER: crate::term::Color = crate::term::Color {
     g: 0x0a,
     b: 0x0a,
 };
+/// 被拖拽 tab 的"抬起"box 底色(比 active #444 略亮 #555,读作浮起 / 高亮)。
+const TAB_DRAG_BG: crate::term::Color = crate::term::Color {
+    r: 0x55,
+    g: 0x55,
+    b: 0x55,
+};
+/// 被拖拽 tab 的落影色(near-black,画在 box 下方偏移几 px 露出细边 = 抬起阴影)。
+const TAB_DRAG_SHADOW: crate::term::Color = crate::term::Color {
+    r: 0x00,
+    g: 0x00,
+    b: 0x00,
+};
 
 /// **T-0608/T-0615: tab bar 顶点 append 入口**. 在 `append_titlebar_vertices`
 /// 之后调, 紧贴 titlebar 下方画 [`TAB_BAR_H_LOGICAL_PX`] (28 logical) 高标签条.
 ///
 /// 视觉布局 (派单 In #B + #C, T-0615 polish):
 /// - 整 tab bar 背景 (深灰 #1c1c1c, cell pipeline)
-/// - 左侧 [`TAB_PLUS_W_LOGICAL_PX`] (28 logical 方) "+" 按钮 — 圆角 box (radius
-///   6 logical, rounded pipeline), bg 平时 #2c2c2c 略浮现, hover 时 #444 高亮.
-///   + icon (横竖白线) 走 cell pipeline 居中.
-/// - 中间 tab 列表: 每 tab 按 [`tab_body_width`] 宽; **active 圆角 box** (radius
+/// - (T-0618 follow-up: "+" 按钮已移到 titlebar — 见 `append_titlebar_vertices` —
+///   tab bar 不再含 +。)
+/// - 中间 tab 列表: 每 tab 按 `tab_body_width_no_plus` 宽; **active 圆角 box** (radius
 ///   6 logical, rounded pipeline) 高亮 #444; **inactive 透明** (不画 box, 仅
 ///   title 文字, 派单 In #C); **hover inactive** 圆角 #333 半透明. tabs 间 4 px
 ///   gap (派单 已知陷阱 "tab 之间 ~4 px gap").
@@ -1903,6 +1910,9 @@ pub(crate) struct TabDragRender {
     /// 每个 tab(按 tab_list index 对齐)的视觉 x(**logical** px 左边缘)。
     /// 长度 == tab_count;渲染时 `* hidpi` 换 physical。缺项 fallback 到 slot x。
     pub(crate) visual_x_logical: Vec<f32>,
+    /// 正在被拖拽的 tab 的 index:渲染成"抬起"态(阴影 + 恒画 box)+ 画在**最上层**;
+    /// `None` = 仅落位补间无手持拖拽。
+    pub(crate) dragging_idx: Option<usize>,
 }
 
 /// **`#[allow(clippy::too_many_arguments)]`**: 与 `append_titlebar_vertices` 同
@@ -1963,27 +1973,32 @@ pub(crate) fn append_tab_bar_vertices(
     //    - active tab → 圆角 box (rounded pipeline) bg=#444
     //    - inactive tab → 透明 (不画 box; 仅 title 在 cell 区, glyph pipeline 渲染)
     //    - hover inactive → 圆角 box bg=#333 (rounded pipeline)
-    //    - close × hover → 红圆 (rounded pipeline)
-    for i in 0..tab_count {
-        // 无动画(drag None)→ tab 按 slot `i * body_w` 画(逐像素等价旧行为);
-        // 动画中 → 用 window.rs 传入的视觉 x(logical → physical)。
-        let tab_x0 = match drag {
+    //    - 被拖 tab → 抬起态 (阴影 + #555 box), 画在**最上层** (最后 append)
+    let dragging = drag.and_then(|d| d.dragging_idx);
+    // 拖拽期 suppress hover:hover 停留在 press 时的 tab idx(pointer 拖拽中不更新),
+    // 换序后会错标到别的 tab;drag 中一律不画 hover box。
+    let effective_hover = if drag.is_some() {
+        HoverRegion::None
+    } else {
+        hover
+    };
+    let drag_bg = color_for_vertex_with_srgb(TAB_DRAG_BG, is_srgb);
+    let shadow_color = color_for_vertex_with_srgb(TAB_DRAG_SHADOW, is_srgb);
+    let icon_color = color_for_vertex_with_srgb(BUTTON_ICON, is_srgb);
+    // 每 tab 的视觉左边缘 x(physical):无动画 → slot;动画中 → window.rs 传入的视觉 x。
+    let x_of = |i: usize| -> f32 {
+        match drag {
             Some(d) => d
                 .visual_x_logical
                 .get(i)
                 .map(|x| x * hidpi)
                 .unwrap_or(i as f32 * body_w),
             None => i as f32 * body_w,
-        };
-        let tab_x1 = tab_x0 + body_w;
-        if tab_x0 >= surface_w {
-            // 无动画:x 单调递增,越界即可 break;动画中 x 非单调(被拖 tab 可在任意
-            // 位置),越界的这个跳过但继续画其它 tab。
-            if drag.is_some() {
-                continue;
-            }
-            break;
         }
+    };
+    // 画一个 tab(box + close −)。`lifted` = 被拖 tab(阴影 + #555 box,无视 active/hover)。
+    let mut draw_tab = |i: usize, tab_x0: f32, lifted: bool| {
+        let tab_x1 = tab_x0 + body_w;
         // T-0615: tab body 圆角 box 内缩 gap/2 形成 tab 间空隙. body bbox y 内缩
         // tab_inset_y_phys 让 box 视觉脱离 bar 顶/底 stroke 线.
         let body_x0 = tab_x0 + tab_gap_phys / 2.0;
@@ -1991,11 +2006,21 @@ pub(crate) fn append_tab_bar_vertices(
         let body_x1 = tab_x1 - tab_gap_phys / 2.0;
         let body_y1 = bar_y1 - tab_inset_y_phys;
 
-        let is_active = i == active_idx;
-        let is_hover =
-            matches!(hover, HoverRegion::Tab(idx) | HoverRegion::TabClose(idx) if idx == i);
-        // 仅 active / hover 画 box (inactive 不 hover 时透明仅 title).
-        if is_active {
+        if lifted {
+            // 抬起:先画落影(向下 / 右偏移几 px,box 盖住后仅边缘露出 = drop shadow),
+            // 再画 #555 box(比 active 略亮,读作浮起)。
+            let shadow_off = 2.0 * hidpi;
+            append_rounded_quad_px(
+                rounded_out,
+                body_x0 + shadow_off,
+                body_y0 + shadow_off,
+                body_x1 + shadow_off,
+                body_y1 + shadow_off,
+                surface_w,
+                surface_h,
+                shadow_color,
+                tab_radius_phys,
+            );
             append_rounded_quad_px(
                 rounded_out,
                 body_x0,
@@ -2004,21 +2029,41 @@ pub(crate) fn append_tab_bar_vertices(
                 body_y1,
                 surface_w,
                 surface_h,
-                active_bg,
+                drag_bg,
                 tab_radius_phys,
             );
-        } else if is_hover {
-            append_rounded_quad_px(
-                rounded_out,
-                body_x0,
-                body_y0,
-                body_x1,
-                body_y1,
-                surface_w,
-                surface_h,
-                hover_bg,
-                tab_radius_phys,
+        } else {
+            let is_active = i == active_idx;
+            let is_hover = matches!(
+                effective_hover,
+                HoverRegion::Tab(idx) | HoverRegion::TabClose(idx) if idx == i
             );
+            // 仅 active / hover 画 box (inactive 不 hover 时透明仅 title).
+            if is_active {
+                append_rounded_quad_px(
+                    rounded_out,
+                    body_x0,
+                    body_y0,
+                    body_x1,
+                    body_y1,
+                    surface_w,
+                    surface_h,
+                    active_bg,
+                    tab_radius_phys,
+                );
+            } else if is_hover {
+                append_rounded_quad_px(
+                    rounded_out,
+                    body_x0,
+                    body_y0,
+                    body_x1,
+                    body_y1,
+                    surface_w,
+                    surface_h,
+                    hover_bg,
+                    tab_radius_phys,
+                );
+            }
         }
 
         // T-0618 follow-up: close − 始终可见 (不再 hover-only 红圆). 用户视觉
@@ -2031,9 +2076,9 @@ pub(crate) fn append_tab_bar_vertices(
         let close_y0 = close_cy - close_diameter / 2.0;
         let close_x1 = close_cx + close_diameter / 2.0;
         let close_y1 = close_cy + close_diameter / 2.0;
-        // hover bg (subtle, 非红): 圆形 #444 (跟 active tab 同色). 仅 hover 画.
+        // hover bg (subtle, 非红): 圆形 #444 (跟 active tab 同色). 仅 hover 画 (drag 中 suppress).
         let close_radius = close_diameter / 2.0;
-        if let HoverRegion::TabClose(idx) = hover {
+        if let HoverRegion::TabClose(idx) = effective_hover {
             if idx == i {
                 append_rounded_quad_px(
                     rounded_out,
@@ -2060,11 +2105,34 @@ pub(crate) fn append_tab_bar_vertices(
             close_cy + stroke_w_close / 2.0,
             surface_w,
             surface_h,
-            color_for_vertex_with_srgb(BUTTON_ICON, is_srgb),
+            icon_color,
             0.0,
         );
-        let _ = tab_close_red; // T-0618 follow-up: deprecated 红圆 bg, 留 const 防外部 ref
+    };
+
+    // 先画非拖拽 tab(按 index 顺序),被拖 tab 留到最后画(叠在最上层)。
+    for i in 0..tab_count {
+        if Some(i) == dragging {
+            continue;
+        }
+        let tab_x0 = x_of(i);
+        if tab_x0 >= surface_w {
+            // 无动画:x 单调递增,越界即可 break;动画中 x 非单调(被拖 tab 可在任意
+            // 位置),越界的这个跳过但继续画其它 tab。
+            if drag.is_some() {
+                continue;
+            }
+            break;
+        }
+        draw_tab(i, tab_x0, false);
     }
+    // 被拖 tab 最后画 = z-order 最上层(叠在让位滑动的邻居之上)。
+    if let Some(di) = dragging {
+        if di < tab_count {
+            draw_tab(di, x_of(di), true);
+        }
+    }
+    let _ = tab_close_red; // T-0618 follow-up: deprecated 红圆 bg, 留 const 防外部 ref
 
     // 4. tab bar 底部细线分隔 (与 cell 区分开)
     let stroke_w = 2.0 * hidpi;
@@ -7349,6 +7417,57 @@ mod tests {
         assert_eq!(
             n_verts, 30,
             "T-0618 follow-up: hover TabClose(0) 含 active + close hover bg + 3 close − strokes (5 quad × 6), got {n_verts}",
+        );
+    }
+
+    /// tab 拖拽:被拖 tab 抬起态 = 落影(1)+ #555 box(1)+ close −(1);drag 中 suppress
+    /// hover;非拖拽 active(0)= box + close(2),inactive(2)= close(1)。共 6 quad × 6 = 36。
+    /// 且被拖 tab 用传入视觉 x(不按 slot),证明"跟手位"生效。
+    #[test]
+    fn append_tab_bar_vertices_drag_lifts_dragged_tab_on_top() {
+        use crate::wl::pointer::HoverRegion;
+        let mut cell_out = Vec::new();
+        let mut rounded_out = Vec::new();
+        // 3 tab,active 0,拖 idx 1 到跟手 x=500 logical(非其 slot)。hover 传 Tab(2)
+        // 但 drag 中应被 suppress(不画 hover box)。
+        let drag = TabDragRender {
+            visual_x_logical: vec![0.0, 500.0, 400.0],
+            dragging_idx: Some(1),
+        };
+        append_tab_bar_vertices(
+            &mut cell_out,
+            &mut rounded_out,
+            1600.0,
+            1200.0,
+            false,
+            3,
+            0,
+            HoverRegion::Tab(2),
+            Some(&drag),
+        );
+        let n_verts = rounded_out.len() / ROUNDED_VERTEX_BYTES;
+        assert_eq!(
+            n_verts, 36,
+            "拖拽:active box(1)+shadow(1)+drag box(1)+3 close −(3)=6 quad×6,hover suppress,got {n_verts}"
+        );
+        // 被拖 tab(idx 1)在跟手 x=500 logical → physical 500*2=1000。其 box/shadow 顶点
+        // x 应出现在 ~1000 附近(而非 slot 1 的 200*2=400)。扫顶点 x(左边缘)证明跟手。
+        let hidpi = HIDPI_SCALE as f32;
+        let drag_left_phys = 500.0 * hidpi; // 1000
+        let mut found_at_drag_pos = false;
+        for i in 0..n_verts {
+            let off = i * ROUNDED_VERTEX_BYTES;
+            let px = f32::from_ne_bytes(rounded_out[off..off + 4].try_into().unwrap());
+            // NDC → phys 反算:px = (ndc+1)/2 * surface_w。
+            let phys_x = (px + 1.0) / 2.0 * 1600.0;
+            if (phys_x - (drag_left_phys + 4.0 * hidpi / 2.0)).abs() < 6.0 * hidpi {
+                found_at_drag_pos = true;
+                break;
+            }
+        }
+        assert!(
+            found_at_drag_pos,
+            "被拖 tab 应画在跟手 x≈{drag_left_phys} phys(而非 slot),未找到该位置顶点"
         );
     }
 }

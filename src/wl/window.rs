@@ -300,6 +300,15 @@ pub(crate) struct TabAnimState {
     visual_x: Vec<(u64, f32)>,
     /// 上次缓动 tick 时刻(算 dt)。timer 停时置 None。
     last_tick: Option<Instant>,
+    /// 正在被拖拽的 tab 的 id(`StartTabDrag` 置,落位 settle 后清)。`None` = 无拖拽。
+    drag_id: Option<u64>,
+    /// 手指是否仍按住:`true` = 被拖 tab x 跟手 `drag_x`(motion 事件驱动重画,无补间);
+    /// `false`(松手后)= 被拖 tab 补间落位到槽位。
+    held: bool,
+    /// 被拖 tab 跟手 x(**logical** 左边缘,已 clamp 到 tab 栏)= 指针 x - `grab_offset`。
+    drag_x: f32,
+    /// 抓取点相对被拖 tab 左边缘的偏移(logical),让拖拽不跳。
+    grab_offset: f32,
 }
 
 /// 把 wayland `EventQueue<State>`、业务 `State`、T-0301 的 `TermState`、
@@ -3095,9 +3104,13 @@ fn tab_anim_tick(data: &mut LoopData) -> TimeoutAction {
     if needs_more {
         TimeoutAction::ToDuration(Duration::from_millis(TAB_ANIM_FRAME_MS))
     } else {
-        // 全部到位 → 清空动画态回 idle,timer 自停(源移除)。
+        // 全部到位 → 拖拽 / 补间彻底结束,清全部 drag 态回 idle,timer 自停(源移除)。
+        // (timer 只在【松手后】的落位补间跑 —— 手指按住期靠 motion 事件重画不起 timer ——
+        // 故 settle 必在 held=false,清 drag_id 安全。)
         data.state.tab_anim.visual_x.clear();
         data.state.tab_anim.last_tick = None;
+        data.state.tab_anim.drag_id = None;
+        data.state.tab_anim.held = false;
         data.tab_anim_token = None;
         TimeoutAction::Drop
     }
@@ -3126,12 +3139,22 @@ fn ensure_tab_anim_timer(data: &mut LoopData) {
     }
 }
 
-/// tab 拖拽 / 让位 / 落位动画的 drive_wayland 消费点(step 3.8b)。**idle(无动画)零成本早返**。
-/// 有活动动画时保证逐帧 timer 在飞(拖拽跟手 / 实时换序在 commit 2/3 接入本函数)。
+/// tab 拖拽 / 让位 / 落位动画的 drive_wayland 消费点(step 3.8b)。
+///
+/// - **idle**(无拖拽、无补间)→ 零成本早返(不起 timer、不重画)。
+/// - **手指按住**(`held`)→ 被拖 tab 跟手靠 motion 事件重画,**不起 timer**(零常驻重画;
+///   让位补间在 commit 3 接入)。
+/// - **松手后**(`held=false` 且仍有被拖 tab)→ 起落位补间 timer(被拖 tab 从 `drag_x`
+///   缓动到槽位),settle 后 [`tab_anim_tick`] 自停 + 清态。
 fn apply_tab_drag(data: &mut LoopData) {
-    if data.state.tab_anim.visual_x.is_empty() {
-        return; // idle:不起 timer、不重画(零成本)
+    let anim = &data.state.tab_anim;
+    if anim.drag_id.is_none() && anim.visual_x.is_empty() {
+        return; // idle:零成本
     }
+    if anim.held {
+        return; // 跟手期:motion 事件驱动重画,不起 timer
+    }
+    // 松手后的落位补间。
     ensure_tab_anim_timer(data);
 }
 
@@ -3146,25 +3169,39 @@ fn build_tab_drag_render(
     }
     let tabs = state.tabs.as_ref()?;
     let body_w = super::pointer::tab_body_width_no_plus(state.core.width, tab_count) as f32;
+    // 被拖 tab 的当前 index(换序后仍靠 id 追)。
+    let dragging_idx = state
+        .tab_anim
+        .drag_id
+        .and_then(|id| tabs.iter().position(|t| t.id().raw() == id));
     let mut visual_x_logical = Vec::with_capacity(tab_count);
     for i in 0..tab_count {
         let slot_x = i as f32 * body_w;
-        let x = match tabs.get(i) {
-            Some(t) => {
-                let id = t.id().raw();
-                state
-                    .tab_anim
-                    .visual_x
-                    .iter()
-                    .find(|(vid, _)| *vid == id)
-                    .map(|(_, x)| *x)
-                    .unwrap_or(slot_x)
+        // 手指按住时被拖 tab 直接画在跟手 drag_x(不经 visual_x 缓动);其它 tab
+        // (及松手落位中的被拖 tab)走 visual_x 缓动值,缺项 fallback 到槽位。
+        let x = if state.tab_anim.held && Some(i) == dragging_idx {
+            state.tab_anim.drag_x
+        } else {
+            match tabs.get(i) {
+                Some(t) => {
+                    let id = t.id().raw();
+                    state
+                        .tab_anim
+                        .visual_x
+                        .iter()
+                        .find(|(vid, _)| *vid == id)
+                        .map(|(_, x)| *x)
+                        .unwrap_or(slot_x)
+                }
+                None => slot_x,
             }
-            None => slot_x,
         };
         visual_x_logical.push(x);
     }
-    Some(crate::wl::render::TabDragRender { visual_x_logical })
+    Some(crate::wl::render::TabDragRender {
+        visual_x_logical,
+        dragging_idx,
+    })
 }
 
 /// T-0608: 关闭 idx 处 tab — drop TabInstance + remove calloop source + 邻近
@@ -3773,7 +3810,6 @@ pub fn run_window(initial_cwd: Option<std::path::PathBuf>, share: bool) -> Resul
         pending_share_toggle: false,
         // E′(ADR-0018):共享启动失败指示,默认 false(无错,零回归);仅启动失败置位。
         share_error: false,
-        last_tab_drag_x: 0.0,
         // tab 拖拽动画起步空(无动画,idle 零成本);StartTabDrag 时填充。
         tab_anim: TabAnimState::default(),
         // T-0611: DnD 状态全空起步. compositor 在拖入时发 DataOffer + Enter,
@@ -4633,9 +4669,6 @@ struct State {
     /// ([`crate::wl::render::Renderer::set_share_error`])→ 标题栏 share icon 画成 error 态(琥珀),
     /// 与 off(灰)/ on(绿)视觉明显区别,让"点了但没开起来"可见而非静默回灰。**POD bool,drop 序无关**。
     pub(crate) share_error: bool,
-    /// T-0608: tab drag 期间最后一次 motion 的 logical x. EndTabDrag 时按此 x
-    /// 算 target_idx (派单 In #F).
-    pub(crate) last_tab_drag_x: f64,
     /// tab 拖拽 / 让位 / 落位动画状态(见 [`TabAnimState`])。默认空 = 无动画(idle,
     /// 零成本);drag 期间 [`drive_wayland`] 的 timer 逐帧缓动,settle 后清空 + 停 timer。
     /// **POD,drop 序无关**(不持 GPU / wl 句柄,不破 INV-008)。
@@ -6417,42 +6450,63 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
             PointerAction::CloseTab(idx) => {
                 state.pending_tab_op = Some(TabOp::Close(idx));
             }
-            PointerAction::StartTabDrag(_idx) => {
-                // 派单 In #F: drag 期间视觉跟随鼠标半透明显示, 当前实装偏离 —
-                // **drag 视觉 ghost overlay 留作后续 ticket** (派单 In #F 半透明
-                // ghost 跟随需要新建 wgpu 顶点 buffer + 第二 pass blend, 工作量
-                // 与本 ticket 主线 reorder 解耦; reorder 逻辑本身已实装).
-                tracing::trace!(target: "quill::pointer", "StartTabDrag (ghost overlay 留作后续)");
+            PointerAction::StartTabDrag { idx, x_logical } => {
+                // 抬起被拖 tab:记 drag_id / grab_offset,初始视觉位 = 各 tab 槽位
+                // (被拖 tab 之后跟手 drag_x)。drive_wayland step 3.8b 接管补间 / 换序。
+                if let Some(tab_list) = state.tabs.as_ref() {
+                    let count = tab_list.len();
+                    if count >= 2 && idx < count {
+                        let body_w =
+                            super::pointer::tab_body_width_no_plus(state.core.width, count) as f32;
+                        let slot_x = idx as f32 * body_w;
+                        let grab_offset = x_logical as f32 - slot_x;
+                        state.tab_anim.drag_id = tab_list.get(idx).map(|t| t.id().raw());
+                        state.tab_anim.held = true;
+                        state.tab_anim.grab_offset = grab_offset;
+                        state.tab_anim.drag_x = slot_x; // 起始 = 槽位, 不跳
+                        state.tab_anim.visual_x = (0..count)
+                            .filter_map(|i| {
+                                tab_list.get(i).map(|t| (t.id().raw(), i as f32 * body_w))
+                            })
+                            .collect();
+                        state.tab_anim.last_tick = None;
+                        state.presentation_dirty = true;
+                    }
+                }
             }
             PointerAction::TabDragMove { x_logical } => {
-                // drag 期间记 last x, 用于 release 时算 target_idx. State 字段
-                // last_tab_drag_x 暂存.
-                state.last_tab_drag_x = x_logical;
-            }
-            PointerAction::EndTabDrag => {
-                // release 触发 reorder. 派单 In #F: target_idx = (last_x - plus_w)
-                // / tab_body_width. apply_tab_op 路径需要原 idx (来自 PointerState
-                // tab_press, 但 tab_press 已被 take 清空). 改写: PointerAction
-                // 不携带 origin_idx, drive_wayland 路径接到 EndTabDrag 时调
-                // resolve_drag_target 算 (origin_idx 由 idx_of(start tab id) 推
-                // 但已无 anchor — 当前简化: 直接走 last x 落哪个 tab idx 作 target,
-                // 不真 reorder, 派单偏离声明).
-                let last_x = state.last_tab_drag_x;
-                if let Some(tab_list) = state.tabs.as_ref() {
-                    let plus_w = crate::wl::render::TAB_PLUS_W_LOGICAL_PX as f64;
-                    let body_w = super::pointer::tab_body_width(state.core.width, tab_list.len());
-                    if body_w > 0.0 && last_x >= plus_w {
-                        let target_idx = ((last_x - plus_w) / body_w).floor() as usize;
-                        let active_idx = tab_list.active_idx();
-                        let target = target_idx.min(tab_list.len().saturating_sub(1));
-                        if active_idx != target {
-                            state.pending_tab_op = Some(TabOp::Reorder {
-                                from_idx: active_idx,
-                                target_idx: target,
-                            });
+                // 跟手:drag_x = 指针 x - grab_offset,clamp 到 tab 栏 [0, (n-1)*body_w]。
+                if state.tab_anim.drag_id.is_some() {
+                    if let Some(tab_list) = state.tabs.as_ref() {
+                        let count = tab_list.len();
+                        if count >= 2 {
+                            let body_w =
+                                super::pointer::tab_body_width_no_plus(state.core.width, count)
+                                    as f32;
+                            let max_x = ((count - 1) as f32) * body_w;
+                            let dx = x_logical as f32 - state.tab_anim.grab_offset;
+                            state.tab_anim.drag_x = dx.clamp(0.0, max_x.max(0.0));
+                            state.presentation_dirty = true;
                         }
                     }
                 }
+            }
+            PointerAction::EndTabDrag => {
+                // 松手:被拖 tab 从当前跟手位补间落回槽位(commit 2 无换序;换序 + 让位见 commit 3)。
+                // 落位补间起点 = 当前 drag_x(写回被拖 tab 的 visual_x,让 advance 从指位缓动)。
+                state.tab_anim.held = false;
+                if let Some(id) = state.tab_anim.drag_id {
+                    let dx = state.tab_anim.drag_x;
+                    if let Some(entry) = state
+                        .tab_anim
+                        .visual_x
+                        .iter_mut()
+                        .find(|(vid, _)| *vid == id)
+                    {
+                        entry.1 = dx;
+                    }
+                }
+                state.presentation_dirty = true;
             }
         }
     }

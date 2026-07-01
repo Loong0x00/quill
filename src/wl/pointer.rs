@@ -60,8 +60,7 @@ use wayland_client::WEnum;
 
 use super::render::{
     BUTTON_H_LOGICAL_PX, BUTTON_W_LOGICAL_PX, TAB_BAR_H_LOGICAL_PX, TAB_CLOSE_W_LOGICAL_PX,
-    TAB_MAX_W_LOGICAL_PX, TAB_MIN_W_LOGICAL_PX, TAB_PLUS_W_LOGICAL_PX, TITLEBAR_H_LOGICAL_PX,
-    WINDOW_BUTTON_RADIUS_PX,
+    TITLEBAR_H_LOGICAL_PX, WINDOW_BUTTON_RADIUS_PX,
 };
 
 /// CSD 三按钮枚举. 对应 xdg_toplevel 协议 set_minimized / set_maximized
@@ -362,7 +361,9 @@ pub enum PointerAction {
     /// T-0608: 在 tab body 按下并 motion ≥ 5 logical px → 进入 drag 模式.
     /// idx 是按下时的 tab idx (drag 期间 tabs.swap_reorder 后 idx 可能不再
     /// 对应同一 tab id, 调用方需先用 idx 抓 tab.id 锁定 anchor).
-    StartTabDrag(usize),
+    /// `x_logical` = 阈值刚跨过时的指针 x(logical), 调用方据此算抓取偏移
+    /// (grab_offset)让被拖 tab 不跳 + 初始跟手位。
+    StartTabDrag { idx: usize, x_logical: f64 },
     /// T-0608: drag 进行中, motion 期间发, 调用方据 x 算 target_idx 重排.
     TabDragMove { x_logical: f64 },
     /// T-0608: tab drag 松开 → 调用方提交 reorder (按当前最后一次 TabDragMove
@@ -828,7 +829,10 @@ pub(crate) fn apply_motion(
         let dx = (x - start_x).abs();
         if dx >= TAB_DRAG_THRESHOLD_PX && !state.tab_drag_active {
             state.tab_drag_active = true;
-            return PointerAction::StartTabDrag(origin_idx);
+            return PointerAction::StartTabDrag {
+                idx: origin_idx,
+                x_logical: x,
+            };
         }
         if state.tab_drag_active {
             // drag 进行中, 发 TabDragMove(x) 让调用方更新拖中视觉 / 算 target_idx.
@@ -1104,56 +1108,6 @@ pub(crate) fn apply_axis_smooth(state: &mut PointerState, value: f64) -> Pointer
     state.scroll_accum_y -= (lines as f64) * SCROLL_ACCUM_LINE_PX;
     // 修复滚轮默认量: smooth Axis 每个累积步也滚 3 行，alt screen 转发同源生效。
     PointerAction::Scroll(-(lines * WHEEL_LINES_PER_NOTCH))
-}
-
-/// 纯逻辑 hit-test: 给定 surface 内坐标 (logical px) 与 surface 尺寸 (logical),
-/// 算 [`HoverRegion`]. 派单 In #F 抽决策模式硬约束, 单测覆盖 ≥6 case
-/// (titlebar / 3 按钮 / text area / 边界 / T-0701 4 边 + 4 角 resize).
-///
-/// **CSD 视觉布局** (单一来源, 与 [`crate::wl::render`] titlebar 渲染同源):
-/// - 顶部 [`TITLEBAR_H_LOGICAL_PX`] (28 logical) 是 titlebar.
-/// - 三按钮位于 titlebar 右端, 各 [`BUTTON_W_LOGICAL_PX`] × [`BUTTON_H_LOGICAL_PX`]
-///   (24×24 logical), 顺序 (右→左) Close / Maximize / Minimize.
-/// - titlebar 之下是 text area (cell grid).
-/// - 超出 surface (x < 0 / y < 0 / x ≥ w / y ≥ h) → None.
-///
-/// **T-0701 hit-test 优先级** (高 → 低):
-/// 1. 边界外 → None
-/// 2. **4 角** ([`RESIZE_CORNER_PX`] = 8 logical 方块, 4 个) → ResizeEdge(corner) —
-///    优先于 edge / button (派单"角覆盖优先 edge"); 角与右上 Close 按钮区重叠
-///    (右上 8×8 在 Close 24×24 内), 用户在最角即拖窗口, 内移 ≥8 logical 即落
-///    Close — 实测体感与 GNOME / foot 一致.
-/// 3. **4 边** ([`RESIZE_EDGE_PX`] = 4 logical 厚 strip) → ResizeEdge(edge) —
-///    避开 4 角 (角已 step 2 接管). titlebar 顶边 (y < 4) 走 Top 而非 titlebar
-///    drag — 避免拖窗口时误抓窗口顶边过细 (GNOME 同决策).
-/// 4. titlebar 段 (y < TITLEBAR_H, 排除上方边):
-///    - 三按钮 hit (Close / Maximize / Minimize) → Button(...)
-///    - 否则 → TitleBar
-/// 5. text area 段 → TextArea
-///
-/// **why 接 f64 而非 i32**: wl_pointer 坐标是 wl_fixed, wayland-client 转 f64.
-/// 边界判断用 < / >= 而非 ≤, 与 NDC / 像素坐标系一致 (像素中心在整数偏 0.5,
-/// 但 hit_test 不需精度到 sub-pixel, 直接用浮点比较即可).
-///
-/// **单一来源**: 五常数 (TITLEBAR_H / BUTTON_W / BUTTON_H / RESIZE_EDGE_PX /
-/// RESIZE_CORNER_PX) 都从模块顶部 / `render.rs` import. 改一处即视觉与逻辑
-/// 同步, 无漂移风险.
-/// T-0608: 算 tab body width 给定 tab 数量. clamp 到 [TAB_MIN_W, TAB_MAX_W].
-/// surface 上 tab bar 宽度 = surface_w - TAB_PLUS_W (留 + 按钮空间), 每 tab
-/// 平均分. 派单 In #C "标签宽度自适应: 总宽 / tab 数, 上限 ~200, 下限 ~80".
-///
-/// **why 抽 fn**: hit_test + render 都用此公式, 改一处即视觉与逻辑同步
-/// (单一来源, 与 RESIZE_EDGE_PX / cells_from_surface_px 同套路).
-pub fn tab_body_width(surface_w: u32, tab_count: usize) -> f64 {
-    if tab_count == 0 {
-        return 0.0;
-    }
-    let plus_w = TAB_PLUS_W_LOGICAL_PX as f64;
-    let bar_avail = (surface_w as f64 - plus_w).max(0.0);
-    let raw_w = bar_avail / tab_count as f64;
-    let max_w = TAB_MAX_W_LOGICAL_PX as f64;
-    let min_w = TAB_MIN_W_LOGICAL_PX as f64;
-    raw_w.clamp(min_w, max_w)
 }
 
 /// T-0608: 多 tab hit_test 入口. 与 [`hit_test`] 同套路但 tab_count 入参用于
