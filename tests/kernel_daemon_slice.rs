@@ -11,6 +11,7 @@
 //! tests/ 允许 `unwrap`/`expect`(CLAUDE.md 仅约束 src/)。
 
 use std::io::{BufRead, BufReader};
+use std::net::TcpListener;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -100,6 +101,13 @@ fn send_signal(pid: u32, sig: i32) {
     }
 }
 
+/// 取一个空闲 TCP 端口(bind :0 让内核分配后立刻释放)。用于给 daemon `--ws-bind` 一个**独占**端口,
+/// 避免撞默认 `0.0.0.0:7878`(用户 daily-driver `quill --share` 常驻占它)或并行测试互撞。
+fn free_port() -> u16 {
+    let l = TcpListener::bind("127.0.0.1:0").expect("bind 临时端口");
+    l.local_addr().expect("local_addr").port()
+}
+
 #[test]
 fn daemon_serves_snapshot_over_unix_socket() {
     let dir = std::env::temp_dir().join(format!("quill-kernel-t2-{}", std::process::id()));
@@ -108,6 +116,8 @@ fn daemon_serves_snapshot_over_unix_socket() {
 
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_quill-kernel"))
         .arg(format!("--socket={}", sock.display()))
+        // 独占空闲端口:不撞默认 7878(live share)/ 并行测试(测的是 unix socket 面,WS 面无关)。
+        .arg(format!("--ws-bind=127.0.0.1:{}", free_port()))
         .env("RUST_LOG", "quill=warn")
         .spawn()
         .expect("spawn quill-kernel daemon");
