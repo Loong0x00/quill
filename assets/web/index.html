@@ -126,9 +126,9 @@
   #keys button:active { background: #3a3a3a; }
   #keys button.wide { min-width: 4.2rem; }
   /* 砖2 W1:标签栏(手机端 tab 管理)。独立一行,置于顶栏下方、#stage 上方。横向可滚
-     (tab 多了不换行),触摸热区够大(min-height 2.2rem)。只有一个 tab 时整条隐藏
-     (.hidden)→ 单 tab 行为等价今天(不突兀);≥2 tab 才出现。标签栏是【叠加】,坏了
-     切回忠实单 tab 仍工作(faithful 保底)。 */
+     (tab 多了不换行),触摸热区够大(min-height 2.2rem)。≥1 tab 即显示(手机需 "+" 作为
+     唯一的新建 tab 入口 → 单 tab 也显示,只一条窄条 + "+");仅 0 tab 时隐藏(.hidden)。
+     标签栏是【叠加】,坏了切回忠实单 tab 仍工作(faithful 保底)。 */
   #tabbar {
     flex: 0 0 auto; display: flex; gap: .25rem; align-items: stretch;
     padding: .25rem .35rem; background: #101010;
@@ -174,7 +174,8 @@
     <span id="status">连接中…</span>
   </div>
   <!-- 砖2 W1:标签栏。内容由 JS 从 ServerMsg::Workspace(tab 列表)渲染,点 tab=Select、
-       + = New、× = Close。默认 hidden(单 tab 不显),≥2 tab 才出现。 -->
+       + = New、× = Close。初始 hidden;收到 tab 列表后 ≥1 tab 即显示(手机需 "+" 建 tab),
+       仅 0 tab 隐藏。 -->
   <div id="tabbar" class="hidden"></div>
   <!-- A′ toggle-scroll:#term 与 #reflow 同居一个 position:relative 的 #stage,各自
        absolute inset:0(同尺寸叠放)。切重排 = #reflow 不透明盖在 #term 上;#term 永远

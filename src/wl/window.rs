@@ -982,6 +982,15 @@ fn route_share_tab_op(data: &mut LoopData, frame: FeedFrame) {
             let Some(tabs) = data.state.tabs.as_ref() else {
                 return;
             };
+            // 护栏:远程(手机)Close 绝不允许清空最后一个 tab —— close_tab_idx 关到空会
+            // `loop_signal.stop()` 杀整个桌面进程(含所有 tab + 正跑的 Claude Code)。桌面
+            // 自己 Ctrl+W 关最后一个 → quit 是有意的(人在键盘前),但远程误触 / 两客户端
+            // 各关一个 / 弱网双击(web 端 length>1 才渲 × 是滞后软护栏)不该能杀 daily-driver
+            // 会话。这里做后端硬护栏:最后一个 tab 的远程 Close 直接忽略。
+            if tabs.len() <= 1 {
+                tracing::info!(tab_id, "E′ 回灌 TabOp::Close 会清空最后一个 tab,拒绝(护栏)");
+                return;
+            }
             match tabs.iter().position(|t| t.id().raw() == tab_id) {
                 Some(idx) => TabOp::Close(idx),
                 None => {

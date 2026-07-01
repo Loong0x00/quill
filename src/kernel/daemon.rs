@@ -2411,7 +2411,10 @@ fn http_write_pending(
 /// 砖2 W3:serve 的 Service Worker 脚本 = 注入 app-shell 内容哈希版本(`ASSET_VERSION`)+
 /// 内嵌 sw.js 源。`__QUILL_VERSION__` 随资产改动而变 → sw.js 字节变 → 浏览器重装 SW 清旧缓存。
 fn sw_js_served() -> String {
-    format!("self.__QUILL_VERSION__=\"{ASSET_VERSION:016x}\";\n{SW_JS}")
+    // "use strict" 置于 prologue 首条 → SW 严格模式生效。注入版本行若前置会把 sw.js
+    // 自身的 "use strict" 顶出 prologue 位置使其退化成无副作用字符串,故这里在 wrapper
+    // 首行补一条 "use strict";(sw.js 里那条留作 standalone 有效性,此处第二条为无害 no-op)。
+    format!("\"use strict\";\nself.__QUILL_VERSION__=\"{ASSET_VERSION:016x}\";\n{SW_JS}")
 }
 
 /// path → (status line, content-type, body)。纯函数,便于单测。`/sw.js` 不走这里(动态注入
@@ -2744,9 +2747,13 @@ mod tests {
     #[test]
     fn sw_js_served_injects_version_and_shell() {
         let js = sw_js_served();
-        // 注入行在最前,十六进制版本 = ASSET_VERSION(16 位定宽,确定性)。
+        // "use strict" 置顶(严格模式);紧随注入版本行,十六进制 = ASSET_VERSION(16 位定宽)。
         let expect = format!("self.__QUILL_VERSION__=\"{ASSET_VERSION:016x}\";");
-        assert!(js.starts_with(&expect), "sw.js 应以注入的版本行开头");
+        assert!(
+            js.starts_with("\"use strict\";"),
+            "SW 应以 use strict 指令开头(严格模式)"
+        );
+        assert!(js.contains(&expect), "应注入版本行");
         // 内嵌 SW 源被带上(cache-first shell 逻辑在里头)。
         assert!(js.contains("quill-shell-"), "应含缓存命名空间前缀");
         assert!(js.contains("addEventListener(\"fetch\""), "应含 fetch 处理");
