@@ -465,6 +465,8 @@ pub fn run(config: DaemonConfig) -> Result<()> {
         }
         SourceConfig::Fed { read_fd, write_fd } => {
             // 单 feeder via 继承 pipe(测试 / 旧 E′):启动即建一个 feeder = 一个 workspace = 锚。
+            // 两 fd 是父继承传入的独立 pipe 端(read_fd != write_fd),归 make_feeder 接管(契约:成功=
+            // own、失败=已自行 close);本 caller 从不另行 close,故契约自洽、无双关。
             let id = next_feeder_id;
             next_feeder_id += 1;
             let feeder = make_feeder(&loop_handle, id, *read_fd, *write_fd)
@@ -628,39 +630,60 @@ struct Feeder {
     created_at: Instant,
 }
 
-/// 建一个 [`Feeder`]:dup(若读写同 fd = 会合 socket 全双工)+ 设非阻塞 + 注册 READ 源(feed 帧入)
-/// 与 back-channel WRITE 源(初始 disable)。`read_fd == write_fd`(会合 socket)时 dup 写端,避免两个
-/// `OwnedFd` 重复 close 同一 fd。`feeder_id` 捕获进两源闭包,派发时定位到本 feeder。
+/// 建一个 [`Feeder`],**事务化**(契约):
+/// - **成功** = 接管所有传入 fd(`read_fd` / `write_fd`,经 `OwnedFd` 或已注册的 calloop 源 own,
+///   由本 kernel 负责最终 close);
+/// - **失败** = **已自行 close 其接管的一切**(含为全双工 dup 出的写端)**并移除已注册的 calloop 源**
+///   → 调用方(见 [`attach_feeder`] / Fed 拓扑)**不得再 close 传入 fd**。
+///
+/// 这条契约治的正是联邦 **fd 双关 bug**:旧实现里 READ 源注册成功(已 move-own read_owned)后,若
+/// back-channel 注册 / disable 失败即 `?` 早退 —— `read_token` 被 drop 但 calloop 源**不随之移除**(源
+/// 仍注册着、own 着 read_fd),而 [`attach_feeder`] 的 Err 臂又 `libc::close(raw)` → **双关 + epoll 悬挂
+/// 已关 fd**;另外早期 `set_fd_nonblocking(read_fd)` 失败时,已 dup 出的写端无人接管 → 泄漏。
+///
+/// 实现顺序保证契约:先把 read_fd /(dup 后的)write_fd **立即**包成 `OwnedFd`(RAII),此后任何早退都
+/// 由 `OwnedFd::drop` 关闭它们(灭 dup 泄漏);READ 源一旦注册成功,后续任一步失败前必
+/// `loop_handle.remove(read_token)` 回滚(移除源 → drop read_owned → 关 read_fd,灭双关 + 悬挂)。
+/// `read_fd == write_fd`(会合 socket 全双工)时 dup 写端,避免两个 `OwnedFd` 双关同一 fd。
+/// `feeder_id` 捕获进两源闭包,派发时定位到本 feeder。
 fn make_feeder(
     loop_handle: &LoopHandle<'static, DaemonData>,
     feeder_id: u64,
     read_fd: RawFd,
     write_fd: RawFd,
 ) -> Result<Feeder> {
-    // 读写同 fd(会合 socket 全双工)时 dup 写端,防两个 OwnedFd 双关同一 fd。
-    let write_fd = if write_fd == read_fd {
-        // SAFETY: dup 复制 fd,失败返 -1;成功得独立 fd 由下方 OwnedFd 接管 close。
+    // ① 立即接管 read_fd(RAII):此后任何早退都由 read_owned::drop 关它,零泄漏。
+    // SAFETY: read_fd 由调用方独占传入(Fed:父继承;Federated:accept 得到);from_raw_fd 接管其 close。
+    #[allow(unsafe_code)]
+    let read_owned = unsafe { OwnedFd::from_raw_fd(read_fd) };
+    // ② 读写同 fd(会合 socket 全双工)→ dup 写端并【立即】接管(防两 OwnedFd 双关 + 防 dup 后早退泄漏)。
+    let write_owned = if write_fd == read_fd {
+        // SAFETY: dup 复制 fd,失败返 -1;成功得独立 fd,紧接 from_raw_fd 接管其 close。
         #[allow(unsafe_code)]
         let d = unsafe { libc::dup(write_fd) };
         if d < 0 {
+            // read_owned::drop 关 read_fd(契约:失败已清理接管的一切)。
             return Err(
                 anyhow::Error::new(io::Error::last_os_error()).context("dup feeder write fd 失败")
             );
         }
-        d
+        // SAFETY: d 是刚 dup 出的独立 fd,本函数独占;from_raw_fd 接管其 close。
+        #[allow(unsafe_code)]
+        unsafe {
+            OwnedFd::from_raw_fd(d)
+        }
     } else {
-        write_fd
+        // SAFETY: write_fd 由调用方独占传入;from_raw_fd 接管其 close。
+        #[allow(unsafe_code)]
+        unsafe {
+            OwnedFd::from_raw_fd(write_fd)
+        }
     };
-    set_fd_nonblocking(read_fd).context("feeder read fd 设非阻塞失败")?;
-    set_fd_nonblocking(write_fd).context("feeder write fd 设非阻塞失败")?;
-    // SAFETY: read_fd / write_fd 由调用方(Fed:父继承传入;Federated:accept + dup)独占;包成
-    // OwnedFd 接管 close。窗口关其端 → 本侧读端 EOF(据此移除该 feeder / 最后一个 → kernel 退)。
-    #[allow(unsafe_code)]
-    let read_owned = unsafe { OwnedFd::from_raw_fd(read_fd) };
-    #[allow(unsafe_code)]
-    let write_owned = unsafe { OwnedFd::from_raw_fd(write_fd) };
+    // 此后 read_owned / write_owned 的 drop 保证两 fd 在任何早退被关(含下面 set_fd_nonblocking 失败)。
+    set_fd_nonblocking(read_owned.as_raw_fd()).context("feeder read fd 设非阻塞失败")?;
+    set_fd_nonblocking(write_owned.as_raw_fd()).context("feeder write fd 设非阻塞失败")?;
 
-    // READ 源(feed 帧入)。Generic own read_owned;闭包捕获 feeder_id + raw fd(int Copy)。
+    // ③ READ 源(feed 帧入)。Generic own read_owned;闭包捕获 feeder_id + raw fd(int Copy)。
     let read_raw = read_owned.as_raw_fd();
     let read_token = loop_handle
         .insert_source(
@@ -670,8 +693,19 @@ fn make_feeder(
             },
         )
         .map_err(|e| anyhow!("calloop insert_source(feeder read) 失败: {e}"))?;
+    // ★ 自此 read_owned 已被 READ 源 own:任何失败必 `loop_handle.remove(read_token)` 回滚(见契约)。
 
-    // back-channel WRITE 源(初始 disable —— 无待写不忙等;有积压 arm、drain 空 disarm)。borrow
+    // 测试注入点(仅 debug 构建,release 编译不进 → 生产零足迹):模拟"READ 源注册成功、后段失败",
+    // 走回滚路径,供 tests/kernel_federation_slice.rs 验无双关 / 无 fd 泄漏。
+    #[cfg(debug_assertions)]
+    if std::env::var_os("QUILL_TEST_FEEDER_FAIL_AFTER_READ").is_some() {
+        loop_handle.remove(read_token); // 回滚 READ 源 → drop read_owned → 关 read_fd。write_owned 由下方 drop 关。
+        return Err(anyhow!(
+            "QUILL_TEST_FEEDER_FAIL_AFTER_READ:注入 make_feeder 后段失败(仅 debug)"
+        ));
+    }
+
+    // ④ back-channel WRITE 源(初始 disable —— 无待写不忙等;有积压 arm、drain 空 disarm)。borrow
     // back_owned 的 raw(它进 Feeder.back 由 DaemonData own,run() scope 全程活;真写走 Feeder.back)。
     let back_raw = write_owned.as_raw_fd();
     // SAFETY: back_raw 借自下方 move 进 data.feeders 的 write_owned(run() scope 全程活);borrow_raw
@@ -679,15 +713,26 @@ fn make_feeder(
     // → 干净 EPOLL_CTL_DEL)再 drop Feeder 关 back;即便错序 calloop 对已关 fd 的 DEL 返 EBADF 容忍。
     #[allow(unsafe_code)]
     let back_borrowed: BorrowedFd<'static> = unsafe { BorrowedFd::borrow_raw(back_raw) };
-    let write_token = loop_handle
-        .insert_source(
-            Generic::new(back_borrowed, Interest::WRITE, Mode::Level),
-            move |_readiness, _meta, data: &mut DaemonData| feeder_back_writable(data, feeder_id),
-        )
-        .map_err(|e| anyhow!("calloop insert_source(feeder back-channel write) 失败: {e}"))?;
-    loop_handle
-        .disable(&write_token)
-        .map_err(|e| anyhow!("disable feeder back-channel WRITE 源失败: {e}"))?;
+    let write_token = match loop_handle.insert_source(
+        Generic::new(back_borrowed, Interest::WRITE, Mode::Level),
+        move |_readiness, _meta, data: &mut DaemonData| feeder_back_writable(data, feeder_id),
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            // 回滚 READ 源(关 read_fd);write_owned 由本函数尾 drop 关写端(WRITE 源未注册,无需拆)。
+            loop_handle.remove(read_token);
+            return Err(anyhow!(
+                "calloop insert_source(feeder back-channel write) 失败: {e}"
+            ));
+        }
+    };
+    if let Err(e) = loop_handle.disable(&write_token) {
+        // 回滚:WRITE 源(借 write_owned 的 fd,不关、仅 EPOLL_CTL_DEL)+ READ 源(关 read_fd);
+        // write_owned 由本函数尾 drop 关写端。
+        loop_handle.remove(write_token);
+        loop_handle.remove(read_token);
+        return Err(anyhow!("disable feeder back-channel WRITE 源失败: {e}"));
+    }
 
     Ok(Feeder {
         decoder: FeedDecoder::new(),
@@ -1076,18 +1121,10 @@ fn feeder_accept_ready(listener: &UnixListener, data: &mut DaemonData) -> io::Re
 fn attach_feeder(data: &mut DaemonData, stream: UnixStream) -> Result<()> {
     let raw = stream.into_raw_fd(); // 转 raw:make_feeder 接管(dup + OwnedFd),同 fd 读写全双工。
     let id = data.next_feeder_id;
-    let feeder = match make_feeder(&data.loop_handle, id, raw, raw) {
-        Ok(f) => f,
-        Err(e) => {
-            // make_feeder 失败前未接管 raw(dup/nonblock/register 任一步失败即返)→ 这里关掉防泄漏。
-            // SAFETY: raw 是本函数刚 into_raw_fd 得到、无人接管的 fd。
-            #[allow(unsafe_code)]
-            unsafe {
-                libc::close(raw);
-            }
-            return Err(e);
-        }
-    };
+    // make_feeder 契约(见其 doc):成功=接管 raw;失败=已自行 close raw(+ 移除已注册源)。故此处
+    // **不再** `libc::close(raw)` —— 旧代码在失败臂关 raw,而 make_feeder 后段失败时 READ 源已 own raw
+    // 未拆除 → 双关 + epoll 悬挂已关 fd(联邦 #3 顺带修的 fd 双关 bug)。现全交 make_feeder 事务化处理。
+    let feeder = make_feeder(&data.loop_handle, id, raw, raw)?;
     data.next_feeder_id = data.next_feeder_id.wrapping_add(1);
     data.feeders.insert(id, feeder);
     if data.anchor_feeder.is_none() {

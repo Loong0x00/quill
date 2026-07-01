@@ -41,18 +41,24 @@ struct FedKernel {
 
 impl FedKernel {
     fn spawn(port: u16) -> Self {
+        Self::spawn_with_env(port, &[])
+    }
+
+    fn spawn_with_env(port: u16, extra_env: &[(&str, &str)]) -> Self {
         let dir = std::env::temp_dir().join(format!("quill-fed-{}-{}", std::process::id(), port));
         std::fs::create_dir_all(&dir).expect("建临时目录");
         let sock = dir.join("rendezvous.sock");
-        let child = Command::new(env!("CARGO_BIN_EXE_quill-kernel"))
-            .arg(format!("--rendezvous={}", sock.display()))
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_quill-kernel"));
+        cmd.arg(format!("--rendezvous={}", sock.display()))
             .arg(format!("--ws-bind=127.0.0.1:{port}"))
             .env("RUST_LOG", "quill=warn")
             // 关键:每 feeder 断都会触发"最后 feeder?"检查;若 kernel 启动即零 feeder 会等 grace。
             // 测试里我们很快接入 feeder,不必等 grace;但把 grace 设长防误退。
-            .env("QUILL_FED_STARTUP_GRACE_MS", "60000")
-            .spawn()
-            .expect("spawn quill-kernel (Federated)");
+            .env("QUILL_FED_STARTUP_GRACE_MS", "60000");
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        let child = cmd.spawn().expect("spawn quill-kernel (Federated)");
         // 等会合 socket 出现(kernel bind 完成)。
         let deadline = Instant::now() + Duration::from_secs(10);
         while !sock.exists() && Instant::now() < deadline {
@@ -306,6 +312,59 @@ fn federated_last_feeder_disconnect_exits_and_cleans_socket() {
 
     assert!(exited, "断最后一个 feeder 后 kernel 应退出(F2b)");
     assert!(sock_gone, "kernel 退出应清理会合 socket 文件(F2b)");
+}
+
+/// 数 kernel 进程当前打开的 fd 数(Linux `/proc/<pid>/fd`)。用于 fd 泄漏回归。
+fn kernel_fd_count(k: &FedKernel) -> usize {
+    let path = format!("/proc/{}/fd", k.child.id());
+    std::fs::read_dir(&path).map(|it| it.count()).unwrap_or(0)
+}
+
+/// commit A 回归(联邦 fd 双关 bug):`make_feeder` 在 READ 源已注册后若后段失败,必须**事务化回滚**
+/// —— 移除已注册 READ 源(关 read_fd)+ 关它 dup 出的写端,且 `attach_feeder` **不再** double-close
+/// (旧 bug:READ 源 own 着 raw 的同时 attach 又 `libc::close(raw)` → 双关 + epoll 悬挂已关 fd)。
+/// 注入 `QUILL_TEST_FEEDER_FAIL_AFTER_READ`(仅 debug 构建生效)让**每个**会合接入都走"后段失败→回滚"
+/// 路径,验:(a) kernel 反复失败接入后仍存活(无双关致崩 / 无 epoll 悬挂源);(b) kernel 进程 fd 数
+/// 不随失败接入增长(回滚真关了 read_fd + dup 写端,无泄漏)。
+#[test]
+fn federated_make_feeder_failure_rolls_back_no_leak_no_crash() {
+    let port = free_port();
+    let mut k = FedKernel::spawn_with_env(port, &[("QUILL_TEST_FEEDER_FAIL_AFTER_READ", "1")]);
+
+    // 预热:先来一次失败接入,让 kernel 把稳态 fd(WS/会合 listener、signal、timer…)都建好再取基线。
+    if let Ok(s) = UnixStream::connect(&k.sock) {
+        std::thread::sleep(Duration::from_millis(50));
+        drop(s);
+    }
+    std::thread::sleep(Duration::from_millis(250));
+    let base = kernel_fd_count(&k);
+    assert!(base > 0, "应能读到 kernel /proc fd 数(Linux)");
+
+    // 反复接入:每次 kernel 侧 accept → attach_feeder → make_feeder 后段失败 → 事务化回滚。
+    for _ in 0..25 {
+        if let Ok(s) = UnixStream::connect(&k.sock) {
+            std::thread::sleep(Duration::from_millis(20)); // 给 kernel 处理 accept+失败+回滚。
+            drop(s);
+        }
+    }
+    std::thread::sleep(Duration::from_millis(400));
+
+    // (a) kernel 仍存活(无双关致崩 / 无 epoll 悬挂源致 panic)。
+    let alive = matches!(k.child.try_wait(), Ok(None));
+    // (b) 无 fd 泄漏:回滚关了 read_fd + dup 的写端;attach 不再 double-close。
+    let after = kernel_fd_count(&k);
+    let no_leak = after <= base + 3;
+
+    k.cleanup();
+
+    assert!(
+        alive,
+        "反复 make_feeder 后段失败后 kernel 应存活(无双关致崩 / 无 epoll 悬挂源)"
+    );
+    assert!(
+        no_leak,
+        "make_feeder 失败回滚不应泄漏 fd(基线 {base},25 次失败接入后 {after})"
+    );
 }
 
 /// 在 deadline 内从一个 feeder 的 back-channel(全双工 socket 读向)读一帧;无则 None。
