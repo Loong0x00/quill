@@ -3018,10 +3018,15 @@ fn on_active_tab_changed(data: &mut LoopData) {
 }
 
 /// 把当前桌面 tab 列表【整份】发给共享子(砖2 B2:父→子 `TabList` 帧)。`share` 未武装 = no-op
-/// (默认零回归)。先收集 owned `(tab_id, title)`(释放 `state.tabs` 不可变借用)再借 `data.share`
-/// (与 `state` 是 disjoint LoopData 字段),避免借用冲突。tab 增删 / 换序 / 焦点变时由
-/// [`on_active_tab_changed`] 调,共享启动时由 [`LoopData::start_share`] 调(发初始列表)。
+/// (默认零回归:**先** null-check `share` 再收集,不武装时连 owned 列表都不分配 —— 每次 tab
+/// 增删 / 换序 / 焦点变都经本函数,默认路径必须零开销)。武装时先收集 owned `(tab_id, title)`
+/// (释放 `state.tabs` 不可变借用)再借 `data.share`(与 `state` 是 disjoint LoopData 字段),避免
+/// 借用冲突。tab 增删 / 换序 / 焦点变时由 [`on_active_tab_changed`] 调,共享启动时由
+/// [`LoopData::start_share`] 调(发初始列表)。
 fn sync_share_tab_list(data: &mut LoopData) {
+    if data.share.is_none() {
+        return; // 默认(无 --share)路径:不武装则连列表都不收集,零开销。
+    }
     let Some(tabs) = data.state.tabs.as_ref() else {
         return;
     };
