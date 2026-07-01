@@ -1202,12 +1202,17 @@ impl LoopData {
     /// E′ 运行期【翻转】共享开关:已开 → [`Self::stop_share`];未开 → [`Self::start_share`]。
     /// 可反复开关、第二次开能干净重起(stop 路径已 reap 子 + 释放端口)。
     ///
-    /// **清 error 态**:每次用户 toggle(点按钮 / `Ctrl+Shift+S`)先清 `share_error` —— 上次启动失败
-    /// 后 icon 停在 error 态,用户"再点一次开/关"即重置(要么本次 start 成功转绿、要么再次失败重置回
-    /// error、要么本就没开的 stop 回灰)。清在翻转之前,故本次若又启动失败(start_share Err / 短窗 EOF)
-    /// 能重新置上。
+    /// **error 态点击 = 消错回灰(不重试)**:上次启动失败后 icon 停在琥珀 error 态、且 `share=None`
+    /// (与 `share_error` 互斥)。此时若点击走 `start_share` 会大概率又撞同一个占用者(如另一个 quill
+    /// 占着 7878)、再次失败卡回琥珀 → 用户感觉"点不动、黄的变不回灰"。故 **error 态一次点击 = 清
+    /// `share_error` 回灰(off)后【直接返回不重试】**;要重试就再点一次(从灰走 `start_share`)。非
+    /// error 态才按 `share.is_some()` 开(start)/ 关(stop)。重画由调用方 `apply_share_toggle` 置
+    /// `presentation_dirty` 保证。
     fn toggle_share(&mut self) {
-        self.state.share_error = false;
+        if self.state.share_error {
+            self.state.share_error = false;
+            return;
+        }
         if self.share.is_some() {
             self.stop_share();
         } else {
