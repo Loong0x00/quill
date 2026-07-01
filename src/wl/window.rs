@@ -495,6 +495,23 @@ const SHARE_DESKTOP_WS_ID: u64 = 1;
 /// 避端口冲突 / 测试)。
 const SHARE_WS_BIND_DEFAULT: &str = "0.0.0.0:7878";
 
+/// 共享子进程 spawn 后判"启动失败 vs 运行中崩溃"的短窗阈值。子 `Command::spawn` 成功后立即
+/// 去 bind `0.0.0.0:7878`;第二个窗口撞端口(`EADDRINUSE`)会**几毫秒内**退出 → 父读 back-channel
+/// EOF。若 EOF 距 spawn **短于本阈值** = 子几乎没活起来(绑端口失败 / 立即崩)= **启动失败**,
+/// 置 `share_error` 让标题栏 icon 转 error 态(用户一眼可见"点了但没开起来");EOF 距 spawn **长于
+/// 本阈值** = 共享已正常运行一段后子才崩 = 运行中崩溃,维持既有"静默降级回纯终端"(不误报)。
+/// 2s 远超本机 bind + listen 的亚毫秒级耗时,又远短于任何"用了一会才崩"的真实运行时长,判别裕度足。
+const SHARE_EOF_STARTUP_FAIL_WINDOW: Duration = Duration::from_secs(2);
+
+/// 纯决策:共享子 back-channel EOF / 断流距其 spawn 的时长 `elapsed` 是否算【启动失败】。
+///
+/// **why 纯 fn**:把"启动失败 vs 运行中崩溃"的判别抽出来(conventions §3 复杂决策抽纯函数 + 单测),
+/// 让 [`share_back_channel_readable`] 的 down 路径只负责取时长 + 据此置错,判据本身可 headless 单测
+/// (无需起 calloop / spawn 真子进程)。`elapsed < 阈值` = 子几乎没活起来就 EOF = 启动失败。
+fn share_eof_is_startup_failure(elapsed: Duration) -> bool {
+    elapsed < SHARE_EOF_STARTUP_FAIL_WINDOW
+}
+
 /// 设 fd 为非阻塞(父保留的 pipe 两端:tee 写**绝不阻塞**热路径;back-channel 读 drain 到
 /// WouldBlock)。
 #[allow(unsafe_code)]
@@ -647,6 +664,11 @@ struct ShareChild {
     /// (本结构被 `take` 掉,本字段随之 drop = no-op,RegistrationToken 是 Copy/POD),两条拆路互不
     /// 重复(parent-initiated 用本字段、self-remove 用 PostAction)。
     back_token: RegistrationToken,
+    /// 本子进程 spawn 完成(pipe + back-channel 源就绪)的时刻。用于 [`share_back_channel_readable`]
+    /// 的 down 路径判别【启动失败】(EOF 距此 < [`SHARE_EOF_STARTUP_FAIL_WINDOW`] = 子绑端口失败 /
+    /// 立即崩)vs【运行中崩溃】(EOF 距此较久 = 用了一会才崩),前者置 `share_error` 报错、后者静默降级。
+    /// POD `Instant`,drop 序无关(与 `dropped_frames` 同性质)。
+    spawn_at: Instant,
 }
 
 impl ShareChild {
@@ -758,6 +780,8 @@ impl ShareChild {
             last_dims: None,
             dropped_frames: 0,
             back_token,
+            // spawn + pipe + back-channel 源就绪的时刻;down 路径据此判启动失败 vs 运行中崩溃。
+            spawn_at: Instant::now(),
         })
     }
 
@@ -933,10 +957,22 @@ fn share_back_channel_readable(data: &mut LoopData, fd: RawFd) -> std::io::Resul
     }
 
     if down {
+        // 区分【启动失败】(EOF 距 spawn 短 = 子绑 7878 撞车 / 立即崩,本 bug:两个窗口都开共享,
+        // 第二个撞端口)与【运行中崩溃】(EOF 距 spawn 久 = 共享用了一会才崩):前者置 `share_error`
+        // → 标题栏 icon 转 error 态(用户一眼知道"点了但没开起来"、不与"从没开过"的灰混同);后者
+        // 维持既有静默降级回纯终端(不置 error、不误报)。判据在 take 之前读 spawn_at。
+        let startup_fail = data
+            .share
+            .as_ref()
+            .map(|sh| share_eof_is_startup_failure(sh.spawn_at.elapsed()))
+            .unwrap_or(false);
         // 拆 share:ShareChild::drop kill + reap 子 + 关父留 fd;本源 PostAction::Remove
         // (calloop 回调返回后才应用,故"删自身源"安全 —— 别在回调内手动 loop_handle.remove)。
         let _ = data.share.take();
-        // 子崩溃自动降级回纯终端 → 标题栏 share icon 须转灰,主动请求重画(同 toggle)。
+        if startup_fail {
+            data.state.share_error = true;
+        }
+        // 降级回纯终端(或转 error 态)→ 标题栏 share icon 须重画,主动请求重画(同 toggle)。
         data.state.presentation_dirty = true;
         return Ok(PostAction::Remove);
     }
@@ -1135,6 +1171,10 @@ impl LoopData {
                     ?e,
                     "E′ 共享 spawn 失败,维持纯终端(本次开共享无效,终端不受影响)"
                 );
+                // spawn 同步失败(exe 缺失 / pipe 建不出 / 源注册失败)= 启动失败:置 error 态,
+                // 让标题栏 icon 可见报错(与 back-channel EOF 短窗那条启动失败路径同处置)。调用方
+                // apply_share_toggle 随后置 presentation_dirty 触发重画。
+                self.state.share_error = true;
             }
         }
     }
@@ -1161,7 +1201,13 @@ impl LoopData {
 
     /// E′ 运行期【翻转】共享开关:已开 → [`Self::stop_share`];未开 → [`Self::start_share`]。
     /// 可反复开关、第二次开能干净重起(stop 路径已 reap 子 + 释放端口)。
+    ///
+    /// **清 error 态**:每次用户 toggle(点按钮 / `Ctrl+Shift+S`)先清 `share_error` —— 上次启动失败
+    /// 后 icon 停在 error 态,用户"再点一次开/关"即重置(要么本次 start 成功转绿、要么再次失败重置回
+    /// error、要么本就没开的 stop 回灰)。清在翻转之前,故本次若又启动失败(start_share Err / 短窗 EOF)
+    /// 能重新置上。
     fn toggle_share(&mut self) {
+        self.state.share_error = false;
         if self.share.is_some() {
             self.stop_share();
         } else {
@@ -6264,6 +6310,22 @@ mod tests {
         assert!(!share_should_drop_frame(6, 2, 8));
         // 加法溢出不 panic(saturating),仍判为超 cap → 丢。
         assert!(share_should_drop_frame(usize::MAX, 1, 8));
+    }
+
+    /// E′(ADR-0018)共享启动失败判据:back-channel EOF 距 spawn 短(< 阈值)= 启动失败
+    /// (绑 7878 撞车 / 立即崩 → 报 error);距 spawn 久 = 运行中崩溃(静默降级、不误报)。
+    #[test]
+    fn share_eof_short_window_is_startup_failure() {
+        // 几毫秒内 EOF(第二个窗口撞端口的实测形态)→ 启动失败。
+        assert!(share_eof_is_startup_failure(Duration::from_millis(5)));
+        assert!(share_eof_is_startup_failure(Duration::from_millis(500)));
+        // 阈值内边界。
+        assert!(share_eof_is_startup_failure(
+            SHARE_EOF_STARTUP_FAIL_WINDOW - Duration::from_millis(1)
+        ));
+        // 恰好到阈值 / 超过 = 运行中崩溃,不算启动失败(不误报)。
+        assert!(!share_eof_is_startup_failure(SHARE_EOF_STARTUP_FAIL_WINDOW));
+        assert!(!share_eof_is_startup_failure(Duration::from_secs(60)));
     }
 
     #[test]
