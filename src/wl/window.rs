@@ -3060,8 +3060,20 @@ fn tab_anim_advance(state: &mut State, dt_secs: f32) -> bool {
         return false;
     }
     let body_w = super::pointer::tab_body_width_no_plus(state.core.width, count) as f32;
+    // 手指按住时被拖 tab 直接吸附跟手 drag_x(不缓动、不计 needs_more),让位补间只驱动其它
+    // tab;松手后(held=false)被拖 tab 也走缓动落位。先拷出防与 visual_x 可变借用冲突。
+    let held_drag_id = if state.tab_anim.held {
+        state.tab_anim.drag_id
+    } else {
+        None
+    };
+    let drag_x = state.tab_anim.drag_x;
     let mut needs_more = false;
     for (id_raw, vx) in state.tab_anim.visual_x.iter_mut() {
+        if Some(*id_raw) == held_drag_id {
+            *vx = drag_x; // 跟手吸附,不计入 needs_more(否则 held 静止时 timer 永不停)
+            continue;
+        }
         let target = match tabs.iter().position(|t| t.id().raw() == *id_raw) {
             Some(i) => i as f32 * body_w,
             None => *vx, // tab 已关(罕见):停原地,不拉扯
@@ -3103,10 +3115,14 @@ fn tab_anim_tick(data: &mut LoopData) -> TimeoutAction {
     data.state.presentation_dirty = true;
     if needs_more {
         TimeoutAction::ToDuration(Duration::from_millis(TAB_ANIM_FRAME_MS))
+    } else if data.state.tab_anim.held {
+        // 让位补间到位但手指仍按住:仅停 timer(**不清 drag 态**)。被拖 tab 继续跟手靠
+        // motion 事件重画;下次跨槽 swap 由 apply_tab_drag 再起 timer。零常驻重画。
+        data.state.tab_anim.last_tick = None;
+        data.tab_anim_token = None;
+        TimeoutAction::Drop
     } else {
-        // 全部到位 → 拖拽 / 补间彻底结束,清全部 drag 态回 idle,timer 自停(源移除)。
-        // (timer 只在【松手后】的落位补间跑 —— 手指按住期靠 motion 事件重画不起 timer ——
-        // 故 settle 必在 held=false,清 drag_id 安全。)
+        // 松手且全部落位 → 拖拽彻底结束,清全部 drag 态回 idle,timer 自停(源移除)。
         data.state.tab_anim.visual_x.clear();
         data.state.tab_anim.last_tick = None;
         data.state.tab_anim.drag_id = None;
@@ -3142,20 +3158,107 @@ fn ensure_tab_anim_timer(data: &mut LoopData) {
 /// tab 拖拽 / 让位 / 落位动画的 drive_wayland 消费点(step 3.8b)。
 ///
 /// - **idle**(无拖拽、无补间)→ 零成本早返(不起 timer、不重画)。
-/// - **手指按住**(`held`)→ 被拖 tab 跟手靠 motion 事件重画,**不起 timer**(零常驻重画;
-///   让位补间在 commit 3 接入)。
+/// - **手指按住**(`held`)→ 被拖 tab 跟手靠 motion 事件重画。当被拖 tab 跨过某槽位 →
+///   实时 `swap_reorder` 换序(邻接 swap 累积 = 浏览器式 shift 让位)→ 其它 tab 补间滑到
+///   新槽位(起 timer),并把新顺序发给共享子(手机 tab 栏跟随)。**无跨槽 + 无未完补间时
+///   不起 timer**(held 静止零常驻重画)。
 /// - **松手后**(`held=false` 且仍有被拖 tab)→ 起落位补间 timer(被拖 tab 从 `drag_x`
-///   缓动到槽位),settle 后 [`tab_anim_tick`] 自停 + 清态。
+///   缓动到【已实时换序后的】最终槽位),settle 后 [`tab_anim_tick`] 自停 + 清态。
 fn apply_tab_drag(data: &mut LoopData) {
-    let anim = &data.state.tab_anim;
-    if anim.drag_id.is_none() && anim.visual_x.is_empty() {
+    if data.state.tab_anim.drag_id.is_none() && data.state.tab_anim.visual_x.is_empty() {
         return; // idle:零成本
     }
-    if anim.held {
-        return; // 跟手期:motion 事件驱动重画,不起 timer
+    if data.state.tab_anim.held {
+        // 实时换序:被拖 tab 跨槽 → 邻接 swap_reorder 移到目标槽(复用现有原语,不改重排逻辑)。
+        if reorder_dragged_toward_finger(&mut data.state) {
+            data.state.presentation_dirty = true;
+            // 手机 tab 栏跟随桌面换序(share 未武装 = no-op)。
+            sync_share_tab_list(data);
+        }
+        // 仅当有未完成让位补间(某非被拖 tab 未到新槽)才保持 timer;否则 held 静止零成本。
+        if tab_anim_has_pending_tween(&data.state) {
+            ensure_tab_anim_timer(data);
+        }
+        return;
     }
-    // 松手后的落位补间。
+    // 松手后的落位补间(被拖 tab 从 drag_x 缓动到最终槽位)。
     ensure_tab_anim_timer(data);
+}
+
+/// 实时换序:按被拖 tab 当前跟手 `drag_x` 算它应落的槽位,用**邻接** [`crate::tab::TabList::swap_reorder`]
+/// 逐格把它移过去(N 次邻接 swap 累积 = 插入 / shift 让位效果)。复用现有 `swap_reorder` 原语,
+/// 不改重排逻辑本身。返回 `true` = 发生了换序(调用方据此重画 + 同步共享 + 起让位补间)。
+fn reorder_dragged_toward_finger(state: &mut State) -> bool {
+    let Some(drag_id) = state.tab_anim.drag_id else {
+        return false;
+    };
+    let count = match state.tabs.as_ref() {
+        Some(t) if t.len() >= 2 => t.len(),
+        _ => return false,
+    };
+    let body_w = super::pointer::tab_body_width_no_plus(state.core.width, count) as f32;
+    if body_w <= 0.0 {
+        return false;
+    }
+    let target = tab_drag_target_slot(state.tab_anim.drag_x, body_w, count);
+    let Some(tabs) = state.tabs.as_mut() else {
+        return false;
+    };
+    let Some(cur) = tabs.iter().position(|t| t.id().raw() == drag_id) else {
+        return false;
+    };
+    if cur == target {
+        return false;
+    }
+    if cur < target {
+        for i in cur..target {
+            tabs.swap_reorder(i, i + 1);
+        }
+    } else {
+        for i in (target..cur).rev() {
+            tabs.swap_reorder(i, i + 1);
+        }
+    }
+    true
+}
+
+/// 被拖 tab 跟手 x(logical 左边缘)→ 它应落的槽位 index(box 中心最近的槽,clamp 到
+/// `[0, count-1]`)。纯函数,单测。
+fn tab_drag_target_slot(drag_x: f32, body_w: f32, count: usize) -> usize {
+    if count == 0 || body_w <= 0.0 {
+        return 0;
+    }
+    let center = drag_x + body_w / 2.0;
+    (center / body_w).floor().clamp(0.0, (count - 1) as f32) as usize
+}
+
+/// 是否有【未完成的让位补间】:某个**非被拖**(松手后含被拖)tab 的视觉 x 尚未到达其当前槽位。
+/// 决定手指按住期是否需要保持逐帧 timer(无补间 = held 静止 = 零成本)。
+fn tab_anim_has_pending_tween(state: &State) -> bool {
+    let Some(tabs) = state.tabs.as_ref() else {
+        return false;
+    };
+    let count = tabs.len();
+    if count == 0 {
+        return false;
+    }
+    let body_w = super::pointer::tab_body_width_no_plus(state.core.width, count) as f32;
+    let held_drag_id = if state.tab_anim.held {
+        state.tab_anim.drag_id
+    } else {
+        None
+    };
+    for (id, vx) in state.tab_anim.visual_x.iter() {
+        if Some(*id) == held_drag_id {
+            continue; // 被拖 tab 跟手,不算补间
+        }
+        if let Some(i) = tabs.iter().position(|t| t.id().raw() == *id) {
+            if (i as f32 * body_w - *vx).abs() > TAB_ANIM_EPS_LOGICAL {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// 从 `State.tab_anim` 构建本帧 tab 拖拽渲染布局(每 tab 视觉 x,index 对齐 `TabList`)。
@@ -6492,8 +6595,9 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 }
             }
             PointerAction::EndTabDrag => {
-                // 松手:被拖 tab 从当前跟手位补间落回槽位(commit 2 无换序;换序 + 让位见 commit 3)。
-                // 落位补间起点 = 当前 drag_x(写回被拖 tab 的 visual_x,让 advance 从指位缓动)。
+                // 松手:被拖 tab 从当前跟手位补间落回【已实时换序后的】最终槽位(换序在 held 期已
+                // 由 apply_tab_drag 邻接 swap_reorder 提交,此处无需再排)。落位补间起点 = 当前
+                // drag_x(写回被拖 tab 的 visual_x,让 advance 从指位缓动到槽位)。
                 state.tab_anim.held = false;
                 if let Some(id) = state.tab_anim.drag_id {
                     let dx = state.tab_anim.drag_x;
@@ -6576,6 +6680,47 @@ mod tests {
             steps <= 12,
             "settle 用了 {steps} 帧(~{}ms),超派单 180ms",
             steps * 16
+        );
+    }
+
+    /// 拖拽换序目标槽:被拖 tab 左边缘 x → box 中心最近的槽 index(clamp)。
+    #[test]
+    fn tab_drag_target_slot_maps_center_to_nearest_slot() {
+        let body_w = 100.0;
+        // 左边缘 0 → 中心 50 → 槽 0。
+        assert_eq!(tab_drag_target_slot(0.0, body_w, 4), 0);
+        // 左边缘 60 → 中心 110 → 槽 1(越过槽 1 起点)。
+        assert_eq!(tab_drag_target_slot(60.0, body_w, 4), 1);
+        // 左边缘 250 → 中心 300 → 槽 3。
+        assert_eq!(tab_drag_target_slot(250.0, body_w, 4), 3);
+        // 超右 → clamp 到 count-1。
+        assert_eq!(tab_drag_target_slot(9999.0, body_w, 4), 3);
+        // 负(理论 clamp 前)→ clamp 到 0。
+        assert_eq!(tab_drag_target_slot(-50.0, body_w, 4), 0);
+    }
+
+    /// 邻接 swap 累积 = 插入 / shift 让位语义(证明复用 `swap_reorder` 邻接调用即得浏览器式
+    /// 让位,而非单次 swap)。用 Vec<usize> 镜像 `reorder_dragged_toward_finger` 的 swap 序列。
+    #[test]
+    fn adjacent_swaps_accumulate_to_shift_not_single_swap() {
+        // 把 index 0 的元素移到 index 3:期望 [1,2,3,0](shift),而非单 swap 的 [3,1,2,0]。
+        let mut order = vec![0usize, 1, 2, 3];
+        let (cur, target) = (0usize, 3usize);
+        for i in cur..target {
+            order.swap(i, i + 1);
+        }
+        assert_eq!(order, vec![1, 2, 3, 0], "前移邻接 swap 累积应得 shift 结果");
+
+        // 把 index 3 移到 index 0:期望 [3,0,1,2](反向 shift)。
+        let mut order = vec![0usize, 1, 2, 3];
+        let (cur, target) = (3usize, 0usize);
+        for i in (target..cur).rev() {
+            order.swap(i, i + 1);
+        }
+        assert_eq!(
+            order,
+            vec![3, 0, 1, 2],
+            "后移邻接 swap 累积应得反向 shift 结果"
         );
     }
 
