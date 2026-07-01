@@ -204,6 +204,11 @@ pub struct Renderer {
     /// (与 `tab_count` / `active_tab_idx` 同 POD 组)。由调用方(window.rs idle callback)每帧
     /// draw_frame 之前经 [`Self::set_share_active`] 同步;默认 false = 今天的 quill(零回归)。
     share_active: bool,
+    /// E′(ADR-0018): 共享【启动失败】(`State::share_error` 的镜像)。render 据此把 titlebar 共享
+    /// icon 画成琥珀 error 态(优先于 on/off,见 [`share_icon_color`])。POD bool 无 GPU 资源, drop
+    /// 序无关(与 `share_active` 同 POD 组)。由调用方(window.rs idle callback)每帧 draw_frame 之前
+    /// 经 [`Self::set_share_error`] 同步;默认 false = 无错(零回归)。
+    share_error: bool,
     /// **T-0610 part 2: live alpha** (CLEAR_ALPHA_LIVE = 0.85 / Opaque fallback 1.0).
     /// `Renderer::new` 据 alpha_mode 决定一次后锁住; `Renderer::resize` 走 update
     /// uniform 时复用本字段, 不需重查 adapter caps. POD f32 顺序无关, 与
@@ -575,6 +580,33 @@ const SHARE_ICON_ON: crate::term::Color = crate::term::Color {
     g: 0xb9,
     b: 0x50,
 };
+
+/// **E′(ADR-0018)共享开关 icon — 启动失败(error 态)** (琥珀 #d29922, 与 off 灰 / on 绿
+/// **视觉明显不同**的"警告"色, 同 GitHub warning 琥珀系). 开共享后子进程启动失败(绑
+/// `0.0.0.0:7878` 撞车 / 立即崩)时信号条画成琥珀 → 用户一眼知道"点了但没开起来", 不与"从没
+/// 开过"的灰混同. 由 [`Renderer::set_share_error`] 镜像的 `State::share_error` 驱动;优先级高于
+/// on/off(error 时无论 active 与否都画琥珀, 见 [`share_icon_color`])。
+const SHARE_ICON_ERROR: crate::term::Color = crate::term::Color {
+    r: 0xd2,
+    g: 0x99,
+    b: 0x22,
+};
+
+/// 纯决策:共享开关 icon 的三态取色。`error` 优先(启动失败 → 琥珀 [`SHARE_ICON_ERROR`]);否则
+/// `active` → 亮绿 [`SHARE_ICON_ON`](共享中);否则暗灰 [`SHARE_ICON_OFF`](未共享)。
+///
+/// **why 纯 fn + error 优先**:三态取色是本 ticket 的核心视觉决策,抽纯函数便于单测(无需构 GPU
+/// Renderer)。error 优先于 active 因启动失败路径里 `share` 已被 take → `share_active=false`,但即便
+/// 未来出现 active&error 并存也应显 error(报错比"看起来在共享"更重要,避免误导)。
+fn share_icon_color(active: bool, error: bool) -> crate::term::Color {
+    if error {
+        SHARE_ICON_ERROR
+    } else if active {
+        SHARE_ICON_ON
+    } else {
+        SHARE_ICON_OFF
+    }
+}
 
 // T-0617: 删 `BORDER_PX` / `BORDER_COLOR` const + `append_border_vertices` fn
 // (T-0606 引入的 1 px 直边框). T-0617 Lead 预先 commit (2be7df9) 已 unhook 调用,
@@ -1525,6 +1557,9 @@ fn append_titlebar_vertices(
     // E′(ADR-0018): 共享是否开启 → 决定 titlebar 共享按钮 icon 亮绿(开)/ 暗灰(关)。
     // 默认 false = 灰 icon(零回归); 不开共享时仍画一个暗灰"未共享"按钮(常驻可见可点)。
     share_active: bool,
+    // E′(ADR-0018): 共享启动失败 → icon 画成琥珀 error 态(优先于 active/off, 见
+    // [`share_icon_color`])。默认 false = 无错(零回归)。
+    share_error: bool,
 ) {
     use crate::wl::pointer::{HoverRegion, WindowButton};
 
@@ -1729,17 +1764,12 @@ fn append_titlebar_vertices(
 
     // 3.4 E′(ADR-0018)Share: 三根递增"信号条"(底对齐, 左矮右高), 读作 signal /
     //     broadcast / streaming —— 与 +(plus)/ □(box)/ -(minus)/ ×(close)四个 icon
-    //     全不撞。色编码开关态: 共享中=亮绿 #3fb950(on-air), 未共享=暗灰 #6a6a6a。
-    //     只用轴对齐 stroke quad(走 rounded_out radius=0), 与其它 icon 同 pipeline。
+    //     全不撞。色编码三态(见 [`share_icon_color`]): 启动失败=琥珀 #d29922(error),
+    //     共享中=亮绿 #3fb950(on-air), 未共享=暗灰 #6a6a6a。只用轴对齐 stroke quad
+    //     (走 rounded_out radius=0), 与其它 icon 同 pipeline。
     if share_x_min >= 0.0 {
-        let share_icon_color = color_for_vertex_with_srgb(
-            if share_active {
-                SHARE_ICON_ON
-            } else {
-                SHARE_ICON_OFF
-            },
-            is_srgb,
-        );
+        let icon_rgb =
+            color_for_vertex_with_srgb(share_icon_color(share_active, share_error), is_srgb);
         let ix_min = share_x_min + icon_pad;
         let ix_max = share_x_max - icon_pad;
         let iy_min = btn_y_top + icon_pad;
@@ -1762,7 +1792,7 @@ fn append_titlebar_vertices(
                 iy_max,
                 surface_w,
                 surface_h,
-                share_icon_color,
+                icon_rgb,
                 0.0,
             );
         }
@@ -2291,6 +2321,9 @@ impl Renderer {
             // E′(ADR-0018): 默认未共享 (灰 icon), 上层 idle callback 每帧 draw_frame
             // 之前调 [`Self::set_share_active`] 同步 LoopData.share.is_some().
             share_active: false,
+            // E′(ADR-0018): 默认无 error (非启动失败), 上层每帧经 [`Self::set_share_error`]
+            // 同步 State::share_error;true → titlebar 共享 icon 转琥珀 error 态。
+            share_error: false,
             // T-0610 part 2: corner mask GPU 资源 (持 device 引用, INV-002
             // 字段顺序: device 之前 drop). 17 → 20 字段 (含 alpha_live POD),
             // Lead follow-up sync docs/invariants.md.
@@ -2313,6 +2346,13 @@ impl Renderer {
     /// titlebar 共享按钮 icon 据此亮绿(开)/ 暗灰(关)。
     pub fn set_share_active(&mut self, active: bool) {
         self.share_active = active;
+    }
+
+    /// E′(ADR-0018): 同步共享【启动失败】态到 renderer(idle callback 每帧 draw_frame 前调,与
+    /// [`Self::set_share_active`] 同 set-once 套路)。`error = State::share_error`;为 true 时 titlebar
+    /// 共享按钮 icon 画成琥珀 error 态(优先于 on/off),让"点了但没开起来"可见而非静默回灰。
+    pub fn set_share_error(&mut self, error: bool) {
+        self.share_error = error;
     }
 
     /// Wayland configure 后把新 surface 像素尺寸推给 wgpu —— 更新 `self.config`
@@ -2976,6 +3016,7 @@ impl Renderer {
             self.surface_is_srgb,
             hover,
             self.share_active,
+            self.share_error,
         );
         // T-0608/T-0615: tab bar 顶点 (仅多 tab). bar bg / icon stroke / 底部 border
         // 走 cell pipeline; active tab 圆角 + close × hover 红圆 走 rounded pipeline.
@@ -4693,6 +4734,8 @@ pub fn render_headless(
         is_srgb,
         hover_override,
         // headless 截图路径无运行期共享态 → 恒画"未共享"(暗灰)按钮(零回归)。
+        false,
+        // headless 无 error 态 → 恒非 error(零回归)。
         false,
     );
     // T-0608: tab bar (默认 1 tab, active idx 0). 集成测试通过 thread-local
@@ -7060,6 +7103,7 @@ mod tests {
             false,
             HoverRegion::Button(WindowButton::Close),
             false,
+            false,
         );
         // hover Close 时: rounded_out 含 close 圆形 bg (6 顶点) + Min/Max icon
         // strokes (4 边 max + 1 line min = 5 quad × 6 顶点 = 30) ≥ 36 顶点
@@ -7100,6 +7144,7 @@ mod tests {
             false,
             HoverRegion::None,
             false,
+            false,
         );
         let n_verts = rounded_out.len() / ROUNDED_VERTEX_BYTES;
         // icon strokes: Maximize 4 边 + Minimize 1 横 + T-0618 + button 横竖 2 条 = 7 quad × 6 = 42 顶点;
@@ -7117,6 +7162,33 @@ mod tests {
                 "非 hover 时 rounded 顶点应全 radius=0 (icon strokes), v{i} got {r}"
             );
         }
+    }
+
+    /// E′(ADR-0018): 共享 icon 三态取色 —— error 优先(启动失败 → 琥珀),否则 active → 亮绿,
+    /// 否则暗灰。error 优先于 active(哪怕 active&error 并存也显 error)。三色两两不同(视觉可辨)。
+    #[test]
+    fn share_icon_color_three_states_and_error_priority() {
+        assert_eq!(
+            share_icon_color(false, false),
+            SHARE_ICON_OFF,
+            "未共享=暗灰"
+        );
+        assert_eq!(share_icon_color(true, false), SHARE_ICON_ON, "共享中=亮绿");
+        assert_eq!(
+            share_icon_color(false, true),
+            SHARE_ICON_ERROR,
+            "启动失败=琥珀"
+        );
+        // error 优先: active 与 error 并存仍取琥珀(报错比"看起来在共享"重要)。
+        assert_eq!(
+            share_icon_color(true, true),
+            SHARE_ICON_ERROR,
+            "error 优先于 active"
+        );
+        // 三态色两两不同 → 用户能一眼区分 off/on/error。
+        assert_ne!(SHARE_ICON_OFF, SHARE_ICON_ON);
+        assert_ne!(SHARE_ICON_OFF, SHARE_ICON_ERROR);
+        assert_ne!(SHARE_ICON_ON, SHARE_ICON_ERROR);
     }
 
     /// `append_tab_bar_vertices` 默认配置 (1 tab, active=0, hover None) 应有

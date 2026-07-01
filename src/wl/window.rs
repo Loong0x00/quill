@@ -3554,6 +3554,8 @@ pub fn run_window(initial_cwd: Option<std::path::PathBuf>, share: bool) -> Resul
         pending_tab_op: None,
         // E′(ADR-0018):运行期共享开关请求标志,默认 false(无 pending,零回归)。
         pending_share_toggle: false,
+        // E′(ADR-0018):共享启动失败指示,默认 false(无错,零回归);仅启动失败置位。
+        share_error: false,
         last_tab_drag_x: 0.0,
         // T-0611: DnD 状态全空起步. compositor 在拖入时发 DataOffer + Enter,
         // 我们填充; Leave / Drop 后清.
@@ -3951,6 +3953,10 @@ pub fn run_window(initial_cwd: Option<std::path::PathBuf>, share: bool) -> Resul
             // E′(ADR-0018):把共享态镜像给 renderer(`share` 是 disjoint LoopData 字段,
             // 与 `r`=state.renderer 不冲突)。默认 None → false → 暗灰"未共享"按钮(零回归)。
             r.set_share_active(share.is_some());
+            // E′(ADR-0018):共享启动失败态镜像给 renderer(`state.share_error` 是 disjoint 字段,
+            // 与 `share` / `r` 不冲突)。true → 标题栏 share icon 画成琥珀 error 态(用户可见"点了
+            // 但没开起来")。默认 false → 零回归(与未共享的灰 icon 行为不变)。
+            r.set_share_error(state.share_error);
             // T-0617: 同步 active tab 的 OSC title 到 renderer. listener 写
             // active_tab.title (Rc<RefCell<String>>), 这里 read snapshot;
             // active_title 空 → 走 DEFAULT_TITLE = "quill" (与 T-0702 默认 + 启动
@@ -4394,6 +4400,14 @@ struct State {
     /// `pending_tab_op` / `pending_selection_op` / `pending_repeat` 同 deferred-side-effect 套路。
     /// **POD bool,drop 序无关**(放 pending_* 组内)。
     pub(crate) pending_share_toggle: bool,
+    /// E′(ADR-0018)共享【启动失败】指示。默认 `false` = 无错(零回归)。置 `true` 的唯一来源 =
+    /// 开共享后子进程【启动失败】:① [`LoopData::start_share`] 的 spawn 同步 Err;② 子 spawn 成功但
+    /// 几毫秒内 back-channel EOF(绑 `0.0.0.0:7878` 撞车 / 立即崩,判据 [`share_eof_is_startup_failure`])。
+    /// 用户主动关(`stop_share`)与运行中共享后来才崩(EOF 距 spawn 久)**不置**本标志。每次用户 toggle
+    /// 开头清零([`LoopData::toggle_share`])= "再点一次开/关就重置"。draw 路径镜像给 renderer
+    /// ([`crate::wl::render::Renderer::set_share_error`])→ 标题栏 share icon 画成 error 态(琥珀),
+    /// 与 off(灰)/ on(绿)视觉明显区别,让"点了但没开起来"可见而非静默回灰。**POD bool,drop 序无关**。
+    pub(crate) share_error: bool,
     /// T-0608: tab drag 期间最后一次 motion 的 logical x. EndTabDrag 时按此 x
     /// 算 target_idx (派单 In #F).
     pub(crate) last_tab_drag_x: f64,
