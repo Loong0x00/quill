@@ -285,6 +285,23 @@ pub(crate) enum TabOp {
     Reorder { from_idx: usize, target_idx: usize },
 }
 
+/// 浏览器式 tab 拖拽 / 让位 / 落位动画状态(POD,无 GPU / wayland 句柄 → drop 序无关,
+/// 不破 INV-008)。**核心不变式:`visual_x` 空 ⟺ 无动画进行**;`visual_x` 非空时
+/// [`drive_wayland`] 有一个 ~16ms calloop timer 在逐帧缓动,settle(全部到位且松手)后
+/// timer 立即停 + 清空本结构 → 回到 quill 原本的 dirty 驱动、**零常驻重画**。
+///
+/// 缓动:每帧 `x += (target - x) * (1 - e^(-dt/TAU))`(指数 ease-out);target = 该 tab
+/// 在当前 `TabList` 中 `index * body_w`(logical),被拖 tab(手指按住时)target = 跟手
+/// `drag_x`(直接吸附,不缓动)。用 **tab id** 而非 index 索引 `visual_x`,让实时
+/// `swap_reorder` 换序后每 tab 的视觉位置仍正确跟随。
+#[derive(Default)]
+pub(crate) struct TabAnimState {
+    /// `(tab_id.raw(), 当前视觉 x logical 左边缘)`。空 = 无动画(idle,零成本)。
+    visual_x: Vec<(u64, f32)>,
+    /// 上次缓动 tick 时刻(算 dt)。timer 停时置 None。
+    last_tick: Option<Instant>,
+}
+
 /// 把 wayland `EventQueue<State>`、业务 `State`、T-0301 的 `TermState`、
 /// calloop `LoopSignal` 四个运行时对象捆成一个结构,让
 /// `calloop::EventLoop<'_, LoopData>` 一把 own。回调签名得到 `&mut LoopData`,
@@ -364,6 +381,12 @@ struct LoopData {
     composer_debounce_token: Option<RegistrationToken>,
     /// T11: completion worker 用 std::mpsc 回传结果,用短Timer轮询并触发重绘。
     completion_poll_token: Option<RegistrationToken>,
+    /// tab 拖拽 / 让位 / 落位补间的逐帧 timer 句柄。`None` = 无动画(idle,timer 已停 =
+    /// 零常驻重画)。[`ensure_tab_anim_timer`] 在有活动动画时 insert 一个 ~16ms 重复
+    /// Timer,[`tab_anim_tick`] 每帧缓动一步;settle 后 tick **自身**置本字段 None +
+    /// 返 [`TimeoutAction::Drop`](源被 calloop 移除)→ 彻底停。与 `repeat_token` /
+    /// `pending_autoscroll_timer` 同 calloop Timer 单飞行套路。
+    tab_anim_token: Option<RegistrationToken>,
     /// T-0607: 当前 autoscroll 方向 (`±1` line / 100ms tick). Timer fire 走
     /// [`autoscroll_tick`] 读此值调 `term.scroll_display(delta)`. T-0804 后
     /// SelectionPos viewport-relative i32 line 自动跟随 viewport, Timer 路径
@@ -2140,6 +2163,15 @@ fn repeat_timer_tick(data: &mut LoopData) -> TimeoutAction {
 /// 派单 In #E "Timer fire 100ms 一次".
 const AUTOSCROLL_INTERVAL_MS: u64 = 100;
 
+/// tab 拖拽 / 让位 / 落位补间的逐帧节奏(~60fps)。**只在动画进行中**跑,settle 立即停
+/// (`tab_anim_tick` 返 [`TimeoutAction::Drop`])→ 绝无常驻重画循环(INV:渲染线程空闲不干活)。
+const TAB_ANIM_FRAME_MS: u64 = 16;
+/// 缓动时间常数(指数 ease-out):每帧 `x += (target-x)*(1-e^(-dt/TAU))`。30ms → 一格
+/// (~150 logical)约 150–170ms 落位(派单"120–180ms")。
+const TAB_ANIM_TAU_MS: f32 = 30.0;
+/// 视觉 x 与目标差 ≤ 此值(logical px)即吸附目标 + 判 settle(可停 timer)。
+const TAB_ANIM_EPS_LOGICAL: f32 = 0.5;
+
 /// T-0607: 消费 `state.pending_autoscroll_op` / `state.pending_autoscroll_cancel`,
 /// 真 schedule / cancel calloop Timer. 与 `apply_repeat_request` 同套路 —
 /// 协议事件路径只 set 单次延迟请求, 单一上游消费者 (drive_wayland step 3.7)
@@ -3005,6 +3037,136 @@ fn apply_tab_op(data: &mut LoopData) {
     }
 }
 
+/// 推进一帧 tab 动画:每个仍在 `visual_x` 的 tab 朝其当前槽位(`index * body_w`,logical)
+/// 指数缓动一步;差 ≤ [`TAB_ANIM_EPS_LOGICAL`] 即吸附到位。返回 `true` = 还有 tab 未到位
+/// (需下一帧)。用 tab id 反查 index → 实时 `swap_reorder` 换序后视觉位置仍正确跟随。
+fn tab_anim_advance(state: &mut State, dt_secs: f32) -> bool {
+    let Some(tabs) = state.tabs.as_ref() else {
+        state.tab_anim.visual_x.clear();
+        return false;
+    };
+    let count = tabs.len();
+    if count == 0 {
+        state.tab_anim.visual_x.clear();
+        return false;
+    }
+    let body_w = super::pointer::tab_body_width_no_plus(state.core.width, count) as f32;
+    let mut needs_more = false;
+    for (id_raw, vx) in state.tab_anim.visual_x.iter_mut() {
+        let target = match tabs.iter().position(|t| t.id().raw() == *id_raw) {
+            Some(i) => i as f32 * body_w,
+            None => *vx, // tab 已关(罕见):停原地,不拉扯
+        };
+        let (nx, reached) = tab_anim_ease(*vx, target, dt_secs);
+        *vx = nx;
+        if !reached {
+            needs_more = true;
+        }
+    }
+    needs_more
+}
+
+/// 单个视觉 x 朝 `target` 缓动一步(指数 ease-out,frame-rate 无关用 dt)。返回
+/// `(new_x, reached)`;`reached` = 差 ≤ [`TAB_ANIM_EPS_LOGICAL`](已吸附到位)。纯函数,单测。
+fn tab_anim_ease(x: f32, target: f32, dt_secs: f32) -> (f32, bool) {
+    let d = target - x;
+    if d.abs() <= TAB_ANIM_EPS_LOGICAL {
+        return (target, true);
+    }
+    let factor = (1.0 - (-dt_secs / (TAB_ANIM_TAU_MS / 1000.0)).exp()).clamp(0.0, 1.0);
+    (x + d * factor, false)
+}
+
+/// tab 动画 timer callback:算 dt → 缓动一步 → 触发重画。还需更多帧则重排 ~16ms;否则
+/// **settle**:清 `visual_x` + `last_tick` + 置 `tab_anim_token = None`,返 [`TimeoutAction::Drop`]
+/// (calloop 移除该源)→ 彻底停、回 dirty 驱动,**零常驻重画**。
+fn tab_anim_tick(data: &mut LoopData) -> TimeoutAction {
+    let now = Instant::now();
+    let dt = data
+        .state
+        .tab_anim
+        .last_tick
+        .map(|t| (now - t).as_secs_f32())
+        .unwrap_or(TAB_ANIM_FRAME_MS as f32 / 1000.0)
+        .clamp(0.0, 0.1);
+    data.state.tab_anim.last_tick = Some(now);
+    let needs_more = tab_anim_advance(&mut data.state, dt);
+    data.state.presentation_dirty = true;
+    if needs_more {
+        TimeoutAction::ToDuration(Duration::from_millis(TAB_ANIM_FRAME_MS))
+    } else {
+        // 全部到位 → 清空动画态回 idle,timer 自停(源移除)。
+        data.state.tab_anim.visual_x.clear();
+        data.state.tab_anim.last_tick = None;
+        data.tab_anim_token = None;
+        TimeoutAction::Drop
+    }
+}
+
+/// 有活动动画(`visual_x` 非空)且 timer 未在飞 → insert 一个 ~16ms 重复 Timer(单飞行)。
+/// idle(`visual_x` 空)不起 timer(零成本)。与 `apply_autoscroll_op` 同 calloop 套路。
+fn ensure_tab_anim_timer(data: &mut LoopData) {
+    if data.tab_anim_token.is_some() || data.state.tab_anim.visual_x.is_empty() {
+        return;
+    }
+    data.state.tab_anim.last_tick = Some(Instant::now());
+    let timer = Timer::from_duration(Duration::from_millis(TAB_ANIM_FRAME_MS));
+    match data
+        .loop_handle
+        .insert_source(timer, |_deadline, _meta, data: &mut LoopData| {
+            tab_anim_tick(data)
+        }) {
+        Ok(token) => data.tab_anim_token = Some(token),
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "calloop insert_source(tab anim) 失败 — tab 拖拽动画不工作但 quill 继续跑"
+            );
+        }
+    }
+}
+
+/// tab 拖拽 / 让位 / 落位动画的 drive_wayland 消费点(step 3.8b)。**idle(无动画)零成本早返**。
+/// 有活动动画时保证逐帧 timer 在飞(拖拽跟手 / 实时换序在 commit 2/3 接入本函数)。
+fn apply_tab_drag(data: &mut LoopData) {
+    if data.state.tab_anim.visual_x.is_empty() {
+        return; // idle:不起 timer、不重画(零成本)
+    }
+    ensure_tab_anim_timer(data);
+}
+
+/// 从 `State.tab_anim` 构建本帧 tab 拖拽渲染布局(每 tab 视觉 x,index 对齐 `TabList`)。
+/// 无动画(`visual_x` 空)→ `None`(renderer 按 slot 画,零回归、零分配)。
+fn build_tab_drag_render(
+    state: &State,
+    tab_count: usize,
+) -> Option<crate::wl::render::TabDragRender> {
+    if state.tab_anim.visual_x.is_empty() {
+        return None;
+    }
+    let tabs = state.tabs.as_ref()?;
+    let body_w = super::pointer::tab_body_width_no_plus(state.core.width, tab_count) as f32;
+    let mut visual_x_logical = Vec::with_capacity(tab_count);
+    for i in 0..tab_count {
+        let slot_x = i as f32 * body_w;
+        let x = match tabs.get(i) {
+            Some(t) => {
+                let id = t.id().raw();
+                state
+                    .tab_anim
+                    .visual_x
+                    .iter()
+                    .find(|(vid, _)| *vid == id)
+                    .map(|(_, x)| *x)
+                    .unwrap_or(slot_x)
+            }
+            None => slot_x,
+        };
+        visual_x_logical.push(x);
+    }
+    Some(crate::wl::render::TabDragRender { visual_x_logical })
+}
+
 /// T-0608: 关闭 idx 处 tab — drop TabInstance + remove calloop source + 邻近
 /// active 切换 + 若最后一个 → quit. 抽出来让 CloseActive / Close(idx) 共用.
 fn close_tab_idx(data: &mut LoopData, idx: usize) {
@@ -3316,6 +3478,10 @@ fn drive_wayland(data: &mut LoopData) -> std::io::Result<PostAction> {
     // 这里真 spawn 子 shell + insert/remove calloop source + 切 active.
     apply_tab_op(data);
 
+    // Step 3.8b: tab 拖拽 / 让位 / 落位补间 — 有活动动画时保证逐帧 timer 在飞,
+    // idle 零成本早返(settle 后 tick 自停,绝无常驻重画)。
+    apply_tab_drag(data);
+
     // Step 3.8.5 (E′, ADR-0018):运行期共享开关消费 — Dispatch 路径(Ctrl+Shift+S /
     // 标题栏共享按钮点击)只置 state.pending_share_toggle,这里真 toggle_share
     // (spawn / kill 隔离 quill-kernel 子 + insert / remove back-channel calloop 源)。
@@ -3608,6 +3774,8 @@ pub fn run_window(initial_cwd: Option<std::path::PathBuf>, share: bool) -> Resul
         // E′(ADR-0018):共享启动失败指示,默认 false(无错,零回归);仅启动失败置位。
         share_error: false,
         last_tab_drag_x: 0.0,
+        // tab 拖拽动画起步空(无动画,idle 零成本);StartTabDrag 时填充。
+        tab_anim: TabAnimState::default(),
         // T-0611: DnD 状态全空起步. compositor 在拖入时发 DataOffer + Enter,
         // 我们填充; Leave / Drop 后清.
         incoming_offer_mimes: Vec::new(),
@@ -3768,6 +3936,7 @@ pub fn run_window(initial_cwd: Option<std::path::PathBuf>, share: bool) -> Resul
         pending_autoscroll_timer: None,
         composer_debounce_token: None,
         completion_poll_token: None,
+        tab_anim_token: None,
         autoscroll_delta: 0,
         // T-0608: 启动后第一个 tab 的 PTY fd 已在上方 insert_source, 把
         // (tab_id, token) push 进 token 表 — close tab 时按 id 找 token + remove.
@@ -3831,6 +4000,9 @@ pub fn run_window(initial_cwd: Option<std::path::PathBuf>, share: bool) -> Resul
                 }
                 None => return,
             };
+            // tab 拖拽动画布局(无动画 → None → renderer 按 slot 画,零回归)。在拿
+            // tab_list 可变借用**之前**构建(只读 state.tab_anim + state.tabs)。
+            let tab_drag_render = build_tab_drag_render(state, tab_count);
             let Some(tab_list) = state.tabs.as_mut() else {
                 return; // tabs 未初始化 (启动期 race) — 跳过本帧
             };
@@ -4001,6 +4173,8 @@ pub fn run_window(initial_cwd: Option<std::path::PathBuf>, share: bool) -> Resul
                 return;
             };
             r.set_tab_state(tab_count, active_idx);
+            // tab 拖拽 / 让位动画布局镜像给 renderer(None = 无动画,按 slot 画零回归)。
+            r.set_tab_drag(tab_drag_render);
             // E′(ADR-0018):把共享态镜像给 renderer(`share` 是 disjoint LoopData 字段,
             // 与 `r`=state.renderer 不冲突)。默认 None → false → 暗灰"未共享"按钮(零回归)。
             r.set_share_active(share.is_some());
@@ -4462,6 +4636,10 @@ struct State {
     /// T-0608: tab drag 期间最后一次 motion 的 logical x. EndTabDrag 时按此 x
     /// 算 target_idx (派单 In #F).
     pub(crate) last_tab_drag_x: f64,
+    /// tab 拖拽 / 让位 / 落位动画状态(见 [`TabAnimState`])。默认空 = 无动画(idle,
+    /// 零成本);drag 期间 [`drive_wayland`] 的 timer 逐帧缓动,settle 后清空 + 停 timer。
+    /// **POD,drop 序无关**(不持 GPU / wl 句柄,不破 INV-008)。
+    pub(crate) tab_anim: TabAnimState,
     /// T-0611: 当前最近创建的 incoming offer 的 mime 列表. compositor 协议序:
     /// `DataOffer` event 创建 offer 对象, 紧跟着 N 个 `Offer` events 推 mime,
     /// 然后 `Enter` (DnD) 或 `Selection` (CLIPBOARD) 把它声明为当前 owner.
@@ -6294,6 +6472,57 @@ mod tests {
         let f: fn(Option<std::path::PathBuf>, bool) -> Result<()> = run_window;
         // 仅保留引用,避免 dead_code;不调用 f(会阻塞事件循环)。
         let _ = &f;
+    }
+
+    /// tab 动画缓动:已在目标 eps 内 → 立即吸附 + reached=true(判 settle 停 timer 的依据)。
+    #[test]
+    fn tab_anim_ease_snaps_within_eps() {
+        let (x, reached) = tab_anim_ease(100.0, 100.2, 0.016);
+        assert!(reached, "差 0.2 ≤ eps 0.5 应判到位");
+        assert_eq!(x, 100.2, "到位即吸附到 target 精确值");
+    }
+
+    /// tab 动画缓动:远离目标 → 朝目标移动一步(单调靠近、不过冲)且 reached=false(需继续)。
+    #[test]
+    fn tab_anim_ease_moves_toward_target_without_overshoot() {
+        let (x, reached) = tab_anim_ease(0.0, 150.0, 0.016);
+        assert!(!reached, "距 150 远大于 eps,未到位");
+        assert!(x > 0.0 && x < 150.0, "朝目标移动但不过冲: {x}");
+    }
+
+    /// tab 动画缓动:反向(target < x)同样单调靠近、不过冲(负向让位方向)。
+    #[test]
+    fn tab_anim_ease_moves_backward_without_overshoot() {
+        let (x, reached) = tab_anim_ease(150.0, 0.0, 0.016);
+        assert!(!reached);
+        assert!(x < 150.0 && x > 0.0, "反向也不过冲: {x}");
+    }
+
+    /// tab 动画缓动:~16ms 逐帧迭代必在派单区间(≤180ms)内 settle 到位 —— 证明 timer 会停
+    /// (无常驻重画)。用一格宽度(~150 logical)从 0 出发。
+    #[test]
+    fn tab_anim_ease_settles_within_180ms() {
+        let mut x = 0.0f32;
+        let target = 150.0f32;
+        let mut steps = 0;
+        loop {
+            let (nx, reached) = tab_anim_ease(x, target, 0.016);
+            x = nx;
+            steps += 1;
+            if reached {
+                break;
+            }
+            assert!(
+                steps < 60,
+                "60 帧(~960ms)仍未 settle = 永不停,违反零常驻重画"
+            );
+        }
+        // 16ms × steps ≤ 180ms → steps ≤ ~11。留余量断言 ≤ 12。
+        assert!(
+            steps <= 12,
+            "settle 用了 {steps} 帧(~{}ms),超派单 180ms",
+            steps * 16
+        );
     }
 
     /// E′ 背压 framing 完整性不变式(砖1b):空队列(帧对齐)永不丢 —— 即便单帧超 cap 也整帧

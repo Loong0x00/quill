@@ -199,6 +199,12 @@ pub struct Renderer {
     /// 通过 [`Self::set_tab_state`] 在每帧 draw_frame 之前同步.
     tab_count: usize,
     active_tab_idx: usize,
+    /// tab 拖拽 / 让位动画的视觉布局(每 tab 视觉 x + 被拖 tab)。`None` = 无动画进行
+    /// (默认 / idle)→ tab 按 `i * body_w` 画,与动画引入前逐像素一致(零回归)。由
+    /// window.rs idle callback 每帧从 `State.tab_anim` 构建并经 [`Self::set_tab_drag`]
+    /// 同步(动画结束即回 `None`,idle 零成本)。POD(`Vec<f32>` + `Option<usize>`)无
+    /// GPU 资源,drop 序无关(与 `tab_count` 同 POD 组)。
+    tab_drag: Option<TabDragRender>,
     /// E′(ADR-0018): 共享是否开启(`LoopData.share.is_some()` 的镜像)。render 据此把
     /// titlebar 共享开关 icon 画成亮绿(开)/ 暗灰(关)。POD bool 无 GPU 资源, drop 序无关
     /// (与 `tab_count` / `active_tab_idx` 同 POD 组)。由调用方(window.rs idle callback)每帧
@@ -1890,6 +1896,15 @@ const TAB_BAR_BORDER: crate::term::Color = crate::term::Color {
 ///   (rounded pipeline, radius=close_w/2, 全圆形 bg = 红色 #cc4444).
 /// - tab bar 底部细线分隔 (cell pipeline).
 ///
+/// tab 拖拽 / 让位动画的每帧视觉布局(由 window.rs 从 `State.tab_anim` 构建)。
+/// `None` 传给 [`append_tab_bar_vertices`] 时 = 无动画,tab 按 `i * body_w` 画
+/// (与动画引入前逐像素一致)。
+pub(crate) struct TabDragRender {
+    /// 每个 tab(按 tab_list index 对齐)的视觉 x(**logical** px 左边缘)。
+    /// 长度 == tab_count;渲染时 `* hidpi` 换 physical。缺项 fallback 到 slot x。
+    pub(crate) visual_x_logical: Vec<f32>,
+}
+
 /// **`#[allow(clippy::too_many_arguments)]`**: 与 `append_titlebar_vertices` 同
 /// 决策 — 抽 struct 反把 NDC 换算主线变间接.
 #[allow(clippy::too_many_arguments)]
@@ -1902,6 +1917,8 @@ pub(crate) fn append_tab_bar_vertices(
     tab_count: usize,
     active_idx: usize,
     hover: super::pointer::HoverRegion,
+    // tab 拖拽 / 让位动画布局。`None`(默认)= tab 按 slot 画,与动画引入前逐像素一致。
+    drag: Option<&TabDragRender>,
 ) {
     use crate::wl::pointer::HoverRegion;
 
@@ -1948,9 +1965,23 @@ pub(crate) fn append_tab_bar_vertices(
     //    - hover inactive → 圆角 box bg=#333 (rounded pipeline)
     //    - close × hover → 红圆 (rounded pipeline)
     for i in 0..tab_count {
-        let tab_x0 = i as f32 * body_w;
+        // 无动画(drag None)→ tab 按 slot `i * body_w` 画(逐像素等价旧行为);
+        // 动画中 → 用 window.rs 传入的视觉 x(logical → physical)。
+        let tab_x0 = match drag {
+            Some(d) => d
+                .visual_x_logical
+                .get(i)
+                .map(|x| x * hidpi)
+                .unwrap_or(i as f32 * body_w),
+            None => i as f32 * body_w,
+        };
         let tab_x1 = tab_x0 + body_w;
         if tab_x0 >= surface_w {
+            // 无动画:x 单调递增,越界即可 break;动画中 x 非单调(被拖 tab 可在任意
+            // 位置),越界的这个跳过但继续画其它 tab。
+            if drag.is_some() {
+                continue;
+            }
             break;
         }
         // T-0615: tab body 圆角 box 内缩 gap/2 形成 tab 间空隙. body bbox y 内缩
@@ -2318,6 +2349,9 @@ impl Renderer {
             // 同步真实 tabs 数量 + active idx.
             tab_count: 1,
             active_tab_idx: 0,
+            // tab 拖拽动画默认无(idle)→ 每帧按 slot 画;drag 期间 window.rs 经
+            // set_tab_drag 注入视觉 x,settle 后回 None(零成本)。
+            tab_drag: None,
             // E′(ADR-0018): 默认未共享 (灰 icon), 上层 idle callback 每帧 draw_frame
             // 之前调 [`Self::set_share_active`] 同步 LoopData.share.is_some().
             share_active: false,
@@ -2339,6 +2373,13 @@ impl Renderer {
     pub fn set_tab_state(&mut self, tab_count: usize, active_idx: usize) {
         self.tab_count = tab_count.max(1);
         self.active_tab_idx = active_idx.min(self.tab_count - 1);
+    }
+
+    /// 同步 tab 拖拽 / 让位动画布局(idle callback 每帧 draw_frame 前调,与
+    /// [`Self::set_tab_state`] 同 set-once 套路)。`None` = 无动画 → tab 按 slot 画
+    /// (零回归);`Some` = drag / 补间进行中 → [`append_tab_bar_vertices`] 按视觉 x 画。
+    pub(crate) fn set_tab_drag(&mut self, drag: Option<TabDragRender>) {
+        self.tab_drag = drag;
     }
 
     /// E′(ADR-0018): 同步共享开关态到 renderer(idle callback 每帧 draw_frame 前调,
@@ -3032,6 +3073,7 @@ impl Renderer {
                 self.tab_count,
                 self.active_tab_idx,
                 hover,
+                self.tab_drag.as_ref(),
             );
         }
         // T-0617: 去掉 1 px 直线边框 — 圆角 + 半透明窗口下, 直边框被 squircle
@@ -4754,6 +4796,8 @@ pub fn render_headless(
             tc,
             ai,
             hover_override,
+            // headless 截图路径无运行期拖拽态 → 恒按 slot 画(零回归)。
+            None,
         );
     }
     // cell_vertex_count 在 preedit underline append 后再算 (T-0505)。
@@ -7208,6 +7252,7 @@ mod tests {
             1,
             0,
             HoverRegion::None,
+            None,
         );
         let n_verts = rounded_out.len() / ROUNDED_VERTEX_BYTES;
         // T-0618 follow-up: active body (1 quad) + close − icon (1 quad) = 2 quad × 6 = 12 顶点.
@@ -7247,6 +7292,7 @@ mod tests {
             3,
             1,
             HoverRegion::None,
+            None,
         );
         // T-0618 follow-up: 3 tabs, active idx=1 body (1) + 3 tab close − strokes (3) = 4 quad × 6 = 24
         let n_verts = rounded_out.len() / ROUNDED_VERTEX_BYTES;
@@ -7271,6 +7317,7 @@ mod tests {
             3,
             0,
             HoverRegion::Tab(2),
+            None,
         );
         // T-0618 follow-up: active body (1) + hover body (1) + 3 close − strokes (3) = 5 quad × 6 = 30
         let n_verts = rounded_out.len() / ROUNDED_VERTEX_BYTES;
@@ -7295,6 +7342,7 @@ mod tests {
             3,
             0,
             HoverRegion::TabClose(0),
+            None,
         );
         // T-0618 follow-up: active body (1) + close hover bg (1) + 3 close − strokes (3) = 5 quad × 6 = 30
         let n_verts = rounded_out.len() / ROUNDED_VERTEX_BYTES;
