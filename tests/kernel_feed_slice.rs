@@ -288,6 +288,72 @@ fn fed_child_broadcasts_tab_list_metadata_to_ws() {
     );
 }
 
+/// 砖2 B3:每客户端独立视图 —— 看 tab7 的客户端**不**收 tab9 的字节;`TabOp::Select` 到 tab9 后
+/// 才本地切 viewed + 重放 tab9 环缓冲拿到那批字节。证"只把 viewed 的 tab 字节给该客户端"+ Select
+/// 本地重放,且不动别的 tab。
+#[test]
+fn fed_child_select_switches_viewed_tab_independently() {
+    use quill::kernel::feed::encode_tab_list;
+    use quill::kernel::proto::{ClientMsg, TabOp};
+
+    let port = free_port();
+    let fc = FedChild::spawn(port);
+    let mut ws = match connect_ws(port, Duration::from_secs(15)) {
+        Some(w) => w,
+        None => {
+            fc.cleanup();
+            panic!("15s 内未能连上 Fed 子进程 WS");
+        }
+    };
+
+    // 两 tab:id=7 "a"(active 0)/ id=9 "b"。焦点 = tab7 → 跟随焦点的客户端 viewed=(1,7)。
+    fc.feed(&FeedFrame {
+        kind: FrameKind::TabList,
+        ws_id: 1,
+        tab_id: 7,
+        payload: encode_tab_list(0, &[(7, "a"), (9, "b")]),
+    });
+    fc.feed(&FeedFrame {
+        kind: FrameKind::FocusChange,
+        ws_id: 1,
+        tab_id: 7,
+        payload: Vec::new(),
+    });
+    std::thread::sleep(Duration::from_millis(300)); // 确保子处理完 → 客户端 viewed=(1,7)
+
+    // 只往 tab9 灌字节(客户端此刻看 tab7,不该收到 → 存进 tab9 环)。
+    fc.feed(&FeedFrame {
+        kind: FrameKind::PtyOutput,
+        ws_id: 1,
+        tab_id: 9,
+        payload: b"NINE_ONLY_DATA".to_vec(),
+    });
+
+    // 负向:2s 内看 tab7 的客户端不该收到 tab9 的字节。
+    let leaked = ws_recv_until(&mut ws, b"NINE_ONLY_DATA", Duration::from_secs(2));
+    assert!(
+        !leaked,
+        "看 tab7 的客户端不该收到 tab9 的字节流(每客户端独立视图)"
+    );
+
+    // 客户端 Select 到 tab9(idx 1)→ 子本地切 viewed + 重放 tab9 环(含 NINE_ONLY_DATA)。
+    let sel = serde_json::to_string(&ClientMsg::TabOp {
+        workspace_id: 1,
+        op: TabOp::Select { idx: 1 },
+    })
+    .expect("ser select");
+    ws.send(Message::Text(sel.into())).expect("send select");
+    let _ = ws.flush();
+
+    let got = ws_recv_until(&mut ws, b"NINE_ONLY_DATA", Duration::from_secs(10));
+    let _ = ws.close(None);
+    fc.cleanup();
+    assert!(
+        got,
+        "Select 到 tab9 后应重放 tab9 环缓冲(拿到之前作为 tab7 客户端没收到的字节)"
+    );
+}
+
 /// 块D-1:父灌 PtyOutput 帧 → 浏览器(WS)收到那批 payload 字节。
 #[test]
 fn fed_child_streams_pty_output_frames_to_ws() {

@@ -67,7 +67,7 @@ use crate::kernel::feed::{
     decode_dims, decode_tab_list, encode_into, FeedDecoder, FeedFrame, FrameKind, FEED_HEADER_LEN,
 };
 use crate::kernel::proto::{
-    ClientMsg, ServerMsg, Snapshot, TabMeta, WorkspaceInfo, WorkspaceList, WorkspaceMeta,
+    ClientMsg, ServerMsg, Snapshot, TabMeta, TabOp, WorkspaceInfo, WorkspaceList, WorkspaceMeta,
 };
 use crate::kernel::session::{Lifecycle, Session};
 use crate::tab::{TabInstance, TabList};
@@ -425,7 +425,7 @@ pub fn run(config: DaemonConfig) -> Result<()> {
         },
         fed_tabs: Vec::new(),
         fed_active: 0,
-        ring: ByteRing::new(BYTE_RING_CAP),
+        rings: HashMap::new(),
         clients: HashMap::new(),
         next_client_id: 1,
         handshake_deadline,
@@ -601,8 +601,10 @@ struct DaemonData {
     /// **Fed 拓扑**桌面焦点 tab 在 [`Self::fed_tabs`] 里的下标(TabList 帧的 active_idx;FocusChange
     /// 帧也据焦点 tab id 更新)。构 `WorkspaceInfo.active`(手机据此标"哪个是桌面焦点")。
     fed_active: usize,
-    /// PTY 原始字节环缓冲(连上重放重建当前屏)。单线程,直接 fan-out 进各连接出站队列。
-    ring: ByteRing,
+    /// **每 tab** 一个 PTY 原始字节环缓冲(砖2 B3),key = `(ws_id, tab_id)`。连上 / Select 时重放
+    /// 目标 tab 的环重建当前屏 + 之后 live。单线程,直接 fan-out 进各连接出站队列。tab 关闭时其环由
+    /// [`fed_tab_list_updated`] 清掉。**Local 拓扑**单 active tab = 单条目(退化,行为等价单 ring)。
+    rings: HashMap<(u64, u64), ByteRing>,
     /// 在册 WS 连接(Peeking / Handshaking / Live)。key = 自增连接 id。
     clients: HashMap<u64, WsClient>,
     /// WS 连接 id 自增源。
@@ -671,6 +673,13 @@ struct WsClient {
     /// (隐式 Hold);收 [`ClientMsg::Hold`] 可改。X 显式关闭(`Release`/`Close`)= explicit
     /// 释放;断线 = 非事件释放(都经 [`release_holder`] 消费此字段,`take` 后幂等)。
     held_ws: Option<u64>,
+    /// 本客户端当前【看】的 (ws_id, tab_id)(砖2 B3:每客户端独立视图)。连上默认 = 桌面焦点
+    /// tab;收 `TabOp::Select` 切到指定 tab。只有 viewed 该 tab 的字节流才发给本客户端(省网)。
+    viewed: (u64, u64),
+    /// 是否"跟随桌面焦点"(砖2 B3)。连上默认 `true`(桌面焦点变则本客户端 viewed 自动跟到新焦点
+    /// tab —— 覆盖"连上早于首个 FocusChange"的 race + 手机初见即镜像桌面);收 `TabOp::Select`
+    /// 后置 `false`(pin 到用户选的 tab,桌面焦点变不再动它 = "绝不动/被动"独立)。
+    follow_focus: bool,
     /// 待写出的帧(数据面字节 + 控制面 JSON,见 [`OutFrame`])。
     outbound: VecDeque<OutFrame>,
     /// `outbound` 当前总字节(背压 cap 判定;各帧 `len` 求和的缓存)。
@@ -784,6 +793,8 @@ fn classify_pty_read(res: &io::Result<usize>) -> PtyRead {
 /// 退出前 flush 已读出的尾部字节(字节流不可丢)。
 fn pty_readable(data: &mut DaemonData) -> io::Result<PostAction> {
     let tab_id = data.tab_id;
+    // Local 单 active tab:所有字节归 (workspace_id, tab_id) 这一条环 / 一组 viewed 该 tab 的客户端。
+    let ws_id = data.workspace_id;
     let mut buf = [0u8; PTY_READ_BUF];
     let mut batch: Vec<u8> = Vec::new();
     loop {
@@ -804,14 +815,14 @@ fn pty_readable(data: &mut DaemonData) -> io::Result<PostAction> {
             PtyRead::Retry => continue,
             PtyRead::Drained => {
                 if !batch.is_empty() {
-                    fan_out_bytes(data, batch);
+                    fan_out_tab_bytes(data, ws_id, tab_id, batch);
                 }
                 return Ok(PostAction::Continue);
             }
             PtyRead::Closed => {
                 tracing::info!(tab_id, "PTY EOF/EIO:子 shell 退出,停止 daemon");
                 if !batch.is_empty() {
-                    fan_out_bytes(data, batch);
+                    fan_out_tab_bytes(data, ws_id, tab_id, batch);
                 }
                 if let Some(s) = data.session.as_mut() {
                     let _ = s.tabs_mut().active_mut().pty_mut().try_wait();
@@ -824,7 +835,7 @@ fn pty_readable(data: &mut DaemonData) -> io::Result<PostAction> {
                     tracing::error!(tab_id, ?e, "PTY read 非预期错误,停止 daemon");
                 }
                 if !batch.is_empty() {
-                    fan_out_bytes(data, batch);
+                    fan_out_tab_bytes(data, ws_id, tab_id, batch);
                 }
                 data.loop_signal.stop();
                 return Ok(PostAction::Remove);
@@ -833,26 +844,30 @@ fn pty_readable(data: &mut DaemonData) -> io::Result<PostAction> {
     }
 }
 
-/// 把一批 PTY 字节 append 进环缓冲,并 fan-out 进每条 live WS 连接的出站队列(打开其
-/// WRITE 兴趣)。某连接积压超 [`WS_CLIENT_OUT_CAP`] → 断开它(重连重放恢复)。
+/// 把一批 **某 (ws, tab) 的** PTY 字节 append 进该 tab 的环缓冲,并 fan-out 进【viewed 该 tab】的
+/// 每条 live WS 连接的出站队列(打开其 WRITE 兴趣)。某连接积压超 [`WS_CLIENT_OUT_CAP`] → 断开它
+/// (重连重放恢复)。砖2 B3:每 tab 独立环 + 每客户端只收自己 viewed 的 tab(手机各看各的、省网)。
 ///
-/// Peeking / Handshaking 阶段的连接**不**入队 live 字节:它们握手完成时会先收环缓冲
-/// 重放(此刻 append 的字节已在环里),不会丢也不会双发(单线程串行保证「ring.snapshot
-/// + 订阅」相对本函数原子)。
-fn fan_out_bytes(data: &mut DaemonData, batch: Vec<u8>) {
-    data.ring.push(&batch);
+/// **viewed 该 tab 的** live 连接才入队;viewed 别的 tab / Peeking / Handshaking 的连接不入队 ——
+/// Peeking/Handshaking 转 Live 时会先收目标 tab 环缓冲重放(此刻 append 的已在环里,单线程串行
+/// 保证「ring.snapshot + 订阅」相对本函数原子,不丢不双发)。
+fn fan_out_tab_bytes(data: &mut DaemonData, ws: u64, tab: u64, batch: Vec<u8>) {
+    data.rings
+        .entry((ws, tab))
+        .or_insert_with(|| ByteRing::new(BYTE_RING_CAP))
+        .push(&batch);
     if data.clients.is_empty() {
         return;
     }
-    // move 进 Bytes(refcount);各 live 连接 clone 只 +1 引用,不拷贝字节。
+    // move 进 Bytes(refcount);各订阅连接 clone 只 +1 引用,不拷贝字节。
     let frame = Bytes::from(batch);
     let ids: Vec<u64> = data.clients.keys().copied().collect();
     for id in ids {
-        let mut is_live = false;
+        let mut is_target = false;
         let mut over_cap = false;
         if let Some(c) = data.clients.get_mut(&id) {
-            if matches!(c.stage, WsStage::Live(_)) {
-                is_live = true;
+            if matches!(c.stage, WsStage::Live(_)) && c.viewed == (ws, tab) {
+                is_target = true;
                 c.outbound_len += frame.len();
                 c.outbound.push_back(OutFrame::Bytes(frame.clone()));
                 over_cap = c.outbound_len > WS_CLIENT_OUT_CAP;
@@ -865,7 +880,7 @@ fn fan_out_bytes(data: &mut DaemonData, batch: Vec<u8>) {
                 "WS 客户端出站积压超上限,断开(重连重放恢复)"
             );
             drop_client_external(data, id);
-        } else if is_live {
+        } else if is_target {
             arm_write(data, id);
         }
     }
@@ -938,22 +953,23 @@ fn fed_pipe_readable(data: &mut DaemonData, fd: RawFd) -> io::Result<PostAction>
     Ok(PostAction::Continue)
 }
 
-/// 路由一条父喂来的帧(Fed 拓扑,块B):
-/// - `PtyOutput` → 焦点流字节,经砖0 [`fan_out_bytes`] 进 ring + 各 live WS 客户端(本地渲染)。
-/// - `FocusChange` → 更新焦点 (workspace, tab) + [`broadcast_stream_focus`] 给所有 live 客户端。
-/// - `WorkspaceAdd` / `WorkspaceRemove` → 砖1a 仅留接口(控制面工作区元数据接线在砖1b)。
-/// - `Input` → 子→父方向,父不该往子发,收到忽略(防协议误用)。
+/// 路由一条父喂来的帧(Fed 拓扑):
+/// - `PtyOutput` → 该 (ws, tab) 的字节,经 [`fan_out_tab_bytes`] 进该 tab 环 + viewed 该 tab 的
+///   live WS 客户端(砖2 B3:每 tab 独立环、每客户端各看各的)。
+/// - `FocusChange` → 更新桌面焦点 (workspace, tab) + [`fed_focus_changed`](重定向"跟随焦点"的
+///   客户端 + 刷元数据 active;砖2 B3:**不再**全局 StreamFocus 劫持所有客户端流)。
+/// - `TabList` → 重建 tab 元数据 + 广播(砖2 B2)+ 处理 viewed 的 tab 被关的客户端(B3)。
+/// - `WorkspaceAdd` / `WorkspaceRemove` → 工作区级元数据(单工作区 E′ 用 TabList 代之)。
+/// - `Input` / `TabOp` → 子→父方向,父不该往子发,收到忽略(防协议误用)。
 fn route_fed_frame(data: &mut DaemonData, frame: FeedFrame) {
     match frame.kind {
         FrameKind::PtyOutput => {
             if !frame.payload.is_empty() {
-                fan_out_bytes(data, frame.payload);
+                fan_out_tab_bytes(data, frame.ws_id, frame.tab_id, frame.payload);
             }
         }
         FrameKind::FocusChange => {
-            data.workspace_id = frame.ws_id;
-            data.tab_id = frame.tab_id;
-            broadcast_stream_focus(data);
+            fed_focus_changed(data, frame.ws_id, frame.tab_id);
         }
         FrameKind::Dims => {
             // A′ 增量1:父发桌面 PTY 尺寸 → 记录 + 广播 ServerMsg::Dims,客户端 term.resize 到桌面宽。
@@ -969,17 +985,10 @@ fn route_fed_frame(data: &mut DaemonData, frame: FeedFrame) {
             }
         }
         FrameKind::TabList => {
-            // 砖2 B2:父发整份 tab 列表 → 重建 fed_tabs + 广播 Workspaces/Workspace 给手机 tab 栏。
+            // 砖2 B2/B3:父发整份 tab 列表 → 重建 fed_tabs + 清死 tab 环 + 重定向 viewed 被关 tab 的
+            // 客户端 + 广播 Workspaces/Workspace 给手机 tab 栏。
             match decode_tab_list(&frame.payload) {
-                Some((active, tabs)) => {
-                    data.workspace_id = frame.ws_id;
-                    data.fed_tabs = tabs
-                        .into_iter()
-                        .map(|(id, title)| TabMeta { tab_id: id, title })
-                        .collect();
-                    data.fed_active = active.min(data.fed_tabs.len().saturating_sub(1));
-                    broadcast_fed_metadata(data);
-                }
+                Some((active, tabs)) => fed_tab_list_updated(data, frame.ws_id, active, tabs),
                 None => tracing::warn!(
                     len = frame.payload.len(),
                     "Fed 收到 TabList 帧 payload 非法,忽略"
@@ -1025,16 +1034,100 @@ fn broadcast_control(data: &mut DaemonData, msg: &ServerMsg) {
     }
 }
 
-/// 向所有 live WS 客户端推一条 [`ServerMsg::StreamFocus`] 控制帧(Text),声明此后 Binary 字节
-/// 属于哪个 (workspace, active tab)。Fed 焦点切换(父发 [`FrameKind::FocusChange`])后调。
-fn broadcast_stream_focus(data: &mut DaemonData) {
-    broadcast_control(
-        data,
-        &ServerMsg::StreamFocus {
-            workspace_id: data.workspace_id,
-            tab_id: data.tab_id,
-        },
-    );
+/// 把一条 live WS 客户端的 viewed 切到 `(ws, tab)`(砖2 B3):发 [`ServerMsg::StreamFocus`](让 web
+/// 端 reset 终端)+ 重放该 tab 环缓冲(关键帧 = 重建当前屏)+ 之后 live 由 [`fan_out_tab_bytes`] 送。
+/// `follow` = 是否"跟随桌面焦点"(见 [`WsClient::follow_focus`])。仅对 Live 连接有效;非 Live / 不
+/// 存在则 no-op。**每客户端独立、不动桌面焦点、不影响别的客户端**(纯改本连接 viewed + 出站队列)。
+fn fed_point_client(data: &mut DaemonData, id: u64, ws: u64, tab: u64, follow: bool) {
+    let replay = data
+        .rings
+        .get(&(ws, tab))
+        .map(|r| r.snapshot())
+        .unwrap_or_default();
+    let focus_json = serde_json::to_string(&ServerMsg::StreamFocus {
+        workspace_id: ws,
+        tab_id: tab,
+    })
+    .ok();
+    let mut armed = false;
+    if let Some(c) = data.clients.get_mut(&id) {
+        if !matches!(c.stage, WsStage::Live(_)) {
+            return;
+        }
+        c.viewed = (ws, tab);
+        c.follow_focus = follow;
+        if let Some(j) = focus_json {
+            c.outbound_len += j.len();
+            c.outbound.push_back(OutFrame::Text(j));
+        }
+        if !replay.is_empty() {
+            c.outbound_len += replay.len();
+            c.outbound.push_back(OutFrame::Bytes(Bytes::from(replay)));
+        }
+        armed = true;
+    }
+    if armed {
+        arm_write(data, id);
+    }
+}
+
+/// 桌面焦点变(父发 [`FrameKind::FocusChange`])的处理(砖2 B3):更新桌面焦点 (workspace, tab) +
+/// 元数据 active,把**跟随焦点**(`follow_focus`)的客户端 viewed 重定向到新焦点 tab(pin 过的
+/// 客户端不动),再广播元数据让 tab 栏刷新 active 标记。**不再全局广播 StreamFocus 劫持所有客户端**
+/// (那是砖1b 单焦点镜像语义;选项②每客户端独立)。
+fn fed_focus_changed(data: &mut DaemonData, ws: u64, tab: u64) {
+    data.workspace_id = ws;
+    data.tab_id = tab;
+    if let Some(i) = data.fed_tabs.iter().position(|t| t.tab_id == tab) {
+        data.fed_active = i;
+    }
+    let followers: Vec<u64> = data
+        .clients
+        .iter()
+        .filter(|(_, c)| c.follow_focus && matches!(c.stage, WsStage::Live(_)))
+        .map(|(id, _)| *id)
+        .collect();
+    for id in followers {
+        fed_point_client(data, id, ws, tab, true);
+    }
+    broadcast_fed_metadata(data);
+}
+
+/// 整份 tab 列表更新(父发 [`FrameKind::TabList`])的处理(砖2 B2/B3):重建 `fed_tabs` / `fed_active`
+/// + 同步桌面焦点 tab + 清掉已关 tab 的环缓冲 + 把 viewed 于**已关 tab** 的客户端回落到跟随焦点 +
+/// 广播元数据。B4 在此基础上加"New 后自动 Select 发起客户端到新 tab"。
+fn fed_tab_list_updated(data: &mut DaemonData, ws: u64, active: usize, tabs: Vec<(u64, String)>) {
+    data.workspace_id = ws;
+    let new_ids: std::collections::HashSet<u64> = tabs.iter().map(|(id, _)| *id).collect();
+    data.fed_tabs = tabs
+        .into_iter()
+        .map(|(id, title)| TabMeta { tab_id: id, title })
+        .collect();
+    data.fed_active = active.min(data.fed_tabs.len().saturating_sub(1));
+    let focus_tab = data
+        .fed_tabs
+        .get(data.fed_active)
+        .map(|t| t.tab_id)
+        .unwrap_or(data.tab_id);
+    data.tab_id = focus_tab;
+    // 清掉本工作区里已不存在 tab 的环缓冲(tab 已关,内存回收)。
+    data.rings
+        .retain(|(rws, rtab), _| *rws != ws || new_ids.contains(rtab));
+    // viewed 于已关 tab 的客户端 → 回落到跟随桌面焦点(pin 与否都回落,因为它看的 tab 没了)。
+    let orphans: Vec<u64> = data
+        .clients
+        .iter()
+        .filter(|(_, c)| {
+            matches!(c.stage, WsStage::Live(_))
+                && c.viewed.0 == ws
+                && !new_ids.contains(&c.viewed.1)
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    for id in orphans {
+        fed_point_client(data, id, ws, focus_tab, true);
+    }
+    broadcast_fed_metadata(data);
 }
 
 /// 向所有 live WS 客户端推一条 [`ServerMsg::Dims`] 控制帧(A′ 增量1),客户端据此 `term.resize`
@@ -1310,6 +1403,9 @@ fn accept_ws_client(stream: TcpStream, data: &mut DaemonData) -> Result<()> {
             read_token: token,
             write: None,
             held_ws: None,
+            // viewed / follow 在 Peeking/Handshaking 阶段无意义,转 Live 时(ws_go_live)设真值。
+            viewed: (0, 0),
+            follow_focus: true,
             outbound: VecDeque::new(),
             outbound_len: 0,
         },
@@ -1471,10 +1567,10 @@ fn ws_drive_handshake(data: &mut DaemonData, id: u64) -> io::Result<PostAction> 
     }
 }
 
-/// 握手完成转 Live:为出站建一个 WRITE 源(owns 另一份 dup 当可写信号)+ 把当前环缓冲
-/// 重放排进出站(重建当前屏)。
+/// 握手完成转 Live:为出站建一个 WRITE 源(owns 另一份 dup 当可写信号)+ 把**初始 viewed tab**
+/// 的环缓冲重放排进出站(重建当前屏)。初始 viewed = 桌面焦点 tab、`follow_focus=true`(砖2 B3)。
 ///
-/// **重放 + 订阅原子性**:单线程串行,本函数与 [`fan_out_bytes`] 绝不交错 —— `ring.snapshot()`
+/// **重放 + 订阅原子性**:单线程串行,本函数与 [`fan_out_tab_bytes`] 绝不交错 —— `ring.snapshot()`
 /// 之后到达的字节都在本连接转 Live 之后由 fan-out 经出站送达(无丢);之前的都在重放里
 /// (无双发)。
 fn ws_go_live(
@@ -1506,11 +1602,20 @@ fn ws_go_live(
     // 不发 ClientMsg::Hold(如旧 web / 测试)也登记为 holder → 断线/关闭都经统一回收路径
     // 释放,无 holder 泄漏。anchor 在(daemon 自锚)故这不会让工作区"该死不死"。
     let ws_id = data.workspace_id;
+    // 初始 viewed = 桌面焦点 tab(砖2 B3);重放该 tab 的环缓冲(而非全局单 ring)。
+    let viewed = (data.workspace_id, data.tab_id);
     // 控制面连上引导帧:全部工作区列表 + 当前工作区结构 + 字节流 (workspace,tab) 标签。
     let control = build_control_text(data, ws_id);
-    let replay = data.ring.snapshot();
+    let replay = data
+        .rings
+        .get(&viewed)
+        .map(|r| r.snapshot())
+        .unwrap_or_default();
     if let Some(c) = data.clients.get_mut(&id) {
         c.stage = WsStage::Live(ws);
+        // 砖2 B3:本连接初始视图 = 桌面焦点 tab,跟随焦点(未 pin);Select 后 pin。
+        c.viewed = viewed;
+        c.follow_focus = true;
         // holder 仅 Local(有 Session)登记:先确认连接在册再登记 holder + held_ws(二者一起
         // 设)→ 杜绝登记了 holder 却没记 held_ws、回收时无从释放的孤立态。Fed 子的工作区生命
         // 周期归父(refcount→父信号留砖1b),子只用 `clients` 表做 fan-out + 回收 → held_ws 留
@@ -1605,12 +1710,8 @@ fn push_server_json(out: &mut Vec<String>, msg: &ServerMsg) {
 }
 
 /// Live READ 可读:`ws.read()` 排空到 WouldBlock,每条数据帧字节直接 [`Session::on_input`]
-/// 写 active tab PTY(同线程,无 channel)。Close / 致命错 → 断开。
+/// 写 PTY(同线程,无 channel)。Close / 致命错 → 断开。
 fn ws_live_read(data: &mut DaemonData, id: u64) -> io::Result<PostAction> {
-    let tab = data.tab_id;
-    // 热路径 Binary 无显式寻址 → 用焦点 (workspace, tab)(Bug3:仅带 workspace_id 字段的
-    // ClientMsg::Input 才用消息字段,见 handle_client_msg)。
-    let ws = data.workspace_id;
     loop {
         let res = match data.clients.get_mut(&id) {
             Some(c) => match &mut c.stage {
@@ -1620,10 +1721,16 @@ fn ws_live_read(data: &mut DaemonData, id: u64) -> io::Result<PostAction> {
             None => return Ok(PostAction::Remove),
         };
         match res {
-            // 数据面:浏览器输入裸字节(WS Binary)→ input sink(块C):Local 直写焦点 tab PTY,
-            // Fed encode Input 帧回灌父 back-channel(子自己不写 PTY)。焦点 tab = StreamFocus 标的。
+            // 数据面:浏览器输入裸字节(WS Binary)→ 写本客户端**当前 viewed tab**(砖2 B3:每客户端
+            // 各看各的 → 各写各的 viewed tab,非全局焦点)。Local 直写该 tab PTY;Fed encode Input 帧
+            // (带 viewed (ws,tab) 标签)回灌父 back-channel(父据标写对应 tab PTY,子自己不写 PTY)。
             Ok(Message::Binary(b)) => {
-                route_input(data, ws, tab, &b);
+                let (vws, vtab) = data
+                    .clients
+                    .get(&id)
+                    .map(|c| c.viewed)
+                    .unwrap_or((data.workspace_id, data.tab_id));
+                route_input(data, vws, vtab, &b);
             }
             // 控制面:WS Text = JSON [`ClientMsg`](Hold / Release / 寻址 Input / Resize)。
             // 与数据面 Binary 分流(T6)。Release 触发显式关闭回收 → 返 drop action。
@@ -1722,9 +1829,44 @@ fn handle_client_msg(data: &mut DaemonData, id: u64, text: &str) -> Option<PostA
             }
             None
         }
-        ClientMsg::TabOp { .. } => {
-            tracing::debug!("收到 TabOp 控制消息:砖0 daemon 单 tab 字节泵不接线(砖1 多 tab 泵)");
+        ClientMsg::TabOp { workspace_id, op } => {
+            handle_tab_op(data, id, workspace_id, op);
             None
+        }
+    }
+}
+
+/// 处理一条 [`ClientMsg::TabOp`](砖2 B3/B4)。**仅 Fed 拓扑**接线(Local standalone 单 active tab
+/// 字节泵不支持多 tab 视图,保持砖0 debug 行为):
+/// - `Select { idx }` = **kernel 本地**切本客户端 viewed 到该 idx 的 tab(不动桌面焦点、不影响别的
+///   客户端)+ 重放目标 tab 环缓冲(见 [`fed_point_client`],`follow=false` pin 住);
+/// - `New` / `Close` / `Reorder` = 回灌父执行(砖2 B4,见 [`forward_tab_op_to_parent`]);
+/// - `SetTitle` = 暂不接(桌面无对应操作,留后续)。
+fn handle_tab_op(data: &mut DaemonData, id: u64, workspace_id: u64, op: TabOp) {
+    if data.fed.is_none() {
+        tracing::debug!(
+            ?op,
+            "Local standalone TabOp 不接线(单 active tab 字节泵),忽略"
+        );
+        return;
+    }
+    match op {
+        TabOp::Select { idx } => {
+            // idx → tab_id(据子维护的 fed_tabs)。用 daemon 的 workspace_id(= 环 / 帧标签一致的
+            // 桌面工作区),而非消息里可能过时的 workspace_id。
+            let _ = workspace_id;
+            let ws = data.workspace_id;
+            match data.fed_tabs.get(idx).map(|t| t.tab_id) {
+                Some(tab_id) => fed_point_client(data, id, ws, tab_id, false),
+                None => tracing::debug!(idx, "TabOp::Select idx 越界(tab 列表未同步?),忽略"),
+            }
+        }
+        // New / Close / Reorder 回灌父执行(砖2 B4 接线,B3 暂 debug)。
+        TabOp::New | TabOp::Close { .. } | TabOp::Reorder { .. } => {
+            tracing::debug!(?op, "TabOp New/Close/Reorder 回灌父(砖2 B4 接线)");
+        }
+        TabOp::SetTitle { .. } => {
+            tracing::debug!("TabOp::SetTitle 暂不接线(桌面无对应操作),忽略");
         }
     }
 }

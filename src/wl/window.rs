@@ -591,13 +591,6 @@ fn share_should_drop_frame(outbound_len: usize, frame_len: usize, cap: usize) ->
     outbound_len > 0 && outbound_len.saturating_add(frame_len) > cap
 }
 
-/// E′ 回灌输入路由决策(纯逻辑,可单测):**帧目标是否当前焦点 tab**。手机镜像桌面焦点,命中
-/// 才回灌(写进 active PTY);不命中 = 焦点 race(桌面已切 tab、手机仍按旧焦点发),丢弃防写
-/// 错 tab。砖1b 单焦点;多 tab 寻址回灌留后续。
-fn share_input_targets_active(frame_tab: u64, active_tab: u64) -> bool {
-    frame_tab == active_tab
-}
-
 /// E′(ADR-0018)父监管的隔离共享【子进程】句柄 + 父↔子 pipe 两端 + 焦点 + 背压队列。
 ///
 /// 仅 `--share` 武装时存在(默认 `None` = 今天的 quill,**零开销、零子进程、零回归**)。父
@@ -948,38 +941,81 @@ fn share_back_channel_readable(data: &mut LoopData, fd: RawFd) -> std::io::Resul
     Ok(PostAction::Continue)
 }
 
-/// 路由一条子回灌的 `Input` 帧到本地 PTY(块ii)。手机镜像桌面**焦点**(= active)tab,故回灌
-/// 输入目标 = 焦点 tab;按帧的 (ws, tab) 标签定位:命中当前 active tab → [`queue_or_write_pty`]
-/// 写进**该 tab 的 PTY**(**复用唯一写汇** = pending_pty_writes 队列 + 每 tick drain,与
-/// paste / keyboard 同背压路径,**不另开写路径**)。
+/// 路由一条子回灌的 `Input` 帧到【帧标签指定的那个 tab】的 PTY(砖2 B3:每客户端看/写各自 viewed
+/// tab → 帧带 viewed (ws, tab) 标签,父据 `tab_id` 定位写对应 tab,**不再仅限焦点 tab**)。
 ///
-/// 不命中(焦点 race:桌面已切 tab,但手机仍按旧焦点发了输入)→ 丢弃 —— 防把键写错 tab;手机
-/// 随后收 `FocusChange` 重同步。砖1b 单焦点;多 tab 寻址回灌(`tab_id` != active 时投对应后台
-/// tab)留后续。父 own PTY,子自己不写 PTY(ADR-0018)。
+/// - **命中 active tab** → [`queue_or_write_pty`](复用唯一写汇 = pending_pty_writes 队列 + 每 tick
+///   drain,与 paste / keyboard 同背压路径);
+/// - **命中后台 tab** → 直接非阻塞写该 tab 的 PTY(尽力而为:键入字节小,内核 PTY 缓冲极少满;满则
+///   按背压丢剩余 + warn。后台 tab 无键盘/paste 竞争,单线程内其自身写有序)。per-tab 背压队列的
+///   完整硬化留后续;
+/// - **tab 不存在**(已关 / race)→ 丢弃(防写错 tab)。父 own PTY,子自己不写 PTY(ADR-0018)。
 fn route_share_input(data: &mut LoopData, frame: FeedFrame) {
-    // 只处理 Input 帧(子→父方向)。其它 kind(父→子方向)不该从 back-channel 来,忽略。
+    // 只处理 Input 帧(子→父方向)。其它 kind 由 [`route_share_frame`] 分派(TabOp)或忽略。
     if frame.kind != FrameKind::Input {
-        tracing::debug!(kind = ?frame.kind, "E′ back-channel 收到非 Input 帧(方向应子→父),忽略");
+        tracing::debug!(kind = ?frame.kind, "E′ back-channel 收到非 Input 帧,route_share_input 忽略");
         return;
     }
     if frame.payload.is_empty() {
         return;
     }
-    let Some(tabs) = data.state.tabs.as_ref() else {
-        return;
-    };
-    let active_id = tabs.active().id().raw();
-    if !share_input_targets_active(frame.tab_id, active_id) {
-        tracing::debug!(
-            frame_tab = frame.tab_id,
-            active = active_id,
-            n = frame.payload.len(),
-            "E′ 回灌输入目标非当前焦点 tab(焦点 race / 多 tab 未支持),丢弃"
-        );
+    write_input_to_tab(&mut data.state, frame.tab_id, &frame.payload);
+}
+
+/// 把回灌输入写进 `tab_id` 指定的 tab 的 PTY(砖2 B3)。active tab 走背压队列写汇;后台 tab 直接
+/// 非阻塞尽力写。未知 tab_id 丢弃。
+fn write_input_to_tab(state: &mut State, tab_id: u64, bytes: &[u8]) {
+    if bytes.is_empty() {
         return;
     }
-    // 命中焦点 tab:复用唯一写汇(写进 active tab 的 PTY,背压排队 + tick drain)。
-    queue_or_write_pty(&mut data.state, &frame.payload, "share-input");
+    // 先只读定位(idx + 是否 active),释放借用后再按情况写(避免与 &mut state 借用冲突)。
+    let (idx, is_active) = {
+        let Some(tabs) = state.tabs.as_ref() else {
+            return;
+        };
+        let Some(idx) = tabs.iter().position(|t| t.id().raw() == tab_id) else {
+            tracing::debug!(
+                tab_id,
+                n = bytes.len(),
+                "E′ 回灌输入目标 tab 不存在(已关?),丢弃"
+            );
+            return;
+        };
+        (idx, idx == tabs.active_idx())
+    };
+    if is_active {
+        // active tab:复用唯一写汇(与键盘 / paste 同背压路径 + 顺序)。
+        queue_or_write_pty(state, bytes, "share-input");
+        return;
+    }
+    // 后台 tab:直接非阻塞尽力写该 tab 的 PTY(键入字节小,极少触内核 PTY 缓冲满)。
+    let Some(tabs) = state.tabs.as_ref() else {
+        return;
+    };
+    let Some(tab) = tabs.get(idx) else {
+        return;
+    };
+    let pty = tab.pty();
+    let mut written = 0;
+    while written < bytes.len() {
+        match pty.write(&bytes[written..]) {
+            Ok(0) => break,
+            Ok(n) => written += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                tracing::debug!(
+                    tab_id,
+                    dropped = bytes.len() - written,
+                    "E′ 回灌后台 tab PTY 背压(WouldBlock),丢剩余(尽力而为)"
+                );
+                break;
+            }
+            Err(e) => {
+                tracing::warn!(tab_id, error = %e, "E′ 回灌后台 tab PTY 写失败");
+                break;
+            }
+        }
+    }
 }
 
 impl LoopData {
