@@ -18,14 +18,14 @@
 
 ---
 
-## 目标(Phase 1-6 必做)
+## 目标(Phase 1-6 —— 基本达成,已 daily-drive 数月;当前在 Phase 7)
 
-- [ ] 跑 Claude Code 长时间无 memory leak(soak 1h RSS 稳定)
-- [ ] 2x HiDPI 整数缩放 + CJK 字形正常
-- [ ] fcitx5 输入法(Wayland `text-input-v3` 协议)
-- [ ] 事件循环零 starvation(单线程 `ppoll` 绑所有 fd)
-- [ ] ~30K LOC 左右,架构读得懂
-- [ ] inline composer + popup 候选不依赖 readline
+- [x] 跑 Claude Code 长时间无 memory leak(日用验证;1h soak 正式测仍可补,见文末命令)
+- [x] 2x HiDPI 整数缩放 + CJK 字形正常
+- [x] fcitx5 输入法(Wayland `text-input-v3` 协议)
+- [x] 事件循环零 starvation(单线程 `ppoll`/calloop 绑所有 fd)
+- [x] inline composer + popup 候选不依赖 readline
+- LOC:已随 Phase 7(kernel/feed/web)增长,超早期 ~30K 估算
 
 ## 非目标(暂不做,不纠结)
 
@@ -98,23 +98,25 @@ tty 时代单 stream 限制的产物, Wayland 窗口能开无数, 在 GUI 终端
   - **砖1b carry-over**:① 父监管子的 workspace holders/refcount 信号;② WorkspaceAdd/Remove 帧接控制面元数据(现仅 debug 日志留接口);③ Fed Resize 回灌(帧集未含 Resize);④ FrameKind::Input 反向(父→子)目前忽略。
 - ✅ **砖1b(碰 wl/window.rs)** `dc52bd4`(2026-06-30):**E′ 桌面接入端到端打通** —— `quill --share`(opt-in,默认关=今天的 quill)→ `ShareChild::spawn` 起隔离 `quill-kernel` 子(Fed 模式,socketpair/pipe + CLOEXEC)→ **tee 焦点 tab 的 PTY 输出喂子**(tee 点 window.rs **ContinueReading 分支**,转原始 `buf[..n]` 非 term_bytes、保 OSC-133,只焦点 tab)→ 子 fan-out 给手机(xterm.js);**子→父 back-channel 读源**(单 calloop Generic READ)解 Input 帧 → `queue_or_write_pty` 写 active tab(复用唯一写汇,与 paste/键盘同背压);`on_active_tab_changed` 发 FocusChange + `set_focus`。`share: Option<ShareChild>` 挂 LoopData 尾(非 State,不破 INV-008 drop 序)、像 `selection_state` 那样 Option 穿 `pty_read_tick(_inner)`。背压:非阻塞 + 队满丢【整帧】(子永不见半帧)。**render.rs 一行没改、键鼠/selection/pointer 零触、零真线程(只 Command::spawn 子进程)、默认路径字节等价**(Lead 独立核 + 4 路审 APPROVE);CI:lib 531(+3 share 单测)+ kernel/feed/ws + 代表性 wl e2e(single/multi_tab/cursor/kbd)全绿。impl 末尾 stall,2 commit + 1b-iii 重构靠增量提交保住、Lead 收口(`dc52bd4`)。
   - **🎉 至此 E′ MVP 通**:`quill --share` 能把你**正在用的桌面焦点 tab** 共享给手机(只读看 + 回打字),默认不开则完全是今天的 quill。
-  - **砖1c carry-over**:① 父侧 workspace holders/refcount 信号(现 Fed 子 held_ws=None,生命周期归父未接);② WorkspaceAdd/Remove 帧接元数据(现 debug 日志);③ Fed Resize 回灌(帧集未含 Resize → 手机改不了 PTY 尺寸);④ 多 tab 寻址回灌(现仅焦点 tab);⑤ FocusChange 走"必达"通道(现与 PtyOutput 同背压路径,极端积压可丢 → 手机焦点标签短暂陈旧、自愈);⑥ **真机端到端实测**(`quill --share` + 手机经 VPN 连,迄今只单测/集成测,没真跑过)。
+  - **砖1c carry-over**(2026-07-01 更新:②④✅砖2 做掉、⑥ 部分):~~② WorkspaceAdd/Remove 元数据~~ ✅ 砖2 接了(TabList 帧→广播 Workspaces);~~④ 多 tab 寻址回灌~~ ✅ 砖2 做了(tee 全部 tab + 每客户端独立 viewed + New/Close/Select);⑥ 真机端到端 **部分**(砖2 LAN 实测"完美";**手机经 VPN 远程仍没跑过** —— 移动 v6 断,见 [[project_home_wireguard_vpn_over_v6]],待 v6 恢复或上 VPS)。**仍开**:① 父侧 workspace holders/refcount 信号(现 held_ws=None,生命周期归父未接);③ Fed Resize 回灌(帧集无 Resize → 手机改不了 PTY 尺寸);⑤ FocusChange 走"必达"通道(现与 PtyOutput 同背压,极端积压可丢、自愈)。
 - ✅ **A′ 响应式渲染(client-side)** `5f5f6d2`..`e01d673`(2026-06-30):**① dims 传播**(桌面 PTY cols/rows → `FrameKind::Dims`→`ServerMsg::Dims`→客户端 `term.resize` 桌面宽 → 忠实视图与桌面像素对齐、宽度折行 artifact 消失;daemon 端 gate 在 `--share`,默认零回归)+ **② 逻辑行 CSS 重排**(从 xterm.js buffer 用 `isWrapped` 接回逻辑行 + 每格 fg/bg/bold 等 → `<span>`+`white-space:pre-wrap`,浏览器按设备宽重折)+ **③ 表格 widget**(带框 `│` / markdown `---|---` / 对齐列 → 可横滑 `<table>`;**裸 ASCII `|` 须配盒绘 `│` 或分隔行才算表** → git graph/管道不误判)+ **④ 忠实↔重排一键切换**(顶栏按钮,忠实=保底)+ **⑤ 滚动修复**(`.xterm-viewport{pointer-events:none}` 让外层 `#term` 独占平滑 2D、X/Y 不互锁;往返不退化:`#term` 不缩 1px、改 `#stage` 包层 + `#reflow` 叠盖)。**只动 `assets/web/index.html` + kernel dims(proto/feed/daemon/window.rs);`render.rs` 一行没改、键鼠/selection 零触、默认路径零回归**;vm-DOM 58 测 + 代表性 wl e2e 绿。
   - ⚠️ **CC 反推重排的天花板(实测确证 2026-06-30,别再试反推)**:reflow 对**流式文本(shell/日志/prose/代码)有效**;但 **Claude Code 这种 `\r` 重绘 TUI** —— 输入框 = **两条满宽 `─` + 中间 `❯`**(无 alt-screen、无 2D 定位,但靠 \r 重绘)+ 状态栏 `[Opus..] │ user`(带 `│`)—— **反推不可靠**:实测(无头 Chrome 渲真 CC + DOM dump)状态栏的 `│` 被 `borderedTableEnd` **误判成表格 widget**(确证),宽终端+窄浏览器下整体糊成"一堆线"(宽浏览器正常)。**这是 CLAUDE.md 客户端渲染策略早标的"任意 2D TUI 可靠重排=AI-hard"那堵墙。CC 用【忠实视图】本就干净(实测"只有一条线")** → 定位:**重排=给非 TUI 流式内容;CC 走忠实**。真·非妥协解 = **CC 专属结构渲染**(CC 是自家工具 → 读其 transcript 渲对话 + 手机原生输入框替代它画的输入框;源码没开但可写插件/hook + transcript 已是结构化产物),归 T7+。
-  - **A′ carry-over**:① **状态栏 `│`→表格误判**(单个 `│` 的状态行不该成表,可修,DOM dump 可验)② **service-worker 缓存静态资产**(弱网首屏快;现 daemon 已发 `Cache-Control:no-store`,手机非缓存问题)③ "弱网一次刷一行"=字节涓流(网络锅、非 client bug,xterm 已 RAF 批渲)④ 忠实视图手机端只平移当前屏、翻历史用重排(scroll 修复的取舍)。
+  - **A′ carry-over**(2026-07-01 更新:②✅砖2 做掉):~~② service-worker 缓存静态资产~~ ✅ 砖2 W3 做了(cache-first app shell + 内容哈希版本作废)**但⚠️只在 HTTPS/localhost 生效,明文 VPN 下休眠 → 待上 HTTPS(VPS 那步)激活**。**仍开**:① 状态栏 `│`→表格误判(单个 `│` 的状态行不该成表,可修,DOM dump 可验;属 CC 反推天花板同类);③ "弱网一次刷一行"=字节涓流(网络锅、非 client bug);④ 忠实视图手机端只平移当前屏、翻历史用重排(scroll 修复的取舍)。
   - **⚠️ 工具限制(本会话踩的)**:主 session + 子 agent **都没 puppeteer**;无头 Chrome harness 能跑 DOM dump(可信)但**视觉截图布局失真(#stage 无高度→空白,不可信)**。要真看手机渲染只能靠用户截图。**复现条件 = 宽终端(307列)+ 窄浏览器(手机宽);宽浏览器正常。**
 - **部署(实测路径)**:web 资产 `include_str!` 烤进 **`quill-kernel`** → 改 `index.html` 必须**重建 + 重装 quill-kernel**(`cargo build --release --bin quill --bin quill-kernel`,`install -m 755` 原子免 ETXTBSY)。**✅ 两套安装位是【有意的稳定/测试分流】(2026-06-30 用户定,非待收口)**:
   - **`/usr/local/bin/quill`(root,系统级)= 稳定日用** —— 桌面图标 Exec 指它;**只在某版【证实稳了】才 `sudo install` 提升上来**(图标传不了 `--share`,日用就是普通终端)。
   - **`~/.local/bin/quill`(用户级,shell `which quill`)= 测试** —— AI 每次重编装这里(**免 sudo**),shell 里 `quill` / `quill --share` 跑最新、不碰日用稳定版。
   - 测共享:shell 跑 `quill --share`(起隔离 `quill-kernel` 子绑 `0.0.0.0:7878`)→ 手机经 VPN `http://10.0.0.2:7878/`(本机 LAN=10.0.0.2,VPN 把门)。⚠️ `quill --share` 找 `quill-kernel` 是【同目录 sibling】→ 装 quill 必同时装 quill-kernel 到同一 bin 目录。
+  - **📍 当前安装快照(2026-07-01,两处【有意分叉】)**:`~/.local` = **最新**(砖2 + 启动失败 error 态 + error 点击回灰,`quill 4f66e23…`);`/usr/local`(稳定日用/图标)= **仍 pre-砖2**(共享开关 + SO_REUSEADDR 那版 `quill cec160…`),**故意让最新在 `~/.local` soak 几天,证实稳了再 `sudo install` 提升到 `/usr/local`**。图标启动的日用 quill 因此暂无砖2 tab 管理(但日用不 --share、无影响)。
 - ✅ **共享开关(运行期 toggle)** `b08caf1`..`45f19ca`(2026-06-30):标题栏右簇按钮(暗灰=未共享 / 亮绿 #3fb950=共享中,信号条 icon)+ `Ctrl+Shift+S` 运行期开/关共享 —— 抽 ShareChild spawn/teardown 成 LoopData `start/stop/toggle_share`(**复用砖1b 机器没两套**,`--share` 启动也走 start_share);点击/快捷键 Dispatch 只置 `pending_share_toggle`(那只有 `&mut State`)→ drive_wayland step 3.8.5 `apply_share_toggle` 真 toggle(同 apply_tab_op 套路)。`stop_share`:take→drop(sh) reap 子释 7878→loop_handle.remove back-channel 源;子崩溃 EOF 与 stop 两条拆路靠 take() 互斥。碰 render.rs(信号条)+ window.rs + keyboard/pointer,**render 纯加法、默认未共享路径零回归**(4 路对抗审 APPROVE)。Lead 收口 presentation_dirty(toggle/子崩溃后主动重画,否则 icon 不即时变色;`45f19ca`)。**已删"第二图标"烂招** `quill-share.desktop`(图标传不了 --share 是死胡同,运行期 toggle 才对)。CI 全绿(lib 532 + 标题栏 e2e 全过)。装 /usr/local + ~/.local 两处(sha256 同源)。
   - ✅ **SO_REUSEADDR(已修并合)** `cbdc9ad`(2026-07-01):kernel `daemon.rs` 抽 `bind_ws_listener(addr)` —— libc 手搓 `socket(SOCK_STREAM|SOCK_CLOEXEC)` + **bind 前 `setsockopt(SO_REUSEADDR)`** + bind/`listen(128)` + `OwnedFd` 接管(任一步失败 Drop close、不泄漏 fd)+ `TcpListener::from(owned)` 单转移;字节序 V4 `sin_port=port.to_be()` / `s_addr=u32::from_ne_bytes(octets())`、V6 `s6_addr=octets()`(没用会错的 from_be_bytes)。Local/Fed 两拓扑统一走它零 gate;`set_nonblocking` 仍保留。不引新 crate(libc 已有)。2 单测(getsockopt 验选项设上 + active-listener 仍 EADDRINUSE 证非 REUSEPORT,确定性不 flaky)。2 路对抗审(unsafe/字节序 + kernel 零回归)+ Lead 独立复核 **APPROVE**;CI 绿(lib 534)。装两处 sha256 同源。修了"手机连着时 toggle 关→开 60s TIME-WAIT 窗内重绑静默失败"。
 - ✅ **砖2 手机端整工作区 tab 管理(选项②)** `a959bec`(2026-07-01,用户实测"完美"):**tee 全部 tab**(去 window.rs tee 点 focus 过滤)+ tab 元数据管线(TabList 帧→子广播 Workspaces)+ **kernel 每客户端独立 viewed-tab**(`TabOp::Select`=本地重放目标 tab 环、**不动桌面焦点/不串别客户端**;child→手机仍只传在看的 tab 省网)+ **New/Close 经新 `FeedTabOp` 帧回父 `apply_tab_op`**(护栏:远程 Close 关不掉最后一个 tab,防误触杀桌面)+ web 标签栏(切/+新建/×关)+ **切 tab 保暖**(留 xterm 实例、切回瞬时,LRU≤6)+ **Service Worker 缓存 app shell**(⚠️只在 HTTPS/localhost 生效,明文 VPN 下休眠,待上 HTTPS 激活)。4 路对抗审 + 断电恢复续做 + 3 审码修复(护栏/注释/SW use-strict)。CI 绿(lib 536)。**已合 main + 装 ~/.local;/usr/local 稳定版先 soak 再提升**。设计岔口=用户选②(独立焦点,是①镜像焦点的超集)。
   - ✅ **共享启动失败提示(已修并合)** `d6f0df9`+`72d4bf6`(2026-07-01):两 quill 窗口都开共享→第二个绑 7878 撞车退出→父读 back-channel EOF 曾**静默降级**、图标绿闪回灰无提示。修=**检测启动失败**(记 `ShareChild.spawn_at`,down 路径 `elapsed < 2s` = 绑端口撞车/立即崩;spawn 同步 Err 亦置)→ 标题栏 share 图标进**第三态 error(琥珀 `#d29922`)**,区别 off灰/on绿,`presentation_dirty` 即时刷新。**无误报**(用户主动关/久后崩/没手机连/反复开关四态都不报;`toggle_share` 开头清 error)。**未做端口预检**(避 SO_REUSEADDR/TIME-WAIT 误判)。render 纯加法零回归,3 路对抗审 APPROVE,CI lib 538。修复在 `quill`(GUI)侧、kernel 不变。是真 bug(任何进程占 7878 都该提示),独立于下面的统一。
-- **★ 北极星方向:所有 quill 框进一个 kernel(本机联邦)** —— 每台一个 quill-kernel **单例**(独占 7878),各 quill 窗口**不再各自 spawn kernel、而是会合(本地 socket/锁)接入同一个**当 feeder,**每个窗口 = 一个 workspace**,手机看**全部窗口的 tab 聚合视图**。地基现成(砖0 多 workspace + feed (ws,tab) 标签 + 砖2 每客户端独立看)。要新造:① 会合(我是第一个?→拉 kernel 占锁;否则接入)② **kernel 生命周期从"某窗口的子"改成"机器级单例、detach、feeder refcount 归零才关"**(修订 E′,值 ADR)。= 早先 LAN 联邦愿景的**本机版**,顺带彻底消除 7878 撞车。用户提(2026-07-01),排在 bug 修之后。
+    - ✅ **续修:error 态点击回灰** `3242781`(2026-07-01,用户实测确认):原 `toggle_share` 开头无条件清 error 再走分支,error 态时 `share=None` → 又 `start_share` 重试 → 撞同一占用者再次失败卡回琥珀("黄的点不回灰")。改成 **error 态一次点击 = 清 `share_error` 回灰后【直接返回不重试】**,要重试再点一次从灰 start。CI lib 538 绿。
+- **★ 北极星方向:所有 quill 框进一个 kernel(本机联邦)** —— 每台一个 quill-kernel **单例**(独占 7878),各 quill 窗口**不再各自 spawn kernel、而是会合(本地 socket/锁)接入同一个**当 feeder,**每个窗口 = 一个 workspace**,手机看**全部窗口的 tab 聚合视图**。地基现成(砖0 多 workspace + feed (ws,tab) 标签 + 砖2 每客户端独立看)。要新造:① 会合(我是第一个?→拉 kernel 占锁;否则接入)② **kernel 生命周期从"某窗口的子"改成"机器级单例、detach、feeder refcount 归零才关"**(修订 E′,值 ADR)。= 早先 LAN 联邦愿景的**本机版**,顺带彻底消除 7878 撞车。用户提(2026-07-01)。**★ 共享相关 bug 已全部清完(见上),这是现在【下一块待办】—— 需先出 ADR(会合机制 + kernel 生命周期改机器级单例 detach + feeder refcount)再分砖。**
 - **T7** web"X 关闭"语义 / PWA 壳(+ 登录 token)→ **硬化**(真网格关键帧替字节尾、bincode、带宽)。
 **⚠️ 凡碰 render/wl 的 ticket(砖1 起),impl/审码 agent 必须自己逐行读 `wl/render.rs`、`wl/window.rs` draw 路径,别信摘要。**
-**⏱️ CI:`ci.sh --fast`(fmt+clippy+build)≈17s 增量;全门 ≈12–25min(33 测里 28 个是 GPU/wl e2e、串行,有一个 e2e binary 单独 ~12min)。kernel 砖改动【不影响】那 28 个 → 可只跑快门 + kernel/pty/ws 测子集(<1min);加 `ci.sh --kernel` 模式是省时选项(暂未做)。**
+**⏱️ CI:`ci.sh --fast`(fmt+clippy+build)≈17s 增量;全门含 GPU/wl e2e(需本机 GPU+Wayland、串行)较慢(十几分钟级)。lib 现 ~538 测;kernel 侧 slice(`kernel_ws_slice`/`kernel_feed_slice`/`kernel_daemon_slice`)+ wl e2e(`single_tab_no_bar`/`multi_tab`/`titlebar_text`/`csd`/`ghostty_tab_polish`…)。**kernel 改动与 render/wl 改动互不影响对方那批** → 可只跑快门 + 相关子集(kernel/feed 改 → 跑 kernel slices;render/window 改 → 跑 titlebar/csd/single_tab)。⚠️ `kernel_ws_slice` 含 slowloris/背压【计时】测,单跑 ~1–2min、高负载下偶 flaky(与业务改动无关,单跑复现即过)。**
 
 **协作环(本阶段在用)**:每砖一个 worktree(`git worktree add ../quill-impl-<x> -b feat/<x>`)→ 写码 **Opus xhigh**(改 render 必自己读 `wl/render.rs`,别信摘要)→ 自跑 `scripts/ci.sh` 调全绿 → **多视角对抗审 Opus xhigh** → Lead(user + 主 session)裁决合并(纯加法的 cohesive 单模块 commit 可超 300 行软线)。⚠️ workflow 每个 agent 显式写 `model:'opus' effort:'xhigh'`,别靠默认(`agentType` 自带便宜模型如 Explore=Haiku)。
 
@@ -246,7 +248,7 @@ git worktree add ../quill-impl-<name> -b feat/<ticket-id>
 ```bash
 # 构建 + 四门验收
 cargo build
-cargo test                            # Phase 1 完有 29 tests(含 state_machine 11 / frame_stats 3)
+cargo test                            # lib ~538 测 + kernel/feed/ws slices + GPU/wl e2e(见上 Phase 7 CI 行)
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 
