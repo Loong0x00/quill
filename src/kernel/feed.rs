@@ -197,6 +197,56 @@ pub fn decode_tab_list(payload: &[u8]) -> Option<(usize, Vec<(u64, String)>)> {
     Some((active, tabs))
 }
 
+/// 子→父 [`FrameKind::TabOp`] 帧的 payload 语义(砖2 B4)。手机发起的 New / Close / Reorder 经
+/// back-channel 回灌父执行(E′ 里 PTY / TabList 归父,子只转发);`Select` 是【子本地】切 viewed、
+/// 不回父,`SetTitle` 桌面暂无对应操作,二者均不走本帧。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedTabOp {
+    /// 新建 tab(父按当前尺寸 spawn shell + 切到新 tab)。
+    New,
+    /// 关闭指定 tab(父按 `tab_id` 定位 idx 后关)。
+    Close { tab_id: u64 },
+    /// 拖拽换序(父按下标 swap)。
+    Reorder { origin: u32, target: u32 },
+}
+
+/// 编码 [`FrameKind::TabOp`] 的 payload(砖2 B4):首字节 = op tag(0=New / 1=Close / 2=Reorder),
+/// 随后 op 参数(New 无参;Close = `tab_id:u64 LE`;Reorder = `origin:u32 LE + target:u32 LE`)。
+pub fn encode_tab_op(op: FeedTabOp) -> Vec<u8> {
+    let mut out = Vec::with_capacity(9);
+    match op {
+        FeedTabOp::New => out.push(0),
+        FeedTabOp::Close { tab_id } => {
+            out.push(1);
+            out.extend_from_slice(&tab_id.to_le_bytes());
+        }
+        FeedTabOp::Reorder { origin, target } => {
+            out.push(2);
+            out.extend_from_slice(&origin.to_le_bytes());
+            out.extend_from_slice(&target.to_le_bytes());
+        }
+    }
+    out
+}
+
+/// 解码 [`FrameKind::TabOp`] 的 payload → [`FeedTabOp`]。tag 未知 / 参数长度不足(流错位 / 协议
+/// 不匹配)返 `None`,调用方**忽略该帧**(非致命,同 [`decode_tab_list`];父链可信但仍防御)。
+pub fn decode_tab_op(payload: &[u8]) -> Option<FeedTabOp> {
+    let (&tag, mut rest) = payload.split_first()?;
+    match tag {
+        0 => Some(FeedTabOp::New),
+        1 => Some(FeedTabOp::Close {
+            tab_id: u64_from(&mut rest)?,
+        }),
+        2 => {
+            let origin = u32_from(&mut rest)?;
+            let target = u32_from(&mut rest)?;
+            Some(FeedTabOp::Reorder { origin, target })
+        }
+        _ => None,
+    }
+}
+
 /// 从切片头部取一个小端 `u32` 并前移游标;不足 4 字节返 `None`。
 fn u32_from(p: &mut &[u8]) -> Option<u32> {
     if p.len() < 4 {
@@ -517,6 +567,37 @@ mod tests {
         // 头都不足 → None。
         assert_eq!(decode_tab_list(&[]), None);
         assert_eq!(decode_tab_list(&[1, 2, 3]), None);
+    }
+
+    /// TabOp payload 编解码往返(New / Close / Reorder),坏 tag / 参数不足返 None。
+    #[test]
+    fn tab_op_payload_roundtrip_and_reject_bad() {
+        for op in [
+            FeedTabOp::New,
+            FeedTabOp::Close { tab_id: 0 },
+            FeedTabOp::Close {
+                tab_id: 0xDEAD_BEEF_CAFE,
+            },
+            FeedTabOp::Reorder {
+                origin: 0,
+                target: 3,
+            },
+            FeedTabOp::Reorder {
+                origin: 9,
+                target: 1,
+            },
+        ] {
+            let enc = encode_tab_op(op);
+            assert_eq!(decode_tab_op(&enc), Some(op), "TabOp 往返应逐字段相等");
+        }
+        // 空 payload → None(无 tag)。
+        assert_eq!(decode_tab_op(&[]), None);
+        // 未知 tag → None。
+        assert_eq!(decode_tab_op(&[0xFF]), None);
+        // Close 声明但 tab_id 不足 8 字节 → None。
+        assert_eq!(decode_tab_op(&[1, 0, 0, 0]), None);
+        // Reorder 声明但只给一个 u32 → None。
+        assert_eq!(decode_tab_op(&[2, 0, 0, 0, 0]), None);
     }
 
     /// Dims payload 编解码往返 + 长度错拒绝。

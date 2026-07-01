@@ -64,7 +64,8 @@ use tungstenite::handshake::MidHandshake;
 use tungstenite::{Bytes, Error as WsError, HandshakeError, Message, WebSocket};
 
 use crate::kernel::feed::{
-    decode_dims, decode_tab_list, encode_into, FeedDecoder, FeedFrame, FrameKind, FEED_HEADER_LEN,
+    decode_dims, decode_tab_list, encode_into, encode_tab_op, FeedDecoder, FeedFrame, FeedTabOp,
+    FrameKind, FEED_HEADER_LEN,
 };
 use crate::kernel::proto::{
     ClientMsg, ServerMsg, Snapshot, TabMeta, TabOp, WorkspaceInfo, WorkspaceList, WorkspaceMeta,
@@ -425,6 +426,7 @@ pub fn run(config: DaemonConfig) -> Result<()> {
         },
         fed_tabs: Vec::new(),
         fed_active: 0,
+        pending_new_select: None,
         rings: HashMap::new(),
         clients: HashMap::new(),
         next_client_id: 1,
@@ -601,6 +603,11 @@ struct DaemonData {
     /// **Fed 拓扑**桌面焦点 tab 在 [`Self::fed_tabs`] 里的下标(TabList 帧的 active_idx;FocusChange
     /// 帧也据焦点 tab id 更新)。构 `WorkspaceInfo.active`(手机据此标"哪个是桌面焦点")。
     fed_active: usize,
+    /// **Fed 拓扑**待自动 Select 的客户端 id(砖2 B4):某客户端发 [`TabOp::New`] → 记其 id,回灌父
+    /// spawn 新 tab、父随后发回含新 tab 的 [`FrameKind::TabList`] → [`fed_tab_list_updated`] 里把该
+    /// 客户端 viewed 自动 pin 到那个新 tab(发起 New 的手机看到新 tab)。单槽(daily-drive 单手机
+    /// 够用;并发多 New 只记最后一个);新 tab 未出现前保留、出现即消费。
+    pending_new_select: Option<u64>,
     /// **每 tab** 一个 PTY 原始字节环缓冲(砖2 B3),key = `(ws_id, tab_id)`。连上 / Select 时重放
     /// 目标 tab 的环重建当前屏 + 之后 live。单线程,直接 fan-out 进各连接出站队列。tab 关闭时其环由
     /// [`fed_tab_list_updated`] 清掉。**Local 拓扑**单 active tab = 单条目(退化,行为等价单 ring)。
@@ -1093,11 +1100,13 @@ fn fed_focus_changed(data: &mut DaemonData, ws: u64, tab: u64) {
     broadcast_fed_metadata(data);
 }
 
-/// 整份 tab 列表更新(父发 [`FrameKind::TabList`])的处理(砖2 B2/B3):重建 `fed_tabs` / `fed_active`
-/// + 同步桌面焦点 tab + 清掉已关 tab 的环缓冲 + 把 viewed 于**已关 tab** 的客户端回落到跟随焦点 +
-/// 广播元数据。B4 在此基础上加"New 后自动 Select 发起客户端到新 tab"。
+/// 整份 tab 列表更新(父发 [`FrameKind::TabList`])的处理(砖2 B2/B3/B4):重建 `fed_tabs` /
+/// `fed_active`,同步桌面焦点 tab,清掉已关 tab 的环缓冲,把 viewed 于**已关 tab** 的客户端回落到
+/// 跟随焦点,广播元数据,最后(B4)把发起 `New` 的客户端自动 Select 到新出现的 tab。
 fn fed_tab_list_updated(data: &mut DaemonData, ws: u64, active: usize, tabs: Vec<(u64, String)>) {
     data.workspace_id = ws;
+    // 记旧 tab id 集合(B4:据此认出"新出现"的 tab → 自动 Select 发起 New 的客户端)。
+    let old_ids: std::collections::HashSet<u64> = data.fed_tabs.iter().map(|t| t.tab_id).collect();
     let new_ids: std::collections::HashSet<u64> = tabs.iter().map(|(id, _)| *id).collect();
     data.fed_tabs = tabs
         .into_iter()
@@ -1128,6 +1137,23 @@ fn fed_tab_list_updated(data: &mut DaemonData, ws: u64, active: usize, tabs: Vec
         fed_point_client(data, id, ws, focus_tab, true);
     }
     broadcast_fed_metadata(data);
+    // 砖2 B4:发起 New 的客户端 → 新 tab 一出现就自动 Select 到它(pin,不再跟随焦点)。新 tab =
+    // 本次列表里旧集合没有的 id;优先桌面焦点 tab(桌面 New 后切到新 tab,焦点 = 新 tab)。新 tab
+    // 尚未出现(如父 spawn 失败 / 帧未到)则保留 pending,待下次 TabList 重试。
+    if let Some(cid) = data.pending_new_select.take() {
+        let target = if !old_ids.contains(&focus_tab) {
+            Some(focus_tab)
+        } else {
+            data.fed_tabs
+                .iter()
+                .map(|t| t.tab_id)
+                .find(|id| !old_ids.contains(id))
+        };
+        match target {
+            Some(tab) => fed_point_client(data, cid, ws, tab, false),
+            None => data.pending_new_select = Some(cid),
+        }
+    }
 }
 
 /// 向所有 live WS 客户端推一条 [`ServerMsg::Dims`] 控制帧(A′ 增量1),客户端据此 `term.resize`
@@ -1861,14 +1887,52 @@ fn handle_tab_op(data: &mut DaemonData, id: u64, workspace_id: u64, op: TabOp) {
                 None => tracing::debug!(idx, "TabOp::Select idx 越界(tab 列表未同步?),忽略"),
             }
         }
-        // New / Close / Reorder 回灌父执行(砖2 B4 接线,B3 暂 debug)。
-        TabOp::New | TabOp::Close { .. } | TabOp::Reorder { .. } => {
-            tracing::debug!(?op, "TabOp New/Close/Reorder 回灌父(砖2 B4 接线)");
+        // New / Close / Reorder = 回灌父执行(砖2 B4:E′ 里 PTY / TabList 归父)。
+        TabOp::New => {
+            // 记发起客户端 → 父发回含新 tab 的 TabList 时自动 Select 它(见 fed_tab_list_updated)。
+            data.pending_new_select = Some(id);
+            forward_tab_op_to_parent(data, FeedTabOp::New);
+        }
+        TabOp::Close { tab_id } => {
+            forward_tab_op_to_parent(data, FeedTabOp::Close { tab_id });
+        }
+        TabOp::Reorder { origin, target } => {
+            forward_tab_op_to_parent(
+                data,
+                FeedTabOp::Reorder {
+                    origin: origin as u32,
+                    target: target as u32,
+                },
+            );
         }
         TabOp::SetTitle { .. } => {
             tracing::debug!("TabOp::SetTitle 暂不接线(桌面无对应操作),忽略");
         }
     }
+}
+
+/// 把手机发起的 tab 操作(New / Close / Reorder)编成 [`FrameKind::TabOp`] 帧,经 back-channel 回灌父
+/// 执行(砖2 B4:E′ 里 PTY / TabList 归父,子只转发)。仅 Fed 拓扑调用(调用方已保证 `data.fed`)。
+/// 复用 [`fed_send_frame`] 的绝不丢半帧 + 背压超限降级路径。帧头 `tab_id` = Close 目标(便利,权威
+/// 在 payload),其余填 0。
+fn forward_tab_op_to_parent(data: &mut DaemonData, op: FeedTabOp) {
+    if data.fed.is_none() {
+        return;
+    }
+    let tab_hdr = match op {
+        FeedTabOp::Close { tab_id } => tab_id,
+        FeedTabOp::New | FeedTabOp::Reorder { .. } => 0,
+    };
+    let payload = encode_tab_op(op);
+    let mut frame = Vec::with_capacity(FEED_HEADER_LEN + payload.len());
+    encode_into(
+        &mut frame,
+        FrameKind::TabOp,
+        data.workspace_id,
+        tab_hdr,
+        &payload,
+    );
+    fed_send_frame(data, &frame);
 }
 
 /// 释放一条连接持有的工作区 holder(引用计数 −1,T6 块C)。`explicit` = 是否显式关闭

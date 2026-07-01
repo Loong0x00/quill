@@ -434,6 +434,72 @@ fn fed_child_round_trips_input_to_back_channel() {
     assert_eq!(frame.tab_id, 7, "Input 帧应带焦点 tab 标签");
 }
 
+/// 砖2 B4:手机发起的 `TabOp::New` / `TabOp::Close` 经子 encode 成 [`FrameKind::TabOp`] 帧写父
+/// back-channel(E′ 里 PTY / TabList 归父,子只转发)。`TabOp::Select` 是子本地、**不**回父(负向验)。
+#[test]
+fn fed_child_forwards_new_close_tab_op_to_back_channel() {
+    use quill::kernel::feed::{decode_tab_op, FeedTabOp};
+    use quill::kernel::proto::{ClientMsg, TabOp};
+
+    let port = free_port();
+    let fc = FedChild::spawn(port);
+    let mut ws = match connect_ws(port, Duration::from_secs(15)) {
+        Some(w) => w,
+        None => {
+            fc.cleanup();
+            panic!("15s 内未能连上 Fed 子进程 WS");
+        }
+    };
+    std::thread::sleep(Duration::from_millis(300)); // 确保子握手完成转 Live
+
+    let send_op = |ws: &mut WebSocket<MaybeTlsStream<TcpStream>>, op: TabOp| {
+        let j = serde_json::to_string(&ClientMsg::TabOp {
+            workspace_id: 1,
+            op,
+        })
+        .expect("ser TabOp");
+        ws.send(Message::Text(j.into())).expect("send TabOp");
+        let _ = ws.flush();
+    };
+
+    let mut dec = FeedDecoder::new();
+
+    // New → 父应收到 TabOp 帧,payload 解码为 FeedTabOp::New。
+    send_op(&mut ws, TabOp::New);
+    let f_new = fc
+        .recv_frame(&mut dec, Duration::from_secs(10))
+        .expect("New 应回灌父 TabOp 帧");
+    assert_eq!(f_new.kind, FrameKind::TabOp, "回灌帧 kind 应为 TabOp");
+    assert_eq!(
+        decode_tab_op(&f_new.payload),
+        Some(FeedTabOp::New),
+        "payload 应解码为 New"
+    );
+
+    // Close{tab_id=42} → 父应收到 TabOp 帧,payload 解码为 Close{42}。
+    send_op(&mut ws, TabOp::Close { tab_id: 42 });
+    let f_close = fc
+        .recv_frame(&mut dec, Duration::from_secs(10))
+        .expect("Close 应回灌父 TabOp 帧");
+    assert_eq!(f_close.kind, FrameKind::TabOp);
+    assert_eq!(
+        decode_tab_op(&f_close.payload),
+        Some(FeedTabOp::Close { tab_id: 42 }),
+        "payload 应解码为 Close{{42}}"
+    );
+
+    // Select 是子本地、不回父:发一个 Select 后 back-channel 不该出现新帧(2s 静默)。
+    send_op(&mut ws, TabOp::Select { idx: 0 });
+    let leaked = fc.recv_frame(&mut dec, Duration::from_secs(2));
+
+    let _ = ws.close(None);
+    fc.cleanup();
+    assert!(
+        leaked.is_none(),
+        "TabOp::Select 是子本地切 viewed,不该回灌父 back-channel"
+    );
+}
+
 /// 块D-5(Lead 补,验 Bug1 修复):大输入(> 默认 pipe 缓冲 64KiB)经 back-channel 回灌父,
 /// 强制子端【分帧 + 出站队列 + 可写时 drain】。父侧逐帧重组须【逐字节完整、无错位】——
 /// 证 write_frame 背压下绝不丢半帧(若丢,recv_frame 会撞解码错位 panic 或重组短/不等)。

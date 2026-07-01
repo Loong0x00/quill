@@ -42,7 +42,8 @@ use calloop::{EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction, Reg
 use crate::composer::prompt_track::Segment;
 use crate::composer::state::{ComposerInput, ComposerOutcome};
 use crate::kernel::feed::{
-    encode_dims, encode_into, encode_tab_list, FeedDecoder, FeedFrame, FrameKind, FEED_HEADER_LEN,
+    decode_tab_op, encode_dims, encode_into, encode_tab_list, FeedDecoder, FeedFrame, FeedTabOp,
+    FrameKind, FEED_HEADER_LEN,
 };
 use crate::tab::{TabInstance, TabList};
 use smithay_client_toolkit::{
@@ -621,9 +622,10 @@ struct ShareChild {
     /// 后续 drain 补完);积压超 cap 时丢【新整帧】(不 append、不截断已入队的)→ 子 decoder
     /// 见到的恒是完整帧序列,framing 绝不错位。
     data_outbound: std::collections::VecDeque<u8>,
-    /// 子→父 `Input` 帧增量解码器(半包 / 粘包,见 [`FeedDecoder`])。子→父 input 读端
+    /// 子→父帧(`Input` + 砖2 B4 `TabOp`)增量解码器(半包 / 粘包,见 [`FeedDecoder`])。子→父读端
     /// (`back_read` OwnedFd)由 calloop Generic READ 源**直接 own**(见 [`ShareChild::spawn`],
-    /// 同 daemon Fed-read 范式)→ 源 remove / drop 时关闭 fd,本结构不再单独持有它。
+    /// 同 daemon Fed-read 范式)→ 源 remove / drop 时关闭 fd,本结构不再单独持有它。解出的帧经
+    /// [`route_share_frame`] 按 kind 分派(Input → 写 tab PTY;TabOp → 执行桌面 tab-op)。
     back_decoder: FeedDecoder,
     /// tee 热路径复用的 encode buffer(`clear` 后重填,零额外分配)。
     frame_scratch: Vec<u8>,
@@ -927,7 +929,7 @@ fn share_back_channel_readable(data: &mut LoopData, fd: RawFd) -> std::io::Resul
     }
 
     for f in frames {
-        route_share_input(data, f);
+        route_share_frame(data, f);
     }
 
     if down {
@@ -939,6 +941,67 @@ fn share_back_channel_readable(data: &mut LoopData, fd: RawFd) -> std::io::Resul
         return Ok(PostAction::Remove);
     }
     Ok(PostAction::Continue)
+}
+
+/// 分派一条子回灌帧(子→父方向,砖2 B4):
+/// - `Input` → 写帧标签指定 tab 的 PTY([`route_share_input`]);
+/// - `TabOp` → 手机发起的 New / Close / Reorder,走既有桌面 tab-op 执行汇([`route_share_tab_op`]);
+/// - 其余 kind(父→子方向)不该从 back-channel 来,忽略。
+fn route_share_frame(data: &mut LoopData, frame: FeedFrame) {
+    match frame.kind {
+        FrameKind::Input => route_share_input(data, frame),
+        FrameKind::TabOp => route_share_tab_op(data, frame),
+        other => {
+            tracing::debug!(kind = ?other, "E′ back-channel 收到非子→父方向帧,忽略");
+        }
+    }
+}
+
+/// 执行一条手机发起的 tab 操作(砖2 B4:子→父 `TabOp` 帧)。子把 New / Close / Reorder 经
+/// back-channel 回灌 → 父映射成桌面 [`TabOp`],走**既有** [`apply_tab_op`](spawn PTY + 注册 calloop
+/// 源 / drop + 移除源 / swap 换序);产生的 tab 增删经 [`on_active_tab_changed`] → [`sync_share_tab_list`]
+/// 整份重发给子 → 子广播给所有客户端刷 tab 栏(New 后子还会把发起客户端自动 Select 到新 tab)。
+/// `Select` / `SetTitle` 不走本路(前者子本地切 viewed,后者桌面无对应操作)。
+///
+/// **why 直接执行而非置 `pending_tab_op` 等 drive_wayland**:`pending_tab_op` 单槽 + drive_wayland
+/// step 3.8 的推迟是给 **Dispatch 路径**(只有 `&mut State`、拿不到 `LoopHandle`)用的;本函数在
+/// back-channel calloop **源回调**里,持完整 `&mut LoopData`(含 `loop_handle`),可直接调 `apply_tab_op`
+/// (它本就从另一个源回调 drive_wayland 里调 `insert_source`/`remove`,同源回调内改 loop 合法)。为防
+/// 与同轮 Dispatch 置的桌面 op 抢单槽,借前 `take` 保存、执行后还原。
+fn route_share_tab_op(data: &mut LoopData, frame: FeedFrame) {
+    let Some(op) = decode_tab_op(&frame.payload) else {
+        tracing::warn!(
+            len = frame.payload.len(),
+            "E′ back-channel TabOp payload 非法,忽略"
+        );
+        return;
+    };
+    let desktop_op = match op {
+        FeedTabOp::New => TabOp::New,
+        FeedTabOp::Close { tab_id } => {
+            let Some(tabs) = data.state.tabs.as_ref() else {
+                return;
+            };
+            match tabs.iter().position(|t| t.id().raw() == tab_id) {
+                Some(idx) => TabOp::Close(idx),
+                None => {
+                    tracing::debug!(tab_id, "E′ 回灌 TabOp::Close 目标 tab 不存在(已关?),忽略");
+                    return;
+                }
+            }
+        }
+        FeedTabOp::Reorder { origin, target } => TabOp::Reorder {
+            from_idx: origin as usize,
+            target_idx: target as usize,
+        },
+    };
+    // 复用桌面唯一 tab-op 执行汇(apply_tab_op 消费 pending_tab_op);保存 / 还原任何同轮桌面 op。
+    let saved = data.state.pending_tab_op.take();
+    data.state.pending_tab_op = Some(desktop_op);
+    apply_tab_op(data);
+    if let Some(s) = saved {
+        data.state.pending_tab_op = Some(s);
+    }
 }
 
 /// 路由一条子回灌的 `Input` 帧到【帧标签指定的那个 tab】的 PTY(砖2 B3:每客户端看/写各自 viewed
@@ -6173,14 +6236,6 @@ mod tests {
         assert!(!share_should_drop_frame(6, 2, 8));
         // 加法溢出不 panic(saturating),仍判为超 cap → 丢。
         assert!(share_should_drop_frame(usize::MAX, 1, 8));
-    }
-
-    /// E′ 回灌输入路由门:命中焦点 tab 才回灌;不命中(焦点 race / 多 tab)丢弃。
-    #[test]
-    fn share_input_routes_only_to_focused_tab() {
-        assert!(share_input_targets_active(7, 7));
-        assert!(!share_input_targets_active(7, 9));
-        assert!(!share_input_targets_active(0, 1));
     }
 
     #[test]
