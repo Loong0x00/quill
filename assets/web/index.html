@@ -57,7 +57,10 @@
   /* xterm 容器。A′ 增量1:忠实视图按【桌面宽】渲染(term.resize 到桌面 cols/rows,不再 fit 到
      浏览器)→ 与桌面像素对齐、宽度不匹配的折行 artifact 消失。桌面宽通常比手机宽 → overflow:auto
      给横/纵滑动(忠实保底"大不了缩放/横滑")。absolute inset:0 = 永远填满 #stage、尺寸恒定。 */
-  #term {
+  /* 砖2 W2:每个【看过的 tab】各留一个 xterm 实例,各自一个 .termhost(absolute inset:0
+     叠在 #stage 里),同一时刻只显示当前 viewed 的那个(display 切换),其余隐藏不 dispose
+     → 切回瞬时无重建闪烁。样式与原 #term 一致(忠实视图保底)。 */
+  .termhost {
     position: absolute; inset: 0; padding: .25rem;
     overflow: auto; -webkit-overflow-scrolling: touch;
     touch-action: pan-x pan-y; overscroll-behavior: contain;
@@ -71,7 +74,7 @@
      focus(mousedown 在 .xterm 根上)/ selection(在 .xterm-screen 上)走事件冒泡仍工作;
      live 跟随是程序性 scrollTop,不受 pointer-events 影响。代价:忠实视图在手机上不再能
      拖动 xterm scrollback(看历史用重排视图);忠实保底像素仍 1:1。 */
-  #term .xterm-viewport { pointer-events: none !important; }
+  .termhost .xterm-viewport { pointer-events: none !important; }
   /* A′ 增量2 / toggle-scroll:重排视图叠在 #term 上层。忠实视图(#term)是保底,重排是叠加。
      切到重排 = #reflow 显示(absolute inset:0 + 不透明黑底 + z-index 盖住 #term);#term 仍在
      原位、全尺寸(不 display:none、不缩 1px)→ ① xterm 隐藏 textarea 仍可聚焦打字(点 #reflow
@@ -177,7 +180,7 @@
        absolute inset:0(同尺寸叠放)。切重排 = #reflow 不透明盖在 #term 上;#term 永远
        保持全尺寸(绝不缩成 1px)→ xterm 几何/滚动容器永不被扰动,往返切换后忠实滚动不退化。 -->
   <div id="stage">
-    <div id="term"></div>
+    <!-- 砖2 W2:每 tab 一个 .termhost 由 JS 动态插入此处(#reflow 之前);同一刻只显示当前 tab。 -->
     <!-- A′ 增量2/3:重排视图(从 xterm.js buffer 还原逻辑行 → CSS 重排 + 表格 widget)。
          默认隐藏(忠实视图保底),点顶栏按钮切换。 -->
     <div id="reflow" style="display:none"></div>
@@ -194,15 +197,87 @@ const dotEl = $("dot"), titleEl = $("title"), statusEl = $("status");
 // 重连退避(ms):断线非事件(R1),后台/锁屏/网络抖动回来自动重连重放。
 const RECONNECT_MS = 1000;
 
-const term = new Terminal({
-  convertEol: false,          // daemon 转发原始字节,换行语义由字节流自带,别替客户端改
-  cursorBlink: true,
-  fontFamily: '"DejaVu Sans Mono", "Noto Sans Mono CJK SC", monospace',
-  fontSize: 14,
-  scrollback: 10000,
-  theme: { background: "#000000" },
-});
-term.open($("term"));
+// ── 砖2 W2:每 tab 一个 xterm 实例(保暖切换)─────────────────────────────────────────
+// 后端一次只流【本客户端 viewed 的那个 tab】的字节(切 tab = TabOp::Select → 后端发
+// StreamFocus + 重放目标 tab 环缓冲)。为了切回【看过的 tab】瞬时无重建闪烁,给每个看过的
+// tab 各留一个 xterm 实例(隐藏而非 dispose):切回先【瞬时显示其上次状态】(无空屏),随后
+// 到达的重放帧一次 reset+write 更新到当前(pendingReset,见 onmessage)→ 无空白闪。有界
+// (超 MAX_WARM_TERMS 淘汰最久没看的、且非当前 viewed 的实例,防内存无限涨)。
+// `term` = 当前 viewed 实例的 Terminal(所有 reflow/读取代码都读这个变量,切换时重新指向)。
+const stageEl = $("stage");
+const MAX_WARM_TERMS = 6;
+const termInstances = new Map();  // tab_id -> { term, host, lastUsed, pendingReset }
+let term = null;                  // 当前 viewed 实例(懒建,首个 StreamFocus 后非空)
+let curInst = null;               // 当前 viewed 实例的记录(pendingReset 挂它上)
+let curDims = null;               // 最近的桌面 dims { cols, rows }(新实例按此 resize)
+let lruSeq = 0;                   // 单调递增的"最近使用"序号(淘汰最久没看的)
+
+function newTerminal() {
+  return new Terminal({
+    convertEol: false,          // daemon 转发原始字节,换行语义由字节流自带,别替客户端改
+    cursorBlink: true,
+    fontFamily: '"DejaVu Sans Mono", "Noto Sans Mono CJK SC", monospace',
+    fontSize: 14,
+    scrollback: 10000,
+    theme: { background: "#000000" },
+  });
+}
+
+// 新建一个 tab 的 xterm 实例(host 可见插入 #reflow 之前 → 测量布局正确;调用方随即在
+// showInstance 里隐藏别的)。每实例各自注册 onData/onBinary/onWriteParsed/onTitleChange
+// (只有当前 active 实例收字节 / 有焦点,故背景实例的这些回调实际不触发;仍逐实例注册求正确)。
+function makeTermInstance(tabId) {
+  const host = document.createElement("div");
+  host.className = "termhost";
+  stageEl.insertBefore(host, reflowEl);
+  const t = newTerminal();
+  t.open(host);
+  if (curDims) { try { t.resize(curDims.cols, curDims.rows); } catch (_) {} }
+  t.onData((d) => sendStr(d));
+  t.onBinary((s) => {
+    const u8 = new Uint8Array(s.length);
+    for (let i = 0; i < s.length; i++) u8[i] = s.charCodeAt(i) & 0xff;
+    sendBytes(u8);
+  });
+  t.onWriteParsed(() => { if (t === term) scheduleReflowRender(); });
+  t.onTitleChange((title) => { if (t === term) titleEl.textContent = title && title.length ? title : "quill"; });
+  const inst = { term: t, host, lastUsed: ++lruSeq, pendingReset: false };
+  termInstances.set(tabId, inst);
+  return inst;
+}
+
+// 淘汰:超上限时,dispose 最久没看的、且不是当前 viewed 的实例(连 DOM host 一起移除)。
+function evictWarmTerms() {
+  while (termInstances.size > MAX_WARM_TERMS) {
+    let victimId = null, victimUsed = Infinity;
+    for (const [id, inst] of termInstances) {
+      if (id === viewedTab) continue;                 // 绝不淘汰当前在看的
+      if (inst.lastUsed < victimUsed) { victimUsed = inst.lastUsed; victimId = id; }
+    }
+    if (victimId === null) break;
+    const v = termInstances.get(victimId);
+    try { v.term.dispose(); } catch (_) {}
+    if (v.host && v.host.parentNode) v.host.parentNode.removeChild(v.host);
+    termInstances.delete(victimId);
+  }
+}
+
+// 切到 tabId 的实例:get-or-create(首次看某 tab 才建 = "从 kernel 重放重建");显示它、
+// 隐藏其余;重新指向 `term`/`curInst`;更新 LRU;有界淘汰。返回该实例。
+function showInstance(tabId) {
+  let inst = termInstances.get(tabId);
+  const fresh = !inst;
+  if (fresh) inst = makeTermInstance(tabId);
+  for (const [id, i2] of termInstances) i2.host.style.display = (id === tabId) ? "" : "none";
+  term = inst.term;
+  curInst = inst;
+  inst.lastUsed = ++lruSeq;
+  // 新建:按桌面宽 resize(在可见状态下,布局正确);保暖:强制在新可见状态重绘一次。
+  if (fresh) { if (curDims) { try { inst.term.resize(curDims.cols, curDims.rows); } catch (_) {} } }
+  else { try { inst.term.refresh(0, inst.term.rows - 1); } catch (_) {} }
+  evictWarmTerms();
+  return inst;
+}
 
 // ── A′ 增量1:忠实视图按【桌面宽】渲染 ─────────────────────────────────────────────
 // 桌面把字节流按桌面 cols/rows 烤死;客户端必须用【同一个宽】渲染才能
@@ -211,8 +286,11 @@ term.open($("term"));
 // 桌面宽通常比手机宽 → #term 横/纵滑动(忠实保底)。响应式重排是增量2。
 function applyDims(cols, rows) {
   if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols < 1 || rows < 1) return;
-  if (term.cols === cols && term.rows === rows) return;
-  try { term.resize(cols, rows); } catch (_) {}
+  curDims = { cols, rows };            // 记住桌面宽 → 之后新建的 tab 实例也按此 resize
+  for (const inst of termInstances.values()) {   // 所有看过的实例都跟着桌面宽(切回宽度一致)
+    if (inst.term.cols === cols && inst.term.rows === rows) continue;
+    try { inst.term.resize(cols, rows); } catch (_) {}
+  }
   scheduleReflowRender();  // 桌面宽变 → xterm 重排 buffer → 重排视图也得重画(若在重排模式)
 }
 
@@ -283,6 +361,7 @@ function cellCss(cell) {
 // cells 给渲染(原字符,含组合字符/宽字符);cols/text 给探测+切列(每 cell 恰好 1 个代表
 // 字符 → text 下标 ↔ cell 下标严格对齐,表格切列才能按字符位置切回带属性的 cell)。
 function buildLogicalLines() {
+  if (!term) return [];        // 砖2 W2:首个 StreamFocus 前无 term 实例
   const buf = term.buffer.active;
   const total = buf.length;
   const start = Math.max(0, total - REFLOW_MAX_ROWS);
@@ -623,13 +702,12 @@ function setViewMode(m) {
   reflowEl.style.display = reflow ? "" : "none";
   modeBtn.textContent = reflow ? "忠实视图" : "重排视图";
   if (reflow) { try { renderReflow(); } catch (_) {} }
-  else { try { term.refresh(0, term.rows - 1); } catch (_) {} }
+  else if (term) { try { term.refresh(0, term.rows - 1); } catch (_) {} }
 }
 modeBtn.addEventListener("click", () => setViewMode(viewMode === "reflow" ? "faithful" : "reflow"));
 // 重排模式下点内容区 → 聚焦 xterm 隐藏 textarea(手机弹软键盘,重排下也能打字;软键栏始终可用)。
-reflowEl.addEventListener("pointerup", () => { if (viewMode === "reflow") { try { term.focus(); } catch (_) {} } });
-// live 字节解析完 → 重排视图节流重画(忠实视图 xterm 自己已经画了)。
-term.onWriteParsed(() => scheduleReflowRender());
+reflowEl.addEventListener("pointerup", () => { if (viewMode === "reflow" && term) { try { term.focus(); } catch (_) {} } });
+// 砖2 W2:onWriteParsed / onData / onBinary / onTitleChange 改为逐实例注册(见 makeTermInstance)。
 
 // ── 输入回灌(片2):键盘/方向键/粘贴/IME → WS 二进制帧 → daemon → active tab PTY ──
 // 发原始字节(二进制帧),与片1 出站 Binary 对称;daemon 收到直接写 PTY。`ws` 是
@@ -641,16 +719,8 @@ function sendBytes(u8) {
 // xterm 编码好,含粘贴/IME 上屏);TextEncoder 编 UTF-8 后发。
 const enc = new TextEncoder();
 function sendStr(s) { sendBytes(enc.encode(s)); }
-
-// xterm 把物理键/方向键/粘贴/IME 全汇流成 onData 的 VT 字节串,原样回发即可。
-term.onData((d) => sendStr(d));
-// onBinary 给的是 latin1「二进制串」(如鼠标上报含 >127 字节)→ 按字符码取字节,
-// 不能用 TextEncoder(会 UTF-8 膨胀破坏字节)。
-term.onBinary((s) => {
-  const u8 = new Uint8Array(s.length);
-  for (let i = 0; i < s.length; i++) u8[i] = s.charCodeAt(i) & 0xff;
-  sendBytes(u8);
-});
+// 注:onData(VT 字节串)/ onBinary(latin1 二进制串,如鼠标上报)的回发在 makeTermInstance
+// 里逐实例注册 —— 只有当前 active 实例有焦点会触发,输入始终去本客户端 viewed 的 tab。
 
 // ── 软键栏:手机软键盘没有的键,各发对应控制字节(与桌面 wl/keyboard.rs 同款序列)──
 // label, 字节序列, 是否宽按钮
@@ -677,7 +747,7 @@ const SOFTKEYS = [
     b.addEventListener("pointerdown", (e) => {
       e.preventDefault();
       sendStr(seq);
-      term.focus();
+      if (term) term.focus();
     });
     keysEl.appendChild(b);
   }
@@ -775,18 +845,15 @@ function updateWorkspace(info) {
 }
 
 // 收到 StreamFocus{tab_id} = 后端确认"此后字节流属于 tab_id"(连上 / Select 确认 / 跟随焦点)。
-// 切了 tab → 本客户端 viewed 更新 + 字节侧重建(见 switchViewedTab)+ 高亮刷新。
+// 砖2 W2:切到该 tab 的实例(看过的瞬时显示上次状态,没看过的新建=从 kernel 重放重建),
+// 标记 pendingReset(随后到达的重放帧一次 reset+write 更新到当前 → 无空白闪),刷新高亮/标题。
 function onStreamFocus(tabId) {
-  const changed = viewedTab !== tabId;
-  viewedTab = tabId;
-  if (changed) switchViewedTab(tabId);
+  viewedTab = tabId;                     // 先设(showInstance/淘汰须保住当前 viewed)
+  const inst = showInstance(tabId);
+  inst.pendingReset = true;              // 关键帧重放紧随其后 → 应用前先 reset(见 onmessage)
+  const meta = tabList.find((t) => t.tab_id === tabId);
+  if (meta) titleEl.textContent = meta.title && meta.title.length ? meta.title : "quill";
   renderTabBar();
-}
-
-// W1(单 term 实例):切 viewed tab → reset 终端,后端随即重放目标 tab 环缓冲重建当前屏
-// (代价:切换时一瞬重建闪烁)。W2 换成"每 tab 各留一个实例、保暖切换"替换此实现。
-function switchViewedTab(_tabId) {
-  try { term.reset(); } catch (_) {}
   scheduleReflowRender();
 }
 
@@ -843,17 +910,21 @@ function connect() {
   ws.binaryType = "arraybuffer";
 
   ws.onopen = () => {
-    // why: 每次(重)连先 reset,否则 daemon 的重放缓冲会叠加到 xterm 已有内容 →
-    // 屏幕重复。断线重连是手机高频路径(后台/锁屏/弱网),不 reset 每次都重复一屏。
-    term.reset();
+    // 砖2 W2:不再在此无条件 reset。重连后保暖实例仍在(手机后台/锁屏/弱网是高频路径),
+    // viewedTab 归 null → 首个 StreamFocus 会 showInstance + pendingReset,由随后重放帧一次
+    // reset+write 重建当前屏(旧的"reset 防重复"语义移到 pendingReset,且切回不空屏)。
     held = false; // 新连接 → 等学到 workspace id 后重新 Hold
-    viewedTab = null; // 新连接 → 首个 StreamFocus 视作初始 viewed(不额外 reset,onopen 已 reset)
-    scheduleReflowRender(); // reset 清空 buffer → 重排视图(若在用)同步清屏,等重放字节重建
+    viewedTab = null; // 新连接 → 首个 StreamFocus 视作初始 viewed
+    scheduleReflowRender();
     setLive(true, "已连接(直播)");
   };
   ws.onmessage = (ev) => {
     // 控制面 Text 帧(JSON ServerMsg)与数据面 Binary 帧(PTY 字节)分流(T6 块C)。
     if (typeof ev.data === "string") { handleServerControl(ev.data); return; }
+    if (!term) return;                       // 首个 StreamFocus 前无实例(理论上字节不先到)
+    // pendingReset:切到该 tab 后的首个字节 = 关键帧重放 → 先 reset 再 write,同一 handler /
+    // 同一次绘制内完成 → 保暖切换从"上次状态"直接刷成"当前",无中间空屏闪。
+    if (curInst && curInst.pendingReset) { try { term.reset(); } catch (_) {} curInst.pendingReset = false; }
     term.write(new Uint8Array(ev.data));     // xterm 本地模拟 VT + 本地 reflow
   };
   ws.onclose = () => { setLive(false, "连接已断,重连中…"); scheduleReconnect(); };
@@ -868,8 +939,8 @@ function scheduleReconnect() {
   }, RECONNECT_MS);
 }
 
-// OSC 标题(xterm 解析 \x1b]0;…\x07)→ 顶栏标题。
-term.onTitleChange((t) => { titleEl.textContent = t && t.length ? t : "quill"; });
+// OSC 标题(xterm 解析 \x1b]0;…\x07)→ 顶栏标题:砖2 W2 移到 makeTermInstance 逐实例注册
+// (只更新当前 active 实例的标题;切 tab 时 onStreamFocus 用后端 tab 标题即时刷新)。
 
 // ── 真 X 关闭 vs 断线(T6 块C, ADR-0015 R1)──────────────────────────────────────
 // "真 X" = 用户关 tab / 导航离开(pagehide 且非 bfcache 持久态)→ 发 **Release**(显式
