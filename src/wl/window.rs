@@ -30,7 +30,9 @@
 //! - INV-009 master fd O_NONBLOCK
 
 use std::ffi::c_void;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -416,6 +418,13 @@ struct LoopData {
     /// **位于 LoopData 尾**(`pty_tokens` 之后):不持 wgpu / wayland 句柄,与 INV-001 资源链
     /// (renderer→window→conn,在 `State` 内)解耦,drop 序无 UB(见 [`ShareChild`] doc)。
     share: Option<ShareChild>,
+    /// ADR-0020 §2 无锁异步会合的【进行中】态:本窗口已拉起 detached kernel、正用 calloop Timer
+    /// (`retry_token`)异步重试非阻塞 connect 会合 socket,尚未连上。连上 → 建 [`ShareChild`] 置
+    /// `share`、清本字段;deadline 到期仍连不上 → 置 `share_error`、清本字段(见
+    /// [`share_rendezvous_retry_tick`])。`None` = 无进行中会合(未共享 / 已连上 / 已失败)。
+    /// **与 `share` 互斥**(连上瞬间 `share_pending → None`、`share → Some`)。挂 LoopData 尾同
+    /// `share`(不持 wgpu / wayland 句柄),drop 序无 UB;重试 Timer 源随 `event_loop` drop 清。
+    share_pending: Option<SharePending>,
 }
 
 // T-0108 删除:`run_main_loop` / `StepResult` / `install_signal_handlers` /
@@ -517,22 +526,34 @@ pub(crate) fn pty_readable_action(result: &std::io::Result<usize>) -> PtyAction 
 /// 所需(队列常空),只有真跟不上的卡死子才触顶丢帧,绝不无界堆 + 绝不阻塞终端热路径。
 const SHARE_DATA_OUT_CAP: usize = 1 << 20;
 
-/// 桌面单工作区在 E′ 帧里的 workspace 标签。父侧(window.rs)暂无真多工作区概念(Session
-/// 多 workspace 是 kernel 侧),固定值即可:子据此广播 `StreamFocus`,并把它原样回灌进 `Input`
-/// 帧的 `ws_id`(见 daemon `route_input`),父端单工作区下主要按 `tab_id` 路由。
-const SHARE_DESKTOP_WS_ID: u64 = 1;
+/// 本窗口的 workspace 标签(ADR-0019:一个窗口 = 一个 workspace = 一个 feeder)。**每窗口进程
+/// 唯一** —— 用 PID(联邦里多个窗口接入同一 kernel,各 feeder 声明的 ws 必须互不相同,kernel 据此
+/// 分 workspace / 路由 back-channel;PID 天然唯一且非零)。所有喂给 kernel 的帧头 `ws_id` 都用它。
+fn share_ws_id() -> u64 {
+    std::process::id() as u64
+}
 
-/// 共享子进程 WS 监听地址(与 kernel `DEFAULT_WS_PORT` 一致;手机经 WireGuard VPN → 路由器
-/// → `10.0.0.2:7878` 可达,安全靠 VPN 把门)。可经 env `QUILL_SHARE_WS_BIND` 覆盖(调参 /
-/// 避端口冲突 / 测试)。
+/// 共享 kernel WS 监听地址(与 kernel `DEFAULT_WS_PORT` 一致;手机经 WireGuard VPN → 路由器
+/// → `10.0.0.2:7878` 可达,安全靠 VPN 把门)。仅**本窗口拉起 kernel(owner)时**用作 `--ws-bind`;
+/// 作为 feeder 接入已有 kernel 时不用(端口是那个 kernel 定的)。可经 env `QUILL_SHARE_WS_BIND` 覆盖。
 const SHARE_WS_BIND_DEFAULT: &str = "0.0.0.0:7878";
 
-/// 共享子进程 spawn 后判"启动失败 vs 运行中崩溃"的短窗阈值。子 `Command::spawn` 成功后立即
-/// 去 bind `0.0.0.0:7878`;第二个窗口撞端口(`EADDRINUSE`)会**几毫秒内**退出 → 父读 back-channel
-/// EOF。若 EOF 距 spawn **短于本阈值** = 子几乎没活起来(绑端口失败 / 立即崩)= **启动失败**,
-/// 置 `share_error` 让标题栏 icon 转 error 态(用户一眼可见"点了但没开起来");EOF 距 spawn **长于
-/// 本阈值** = 共享已正常运行一段后子才崩 = 运行中崩溃,维持既有"静默降级回纯终端"(不误报)。
-/// 2s 远超本机 bind + listen 的亚毫秒级耗时,又远短于任何"用了一会才崩"的真实运行时长,判别裕度足。
+/// 会合连接(ADR-0020 §2 无锁异步会合):本窗口拉起 detached kernel 后,用 calloop Timer **异步**
+/// 重试非阻塞 connect 会合 socket 的最长 deadline。kernel bind 会合 socket 亚秒级,3s 极宽松;到期
+/// 仍连不上 = 置 `share_error` 琥珀态。**全程不阻塞 calloop 线程**(重试是 Timer 不是 sleep,见
+/// [`share_rendezvous_retry_tick`])。
+const SHARE_RENDEZVOUS_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// 会合异步重试的轮询间隔(calloop Timer 每隔此时长非阻塞 try-connect 一次)。~40ms:kernel bind
+/// 亚秒级,几次即中;间隔小到用户无感、又远不到忙轮询。
+const SHARE_RENDEZVOUS_RETRY_INTERVAL: Duration = Duration::from_millis(40);
+
+/// 会合接入 kernel 后判"启动失败 vs 运行中崩溃"的短窗阈值。本窗口作为 feeder 接入后立即 tee;
+/// 若 back-channel **短于本阈值**内就 EOF(kernel 立即崩 / 会合 socket 被非 quill 进程占等)= **启动
+/// 失败**,置 `share_error` 让标题栏 icon 转 error 态(用户一眼可见"点了但没开起来");EOF 距接入
+/// **长于本阈值** = 共享已正常运行一段后 kernel 才崩 / 本 feeder 被移除 = 运行中崩溃,维持既有"静默
+/// 降级回纯终端"(不误报)。2s 远超本机 bind + listen 的亚毫秒级耗时,又远短于任何"用了一会才崩"的
+/// 真实运行时长,判别裕度足。
 const SHARE_EOF_STARTUP_FAIL_WINDOW: Duration = Duration::from_secs(2);
 
 /// 纯决策:共享子 back-channel EOF / 断流距其 spawn 的时长 `elapsed` 是否算【启动失败】。
@@ -579,20 +600,7 @@ fn share_set_cloexec(fd: RawFd) -> std::io::Result<()> {
     Ok(())
 }
 
-/// 建匿名 pipe(无 CLOEXEC → 子经 fork/exec 继承;父保留端事后自设 CLOEXEC)。返
-/// `(read_fd, write_fd)`。照 `tests/kernel_feed_slice.rs` 父侧范式。
-#[allow(unsafe_code)]
-fn share_make_pipe() -> std::io::Result<(RawFd, RawFd)> {
-    let mut fds = [0 as RawFd; 2];
-    // SAFETY: pipe 写两个 fd 进栈上数组;返回值按 != 0 判错。
-    let r = unsafe { libc::pipe(fds.as_mut_ptr()) };
-    if r != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok((fds[0], fds[1]))
-}
-
-/// 关一个本进程持有的 raw fd(spawn 后父关子已继承的副本;或早失败清理路径)。
+/// 关一个本进程持有的 raw fd(会合 socket dup 失败 / 早失败清理路径)。
 #[allow(unsafe_code)]
 fn share_close_fd(fd: RawFd) {
     if fd >= 0 {
@@ -631,6 +639,55 @@ fn share_kernel_path() -> std::path::PathBuf {
     std::path::PathBuf::from("quill-kernel")
 }
 
+/// 会合 socket 路径(ADR-0019:机器级单例 kernel 的接入点),= `$XDG_RUNTIME_DIR/quill-kernel.sock`
+/// (与 kernel `--rendezvous` 一致)。XDG 未设时报错(不静默落 `/tmp` 这种他人可写位置)。
+fn share_rendezvous_socket_path() -> Result<PathBuf> {
+    crate::kernel::daemon::default_socket_path()
+}
+
+/// spawn **detached** 的会合 kernel(ADR-0019 F1a owner 路径 / ADR-0020 §2):`--rendezvous` +
+/// `--detach`(kernel 自 daemonize 双 fork 脱离本窗口 = 机器级单例、不随窗口退出而死、不再是窗口
+/// 子进程)+ `--ws-bind`。`Command::spawn` 起的是即将 daemonize 的原进程(fork1 后 `_exit`)→
+/// `wait` 立即收尸(无僵尸),真 daemon 已被 init 收养。**这一步只 spawn + 立即 wait 原进程**(亚毫秒,
+/// 不阻塞);随后由 [`share_rendezvous_retry_tick`] 用 calloop Timer **异步**非阻塞 connect 到就绪。
+///
+/// **无锁**(ADR-0020 §2):不占 flock、不做同步轮询。万一真并发双 spawn(手动 opt-in 几乎不可达),
+/// 靠 kernel bind 会合 socket / 7878 的原子性兜底 —— 输的 kernel 秒退,是普通错误处理(接 back-channel
+/// EOF 短窗 → 琥珀),不上锁。
+fn share_spawn_detached_kernel(sock: &Path) -> Result<()> {
+    let exe = share_kernel_path();
+    let ws_bind =
+        std::env::var("QUILL_SHARE_WS_BIND").unwrap_or_else(|_| SHARE_WS_BIND_DEFAULT.to_string());
+    let mut child = std::process::Command::new(&exe)
+        .arg(format!("--rendezvous={}", sock.display()))
+        .arg(format!("--ws-bind={ws_bind}"))
+        .arg("--detach")
+        .spawn()
+        .with_context(|| format!("spawn detached 会合 kernel {} 失败", exe.display()))?;
+    // 收原进程(fork1 后即 _exit(0),真 daemon 是被 init 收养的孙进程 → 不是本窗口的子)。
+    let _ = child.wait();
+    Ok(())
+}
+
+/// **非阻塞** try-connect 会合 socket(ADR-0020 §2)。AF_UNIX SOCK_STREAM connect 对没在监听的
+/// socket **立即**返 ENOENT / ECONNREFUSED(不会 EINPROGRESS 挂起),故这一次 connect 本身不阻塞
+/// calloop 线程。返回:
+/// - `Ok(Some(stream))` 连上(kernel 已在跑:开机服务 / 别的窗口 / 本窗口刚拉起的);
+/// - `Ok(None)` 没 kernel(ENOENT / ECONNREFUSED),调用方据此拉起 detached kernel + 异步重试;
+/// - `Err` 其它意外错(极少;调用方按启动失败处理)。
+fn share_try_connect(sock: &Path) -> std::io::Result<Option<UnixStream>> {
+    match UnixStream::connect(sock) {
+        Ok(s) => Ok(Some(s)),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                || e.kind() == std::io::ErrorKind::ConnectionRefused =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// E′ 父→子 data 端背压决策(纯逻辑,可单测):**是否丢弃整帧**。
 ///
 /// **framing 完整性不变式**:只在【已积压】(`outbound_len > 0`)且【加上本帧会超 cap】时丢,且
@@ -641,31 +698,50 @@ fn share_should_drop_frame(outbound_len: usize, frame_len: usize, cap: usize) ->
     outbound_len > 0 && outbound_len.saturating_add(frame_len) > cap
 }
 
-/// E′(ADR-0018)父监管的隔离共享【子进程】句柄 + 父↔子 pipe 两端 + 焦点 + 背压队列。
+/// ADR-0020 §2 无锁异步会合【进行中】态(见 [`LoopData::share_pending`]):本窗口拉起 detached
+/// kernel 后,用 calloop Timer 异步重试非阻塞 connect 会合 socket 直到连上 / deadline。**全程不阻塞
+/// calloop 线程**(重试是 Timer 不是 sleep)。POD 字段、drop 序清晰(retry_token 是 Copy)。
+struct SharePending {
+    /// 会合 socket 路径(重试 connect 用)。
+    sock: PathBuf,
+    /// 连上目标 tab(连上后建 [`ShareChild`] 传给它当初始焦点)。
+    focus_tab: u64,
+    /// 放弃 deadline(`now >= deadline` 仍连不上 → 置 `share_error` 琥珀态、停重试)。
+    deadline: Instant,
+    /// 重试 Timer 的 calloop 句柄。[`LoopData::stop_share`] 用它 `loop_handle.remove` 取消进行中会合;
+    /// self-complete(连上 / 超时)路径走 `TimeoutAction::Drop`,不用本字段。
+    retry_token: RegistrationToken,
+}
+
+/// ADR-0019 联邦共享句柄:本窗口作为 **feeder** 接入机器级单例 `quill-kernel` 的会合连接 +
+/// 焦点 + 背压队列。**kernel 是 detached 独立进程(非本窗口子进程)**,本结构不持 `Child`。
 ///
-/// 仅 `--share` 武装时存在(默认 `None` = 今天的 quill,**零开销、零子进程、零回归**)。父
-/// own PTY 直接渲染(热路径零 IPC);本结构只在【共享支线】活动,**绝不阻塞渲染 / PTY 热路径**:
-/// - **tee**(父→子,[`tee_tab_output`]):**全部 tab**(砖2 选项②)的【原始】PTY 字节 →
-///   `PtyOutput` 帧(各按自身 (ws, tab) 打标)→ **非阻塞**写;写不完入 [`data_outbound`](背压),
-///   超 [`SHARE_DATA_OUT_CAP`] 丢【整帧】(framing 不错位)。
-/// - **focus**(父→子,[`set_focus`]):焦点 tab 变 → `FocusChange` 帧(子据此广播 StreamFocus
-///   + 过滤回灌 Input 帧标签)。
-/// - **input 回灌**(子→父):back-channel 读端(OwnedFd)由 calloop READ 源
-///   ([`share_back_channel_readable`])**直接 own**,子把手机输入 encode 成 `Input` 帧写来。
-/// - **监管 / 降级**:子崩溃 → back-channel EOF → 拆 share 降级回纯终端;[`Drop`] kill + reap 子
-///   (OS 进程边界隔离,**不用 catch_unwind** —— 它接不住 abort/UB/OOM,正是否决 E 的理由)。
+/// 仅 `--share` 武装时存在(默认 `None` = 今天的 quill,**零开销、零回归**)。窗口 own PTY 直接
+/// 渲染(热路径零 IPC);本结构只在【共享支线】活动,**绝不阻塞渲染 / PTY 热路径**:
+/// - **tee**(窗口→kernel,[`tee_tab_output`]):**全部 tab**(砖2 选项②)的【原始】PTY 字节 →
+///   `PtyOutput` 帧(各按 (本窗口 ws, tab) 打标)→ **非阻塞**写会合 socket;写不完入 [`data_outbound`]
+///   (背压),超 [`SHARE_DATA_OUT_CAP`] 丢【整帧】(framing 不错位)。
+/// - **focus**(窗口→kernel,[`set_focus`]):焦点 tab 变 → `FocusChange` 帧(kernel 据此重定向跟随
+///   焦点的手机客户端 + 标 active tab;其后回灌 Input 帧带这对 (ws, tab) 标签)。
+/// - **input 回灌**(kernel→窗口):back-channel 读端(OwnedFd)由 calloop READ 源
+///   ([`share_back_channel_readable`])**直接 own**,kernel 把手机输入 encode 成 `Input` 帧写来。
+/// - **监管 / 降级**:kernel 崩溃 / 本 feeder 被 kernel 移除 → back-channel EOF → 拆 share 降级回纯
+///   终端(OS 进程边界隔离,kernel 崩不拖垮本窗口)。**本窗口退出 → 会合连接关 → kernel 移除本
+///   workspace**(本窗口是最后 feeder 则 kernel 自退,ADR-0019 F2b)。[`Drop`] **不 kill / 不 reap**
+///   (kernel 非本窗口子进程),只关会合 socket 写端 dup。
+///
+/// **会合连接 = 全双工 unix socket**(`data_write` 写 feed 帧 / `back_read` 读 back-channel,二者是
+/// 同一 socket 的两个 dup)。
 ///
 /// **drop 序(INV-008)**:本结构挂 [`LoopData`] 尾(`pty_tokens` 之后),不持 wgpu / wayland
 /// 句柄,与 INV-001 链(renderer→window→conn,在 `State` 内)解耦。`LoopData` 先于
-/// `event_loop` drop → 本结构 drop(关 `data_write` OwnedFd + reap 子)→ 之后 `event_loop`
-/// drop 移除并关闭 back-channel Generic 源 own 的 back_read OwnedFd(源 own fd,EPOLL_CTL_DEL
-/// 在 fd 仍开时执行,无 EBADF)。
+/// `event_loop` drop → 本结构 drop(关 `data_write` 写端 dup)→ 之后 `event_loop` drop 移除并关闭
+/// back-channel Generic 源 own 的 `back_read` dup(两 dup 都关 = 会合 socket 全关 → kernel 侧本
+/// feeder EOF;源 own fd,EPOLL_CTL_DEL 在 fd 仍开时执行,无 EBADF)。
 struct ShareChild {
-    /// 受监管的 `quill-kernel`(Fed 模式)子进程。[`Drop`] kill + wait 收尸(只 wait 本 child,
-    /// 不抢 portable-pty 对 shell 子的 reap;不用 SIGCHLD)。
-    child: std::process::Child,
-    /// 父→子 data 写端(`PtyOutput` / `FocusChange` 帧),非阻塞。`OwnedFd` 持有 → drop 关闭
-    /// → 子 `--fed-in` 读端 EOF → 子退出(ADR-0018 子靠 EOF 察觉父没了)。
+    /// 会合 socket **写端 dup**(`PtyOutput` / `FocusChange` / `Dims` / `TabList` 帧 → kernel),非阻塞。
+    /// `OwnedFd` 持有 → drop 关这一 dup;配合 back-channel 源关另一 dup → 会合 socket 全关 → kernel
+    /// 读到本 feeder EOF → 移除本 workspace(ADR-0019 F2b)。
     data_write: OwnedFd,
     /// 写不完的字节尾(背压队列)。**只 append 整帧**(半帧仅来自整帧的【部分 write】,会被
     /// 后续 drain 补完);积压超 cap 时丢【新整帧】(不 append、不截断已入队的)→ 子 decoder
@@ -696,92 +772,63 @@ struct ShareChild {
     /// (本结构被 `take` 掉,本字段随之 drop = no-op,RegistrationToken 是 Copy/POD),两条拆路互不
     /// 重复(parent-initiated 用本字段、self-remove 用 PostAction)。
     back_token: RegistrationToken,
-    /// 本子进程 spawn 完成(pipe + back-channel 源就绪)的时刻。用于 [`share_back_channel_readable`]
-    /// 的 down 路径判别【启动失败】(EOF 距此 < [`SHARE_EOF_STARTUP_FAIL_WINDOW`] = 子绑端口失败 /
-    /// 立即崩)vs【运行中崩溃】(EOF 距此较久 = 用了一会才崩),前者置 `share_error` 报错、后者静默降级。
-    /// POD `Instant`,drop 序无关(与 `dropped_frames` 同性质)。
+    /// 会合接入完成(socket dup + back-channel 源就绪)的时刻。用于 [`share_back_channel_readable`]
+    /// 的 down 路径判别【启动失败】(EOF 距此 < [`SHARE_EOF_STARTUP_FAIL_WINDOW`] = kernel 立即崩 /
+    /// 会合 socket 被占)vs【运行中崩溃】(EOF 距此较久 = 用了一会才崩),前者置 `share_error` 报错、
+    /// 后者静默降级。POD `Instant`,drop 序无关(与 `dropped_frames` 同性质)。
     spawn_at: Instant,
 }
 
 impl ShareChild {
-    /// spawn 受监管的隔离 `quill-kernel`(Fed 模式)子进程 + 建父↔子双向 pipe + 注册 back-channel
-    /// READ 源。失败返 `Err`(调用方 log + 降级回纯终端,**绝不让共享出错拖累启动**)。
-    ///
-    /// fd 拓扑(照 `tests/kernel_feed_slice.rs` 父侧):pipe1 父→子 data(子继承读端经 `--fed-in`,
-    /// 父留写端);pipe2 子→父 input(子继承写端经 `--fed-out`,父留读端)。父保留端设 CLOEXEC
-    /// (不被子继承)+ 非阻塞;spawn 后父关子那两端(子已继承 → 父留端成唯一持有者,EOF 语义成立)。
-    fn spawn(
+    /// 作为 feeder 接入机器级单例 kernel(ADR-0019 F1a / ADR-0020 §2):调用方已通过**无锁 try-connect**
+    /// (立即连上)或**异步重试**([`share_rendezvous_retry_tick`])拿到会合 socket 连接 `stream`(全双工),
+    /// 本函数把它 dup 成读 / 写两端(独立 OwnedFd)→ 注册 back-channel READ 源。失败返 `Err`(调用方 log +
+    /// 降级回纯终端,**绝不让共享出错拖累终端**)。**kernel 是 detached 独立进程**(不是本窗口子进程),
+    /// 故不持 `Child`、不 spawn(spawn detached kernel 是会合另一路,见 [`share_spawn_detached_kernel`])。
+    fn from_stream(
         loop_handle: &LoopHandle<'static, LoopData>,
-        focus_ws: u64,
+        stream: UnixStream,
         focus_tab: u64,
     ) -> Result<ShareChild> {
-        let exe = share_kernel_path();
-        let ws_bind = std::env::var("QUILL_SHARE_WS_BIND")
-            .unwrap_or_else(|_| SHARE_WS_BIND_DEFAULT.to_string());
-        // Fed 模式不绑 unix socket,但 quill-kernel 仍解析 --socket(XDG 未设时报错)→ 给占位
-        // 路径(Fed 分支从不 bind / 创建它,见 daemon::run)。
-        let placeholder_socket =
-            std::env::temp_dir().join(format!("quill-share-{}.sock", std::process::id()));
-
-        // pipe1: 父→子 data。父写 p_write,子读 c_read(经 --fed-in)。
-        let (c_read, p_write) = share_make_pipe().context("建父→子 data pipe 失败")?;
-        // pipe2: 子→父 input。子写 c_write(经 --fed-out),父读 p_read。
-        let (p_read, c_write) = match share_make_pipe() {
-            Ok(p) => p,
-            Err(e) => {
-                share_close_fd(c_read);
-                share_close_fd(p_write);
-                return Err(anyhow::Error::new(e).context("建子→父 input pipe 失败"));
+        // 会合 socket 全双工:dup 成两个独立 OwnedFd —— 写端(data_write,写 feed 帧)+ 读端
+        // (back_read,由 back-channel READ 源 own)。两 dup 都关 = socket 全关 → kernel 侧本 feeder EOF。
+        let raw = stream.into_raw_fd();
+        // SAFETY: raw 来自刚 into_raw_fd 的会合 UnixStream,本进程独占;dup 出第二个 fd。失败关已得 fd。
+        #[allow(unsafe_code)]
+        let write_fd = {
+            let d = unsafe { libc::dup(raw) };
+            if d < 0 {
+                let e = std::io::Error::last_os_error();
+                share_close_fd(raw);
+                return Err(anyhow::Error::new(e).context("dup 会合 socket 写端失败"));
             }
+            d
         };
-
-        // 父保留端:CLOEXEC(不被子继承)+ 非阻塞。任一失败 → 清理全部 fd 后返错。
+        // 两端非阻塞(tee 写绝不阻塞热路径 / back-channel drain 到 WouldBlock)+ CLOEXEC(不被随后
+        // spawn 的 shell / 别的子进程继承)。任一失败 → 清理两 fd 后返错。
         let setup = (|| -> std::io::Result<()> {
-            share_set_cloexec(p_write)?;
-            share_set_cloexec(p_read)?;
-            share_set_nonblocking(p_write)?;
-            share_set_nonblocking(p_read)?;
+            share_set_nonblocking(raw)?;
+            share_set_nonblocking(write_fd)?;
+            share_set_cloexec(raw)?;
+            share_set_cloexec(write_fd)?;
             Ok(())
         })();
         if let Err(e) = setup {
-            for fd in [c_read, p_write, p_read, c_write] {
-                share_close_fd(fd);
-            }
-            return Err(anyhow::Error::new(e).context("配置父保留 pipe 端失败"));
+            share_close_fd(raw);
+            share_close_fd(write_fd);
+            return Err(anyhow::Error::new(e).context("配置会合 socket 两端失败"));
         }
 
-        let spawned = std::process::Command::new(&exe)
-            .arg(format!("--socket={}", placeholder_socket.display()))
-            .arg(format!("--ws-bind={ws_bind}"))
-            .arg(format!("--fed-in={c_read}"))
-            .arg(format!("--fed-out={c_write}"))
-            .spawn();
-        let child = match spawned {
-            Ok(c) => c,
-            Err(e) => {
-                for fd in [c_read, p_write, p_read, c_write] {
-                    share_close_fd(fd);
-                }
-                return Err(anyhow::Error::new(e)
-                    .context(format!("spawn 共享子进程 {} 失败", exe.display())));
-            }
-        };
-
-        // 父关子那两端(子已继承副本)→ 父留端成唯一持有者(EOF 察觉语义)。
-        share_close_fd(c_read);
-        share_close_fd(c_write);
-
-        // SAFETY: p_write / p_read 由父独占(子继承的 c_read / c_write 已关);包成 OwnedFd
-        // 接管 close。data_write 进 ShareChild(drain 写它);back_read 直接交给 calloop Generic
-        // 源 own(同 daemon Fed-read 范式)→ 源 remove / drop 时关闭 fd。
+        // SAFETY: raw / write_fd 本进程独占;包 OwnedFd 接管 close。data_write 进 ShareChild;back_read
+        // 交 calloop Generic 源 own(源 remove / drop 时关)。
         #[allow(unsafe_code)]
-        let data_write = unsafe { OwnedFd::from_raw_fd(p_write) };
+        let data_write = unsafe { OwnedFd::from_raw_fd(write_fd) };
         #[allow(unsafe_code)]
-        let back_read = unsafe { OwnedFd::from_raw_fd(p_read) };
+        let back_read = unsafe { OwnedFd::from_raw_fd(raw) };
 
-        // 注册 back-channel READ 源(子→父 Input 帧)。Generic **own** back_read OwnedFd;闭包捕获
-        // raw(int Copy)给 libc::read 用,源在 loop 生命期内不删 → fd 全程有效。drop 序:本源
-        // (含 OwnedFd)随 event_loop drop 自关 fd(EPOLL_CTL_DEL 在 fd 仍开时执行,无 EBADF)。
+        // 注册 back-channel READ 源(kernel→窗口 Input / TabOp 帧)。Generic **own** back_read;闭包捕获
+        // raw(int Copy)给 libc::read 用,源在 loop 生命期内不删 → fd 全程有效。drop 序:本源(含
+        // OwnedFd)随 event_loop drop 自关 fd(EPOLL_CTL_DEL 在 fd 仍开时执行,无 EBADF)。
         let back_raw = back_read.as_raw_fd();
         let back_token = match loop_handle.insert_source(
             Generic::new(back_read, Interest::READ, Mode::Level),
@@ -792,27 +839,23 @@ impl ShareChild {
             Ok(tok) => tok,
             Err(e) => {
                 // 注册失败:InsertError 持回 Generic(含 back_read OwnedFd)→ 随 `e` drop 关闭;
-                // 这里显式 kill + reap 子 + 关 data_write。
-                let mut child = child;
-                let _ = child.kill();
-                let _ = child.wait();
+                // 这里显式关 data_write。会合连接随之全关 → kernel 移除本(半接入的)feeder。
                 drop(data_write);
                 return Err(anyhow!("注册 back-channel READ 源失败: {e}"));
             }
         };
 
         Ok(ShareChild {
-            child,
             data_write,
             data_outbound: std::collections::VecDeque::new(),
             back_decoder: FeedDecoder::new(),
             frame_scratch: Vec::with_capacity(FEED_HEADER_LEN + PTY_READ_BUF),
-            focus_ws,
+            focus_ws: share_ws_id(),
             focus_tab,
             last_dims: None,
             dropped_frames: 0,
             back_token,
-            // spawn + pipe + back-channel 源就绪的时刻;down 路径据此判启动失败 vs 运行中崩溃。
+            // 会合接入 + back-channel 源就绪的时刻;down 路径据此判启动失败 vs 运行中崩溃。
             spawn_at: Instant::now(),
         })
     }
@@ -822,18 +865,19 @@ impl ShareChild {
     /// **砖2 选项②**:tee【全部】tab(非仅焦点),每个 tab 的字节按其【自身】(ws, tab) 打标 →
     /// 子据标把字节分 tab 存进各自环缓冲、只发给 viewed 该 tab 的客户端(手机各看各的)。**非阻塞、
     /// 绝不阻塞热路径**:写不完入队,超 cap 丢整帧。空输入 no-op。
-    fn tee_tab_output(&mut self, ws: u64, tab: u64, bytes: &[u8]) {
+    fn tee_tab_output(&mut self, tab: u64, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
+        let ws = self.focus_ws;
         self.push_frame(FrameKind::PtyOutput, ws, tab, bytes);
     }
 
     /// 焦点 tab 变 → 更新本地焦点 + 发 `FocusChange` 帧(子据此广播 StreamFocus,且其后回灌的
     /// `Input` 帧带这对 (ws, tab) 标签)。
-    fn set_focus(&mut self, ws: u64, tab: u64) {
-        self.focus_ws = ws;
+    fn set_focus(&mut self, tab: u64) {
         self.focus_tab = tab;
+        let ws = self.focus_ws;
         self.push_frame(FrameKind::FocusChange, ws, tab, &[]);
     }
 
@@ -855,10 +899,11 @@ impl ShareChild {
     /// 发整份 tab 列表给子(砖2 B2:父→子 `TabList` 帧)。`active_idx` = 桌面焦点 tab 下标,
     /// `tabs` = 按显示顺序的 (tab_id, title)。任何 tab 增删 / 换序 / 焦点变时父整份重发 → 子重建
     /// [`WorkspaceInfo`] 广播给手机 tab 栏。帧头 `tab_id` 填桌面焦点 tab(冗余便利,权威在 payload)。
-    fn send_tab_list(&mut self, ws: u64, active_idx: usize, tabs: &[(u64, String)]) {
+    fn send_tab_list(&mut self, active_idx: usize, tabs: &[(u64, String)]) {
         let refs: Vec<(u64, &str)> = tabs.iter().map(|(id, t)| (*id, t.as_str())).collect();
         let payload = encode_tab_list(active_idx, &refs);
         let active_tab = tabs.get(active_idx).map(|(id, _)| *id).unwrap_or(0);
+        let ws = self.focus_ws;
         self.push_frame(FrameKind::TabList, ws, active_tab, &payload);
     }
 
@@ -917,15 +962,15 @@ impl ShareChild {
 
 impl Drop for ShareChild {
     fn drop(&mut self) {
-        // OS 进程边界隔离(不用 catch_unwind):kill + reap 受监管子。子也会因 data_write 关闭
-        // (本结构 OwnedFd 字段随后 drop)得 EOF 自退,kill 是 prompt + 兜底;wait 防僵尸
-        // (只 wait 本结构的 quill-kernel 子,不抢 portable-pty 对 shell 子的 reap)。
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // ADR-0019:kernel 是 detached 独立进程(非本窗口子进程)—— **不 kill / 不 reap**。drop 只
+        // 关会合 socket 写端 dup(`data_write` OwnedFd 随 self drop 关);配合 back-channel 源关读端
+        // dup(stop_share `loop_handle.remove(back_token)` / 或 event_loop drop)→ 会合 socket 全关 →
+        // kernel 读到本 feeder EOF → 移除本 workspace(本窗口是最后 feeder 则 kernel 自退,F2b)。
+        // OS 进程边界隔离仍在(kernel 崩不拖垮本窗口),但生命周期是 refcount 而非父子 reap。
         if self.dropped_frames > 0 {
             tracing::debug!(
                 dropped = self.dropped_frames,
-                "E′ 共享 tee 背压期间丢弃的整帧数(手机少了这些段输出,framing 未错位)"
+                "联邦共享 tee 背压期间丢弃的整帧数(手机少了这些段输出,framing 未错位)"
             );
         }
     }
@@ -967,7 +1012,7 @@ fn share_back_channel_readable(data: &mut LoopData, fd: RawFd) -> std::io::Resul
             continue;
         }
         if n == 0 {
-            tracing::info!("E′ 共享子 back-channel EOF:子进程退出 / 崩溃,降级回纯终端");
+            tracing::info!("联邦共享 back-channel EOF:kernel 退出 / 本 feeder 被移除,降级回纯终端");
             down = true;
             break;
         }
@@ -989,17 +1034,19 @@ fn share_back_channel_readable(data: &mut LoopData, fd: RawFd) -> std::io::Resul
     }
 
     if down {
-        // 区分【启动失败】(EOF 距 spawn 短 = 子绑 7878 撞车 / 立即崩,本 bug:两个窗口都开共享,
-        // 第二个撞端口)与【运行中崩溃】(EOF 距 spawn 久 = 共享用了一会才崩):前者置 `share_error`
-        // → 标题栏 icon 转 error 态(用户一眼知道"点了但没开起来"、不与"从没开过"的灰混同);后者
-        // 维持既有静默降级回纯终端(不置 error、不误报)。判据在 take 之前读 spawn_at。
+        // 区分【启动失败】(EOF 距接入短 = kernel 立即崩 / 会合 socket 被非 quill 进程占 / 输的并发
+        // kernel bind 撞车秒退等)与【运行中崩溃】(EOF 距接入久 = 共享用了一会 kernel 才崩 / 本 feeder
+        // 被移除):前者置 `share_error` → 标题栏 icon 转 error 态(用户一眼知道"点了但没开起来"、不与
+        // "从没开过"的灰混同);后者维持既有静默降级回纯终端(不置 error、不误报)。判据在 take 之前读
+        // spawn_at。
         let startup_fail = data
             .share
             .as_ref()
             .map(|sh| share_eof_is_startup_failure(sh.spawn_at.elapsed()))
             .unwrap_or(false);
-        // 拆 share:ShareChild::drop kill + reap 子 + 关父留 fd;本源 PostAction::Remove
-        // (calloop 回调返回后才应用,故"删自身源"安全 —— 别在回调内手动 loop_handle.remove)。
+        // 拆 share:ShareChild::drop 关会合 socket 写端 dup(kernel 是 detached 独立进程,不 kill);
+        // 本源 PostAction::Remove 关读端 dup(calloop 回调返回后才应用,故"删自身源"安全 —— 别在
+        // 回调内手动 loop_handle.remove)→ 会合 socket 全关 → kernel 移除本 workspace。
         let _ = data.share.take();
         if startup_fail {
             data.state.share_error = true;
@@ -1159,68 +1206,110 @@ fn write_input_to_tab(state: &mut State, tab_id: u64, bytes: &[u8]) {
 }
 
 impl LoopData {
-    /// E′(ADR-0018)运行期【开共享】:spawn 受监管的隔离 `quill-kernel` 子(Fed 模式)+ 注册
-    /// back-channel 源 + 发初始 `FocusChange` / `Dims` 帧。**幂等**:已武装(`share.is_some()`)直接
-    /// 返回(不重复 spawn / 不再绑第二个 7878)。失败 → log + 维持纯终端(`share` 留 `None`),
-    /// **绝不让共享出错拖累终端**(daily-driver 优先)。
+    /// ADR-0019/0020 运行期【开共享】:作为 feeder 接入机器级单例 `quill-kernel`。**无锁 + calloop
+    /// 异步(ADR-0020 §2/§3:终端永远优先,绝不阻塞)**:
+    /// - **先非阻塞 try-connect** 会合 socket:连上(kernel 已在跑:开机服务 / 别的窗口 / 本窗口先前
+    ///   拉起)→ 立即 [`finish_share_connect`] 作为 feeder 接入;
+    /// - 连不上(没 kernel)→ [`Self::begin_rendezvous_spawn`] 拉起 detached kernel + 排 calloop Timer
+    ///   **异步**重试非阻塞 connect(**绝不 `thread::sleep` / 绝不阻塞 poll / 绝不 flock**);
+    ///
+    /// **幂等**:已连上(`share.is_some()`)或会合进行中(`share_pending.is_some()`)直接返回。任何
+    /// 失败 → log + 维持纯终端 + 置 `share_error`,**绝不让共享出错拖累终端**(daily-driver 优先)。
     ///
     /// 由三处触发同一抽取路径:① `--share` 启动([`run_window`]);② 标题栏共享按钮点击;
     /// ③ `Ctrl+Shift+S`。后两者经 `pending_share_toggle` → [`apply_share_toggle`] → [`Self::toggle_share`]。
     fn start_share(&mut self) {
-        if self.share.is_some() {
-            tracing::debug!("start_share:已在共享(幂等),跳过");
+        if self.share.is_some() || self.share_pending.is_some() {
+            tracing::debug!("start_share:已在共享 / 会合进行中(幂等),跳过");
             return;
         }
         let Some(focus_tab) = self.state.tabs.as_ref().map(|t| t.active().id().raw()) else {
             tracing::warn!("start_share:无 active tab(启动期 race),跳过");
             return;
         };
-        match ShareChild::spawn(&self.loop_handle, SHARE_DESKTOP_WS_ID, focus_tab) {
-            Ok(mut sh) => {
-                sh.set_focus(SHARE_DESKTOP_WS_ID, focus_tab);
-                // 把当前桌面 PTY 尺寸发给子(连上早于首个 resize 的客户端也拿到桌面宽);真尺寸由
-                // 下个 configure 的 propagate_resize_if_dirty 紧接覆盖(set_dims 去重生效)。
-                let (cols, rows) = self
-                    .state
-                    .tabs
-                    .as_ref()
-                    .map(|t| t.active().term().dimensions())
-                    .unwrap_or((80, 24));
-                sh.set_dims(
-                    u16::try_from(cols).unwrap_or(u16::MAX),
-                    u16::try_from(rows).unwrap_or(u16::MAX),
-                );
-                self.share = Some(sh);
-                // 砖2 B2:发初始 tab 列表给子(连上早于首个 tab 变化的客户端也拿到 tab 栏)。
-                sync_share_tab_list(self);
-                tracing::info!(
-                    tab = focus_tab,
-                    "E′ 共享已开启(--share / 标题栏 toggle / Ctrl+Shift+S);全部 tab 输出 tee 给手机"
-                );
-            }
+        let sock = match share_rendezvous_socket_path() {
+            Ok(p) => p,
             Err(e) => {
                 tracing::warn!(
                     ?e,
-                    "E′ 共享 spawn 失败,维持纯终端(本次开共享无效,终端不受影响)"
+                    "start_share:会合 socket 路径不可得(XDG_RUNTIME_DIR 未设?),维持纯终端"
                 );
-                // spawn 同步失败(exe 缺失 / pipe 建不出 / 源注册失败)= 启动失败:置 error 态,
-                // 让标题栏 icon 可见报错(与 back-channel EOF 短窗那条启动失败路径同处置)。调用方
-                // apply_share_toggle 随后置 presentation_dirty 触发重画。
+                self.state.share_error = true;
+                return;
+            }
+        };
+        // ADR-0020 §2/§3:**先非阻塞 try-connect**,绝不在 calloop 线程死等。
+        match share_try_connect(&sock) {
+            Ok(Some(stream)) => {
+                // kernel 已在跑 → 立即作为 feeder 接入(单次 connect 立即返回,不阻塞)。
+                finish_share_connect(self, stream, focus_tab);
+            }
+            Ok(None) => {
+                // 没 kernel → 拉起 detached kernel + calloop Timer 异步重试(永不阻塞终端)。
+                self.begin_rendezvous_spawn(sock, focus_tab);
+            }
+            Err(e) => {
+                tracing::warn!(?e, "start_share:try-connect 会合 socket 意外错,维持纯终端");
                 self.state.share_error = true;
             }
         }
     }
 
-    /// E′ 运行期【关共享】:remove back-channel calloop 源(→ drop Generic<OwnedFd> 关 `back_read`
-    /// fd)+ drop [`ShareChild`](kill + reap 子 + 关 `data_write`)→ 干净降级回纯终端。**幂等**:
-    /// 未武装(`share` 为 `None`)直接返回。
+    /// 会合"无 kernel"支路(ADR-0020 §2):拉起 detached kernel + 排 calloop Timer 异步重试 connect。
+    /// **不阻塞 calloop 线程**(spawn 亚毫秒 + 立即 wait fork1 原进程,连上没交给事件循环每圈顺手查,
+    /// 见 [`share_rendezvous_retry_tick`])。**不在此删残留 socket 文件**:kernel 启动的
+    /// `prepare_socket_path` 自己判(活跃 daemon → 拒绝覆盖 / 残留 → 删),避免窗口侧 TOCTOU 误删活
+    /// kernel 的 socket(ADR-0020 无锁:真并发交给 kernel bind 会合 socket / 7878 的原子性兜底)。
+    fn begin_rendezvous_spawn(&mut self, sock: PathBuf, focus_tab: u64) {
+        if let Err(e) = share_spawn_detached_kernel(&sock) {
+            tracing::warn!(?e, "start_share:拉起 detached 会合 kernel 失败,维持纯终端");
+            self.state.share_error = true;
+            return;
+        }
+        let deadline = Instant::now() + SHARE_RENDEZVOUS_CONNECT_TIMEOUT;
+        let timer = Timer::from_duration(SHARE_RENDEZVOUS_RETRY_INTERVAL);
+        match self
+            .loop_handle
+            .insert_source(timer, |_deadline, _meta, data: &mut LoopData| {
+                share_rendezvous_retry_tick(data)
+            }) {
+            Ok(retry_token) => {
+                self.share_pending = Some(SharePending {
+                    sock,
+                    focus_tab,
+                    deadline,
+                    retry_token,
+                });
+                tracing::info!(
+                    tab = focus_tab,
+                    "start_share:已拉起 detached kernel,calloop 异步重试会合 connect(不阻塞终端)"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(?e, "start_share:排会合重试 Timer 失败,维持纯终端");
+                self.state.share_error = true;
+            }
+        }
+    }
+
+    /// ADR-0019/0020 运行期【关共享】:
+    /// - **进行中会合**(`share_pending`)→ `loop_handle.remove(retry_token)` 停重试 Timer + 丢弃
+    ///   pending(取消尚未连上的会合);已拉起的 detached kernel 若无其它 feeder 会在 startup grace 后
+    ///   自退(ADR-0019 F2b),**不 kill**(detached、非本窗口子)。
+    /// - **已连上**(`share`)→ drop [`ShareChild`](关会合 socket 写端 dup)+ `loop_handle.remove`
+    ///   back-channel 源(关读端 dup)→ 会合 socket 全关 → kernel 移除本 workspace(本窗口是最后
+    ///   feeder 则 kernel 自退,F2b)。**不 kill / 不 reap**(kernel 非本窗口子进程)。
     ///
-    /// **顺序**:先 `take` 出 ShareChild 拿到 `back_token`(Copy),`drop(sh)` 先 reap 子(`wait` 阻塞
-    /// 到子真死 → 子持的 `0.0.0.0:7878` listener fd 被 OS 关闭、端口释放 → 第二次 start_share 能干净
-    /// 重绑),再 `loop_handle.remove(back_token)` 移除源。本方法**不在 back-channel 源自身回调内
-    /// 调用**(那条路走 `PostAction::Remove`,见 [`share_back_channel_readable`]),故 `remove` 移除的
-    /// 是【别的】源,calloop 允许。
+    /// **幂等**:pending / share 皆无直接返回。**顺序**:先 `take` 出 ShareChild 拿到 `back_token`
+    /// (Copy),`drop(sh)` 关写端 dup,再 `loop_handle.remove(back_token)` 移除读源。本方法**不在
+    /// back-channel 源自身回调内调用**(那条走 `PostAction::Remove`,见 [`share_back_channel_readable`]),
+    /// 故 `remove` 移除的是【别的】源,calloop 允许。
     fn stop_share(&mut self) {
+        if let Some(pending) = self.share_pending.take() {
+            self.loop_handle.remove(pending.retry_token);
+            tracing::info!("stop_share:取消进行中的会合连接(pending);回纯终端");
+            return;
+        }
         let Some(sh) = self.share.take() else {
             tracing::debug!("stop_share:本就没共享(幂等),跳过");
             return;
@@ -1228,24 +1317,24 @@ impl LoopData {
         let token = sh.back_token;
         drop(sh);
         self.loop_handle.remove(token);
-        tracing::info!("E′ 共享已关闭(标题栏 toggle / Ctrl+Shift+S);回纯终端");
+        tracing::info!("联邦共享已关闭(标题栏 toggle / Ctrl+Shift+S);回纯终端");
     }
 
-    /// E′ 运行期【翻转】共享开关:已开 → [`Self::stop_share`];未开 → [`Self::start_share`]。
-    /// 可反复开关、第二次开能干净重起(stop 路径已 reap 子 + 释放端口)。
+    /// ADR-0019/0020 运行期【翻转】共享开关:已开 / 会合进行中 → [`Self::stop_share`];未开 →
+    /// [`Self::start_share`]。可反复开关。
     ///
-    /// **error 态点击 = 消错回灰(不重试)**:上次启动失败后 icon 停在琥珀 error 态、且 `share=None`
-    /// (与 `share_error` 互斥)。此时若点击走 `start_share` 会大概率又撞同一个占用者(如另一个 quill
-    /// 占着 7878)、再次失败卡回琥珀 → 用户感觉"点不动、黄的变不回灰"。故 **error 态一次点击 = 清
-    /// `share_error` 回灰(off)后【直接返回不重试】**;要重试就再点一次(从灰走 `start_share`)。非
-    /// error 态才按 `share.is_some()` 开(start)/ 关(stop)。重画由调用方 `apply_share_toggle` 置
-    /// `presentation_dirty` 保证。
+    /// **error 态点击 = 消错回灰(不重试)**:上次启动失败后 icon 停在琥珀 error 态、且
+    /// `share == None && share_pending == None`(与 `share_error` 互斥)。此时若点击走 `start_share`
+    /// 会大概率又撞同一个占用者(如非 quill 进程占着 7878)、再次失败卡回琥珀 → 用户感觉"点不动、
+    /// 黄的变不回灰"。故 **error 态一次点击 = 清 `share_error` 回灰(off)后【直接返回不重试】**;要
+    /// 重试就再点一次(从灰走 `start_share`)。非 error 态才按 `share` / `share_pending` 开 / 关。
+    /// 重画由调用方 `apply_share_toggle` 置 `presentation_dirty` 保证。
     fn toggle_share(&mut self) {
         if self.state.share_error {
             self.state.share_error = false;
             return;
         }
-        if self.share.is_some() {
+        if self.share.is_some() || self.share_pending.is_some() {
             self.stop_share();
         } else {
             self.start_share();
@@ -1265,6 +1354,94 @@ fn apply_share_toggle(data: &mut LoopData) {
     // toggle 不写 PTY,空闲终端 term 不 dirty → 主动请求重画,否则标题栏 share icon
     // 的绿/灰不即时更新(要等鼠标动 / PTY 输出才刷)。兄弟路径 selection ops 同样置位。
     data.state.presentation_dirty = true;
+}
+
+/// 会合连上后:建 [`ShareChild`] feeder + 发初始 focus / dims / tab-list 帧 + 置 `data.share`。
+/// **立即 try-connect 成功**([`LoopData::start_share`])与**异步重试成功**([`share_rendezvous_retry_tick`])
+/// 共用此收尾。失败(dup / 源注册)→ 置 `share_error`、维持纯终端(**绝不让共享出错拖累终端**)。
+fn finish_share_connect(data: &mut LoopData, stream: UnixStream, focus_tab: u64) {
+    match ShareChild::from_stream(&data.loop_handle, stream, focus_tab) {
+        Ok(mut sh) => {
+            sh.set_focus(focus_tab);
+            // 把当前桌面 PTY 尺寸发给 kernel(连上早于首个 resize 的客户端也拿到桌面宽);真尺寸由
+            // 下个 configure 的 propagate_resize_if_dirty 紧接覆盖(set_dims 去重生效)。
+            let (cols, rows) = data
+                .state
+                .tabs
+                .as_ref()
+                .map(|t| t.active().term().dimensions())
+                .unwrap_or((80, 24));
+            sh.set_dims(
+                u16::try_from(cols).unwrap_or(u16::MAX),
+                u16::try_from(rows).unwrap_or(u16::MAX),
+            );
+            data.share = Some(sh);
+            // 砖2 B2:发初始 tab 列表给 kernel(连上早于首个 tab 变化的客户端也拿到 tab 栏)。
+            sync_share_tab_list(data);
+            tracing::info!(
+                tab = focus_tab,
+                "联邦共享已接入 kernel(feeder;--share / 标题栏 toggle / Ctrl+Shift+S);全部 tab 输出 tee 给手机"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                ?e,
+                "联邦共享接入失败,维持纯终端(本次开共享无效,终端不受影响)"
+            );
+            data.state.share_error = true;
+        }
+    }
+}
+
+/// ADR-0020 §2 会合异步重试 Timer 回调:每 [`SHARE_RENDEZVOUS_RETRY_INTERVAL`] 非阻塞 try-connect
+/// 一次会合 socket。**永不阻塞 calloop 线程 / 终端**(单次 connect 立即返回,连不上就下一 tick 再试,
+/// 是 Timer 不是 `thread::sleep`)。
+/// - `share_pending` 已被清(用户 [`LoopData::stop_share`] 取消)/ `share` 已置 → `Drop`(停 Timer);
+/// - 连上 → [`finish_share_connect`] 建 feeder + 清 `share_pending` + 请求重画 → `Drop`;
+/// - deadline 到期仍连不上 → 置 `share_error` 琥珀态 + 清 `share_pending` + 请求重画 → `Drop`;
+/// - 否则(未连上、未到期)→ `ToDuration` 排下一 tick 再试(同一 Timer 源复用,token 不变)。
+fn share_rendezvous_retry_tick(data: &mut LoopData) -> TimeoutAction {
+    // 取消(stop_share take 了 pending)→ 本 Timer 作废,停。
+    let Some(pending) = data.share_pending.as_ref() else {
+        return TimeoutAction::Drop;
+    };
+    // 防御性:已连上(不该发生,连上即清 pending)→ 清 pending 停 Timer。
+    if data.share.is_some() {
+        data.share_pending = None;
+        return TimeoutAction::Drop;
+    }
+    let sock = pending.sock.clone();
+    let focus_tab = pending.focus_tab;
+    let deadline = pending.deadline;
+    match share_try_connect(&sock) {
+        Ok(Some(stream)) => {
+            data.share_pending = None; // 先清 pending(finish 置 share;两者互斥)。
+            finish_share_connect(data, stream, focus_tab);
+            data.state.presentation_dirty = true; // 连上(绿)/ 接入失败(琥珀)→ 主动重画 icon。
+            TimeoutAction::Drop
+        }
+        Ok(None) => {
+            if Instant::now() >= deadline {
+                tracing::warn!(
+                    "会合异步重试超时(拉起 kernel 后 {:?} 内未 bind 会合 socket),置 error 态",
+                    SHARE_RENDEZVOUS_CONNECT_TIMEOUT
+                );
+                data.share_pending = None;
+                data.state.share_error = true;
+                data.state.presentation_dirty = true;
+                TimeoutAction::Drop
+            } else {
+                TimeoutAction::ToDuration(SHARE_RENDEZVOUS_RETRY_INTERVAL)
+            }
+        }
+        Err(e) => {
+            tracing::warn!(?e, "会合异步重试 try-connect 意外错,置 error 态");
+            data.share_pending = None;
+            data.state.share_error = true;
+            data.state.presentation_dirty = true;
+            TimeoutAction::Drop
+        }
+    }
 }
 
 /// calloop Generic source 每次 readable 时跑一圈:循环 `pty.read` → 分派
@@ -1391,7 +1568,7 @@ fn pty_read_tick_inner(
                     //   tab 存环、按各客户端 viewed 分发(手机各看各的 tab、独立于桌面焦点);
                     // - 非阻塞 + 背压丢整帧,**绝不阻塞渲染 / PTY 热路径**(见 [`ShareChild::tee_tab_output`])。
                     if let Some(sh) = share.as_deref_mut() {
-                        sh.tee_tab_output(SHARE_DESKTOP_WS_ID, tab.id().raw(), &buf[..n]);
+                        sh.tee_tab_output(tab.id().raw(), &buf[..n]);
                     }
                     // T5b:先让composer扫描OSC 133,marker只改composer内部提示态,
                     // 普通字节才继续交给终端状态机。
@@ -3373,7 +3550,7 @@ fn on_active_tab_changed(data: &mut LoopData) {
     // 未武装 = no-op。先取 active id(释放 state.tabs 借用)再借 data.share(disjoint 字段)。
     let active_id_for_share = data.state.tabs.as_ref().map(|t| t.active().id().raw());
     if let (Some(active_id), Some(sh)) = (active_id_for_share, data.share.as_mut()) {
-        sh.set_focus(SHARE_DESKTOP_WS_ID, active_id);
+        sh.set_focus(active_id);
     }
     // 砖2 B2:tab 集 / 换序 / 焦点变都经本函数 → 整份重发 tab 列表给子(子广播给手机 tab 栏)。
     sync_share_tab_list(data);
@@ -3395,7 +3572,7 @@ fn sync_share_tab_list(data: &mut LoopData) {
     let active = tabs.active_idx();
     let list: Vec<(u64, String)> = tabs.iter().map(|t| (t.id().raw(), t.title())).collect();
     if let Some(sh) = data.share.as_mut() {
-        sh.send_tab_list(SHARE_DESKTOP_WS_ID, active, &list);
+        sh.send_tab_list(active, &list);
     }
 }
 
@@ -4084,12 +4261,15 @@ pub fn run_window(initial_cwd: Option<std::path::PathBuf>, share: bool) -> Resul
         // 运行期标题栏 toggle / Ctrl+Shift+S 也走同一 start_share/stop_share 抽取路径。
         // 默认(无 --share、不点按钮)= 零子进程、零回归。
         share: None,
+        // ADR-0020 §2:会合进行中态起步恒 None(未拉起 kernel / 未在异步重试)。
+        share_pending: None,
     };
 
-    // E′(ADR-0018):`--share` opt-in 启动 → 运行期 start_share 一次(spawn 受监管隔离子 + 注册
-    // back-channel 源 + 初始 focus/dims 帧),与标题栏共享按钮 / Ctrl+Shift+S 完全同一路径。默认
-    // (`share == false`)不调 → 根本不 spawn 子 = 今天的 quill(零开销、零回归);spawn 失败由
-    // start_share 内部 log + 维持纯终端,绝不拖累 daily-driver 启动。
+    // ADR-0019/0020:`--share` opt-in 启动 → 运行期 start_share 一次(无锁 try-connect 会合 socket:
+    // 连上=接入 feeder / 连不上=拉 detached kernel + calloop 异步重试,**非阻塞**),与标题栏共享按钮 /
+    // Ctrl+Shift+S 完全同一路径。默认(`share == false`)不调 → 不接入 / 不拉 kernel = 今天的 quill
+    // (零开销、零回归);失败由 start_share 内部 log + 维持纯终端,**绝不拖累 daily-driver 启动**(§3
+    // 终端永远优先:start_share 立即返回,连上没交给事件循环每圈顺手查)。
     if share {
         loop_data.start_share();
     }
@@ -4117,9 +4297,11 @@ pub fn run_window(initial_cwd: Option<std::path::PathBuf>, share: bool) -> Resul
                 state,
                 frame_stats,
                 text_system,
-                // E′(ADR-0018):共享态(disjoint LoopData 字段)→ 每帧同步给 renderer 画
-                // titlebar 共享按钮(亮绿=开 / 暗灰=关)。`share.is_some()` 即"共享中"。
+                // E′(ADR-0018)/ ADR-0020:共享态(disjoint LoopData 字段)→ 每帧同步给 renderer 画
+                // titlebar 共享按钮(亮绿=开 / 暗灰=关)。"共享中" = 已接入(`share`)**或**会合进行中
+                // (`share_pending`,ADR-0020 §2 异步 connect 期间乐观显绿;连不上转琥珀 error)。
                 share,
+                share_pending,
                 ..
             } = &mut *data;
             // 字段级 split: tabs / renderer / pointer_state / ime_state /
@@ -4316,7 +4498,7 @@ pub fn run_window(initial_cwd: Option<std::path::PathBuf>, share: bool) -> Resul
             r.set_tab_drag(tab_drag_render);
             // E′(ADR-0018):把共享态镜像给 renderer(`share` 是 disjoint LoopData 字段,
             // 与 `r`=state.renderer 不冲突)。默认 None → false → 暗灰"未共享"按钮(零回归)。
-            r.set_share_active(share.is_some());
+            r.set_share_active(share.is_some() || share_pending.is_some());
             // E′(ADR-0018):共享启动失败态镜像给 renderer(`state.share_error` 是 disjoint 字段,
             // 与 `share` / `r` 不冲突)。true → 标题栏 share icon 画成琥珀 error 态(用户可见"点了
             // 但没开起来")。默认 false → 零回归(与未共享的灰 icon 行为不变)。
@@ -6759,6 +6941,37 @@ mod tests {
         // 恰好到阈值 / 超过 = 运行中崩溃,不算启动失败(不误报)。
         assert!(!share_eof_is_startup_failure(SHARE_EOF_STARTUP_FAIL_WINDOW));
         assert!(!share_eof_is_startup_failure(Duration::from_secs(60)));
+    }
+
+    /// ADR-0020 §2 无锁会合:非阻塞 try-connect 对【没 kernel】的会合 socket 立即返 `Ok(None)`
+    /// (ENOENT / ECONNREFUSED —— **不当致命错、不阻塞**,调用方据此拉起 detached kernel);对
+    /// 【有监听】的立即返 `Ok(Some(_))`(直接当 feeder 接入)。这条是 #3 消失的地基:整个会合决策
+    /// 建在一次立即返回的 connect 上,无 flock、无阻塞 poll。
+    #[test]
+    fn share_try_connect_none_without_kernel_some_when_listening() {
+        use std::os::unix::net::UnixListener;
+        let dir = std::env::temp_dir().join(format!("quill-rdv-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sock = dir.join("rdv.sock");
+        let _ = std::fs::remove_file(&sock);
+        // 不存在(ENOENT)→ Ok(None)。
+        assert!(
+            matches!(share_try_connect(&sock), Ok(None)),
+            "没 kernel(ENOENT)应 Ok(None)"
+        );
+        // 有监听 → Ok(Some)。
+        let listener = UnixListener::bind(&sock).expect("bind test rendezvous socket");
+        assert!(
+            matches!(share_try_connect(&sock), Ok(Some(_))),
+            "有监听应 Ok(Some)"
+        );
+        drop(listener);
+        // 残留 socket 文件但无监听(ConnectionRefused)→ Ok(None)。
+        assert!(
+            matches!(share_try_connect(&sock), Ok(None)),
+            "残留 socket 无监听(refused)应 Ok(None)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
