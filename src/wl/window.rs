@@ -376,9 +376,9 @@ struct LoopData {
     pty_tokens: Vec<(crate::tab::TabId, RegistrationToken)>,
     /// E′(ADR-0018)共享支线:受监管的隔离 `quill-kernel` 子进程(含父↔子 pipe 两端、焦点、
     /// 背压队列)。`None` = `--share` 未武装(默认 = 今天的 quill,**零开销、零子进程、零回归**)。
-    /// 武装时持子句柄;焦点 tab 的【原始】PTY 字节经 [`ShareChild::tee_pty_output`] tee 给子(子
-    /// fan-out 给手机),手机输入经子 back-channel 回灌(块ii)。子崩溃时 back-channel EOF 触发拆
-    /// 回 `None` 降级回纯终端(终端无感)。
+    /// 武装时持子句柄;**全部 tab**(砖2 选项②)的【原始】PTY 字节经 [`ShareChild::tee_tab_output`]
+    /// tee 给子(各按自身 (ws, tab) 打标,子分 tab 存环 + fan-out 给 viewed 该 tab 的手机),手机
+    /// 输入经子 back-channel 回灌(块ii)。子崩溃时 back-channel EOF 触发拆回 `None` 降级回纯终端。
     ///
     /// **位于 LoopData 尾**(`pty_tokens` 之后):不持 wgpu / wayland 句柄,与 INV-001 资源链
     /// (renderer→window→conn,在 `State` 内)解耦,drop 序无 UB(见 [`ShareChild`] doc)。
@@ -602,9 +602,9 @@ fn share_input_targets_active(frame_tab: u64, active_tab: u64) -> bool {
 ///
 /// 仅 `--share` 武装时存在(默认 `None` = 今天的 quill,**零开销、零子进程、零回归**)。父
 /// own PTY 直接渲染(热路径零 IPC);本结构只在【共享支线】活动,**绝不阻塞渲染 / PTY 热路径**:
-/// - **tee**(父→子,[`tee_pty_output`]):焦点 tab 的【原始】PTY 字节 → `PtyOutput` 帧 →
-///   **非阻塞**写;写不完入 [`data_outbound`](背压),超 [`SHARE_DATA_OUT_CAP`] 丢【整帧】
-///   (framing 不错位)。
+/// - **tee**(父→子,[`tee_tab_output`]):**全部 tab**(砖2 选项②)的【原始】PTY 字节 →
+///   `PtyOutput` 帧(各按自身 (ws, tab) 打标)→ **非阻塞**写;写不完入 [`data_outbound`](背压),
+///   超 [`SHARE_DATA_OUT_CAP`] 丢【整帧】(framing 不错位)。
 /// - **focus**(父→子,[`set_focus`]):焦点 tab 变 → `FocusChange` 帧(子据此广播 StreamFocus
 ///   + 过滤回灌 Input 帧标签)。
 /// - **input 回灌**(子→父):back-channel 读端(OwnedFd)由 calloop READ 源
@@ -636,7 +636,9 @@ struct ShareChild {
     frame_scratch: Vec<u8>,
     /// 当前焦点 workspace 标签(发 `FocusChange` / tee 帧头用)。
     focus_ws: u64,
-    /// 当前焦点 tab id(raw)。tee 只转 `focus_tab` 那个 tab 的字节(只读镜像焦点 tab)。
+    /// 当前【桌面焦点】tab id(raw)。发 `FocusChange` / `Dims` 帧头用;砖2 起 tee 不再据此过滤
+    /// (tee 全部 tab,见 [`tee_tab_output`]),此字段仅表桌面焦点(子据 `FocusChange` 让"跟随焦点"
+    /// 的手机客户端重定向 + 标 active tab)。
     focus_tab: u64,
     /// 上次发给子的桌面尺寸 `(cols, rows)`(A′ 增量1)。去重:`propagate_resize_if_dirty` 每次
     /// configure 都跑(focus / 重发 configure 等尺寸没变也跑),仅尺寸**真变**时才发 `Dims` 帧,
@@ -764,13 +766,15 @@ impl ShareChild {
         })
     }
 
-    /// tee 焦点 tab 的【原始】PTY 字节给子(父→子 `PtyOutput` 帧)。**非阻塞、绝不阻塞热
-    /// 路径**:写不完入队,超 cap 丢整帧。空输入 no-op。
-    fn tee_pty_output(&mut self, bytes: &[u8]) {
+    /// tee 【某个】tab 的【原始】PTY 字节给子(父→子 `PtyOutput` 帧,帧头标 (ws, tab))。
+    ///
+    /// **砖2 选项②**:tee【全部】tab(非仅焦点),每个 tab 的字节按其【自身】(ws, tab) 打标 →
+    /// 子据标把字节分 tab 存进各自环缓冲、只发给 viewed 该 tab 的客户端(手机各看各的)。**非阻塞、
+    /// 绝不阻塞热路径**:写不完入队,超 cap 丢整帧。空输入 no-op。
+    fn tee_tab_output(&mut self, ws: u64, tab: u64, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
-        let (ws, tab) = (self.focus_ws, self.focus_tab);
         self.push_frame(FrameKind::PtyOutput, ws, tab, bytes);
     }
 
@@ -1114,9 +1118,9 @@ fn pty_read_tick(
     } else {
         None
     };
-    // E′ tee:`share` 原样穿进 inner(像 selection_state 那样 Option 穿透)。tee 仅对【焦点】
-    // tab 生效(inner 内 `sh.focus_tab == tab.id()` 过滤),故所有 tab 的读回调都可安全传入,
-    // 非焦点 tab 自然不 tee。share 未武装(None)= inner 整段 tee no-op(默认零回归)。
+    // E′ tee:`share` 原样穿进 inner(像 selection_state 那样 Option 穿透)。砖2 选项②:tee 对
+    // 【全部】tab 生效(inner 内按 tab.id() 打标),每个 tab 的读回调 tee 自己的字节;子据标分 tab
+    // 存环、按各客户端 viewed 分发。share 未武装(None)= inner 整段 tee no-op(默认零回归)。
     pty_read_tick_inner(tab, selection_for_inner, loop_signal, share)
 }
 
@@ -1176,16 +1180,15 @@ fn pty_read_tick_inner(
                         bytes = %preview,
                         "pty bytes"
                     );
-                    // E′(ADR-0018)tee:把【焦点】tab 的【原始】PTY 字节(`buf[..n]`,**不是**下面
+                    // E′(ADR-0018)tee:把【这个】tab 的【原始】PTY 字节(`buf[..n]`,**不是**下面
                     // 被 composer 剥了 OSC-133 的 `term_bytes` —— 手机要完整流)转给共享子。
                     // - 单一 null-check:`share` 未武装(`None`)→ 整个 `if let` 不进 → **默认零回归**
                     //   (父 own PTY 直接渲染,热路径零 IPC、≈ 今天的 quill);
-                    // - 仅焦点 tab(`sh.focus_tab == tab.id()`):非焦点 tab 的后台输出不转给手机;
-                    // - 非阻塞 + 背压丢整帧,**绝不阻塞渲染 / PTY 热路径**(见 [`ShareChild::tee_pty_output`])。
+                    // - **砖2 选项②**:tee【全部】tab(非仅焦点),各按自身 (ws, tab.id) 打标 → 子分
+                    //   tab 存环、按各客户端 viewed 分发(手机各看各的 tab、独立于桌面焦点);
+                    // - 非阻塞 + 背压丢整帧,**绝不阻塞渲染 / PTY 热路径**(见 [`ShareChild::tee_tab_output`])。
                     if let Some(sh) = share.as_deref_mut() {
-                        if sh.focus_tab == tab.id().raw() {
-                            sh.tee_pty_output(&buf[..n]);
-                        }
+                        sh.tee_tab_output(SHARE_DESKTOP_WS_ID, tab.id().raw(), &buf[..n]);
                     }
                     // T5b:先让composer扫描OSC 133,marker只改composer内部提示态,
                     // 普通字节才继续交给终端状态机。
