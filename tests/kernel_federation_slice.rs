@@ -8,16 +8,22 @@
 //!    PtyOutput,收不到另一个 feeder 的字节。
 //! 3. **feeder refcount 生命周期(F2b)**:断一个 feeder(非最后)→ kernel 存活;断最后一个
 //!    feeder → kernel 退出 + 清会合 socket 文件。
+//! 4. **锚新 tab 落点(F3)**:手机 `TabOp::New` → 回灌【锚 feeder】的 back-channel(非客户端在看
+//!    的 workspace);非锚 feeder 收不到。
 //!
-//! F3(锚新 tab 落点)在 commit3 单独验。tests/ 允许 `unwrap`/`expect` + 裸 libc。
+//! tests/ 允许 `unwrap`/`expect` + 裸 libc。
 
+use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
-use quill::kernel::feed::{encode_tab_list, FeedFrame, FrameKind};
+use quill::kernel::feed::{
+    decode_tab_op, encode_tab_list, FeedDecoder, FeedFrame, FeedTabOp, FrameKind,
+};
+use quill::kernel::proto::{ClientMsg, TabOp};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 
@@ -300,4 +306,94 @@ fn federated_last_feeder_disconnect_exits_and_cleans_socket() {
 
     assert!(exited, "断最后一个 feeder 后 kernel 应退出(F2b)");
     assert!(sock_gone, "kernel 退出应清理会合 socket 文件(F2b)");
+}
+
+/// 在 deadline 内从一个 feeder 的 back-channel(全双工 socket 读向)读一帧;无则 None。
+fn recv_feeder_frame(
+    stream: &mut UnixStream,
+    dec: &mut FeedDecoder,
+    timeout: Duration,
+) -> Option<FeedFrame> {
+    let deadline = Instant::now() + timeout;
+    let mut buf = [0u8; 4096];
+    loop {
+        match dec.next_frame() {
+            Ok(Some(f)) => return Some(f),
+            Ok(None) => {}
+            Err(e) => panic!("feeder back-channel decode 错位: {e}"),
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        match stream.read(&mut buf) {
+            Ok(0) => return None,
+            Ok(n) => dec.push(&buf[..n]),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// F3:手机 `TabOp::New` → 路由到【锚 feeder】(第一个接入的窗口 = home),经其 back-channel 回灌
+/// TabOp::New 帧;非锚 feeder 收不到(新 tab 落锚,不是客户端在看的 workspace)。Close 仍走各自 feeder。
+#[test]
+fn federated_new_tab_routes_to_anchor_feeder() {
+    let port = free_port();
+    let k = FedKernel::spawn(port);
+
+    // 锚 feeder A(先接入)= ws 100;feeder B = ws 200。
+    let mut fa = k.connect_feeder();
+    declare(&mut fa, 100, 1, &[(1, "alpha")]);
+    std::thread::sleep(Duration::from_millis(200));
+    let mut fb = k.connect_feeder();
+    declare(&mut fb, 200, 2, &[(2, "beta")]);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let mut ws = match connect_ws(port, Duration::from_secs(15)) {
+        Some(w) => w,
+        None => {
+            k.cleanup();
+            panic!("15s 内未能连上联邦 kernel WS");
+        }
+    };
+    // 等连上引导帧处理完(客户端 attach 到锚 A)。
+    let _ = ws_recv_text_until(&mut ws, &["\"Workspaces\""], Duration::from_secs(10));
+
+    // 手机发 New → 应回灌【锚 A】(不是客户端在看的 workspace,虽此处恰好也是 A)。
+    let new = serde_json::to_string(&ClientMsg::TabOp {
+        workspace_id: 100,
+        op: TabOp::New,
+    })
+    .expect("ser New");
+    ws.send(Message::Text(new.into())).expect("send New");
+    let _ = ws.flush();
+
+    // 锚 A 的 back-channel 应收到 TabOp::New 帧。
+    let mut dec_a = FeedDecoder::new();
+    let got_a = recv_feeder_frame(&mut fa, &mut dec_a, Duration::from_secs(10));
+    let got_a = got_a.expect("锚 feeder 应收到 New 的 TabOp 回灌帧");
+    assert_eq!(got_a.kind, FrameKind::TabOp, "锚回灌帧 kind 应为 TabOp");
+    assert_eq!(
+        decode_tab_op(&got_a.payload),
+        Some(FeedTabOp::New),
+        "锚回灌 payload 应为 New"
+    );
+
+    // 非锚 B 的 back-channel 不该收到任何帧(2s 静默)。
+    let mut dec_b = FeedDecoder::new();
+    let leaked_b = recv_feeder_frame(&mut fb, &mut dec_b, Duration::from_secs(2));
+    assert!(
+        leaked_b.is_none(),
+        "非锚 feeder 不该收到 New 回灌帧(新 tab 落锚,F3)"
+    );
+
+    let _ = ws.close(None);
+    drop(fa);
+    drop(fb);
+    k.cleanup();
 }

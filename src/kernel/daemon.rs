@@ -2309,7 +2309,7 @@ fn handle_client_msg(data: &mut DaemonData, id: u64, text: &str) -> Option<PostA
 /// 多 tab 视图,debug 忽略):
 /// - `Select { idx }` = **kernel 本地**切本客户端 viewed 到其 attach feeder 的第 idx 个 tab(不动
 ///   桌面焦点、不影响别的客户端)+ 重放目标 tab 环缓冲(`follow=false` pin 住);
-/// - `New` = 回灌**其 attach feeder** 的窗口 spawn(commit3 F3 改为回灌**锚** feeder);
+/// - `New` = **回灌锚 feeder 的窗口 spawn**(F3:新 tab 落"共享锚窗口" = 第一个开共享的窗口);
 /// - `Close` / `Reorder` = 回灌其 attach feeder 的窗口执行(该 workspace 的 tab 归它);
 /// - `SetTitle` = 暂不接(桌面无对应操作,留后续)。
 fn handle_tab_op(data: &mut DaemonData, id: u64, _workspace_id: u64, op: TabOp) {
@@ -2334,13 +2334,16 @@ fn handle_tab_op(data: &mut DaemonData, id: u64, _workspace_id: u64, op: TabOp) 
                 None => tracing::debug!(idx, "TabOp::Select idx 越界(tab 列表未同步?),忽略"),
             }
         }
-        // New = 回灌其 attach feeder 的窗口 spawn(commit3 F3 改为锚)。记发起客户端到该 feeder →
-        // 窗口发回含新 tab 的 TabList 时自动 Select 它(见 feeder_tab_list_updated)。
+        // F3:New → 回灌**锚 feeder**(= 第一个开共享的窗口 = home),**不是**客户端在看的那个
+        // workspace —— "新 tab 落共享锚窗口"是有语义的 #0(ADR-0019 §4)。记发起客户端到锚 feeder →
+        // 锚窗口发回含新 tab 的 TabList 时把该客户端自动 Select 到新 tab(见 feeder_tab_list_updated)。
+        // 无锚(不该发生:feeders 非空必有锚)回落到 attach feeder。
         TabOp::New => {
-            if let Some(f) = data.feeders.get_mut(&feeder_id) {
+            let target = data.anchor_feeder.unwrap_or(feeder_id);
+            if let Some(f) = data.feeders.get_mut(&target) {
                 f.pending_new_select = Some(id);
             }
-            forward_tab_op_to_feeder(data, feeder_id, FeedTabOp::New);
+            forward_tab_op_to_feeder(data, target, FeedTabOp::New);
         }
         TabOp::Close { tab_id } => {
             forward_tab_op_to_feeder(data, feeder_id, FeedTabOp::Close { tab_id });
