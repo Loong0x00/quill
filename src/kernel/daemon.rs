@@ -80,6 +80,32 @@ const INDEX_HTML: &str = include_str!("../../assets/web/index.html");
 const XTERM_JS: &str = include_str!("../../assets/web/vendor/xterm.js");
 const XTERM_CSS: &str = include_str!("../../assets/web/vendor/xterm.css");
 const XTERM_FIT_JS: &str = include_str!("../../assets/web/vendor/xterm-addon-fit.js");
+/// 砖2 W3:app-shell Service Worker(cache-first 缓存静态壳,弱网首屏快)。同 include_str!
+/// 烤进二进制,由 [`serve_http_response`] 从根 `/sw.js` serve(scope 覆盖整站)。
+const SW_JS: &str = include_str!("../../assets/web/sw.js");
+
+/// 砖2 W3:app-shell 内容哈希 = Service Worker 缓存版本 key(FNV-1a 64-bit,编译期算)。
+/// 任一内嵌资产(含 sw.js 自身)改动 → 哈希变 → serve /sw.js 时注入的 `__QUILL_VERSION__`
+/// 变 → sw.js 字节变 → 浏览器检测到新 SW → activate 清旧版本缓存(重建后旧 UI 不卡)。
+/// 用内容哈希而非 crate 版本:UI 常改不 bump 版本号,内容哈希才能自动作废旧缓存。
+const ASSET_VERSION: u64 = {
+    let h = fnv1a64(0xcbf2_9ce4_8422_2325, INDEX_HTML.as_bytes());
+    let h = fnv1a64(h, XTERM_JS.as_bytes());
+    let h = fnv1a64(h, XTERM_CSS.as_bytes());
+    let h = fnv1a64(h, XTERM_FIT_JS.as_bytes());
+    fnv1a64(h, SW_JS.as_bytes())
+};
+
+/// FNV-1a 64-bit 增量哈希(`const fn`,供 [`ASSET_VERSION`] 编译期折叠资产内容)。
+const fn fnv1a64(mut hash: u64, bytes: &[u8]) -> u64 {
+    let mut i = 0;
+    while i < bytes.len() {
+        hash ^= bytes[i] as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        i += 1;
+    }
+    hash
+}
 
 /// 默认 grid 尺寸,与 `wl::run_window` 启动期 + `run_headless_screenshot` 一致
 /// (一个 PTY 一个尺寸,ADR-0015 "主控端定尺寸";多客户端尺寸协商留 T6)。
@@ -2320,7 +2346,19 @@ fn serve_http_response(data: &mut DaemonData, stream: TcpStream, head: &[u8]) {
     let _ = stream.set_nonblocking(true); // dup 已继承 original 的非阻塞,稳妥再设一次
     cap_http_send_buffer(&stream); // 见 HTTP_SEND_BUF_BYTES:封顶内核 send 内存 + 让卡死写源可见可收割
     let path = request_path(head).unwrap_or_default();
-    let (status, ctype, body) = http_response_parts(&path);
+    // 砖2 W3:`/sw.js` 单独走(注入 app-shell 内容哈希当缓存版本 key → 动态 body);其余
+    // 静态资产零拷贝返 `&'static [u8]`。`sw_body` String 撑住 sw.js 情形的 body 生命周期。
+    let sw_body;
+    let (status, ctype, body): (&str, &str, &[u8]) = if path == "/sw.js" {
+        sw_body = sw_js_served();
+        (
+            "200 OK",
+            "text/javascript; charset=utf-8",
+            sw_body.as_bytes(),
+        )
+    } else {
+        http_response_parts(&path)
+    };
     let header = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\
          Connection: close\r\nCache-Control: no-store\r\n\r\n",
@@ -2370,7 +2408,14 @@ fn http_write_pending(
     Ok(action)
 }
 
-/// path → (status line, content-type, body)。纯函数,便于单测。
+/// 砖2 W3:serve 的 Service Worker 脚本 = 注入 app-shell 内容哈希版本(`ASSET_VERSION`)+
+/// 内嵌 sw.js 源。`__QUILL_VERSION__` 随资产改动而变 → sw.js 字节变 → 浏览器重装 SW 清旧缓存。
+fn sw_js_served() -> String {
+    format!("self.__QUILL_VERSION__=\"{ASSET_VERSION:016x}\";\n{SW_JS}")
+}
+
+/// path → (status line, content-type, body)。纯函数,便于单测。`/sw.js` 不走这里(动态注入
+/// 版本,见 [`sw_js_served`] / [`serve_http_response`])。
 fn http_response_parts(path: &str) -> (&'static str, &'static str, &'static [u8]) {
     let js = "text/javascript; charset=utf-8";
     match path {
@@ -2692,6 +2737,22 @@ mod tests {
         let (status, _ctype, body) = http_response_parts("/nope");
         assert!(status.starts_with("404"));
         assert_eq!(body, b"not found\n");
+    }
+
+    /// 砖2 W3:serve 的 sw.js = 注入的版本行 + 内嵌 SW 源;版本 = app-shell 内容哈希(稳定、
+    /// 非零、随资产变)。缓存 key 前缀在两处一致(注入行 → sw.js 用它拼 `quill-shell-<ver>`)。
+    #[test]
+    fn sw_js_served_injects_version_and_shell() {
+        let js = sw_js_served();
+        // 注入行在最前,十六进制版本 = ASSET_VERSION(16 位定宽,确定性)。
+        let expect = format!("self.__QUILL_VERSION__=\"{ASSET_VERSION:016x}\";");
+        assert!(js.starts_with(&expect), "sw.js 应以注入的版本行开头");
+        // 内嵌 SW 源被带上(cache-first shell 逻辑在里头)。
+        assert!(js.contains("quill-shell-"), "应含缓存命名空间前缀");
+        assert!(js.contains("addEventListener(\"fetch\""), "应含 fetch 处理");
+        // 哈希非退化(FNV-1a 初值被资产扰动过)。
+        assert_ne!(ASSET_VERSION, 0);
+        assert_ne!(ASSET_VERSION, 0xcbf2_9ce4_8422_2325);
     }
 
     /// 读一个 fd 的 `SO_REUSEADDR` 当前值(测试辅助)。

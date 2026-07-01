@@ -954,6 +954,17 @@ window.addEventListener("pagehide", (e) => {
 });
 
 connect();
+
+// ── 砖2 W3:注册 Service Worker(缓存 app shell,弱网 / 后台回来首屏快)────────────────
+// 从根 `/sw.js` 注册 → scope 覆盖整站(daemon 单起一条 `/sw.js` 路由 serve 它)。SW 只
+// cache-first 静态壳(index.html + vendored xterm),WS 数据面 / 动态请求照常走网络 → 忠实
+// 镜像保底不受影响。**渐进增强**:不支持 / 注册失败(如经 http://<VPN IP> 非 secure context
+// → serviceWorker 不可用)都静默跳过,行为等价今天。load 后注册,不与首屏资源加载抢带宽。
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("/sw.js").catch(() => {});
+  });
+}
 </script>
 </body>
 </html>
