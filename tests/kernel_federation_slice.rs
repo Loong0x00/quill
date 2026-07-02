@@ -21,7 +21,7 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use quill::kernel::feed::{
-    decode_tab_op, encode_tab_list, FeedDecoder, FeedFrame, FeedTabOp, FrameKind,
+    decode_tab_op, encode_dims, encode_tab_list, FeedDecoder, FeedFrame, FeedTabOp, FrameKind,
 };
 use quill::kernel::proto::{ClientMsg, ServerMsg, TabOp};
 use tungstenite::stream::MaybeTlsStream;
@@ -454,6 +454,100 @@ fn federated_select_switches_viewed_across_windows() {
     assert!(
         got_beta,
         "K2:Select 到窗口2 后其字节流应发给本客户端(viewed 已切)"
+    );
+}
+
+/// K2/F4 回归:跨窗口 Select 后再点 `+`(New 落锚 + 自动 Select 到锚新 tab),客户端 `feeder_id` 必须
+/// 也对齐到锚 feeder(不能停在之前 Select 的非锚窗口)。否则 `feeder_id` 与 `viewed` 分叉 →
+/// `broadcast_dims_for_feeder`(按 feeder_id 过滤)漏掉本客户端 = 锚窗口 resize 时它收不到新尺寸。
+/// 可观测判据 = 锚窗口 Dims 是否送达(分叉 bug 修复前收不到)。
+#[test]
+fn federated_new_after_cross_select_realigns_feeder_id() {
+    let port = free_port();
+    let k = FedKernel::spawn(port);
+
+    let mut fa = k.connect_feeder();
+    declare(&mut fa, 100, 1, &[(1, "alpha")]); // 锚 A(ws 100,第一个 feeder)
+    std::thread::sleep(Duration::from_millis(200));
+    let mut fb = k.connect_feeder();
+    declare(&mut fb, 200, 2, &[(2, "beta")]); // B(ws 200)
+    std::thread::sleep(Duration::from_millis(300));
+
+    let mut ws = match connect_ws(port, Duration::from_secs(15)) {
+        Some(w) => w,
+        None => {
+            k.cleanup();
+            panic!("15s 内未能连上联邦 kernel WS");
+        }
+    };
+    // 引导:attach 锚 A,吃掉 bootstrap StreamFocus{100,1}。
+    let _ = ws_wait_msg(
+        &mut ws,
+        Duration::from_secs(10),
+        |m| matches!(m, ServerMsg::StreamFocus { workspace_id, .. } if *workspace_id == 100),
+    );
+
+    // ① 跨窗口 Select 到 B → feeder_id/viewed 切到 B(follow_focus=false 钉住)。
+    let sel = serde_json::to_string(&ClientMsg::TabOp {
+        workspace_id: 200,
+        op: TabOp::Select { idx: 0 },
+    })
+    .expect("ser Select");
+    ws.send(Message::Text(sel.into())).expect("send Select");
+    let _ = ws.flush();
+    let to_b = ws_wait_msg(&mut ws, Duration::from_secs(10), |m| {
+        matches!(m, ServerMsg::StreamFocus { workspace_id, tab_id }
+            if *workspace_id == 200 && *tab_id == 2)
+    });
+
+    // ② 点 + → New 落锚 A(handle_tab_op New 用 anchor_feeder,记 pending_new_select 在 A)。
+    let new = serde_json::to_string(&ClientMsg::TabOp {
+        workspace_id: 200,
+        op: TabOp::New,
+    })
+    .expect("ser New");
+    ws.send(Message::Text(new.into())).expect("send New");
+    let _ = ws.flush();
+    std::thread::sleep(Duration::from_millis(200));
+
+    // ③ 锚 A 出现新 tab(3)(测试扮演窗口对 New 的响应)→ feeder_tab_list_updated 触发 pending
+    //    自动 Select 到 (100,3);修复:同时把 feeder_id 对齐回锚 A。等 StreamFocus{100,3} 确认。
+    declare(&mut fa, 100, 3, &[(1, "alpha"), (3, "new")]);
+    let back_to_a = ws_wait_msg(&mut ws, Duration::from_secs(10), |m| {
+        matches!(m, ServerMsg::StreamFocus { workspace_id, tab_id }
+            if *workspace_id == 100 && *tab_id == 3)
+    });
+
+    // ④ 锚 A 发一个【独特】尺寸的 Dims → broadcast_dims_for_feeder(A) 按 feeder_id==A 过滤。
+    //    修复后 feeder_id=A → 收得到;分叉 bug(feeder_id 仍=B)→ 收不到 → 本测失败。
+    feed(
+        &mut fa,
+        &FeedFrame {
+            kind: FrameKind::Dims,
+            ws_id: 100,
+            tab_id: 3,
+            payload: encode_dims(207, 61).to_vec(),
+        },
+    );
+    let got_dims = ws_wait_msg(
+        &mut ws,
+        Duration::from_secs(10),
+        |m| matches!(m, ServerMsg::Dims { cols, rows } if *cols == 207 && *rows == 61),
+    );
+
+    let _ = ws.close(None);
+    drop(fa);
+    drop(fb);
+    k.cleanup();
+
+    assert!(to_b, "前置:跨窗口 Select 应切到 B(StreamFocus{{200,2}})");
+    assert!(
+        back_to_a,
+        "前置:New 落锚 + 自动 Select 应回到锚新 tab(StreamFocus{{100,3}})"
+    );
+    assert!(
+        got_dims,
+        "回归:New 自动 Select 后 feeder_id 未对齐锚 → broadcast_dims_for_feeder(A) 漏本客户端(锚 resize 收不到尺寸)"
     );
 }
 

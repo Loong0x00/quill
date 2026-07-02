@@ -1515,7 +1515,18 @@ fn feeder_tab_list_updated(
             })
         };
         match target {
-            Some(tab) => fed_point_client(data, cid, ws, tab, false),
+            Some(tab) => {
+                // F4:auto-Select 也须把 feeder_id 对齐到锚 feeder(= 本次 TabList 的 `feeder_id`,其
+                // `ws_id == ws`)。否则:客户端先跨窗口 Select 到非锚窗口(feeder_id=那个)、再点 + →
+                // New 落锚 + 自动 Select 到锚新 tab,只 `viewed` 切到锚、`feeder_id` 仍停在旧非锚窗口
+                // → feeder_id 与 viewed 分叉,dims 广播 / orphan 回收 / 焦点跟随按 feeder_id 过滤时漏
+                // 掉本客户端。对齐 handle_tab_op 里 Select 同步 feeder_id 的做法(get_mut 即释放后再
+                // fed_point_client,借用不重叠)。
+                if let Some(c) = data.clients.get_mut(&cid) {
+                    c.feeder_id = Some(feeder_id);
+                }
+                fed_point_client(data, cid, ws, tab, false);
+            }
             None => {
                 if let Some(f) = data.feeders.get_mut(&feeder_id) {
                     f.pending_new_select = Some(cid);
