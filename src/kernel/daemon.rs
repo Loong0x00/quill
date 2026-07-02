@@ -1600,8 +1600,9 @@ fn broadcast_workspaces_list(data: &mut DaemonData) {
 }
 
 /// 某 feeder 元数据变(焦点 / tab 列表)后广播:① 聚合工作区列表给所有客户端(知道有哪些 workspace);
-/// ② 该 feeder 的 [`WorkspaceInfo`] 发给 attach 本 feeder 的客户端(它们看这个 workspace 的 tab 栏)。
-/// **单 feeder 时** = 所有客户端都 attach 它 → 等价砖2 的"广播 Workspaces + Workspace 给全部"。
+/// ② 该 feeder 的 [`WorkspaceInfo`] 发给 **所有 live 客户端**(K1b/F4:每个客户端都要能跟到【每个
+/// 窗口】的 tab 增删 / 焦点变化 → 分段栏,不再只发 attach 本 feeder 的那批)。
+/// **单 feeder 时** = 所有客户端都 attach 它 → 与砖2 的"广播 Workspaces + Workspace 给全部"等价。
 fn broadcast_feeder_metadata(data: &mut DaemonData, feeder_id: u64) {
     broadcast_workspaces_list(data);
     let info = match data.feeders.get(&feeder_id) {
@@ -1611,7 +1612,7 @@ fn broadcast_feeder_metadata(data: &mut DaemonData, feeder_id: u64) {
     let clients: Vec<u64> = data
         .clients
         .iter()
-        .filter(|(_, c)| c.feeder_id == Some(feeder_id))
+        .filter(|(_, c)| matches!(c.stage, WsStage::Live(_)))
         .map(|(id, _)| *id)
         .collect();
     for id in clients {
@@ -2153,9 +2154,12 @@ fn build_control_text(
     out
 }
 
-/// 联邦拓扑连上引导帧:① 聚合工作区列表 ② attach 的 feeder(= 所看 workspace)的 tab 明细
-/// (连上前该 feeder 未收 TabList 则 tab 列表暂空、后续 TabList 补)③ 字节流 (workspace, tab) 标签。
-/// 无 attach feeder(悬空)→ 仅发聚合列表(可能空),待 feeder 接入 + 声明后补齐。
+/// 联邦拓扑连上引导帧:① 聚合工作区列表 ② **每个**已声明 ws 的 feeder(= 每个窗口)的 tab 明细
+/// (K1a/F4:客户端一次拿到【全部窗口】的 tab 列表 → 分段栏;非 attach 的窗口也拿得到)③ attach 的
+/// feeder(= 所看 workspace)的字节流 (workspace, tab) 标签。无 attach feeder(悬空)→ 仍发聚合列表
+/// + 各 feeder 明细(可能空),仅省 StreamFocus,待 feeder 接入 + 声明后补齐。
+///
+/// 顺序:先 Workspaces 列表,再各 Workspace 明细(按 ws_id 稳定排),再 StreamFocus。
 fn build_control_text_feeder(
     data: &DaemonData,
     attach_feeder: Option<u64>,
@@ -2167,8 +2171,20 @@ fn build_control_text_feeder(
         &mut out,
         &ServerMsg::Workspaces(aggregate_workspace_list(data)),
     );
-    if let Some(f) = attach_feeder.and_then(|a| data.feeders.get(&a)) {
-        push_server_json(&mut out, &ServerMsg::Workspace(feeder_workspace_info(f)));
+    // K1a(F4):对【每个】已声明 ws 的 feeder 都发一条 Workspace 明细。HashMap 迭代无序 → 按 ws_id
+    // 排(与 aggregate_workspace_list 一致),使客户端分段顺序稳定。尚未声明 ws(刚 accept)的跳过。
+    let mut infos: Vec<WorkspaceInfo> = data
+        .feeders
+        .values()
+        .filter(|f| f.ws_id != 0)
+        .map(feeder_workspace_info)
+        .collect();
+    infos.sort_by_key(|i| i.workspace_id);
+    for info in infos {
+        push_server_json(&mut out, &ServerMsg::Workspace(info));
+    }
+    // StreamFocus 仍只声明 attach/viewed 的那个(此后 Binary 字节流属于哪个 (ws,tab))。
+    if attach_feeder.and_then(|a| data.feeders.get(&a)).is_some() {
         push_server_json(
             &mut out,
             &ServerMsg::StreamFocus {
@@ -2343,49 +2359,80 @@ fn handle_client_msg(data: &mut DaemonData, id: u64, text: &str) -> Option<PostA
 }
 
 /// 处理一条 [`ClientMsg::TabOp`]。**仅联邦拓扑**接线(Local standalone 单 active tab 字节泵不支持
-/// 多 tab 视图,debug 忽略):
-/// - `Select { idx }` = **kernel 本地**切本客户端 viewed 到其 attach feeder 的第 idx 个 tab(不动
-///   桌面焦点、不影响别的客户端)+ 重放目标 tab 环缓冲(`follow=false` pin 住);
+/// 多 tab 视图,debug 忽略)。`workspace_id` = 消息里客户端点的那个窗口(分段栏每个段一个 window):
+/// - `Select { idx }` = **K2/F4 跨窗口**:据消息 `workspace_id` 定位目标 feeder(**不依赖客户端当前
+///   attach 的那个 feeder**),把本客户端 viewed 切到该窗口第 idx 个 tab(不动桌面焦点、不影响别的
+///   客户端)+ 重放目标 tab 环缓冲(`follow=false` pin);并把本客户端 `feeder_id` 更新为目标窗口
+///   → 随后 Close / 焦点跟随对准"当前所看窗口";
 /// - `New` = **回灌锚 feeder 的窗口 spawn**(F3:新 tab 落"共享锚窗口" = 第一个开共享的窗口);
-/// - `Close` / `Reorder` = 回灌其 attach feeder 的窗口执行(该 workspace 的 tab 归它);
+/// - `Close` / `Reorder` = 据消息 `workspace_id` 定位窗口回灌(择稳:关/换哪个窗口的 tab 由客户端
+///   点的段决定,独立于本客户端在看哪个);
 /// - `SetTitle` = 暂不接(桌面无对应操作,留后续)。
-fn handle_tab_op(data: &mut DaemonData, id: u64, _workspace_id: u64, op: TabOp) {
+///
+/// 越界 / 找不到目标 feeder → debug 忽略不 panic。
+fn handle_tab_op(data: &mut DaemonData, id: u64, workspace_id: u64, op: TabOp) {
     if data.feeders.is_empty() {
         tracing::debug!(?op, "Local / 无 feeder,TabOp 不接线,忽略");
         return;
     }
-    // 客户端 attach 的 feeder(= 它在看的 workspace);未 attach(悬空)→ 无处路由。
-    let Some(feeder_id) = data.clients.get(&id).and_then(|c| c.feeder_id) else {
-        tracing::debug!(?op, "客户端未 attach feeder,TabOp 忽略");
-        return;
-    };
     match op {
+        // K2(F4):跨窗口 Select —— 用消息 workspace_id 定位目标 feeder(现在参数不再被忽略)。
         TabOp::Select { idx } => {
-            // idx → (ws, tab_id) 据该 feeder 维护的 fed_tabs;ws 用 feeder 的 ws_id(环/帧标签一致)。
+            let Some(target_feeder) = feeder_id_for_ws(data, workspace_id) else {
+                tracing::debug!(
+                    workspace_id,
+                    "TabOp::Select 无匹配 feeder(workspace 已断?),忽略"
+                );
+                return;
+            };
             let target = data
                 .feeders
-                .get(&feeder_id)
+                .get(&target_feeder)
                 .and_then(|f| f.fed_tabs.get(idx).map(|t| (f.ws_id, t.tab_id)));
-            match target {
-                Some((ws, tab_id)) => fed_point_client(data, id, ws, tab_id, false),
-                None => tracing::debug!(idx, "TabOp::Select idx 越界(tab 列表未同步?),忽略"),
+            let Some((ws, tab_id)) = target else {
+                tracing::debug!(
+                    idx,
+                    workspace_id,
+                    "TabOp::Select idx 越界(tab 列表未同步?),忽略"
+                );
+                return;
+            };
+            // 更新 attach feeder = 目标窗口 → 随后 Close / 焦点跟随对准"当前所看窗口"(见函数 doc)。
+            if let Some(c) = data.clients.get_mut(&id) {
+                c.feeder_id = Some(target_feeder);
             }
+            fed_point_client(data, id, ws, tab_id, false);
         }
         // F3:New → 回灌**锚 feeder**(= 第一个开共享的窗口 = home),**不是**客户端在看的那个
         // workspace —— "新 tab 落共享锚窗口"是有语义的 #0(ADR-0019 §4)。记发起客户端到锚 feeder →
         // 锚窗口发回含新 tab 的 TabList 时把该客户端自动 Select 到新 tab(见 feeder_tab_list_updated)。
-        // 无锚(不该发生:feeders 非空必有锚)回落到 attach feeder。
+        // 无锚(不该发生:feeders 非空必有锚)回落到客户端 attach 的 feeder。
         TabOp::New => {
-            let target = data.anchor_feeder.unwrap_or(feeder_id);
+            let Some(target) = data
+                .anchor_feeder
+                .or_else(|| data.clients.get(&id).and_then(|c| c.feeder_id))
+            else {
+                tracing::debug!("TabOp::New 无锚 / 客户端未 attach feeder,忽略");
+                return;
+            };
             if let Some(f) = data.feeders.get_mut(&target) {
                 f.pending_new_select = Some(id);
             }
             forward_tab_op_to_feeder(data, target, FeedTabOp::New);
         }
+        // Close / Reorder 按消息 workspace_id 路由到该窗口的 feeder(择稳:不依赖客户端 viewed 状态)。
         TabOp::Close { tab_id } => {
+            let Some(feeder_id) = feeder_id_for_ws(data, workspace_id) else {
+                tracing::debug!(workspace_id, "TabOp::Close 无匹配 feeder,忽略");
+                return;
+            };
             forward_tab_op_to_feeder(data, feeder_id, FeedTabOp::Close { tab_id });
         }
         TabOp::Reorder { origin, target } => {
+            let Some(feeder_id) = feeder_id_for_ws(data, workspace_id) else {
+                tracing::debug!(workspace_id, "TabOp::Reorder 无匹配 feeder,忽略");
+                return;
+            };
             forward_tab_op_to_feeder(
                 data,
                 feeder_id,

@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use quill::kernel::feed::{
     decode_tab_op, encode_tab_list, FeedDecoder, FeedFrame, FeedTabOp, FrameKind,
 };
-use quill::kernel::proto::{ClientMsg, TabOp};
+use quill::kernel::proto::{ClientMsg, ServerMsg, TabOp};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 
@@ -190,6 +190,31 @@ fn ws_recv_text_until(
     false
 }
 
+/// 在 deadline 内读 WS Text 帧,反序列化成 [`ServerMsg`] 喂 `pred`;pred 返 true 即停返 true;
+/// 超时返 false。Binary / 其它帧忽略。用于按 ServerMsg 变体断言(比字符串 needle 精确)。
+fn ws_wait_msg(
+    ws: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    timeout: Duration,
+    mut pred: impl FnMut(&ServerMsg) -> bool,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match ws.read() {
+            Ok(Message::Text(t)) => {
+                if let Ok(m) = serde_json::from_str::<ServerMsg>(t.as_str()) {
+                    if pred(&m) {
+                        return true;
+                    }
+                }
+            }
+            Ok(Message::Close(_)) => return false,
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    false
+}
+
 /// F1b/F2:两 feeder 各一 workspace → WS 客户端连上收到【聚合】Workspaces(含两标题);默认看锚
 /// (第一个接入的 feeder)→ 只收锚的 PtyOutput,收不到另一个 feeder 的字节(per-feeder 隔离)。
 #[test]
@@ -257,6 +282,179 @@ fn federated_two_feeders_aggregate_and_isolate() {
     drop(fa);
     drop(fb);
     k.cleanup();
+}
+
+/// K1a(F4):两 feeder 各一 workspace → 新 WS 客户端连上【引导】里应含【两条】Workspace 明细(各自
+/// tab 列表:alpha + beta),不再只发 attach 的那一个 → 客户端一次拿到全部窗口的 tab 栏(分段栏)。
+#[test]
+fn federated_bootstrap_includes_all_feeders_workspaces() {
+    let port = free_port();
+    let k = FedKernel::spawn(port);
+
+    let mut fa = k.connect_feeder();
+    declare(&mut fa, 100, 1, &[(1, "alpha")]);
+    std::thread::sleep(Duration::from_millis(200)); // 确保 A 先被 accept = 锚。
+    let mut fb = k.connect_feeder();
+    declare(&mut fb, 200, 2, &[(2, "beta")]);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let mut ws = match connect_ws(port, Duration::from_secs(15)) {
+        Some(w) => w,
+        None => {
+            k.cleanup();
+            panic!("15s 内未能连上联邦 kernel WS");
+        }
+    };
+
+    // 引导应见【两条】Workspace 明细:一条含 tab "alpha"(窗口1)、一条含 tab "beta"(窗口2)。
+    let mut saw_alpha = false;
+    let mut saw_beta = false;
+    let both = ws_wait_msg(&mut ws, Duration::from_secs(10), |m| {
+        if let ServerMsg::Workspace(info) = m {
+            if info.tabs.iter().any(|t| t.title == "alpha") {
+                saw_alpha = true;
+            }
+            if info.tabs.iter().any(|t| t.title == "beta") {
+                saw_beta = true;
+            }
+        }
+        saw_alpha && saw_beta
+    });
+
+    let _ = ws.close(None);
+    drop(fa);
+    drop(fb);
+    k.cleanup();
+
+    assert!(
+        both,
+        "K1a:新客户端引导应含【全部】feeder 的 Workspace 明细(alpha + beta 两窗口的 tab 列表)"
+    );
+}
+
+/// K1b(F4):某 feeder 的 tab 列表变化后,【所有】客户端(含 attach 的是【别的】feeder 的)都应收到
+/// 它的 Workspace 明细 → 每个客户端都能跟到每个窗口的 tab 增删。修复前:只有 attach 该 feeder 的收到。
+#[test]
+fn federated_tab_change_broadcasts_to_all_clients() {
+    let port = free_port();
+    let k = FedKernel::spawn(port);
+
+    // 锚 A = ws 100(客户端默认 attach 它);B = ws 200(客户端不 attach)。
+    let mut fa = k.connect_feeder();
+    declare(&mut fa, 100, 1, &[(1, "alpha")]);
+    std::thread::sleep(Duration::from_millis(200));
+    let mut fb = k.connect_feeder();
+    declare(&mut fb, 200, 2, &[(2, "beta")]);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let mut ws = match connect_ws(port, Duration::from_secs(15)) {
+        Some(w) => w,
+        None => {
+            k.cleanup();
+            panic!("15s 内未能连上联邦 kernel WS");
+        }
+    };
+    // 等引导处理完(客户端已 attach 到锚 A、转 Live 才吃得到后续广播)。
+    let _ = ws_wait_msg(&mut ws, Duration::from_secs(10), |m| {
+        matches!(m, ServerMsg::Workspaces(_))
+    });
+
+    // 改 B 的 tab 列表(加 tab "beta2")。客户端 attach 的是 A,不是 B。
+    feed(
+        &mut fb,
+        &FeedFrame {
+            kind: FrameKind::TabList,
+            ws_id: 200,
+            tab_id: 2,
+            payload: encode_tab_list(0, &[(2, "beta"), (3, "beta2")]),
+        },
+    );
+    // K1b:即使 attach 的是 A,客户端也应收到 B(ws 200)的 Workspace 明细(含新 tab "beta2")。
+    let got = ws_wait_msg(&mut ws, Duration::from_secs(10), |m| {
+        matches!(m, ServerMsg::Workspace(info)
+            if info.workspace_id == 200 && info.tabs.iter().any(|t| t.title == "beta2"))
+    });
+
+    let _ = ws.close(None);
+    drop(fa);
+    drop(fb);
+    k.cleanup();
+
+    assert!(
+        got,
+        "K1b:attach 别 feeder 的客户端也应收到某 feeder tab 变化后的 Workspace(全客户端广播)"
+    );
+}
+
+/// K2(F4):客户端发 `TabOp{workspace_id: 窗口2, Select{idx}}` → 其 viewed / feeder_id 切到窗口2 的
+/// tab(发 StreamFocus{200,2}),且此后窗口2 的字节流发给它。修复前:Select 忽略消息 workspace_id、
+/// 只在 attach feeder 里取第 idx 个 → 切不到别的窗口。
+#[test]
+fn federated_select_switches_viewed_across_windows() {
+    let port = free_port();
+    let k = FedKernel::spawn(port);
+
+    let mut fa = k.connect_feeder();
+    declare(&mut fa, 100, 1, &[(1, "alpha")]);
+    std::thread::sleep(Duration::from_millis(200));
+    let mut fb = k.connect_feeder();
+    declare(&mut fb, 200, 2, &[(2, "beta")]);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let mut ws = match connect_ws(port, Duration::from_secs(15)) {
+        Some(w) => w,
+        None => {
+            k.cleanup();
+            panic!("15s 内未能连上联邦 kernel WS");
+        }
+    };
+    // 等引导:客户端 attach 到锚 A(ws 100)、Live(先吃掉 bootstrap 的 StreamFocus{100,1})。
+    let _ = ws_wait_msg(
+        &mut ws,
+        Duration::from_secs(10),
+        |m| matches!(m, ServerMsg::StreamFocus { workspace_id, .. } if *workspace_id == 100),
+    );
+
+    // 跨窗口 Select:选窗口2(ws 200)的第 0 个 tab。
+    let sel = serde_json::to_string(&ClientMsg::TabOp {
+        workspace_id: 200,
+        op: TabOp::Select { idx: 0 },
+    })
+    .expect("ser Select");
+    ws.send(Message::Text(sel.into())).expect("send Select");
+    let _ = ws.flush();
+
+    // 应收到目标窗口的 StreamFocus{200, 2}(viewed 已切到窗口2 的 tab 2)。
+    let focused = ws_wait_msg(&mut ws, Duration::from_secs(10), |m| {
+        matches!(m, ServerMsg::StreamFocus { workspace_id, tab_id }
+            if *workspace_id == 200 && *tab_id == 2)
+    });
+
+    // 且此后窗口2 的 PtyOutput 应发给本客户端(feeder_id/viewed 已切;修复前收不到)。
+    feed(
+        &mut fb,
+        &FeedFrame {
+            kind: FrameKind::PtyOutput,
+            ws_id: 200,
+            tab_id: 2,
+            payload: b"BETA_AFTER_SELECT".to_vec(),
+        },
+    );
+    let got_beta = ws_recv_binary_until(&mut ws, b"BETA_AFTER_SELECT", Duration::from_secs(10));
+
+    let _ = ws.close(None);
+    drop(fa);
+    drop(fb);
+    k.cleanup();
+
+    assert!(
+        focused,
+        "K2:跨窗口 Select 后应收到目标 workspace 的 StreamFocus{{200,2}}"
+    );
+    assert!(
+        got_beta,
+        "K2:Select 到窗口2 后其字节流应发给本客户端(viewed 已切)"
+    );
 }
 
 /// F2b:断一个非最后 feeder → kernel 存活;断最后一个 feeder → kernel 退出 + 清会合 socket 文件。
