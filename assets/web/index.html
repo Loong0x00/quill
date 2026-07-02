@@ -859,18 +859,18 @@ function renderTabBar() {
       label.className = "label";
       label.textContent = t.title && t.title.length ? t.title : "tab " + (i + 1);
       el.appendChild(label);
-      // × 只在该窗口 ≥2 tab 时出现:防误触关掉窗口最后一个 tab(= 关整个桌面 quill,后端诚实继承)。
-      if (tabs.length > 1) {
-        const x = document.createElement("span");
-        x.className = "close";
-        x.textContent = "×";
-        // click(非 pointerup):浏览器在滚动手势后抑制 click → 横滑标签栏不会误触 ×。
-        x.addEventListener("click", (e) => {
-          e.stopPropagation();
-          sendTabOp(wsId, { Close: { tab_id: t.tab_id } });
-        });
-        el.appendChild(x);
-      }
+      // × 关 tab。关窗口【最后一个】tab = 关这个窗口(后端 close→loop_signal.stop 让该窗口进程
+      // 退出,与桌面 Ctrl+W 对称;别的窗口是独立进程不受影响)。用户要求手机能关掉最后一个
+      // (2026-07-02),故每个 tab 都渲 ×(不再只在 ≥2 tab 时出现)。
+      const x = document.createElement("span");
+      x.className = "close";
+      x.textContent = "×";
+      // click(非 pointerup):浏览器在滚动手势后抑制 click → 横滑标签栏不会误触 ×。
+      x.addEventListener("click", (e) => {
+        e.stopPropagation();
+        sendTabOp(wsId, { Close: { tab_id: t.tab_id } });
+      });
+      el.appendChild(x);
       el.addEventListener("click", () => {
         if (!(wsId === viewedWs && t.tab_id === viewedTab)) sendTabOp(wsId, { Select: { idx: i } });
       });
