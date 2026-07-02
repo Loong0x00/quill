@@ -1869,27 +1869,40 @@ fn append_titlebar_vertices(
     //    (min/max 边) 走 [`append_line_rect_px`] 整像素吸附 (锐, 不比旧无 AA 矩形软),
     //    对角 × 走 [`append_line_seg_px`] 真 AA. line pipeline 在 rounded (hover 圆 bg)
     //    之后 draw → icon 叠在 hover bg 之上.
-    let stroke_w = 2.0 * hidpi;
+    // TEMP 调参旋钮(定标后移除): env 覆盖, 无则默认。QUILL_ICON_STROKE=min/max/− 笔画逻辑px
+    // (默认 1.5=3px); QUILL_X_STROKE=× 笔画逻辑px(默认 ICON_STROKE*1.3, 斜线 AA 显软故稍粗补偿,
+    // 让 × 读起来与 □ 一样实); QUILL_X_INSET=× 额外内缩逻辑px(默认 CLOSE_X_EXTRA_INSET_PX)。
+    let env_f = |k: &str, d: f32| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(d)
+    };
+    let icon_stroke_l = env_f("QUILL_ICON_STROKE", 1.5);
+    let stroke_w = icon_stroke_l * hidpi;
     let icon_pad = 6.0 * hidpi; // 按钮内边距, icon 不贴边
     let half_w = stroke_w / 2.0;
+    let x_half_w = env_f("QUILL_X_STROKE", icon_stroke_l * 1.3) * hidpi / 2.0;
+    let x_extra_inset = env_f("QUILL_X_INSET", CLOSE_X_EXTRA_INSET_PX) * hidpi;
 
     // 3.1 Close ×: 两条对角线段 (左上↔右下 / 右上↔左下). 走真 AA 线段图元, 取代旧字体字形
     //     "×" (发糊发淡 + 比 min/max 细). 无条件画 (与旧 glyph 路径同, 不加 surface 守卫).
     //     ⚠️ × 铺满对角线时视觉比同框 □ **大** (对角线比边长 √2 倍 + 平头端点探到角外),
     //     故比 □ 多缩 CLOSE_X_EXTRA_INSET (用户实测 2026-07-02 "力量过头/比口大几像素" → 收进来).
     {
-        let x_inset = icon_pad + CLOSE_X_EXTRA_INSET_PX * hidpi;
+        let x_inset = icon_pad + x_extra_inset;
         let cx_min = close_x_min + x_inset;
         let cx_max = close_x_max - x_inset;
         let cy_min = btn_y_top + x_inset;
         let cy_max = btn_y_bot - x_inset;
-        // ↘ 对角
+        // ↘ 对角(× 用 x_half_w — 斜线稍粗补偿 AA 显软)
         append_line_seg_px(
-            line_out, cx_min, cy_min, cx_max, cy_max, half_w, surface_w, surface_h, icon_color,
+            line_out, cx_min, cy_min, cx_max, cy_max, x_half_w, surface_w, surface_h, icon_color,
         );
         // ↗ 对角
         append_line_seg_px(
-            line_out, cx_max, cy_min, cx_min, cy_max, half_w, surface_w, surface_h, icon_color,
+            line_out, cx_max, cy_min, cx_min, cy_max, x_half_w, surface_w, surface_h, icon_color,
         );
     }
 
