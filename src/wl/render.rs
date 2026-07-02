@@ -484,10 +484,6 @@ pub const TAB_CLOSE_W_LOGICAL_PX: u32 = 16;
 /// 视觉一致.
 pub const TAB_ROUNDED_RADIUS_PX: f32 = 6.0;
 
-/// close × 相对 min/max icon 区**额外**的每边内缩 (logical px)。× 铺满对角线视觉比同框 □ 大
-/// (对角线 √2 倍边长 + 平头端点探角), 多缩这些让 × 与 □ 视觉同尺寸 (用户 2026-07-02 实测调)。
-const CLOSE_X_EXTRA_INSET_PX: f32 = 1.5;
-
 /// **T-0615: titlebar Min/Max/Close 圆形按钮半径** (logical px).
 /// 12 logical = 24 physical (HIDPI×2). BUTTON_W/H_LOGICAL_PX = 24, 半径正好半宽
 /// → button bbox 视觉等价完全圆形 (rounded rect 半径 ≥ min(w,h)/2 = 圆形).
@@ -1869,30 +1865,25 @@ fn append_titlebar_vertices(
     //    (min/max 边) 走 [`append_line_rect_px`] 整像素吸附 (锐, 不比旧无 AA 矩形软),
     //    对角 × 走 [`append_line_seg_px`] 真 AA. line pipeline 在 rounded (hover 圆 bg)
     //    之后 draw → icon 叠在 hover bg 之上.
-    // TEMP 调参旋钮(定标后移除): env 覆盖, 无则默认。QUILL_ICON_STROKE=min/max/− 笔画逻辑px
-    // (默认 1.5=3px); QUILL_X_STROKE=× 笔画逻辑px(默认 ICON_STROKE*1.3, 斜线 AA 显软故稍粗补偿,
-    // 让 × 读起来与 □ 一样实); QUILL_X_INSET=× 额外内缩逻辑px(默认 CLOSE_X_EXTRA_INSET_PX)。
-    let env_f = |k: &str, d: f32| {
-        std::env::var(k)
-            .ok()
-            .and_then(|s| s.trim().parse::<f32>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(d)
-    };
-    let icon_stroke_l = env_f("QUILL_ICON_STROKE", 1.5);
-    let stroke_w = icon_stroke_l * hidpi;
+    // 窗口控制图标线宽 / × 微调(用户实测标定 2026-07-02, 真机 6K 逐值拨到最平衡):
+    // - min/max/− 用 ICON_STROKE_L; × 单独用 X_STROKE_L —— 斜线 AA 固有软(直线 SDF AA = 无限
+    //   超采样极限, 不可再锐, SSAA 无益), 故 × 稍粗让实心核心盖过 ~1px 灰边、读起来才与 □ 一样实。
+    // - X_EXTRA_INSET_L: × 铺满对角线视觉比同框 □ 大(对角线 √2 倍边长 + 平头端点探角)→ 每边多缩。
+    // - X_YBOT_PX: × 下边额外下扩(光学重心)—— × 与 □ 几何中心虽重合(实测均 y=27.5), 但 × 交叉点
+    //   vs □ 上下横边的视觉重量分布不同、显错位, 下扩几 px 光学对齐。
+    const ICON_STROKE_L: f32 = 1.5;
+    const X_STROKE_L: f32 = 2.1;
+    const X_EXTRA_INSET_L: f32 = 0.95;
+    const X_YBOT_PX: f32 = 1.0;
+    let stroke_w = ICON_STROKE_L * hidpi;
     let icon_pad = 6.0 * hidpi; // 按钮内边距, icon 不贴边
     let half_w = stroke_w / 2.0;
-    let x_half_w = env_f("QUILL_X_STROKE", icon_stroke_l * 1.3) * hidpi / 2.0;
-    let x_extra_inset = env_f("QUILL_X_INSET", CLOSE_X_EXTRA_INSET_PX) * hidpi;
-    // × 下边额外向下扩展 physical px(光学重心微调: 几何中心虽与 □ 重合, 但 × 交叉点 vs □ 上下边
-    // 的视觉重量分布不同, 显错位, 下扩几 px 光学对齐)。默认 0, 定标后可烤成常量。
-    let x_ybot = env_f("QUILL_X_YBOT", 0.0);
+    let x_half_w = X_STROKE_L * hidpi / 2.0;
+    let x_extra_inset = X_EXTRA_INSET_L * hidpi;
+    let x_ybot = X_YBOT_PX;
 
-    // 3.1 Close ×: 两条对角线段 (左上↔右下 / 右上↔左下). 走真 AA 线段图元, 取代旧字体字形
-    //     "×" (发糊发淡 + 比 min/max 细). 无条件画 (与旧 glyph 路径同, 不加 surface 守卫).
-    //     ⚠️ × 铺满对角线时视觉比同框 □ **大** (对角线比边长 √2 倍 + 平头端点探到角外),
-    //     故比 □ 多缩 CLOSE_X_EXTRA_INSET (用户实测 2026-07-02 "力量过头/比口大几像素" → 收进来).
+    // 3.1 Close ×: 两条对角线段 (左上↔右下 / 右上↔左下), 走真 AA 线段图元 (取代旧字体字形 "×").
+    //     线宽 x_half_w / 内缩 x_extra_inset / 下扩 x_ybot 见上方标定常量。
     {
         let x_inset = icon_pad + x_extra_inset;
         let cx_min = close_x_min + x_inset;
