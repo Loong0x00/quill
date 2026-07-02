@@ -953,13 +953,22 @@ function handleServerControl(text) {
   holdOnce();
 }
 
-// 同源:页面由 daemon 同口 serve,WS 直接连同 host:port。file:// 兜底到 10.0.0.2。
+// P0 CSWSH:从本页 URL 的 ?t=<token> 读取访问 token(用户复制到手机的分享链接里带)。WS 握手
+// 必须带上它,否则 kernel 403 拒绝(恶意网页拿不到 token = 连不上)。
+function shareToken() {
+  try { return new URLSearchParams(location.search).get("t") || ""; }
+  catch (_) { return ""; }
+}
+
+// 同源:页面由 daemon 同口 serve,WS 直接连同 host:port + 带 ?t=<token>。file:// 兜底到 10.0.0.2。
 function wsUrl() {
+  const t = shareToken();
+  const q = t ? ("?t=" + encodeURIComponent(t)) : "";
   if (location.host) {
     const scheme = location.protocol === "https:" ? "wss:" : "ws:";
-    return `${scheme}//${location.host}/`;
+    return `${scheme}//${location.host}/${q}`;
   }
-  return "ws://10.0.0.2:7878/";
+  return `ws://10.0.0.2:7878/${q}`;
 }
 
 let ws = null;
@@ -967,7 +976,12 @@ let reconnectTimer = null;
 
 function connect() {
   const url = wsUrl();
-  setLive(false, `连接 ${url} …`);
+  // P0 CSWSH:无 token 明确提示(而非静默失败 —— 服务端会 403 拒,页面看似"连不上")。
+  if (!shareToken()) {
+    setLive(false, "缺少访问 token:请用完整分享链接打开(形如 …/?t=<token>)");
+  } else {
+    setLive(false, `连接 ${url} …`);
+  }
   try {
     ws = new WebSocket(url);
   } catch (e) {
