@@ -1885,6 +1885,9 @@ fn append_titlebar_vertices(
     let half_w = stroke_w / 2.0;
     let x_half_w = env_f("QUILL_X_STROKE", icon_stroke_l * 1.3) * hidpi / 2.0;
     let x_extra_inset = env_f("QUILL_X_INSET", CLOSE_X_EXTRA_INSET_PX) * hidpi;
+    // × 下边额外向下扩展 physical px(光学重心微调: 几何中心虽与 □ 重合, 但 × 交叉点 vs □ 上下边
+    // 的视觉重量分布不同, 显错位, 下扩几 px 光学对齐)。默认 0, 定标后可烤成常量。
+    let x_ybot = env_f("QUILL_X_YBOT", 0.0);
 
     // 3.1 Close ×: 两条对角线段 (左上↔右下 / 右上↔左下). 走真 AA 线段图元, 取代旧字体字形
     //     "×" (发糊发淡 + 比 min/max 细). 无条件画 (与旧 glyph 路径同, 不加 surface 守卫).
@@ -1895,7 +1898,7 @@ fn append_titlebar_vertices(
         let cx_min = close_x_min + x_inset;
         let cx_max = close_x_max - x_inset;
         let cy_min = btn_y_top + x_inset;
-        let cy_max = btn_y_bot - x_inset;
+        let cy_max = btn_y_bot - x_inset + x_ybot;
         // ↘ 对角(× 用 x_half_w — 斜线稍粗补偿 AA 显软)
         append_line_seg_px(
             line_out, cx_min, cy_min, cx_max, cy_max, x_half_w, surface_w, surface_h, icon_color,
