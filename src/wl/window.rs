@@ -645,6 +645,57 @@ fn share_rendezvous_socket_path() -> Result<PathBuf> {
     crate::kernel::daemon::default_socket_path()
 }
 
+/// 持久 share token 文件路径(P0 CSWSH):`$XDG_CONFIG_HOME/quill/token`(默认 `~/.config/quill/token`)。
+/// XDG 未设回落 `$HOME/.config`;两者皆无 → Err(不静默落他人可写位置)。
+fn share_token_path() -> Result<PathBuf> {
+    if let Some(x) = std::env::var_os("XDG_CONFIG_HOME") {
+        if !x.is_empty() {
+            return Ok(PathBuf::from(x).join("quill").join("token"));
+        }
+    }
+    let home = std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| anyhow!("HOME / XDG_CONFIG_HOME 均未设置,无法定位持久 share token"))?;
+    Ok(PathBuf::from(home)
+        .join(".config")
+        .join("quill")
+        .join("token"))
+}
+
+/// 读出(或首次生成并持久化)共享 token(P0 CSWSH)。**持久** = 手机存的分享 URL 重启不失效。
+/// 文件 mode 0600、父目录 0700(只本人可读写)。owner 窗口拉起 kernel 前经此拿 token 下发
+/// (env `QUILL_SHARE_TOKEN`),并用于日志里拼完整分享 URL。所有窗口读同一文件 → token 一致,
+/// 无论谁拉起 kernel。
+fn share_load_or_create_token() -> Result<String> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let path = share_token_path()?;
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let t = existing.trim();
+        if !t.is_empty() {
+            return Ok(t.to_string());
+        }
+    }
+    // 不存在 / 空 → 生成 + 持久化(与 kernel 同一 CSPRNG 生成器,单一真相源)。
+    let token = crate::kernel::daemon::generate_ws_token()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("建 token 目录 {} 失败", parent.display()))?;
+        // 父目录收紧到 0700(只本人);已存在的目录也顺手收紧(尽力而为)。
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("建 token 文件 {} 失败", path.display()))?;
+    f.write_all(token.as_bytes())
+        .with_context(|| format!("写 token 文件 {} 失败", path.display()))?;
+    Ok(token)
+}
+
 /// spawn **detached** 的会合 kernel(ADR-0019 F1a owner 路径 / ADR-0020 §2):`--rendezvous` +
 /// `--detach`(kernel 自 daemonize 双 fork 脱离本窗口 = 机器级单例、不随窗口退出而死、不再是窗口
 /// 子进程)+ `--ws-bind`。`Command::spawn` 起的是即将 daemonize 的原进程(fork1 后即 `_exit(0)`,真
@@ -661,13 +712,30 @@ fn share_spawn_detached_kernel(sock: &Path) -> Result<std::process::Child> {
     let exe = share_kernel_path();
     let ws_bind =
         std::env::var("QUILL_SHARE_WS_BIND").unwrap_or_else(|_| SHARE_WS_BIND_DEFAULT.to_string());
+    // P0 CSWSH:把持久 token 经 env 下发给 detached kernel(env 存活过 daemonize 的 fork,无 exec
+    // 覆盖)→ kernel WS 握手强制此 token。token 生成/持久失败 → 早退不裸奔起 kernel。
+    let token = share_load_or_create_token()?;
     let child = std::process::Command::new(&exe)
         .arg(format!("--rendezvous={}", sock.display()))
         .arg(format!("--ws-bind={ws_bind}"))
         .arg("--detach")
+        .env("QUILL_SHARE_TOKEN", &token)
         .spawn()
         .with_context(|| format!("spawn detached 会合 kernel {} 失败", exe.display()))?;
     Ok(child)
+}
+
+/// P0 CSWSH:开共享后把**完整分享 URL**(含 `?t=<token>`)`info!` 出来,方便用户复制给手机。bind
+/// 是 `0.0.0.0`(全网卡)→ 无单一可连 host,故 URL 用 `<本机IP>` 占位由用户填(LAN 10.0.0.2 /
+/// VPN IP)。端口从 `QUILL_SHARE_WS_BIND` 抠。
+fn share_log_share_url(token: &str) {
+    let ws_bind =
+        std::env::var("QUILL_SHARE_WS_BIND").unwrap_or_else(|_| SHARE_WS_BIND_DEFAULT.to_string());
+    let port = ws_bind.rsplit(':').next().unwrap_or("7878");
+    tracing::info!(
+        "分享 URL(把 <本机IP> 换成手机可达地址,如 LAN 10.0.0.2 / VPN IP):\
+         http://<本机IP>:{port}/?t={token}"
+    );
 }
 
 /// **非阻塞** try-connect 会合 socket(ADR-0020 §2)。AF_UNIX SOCK_STREAM connect 对没在监听的
@@ -1392,6 +1460,11 @@ fn finish_share_connect(data: &mut LoopData, stream: UnixStream, focus_tab: u64)
                 tab = focus_tab,
                 "联邦共享已接入 kernel(feeder;--share / 标题栏 toggle / Ctrl+Shift+S);全部 tab 输出 tee 给手机"
             );
+            // P0 CSWSH:打印完整分享 URL(含 token)方便复制给手机。读 token 失败不影响已建立的共享。
+            match share_load_or_create_token() {
+                Ok(token) => share_log_share_url(&token),
+                Err(e) => tracing::warn!(?e, "读 share token 拼分享 URL 失败(共享仍已建立)"),
+            }
         }
         Err(e) => {
             tracing::warn!(
