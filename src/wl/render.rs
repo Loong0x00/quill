@@ -484,6 +484,10 @@ pub const TAB_CLOSE_W_LOGICAL_PX: u32 = 16;
 /// 视觉一致.
 pub const TAB_ROUNDED_RADIUS_PX: f32 = 6.0;
 
+/// close × 相对 min/max icon 区**额外**的每边内缩 (logical px)。× 铺满对角线视觉比同框 □ 大
+/// (对角线 √2 倍边长 + 平头端点探角), 多缩这些让 × 与 □ 视觉同尺寸 (用户 2026-07-02 实测调)。
+const CLOSE_X_EXTRA_INSET_PX: f32 = 1.5;
+
 /// **T-0615: titlebar Min/Max/Close 圆形按钮半径** (logical px).
 /// 12 logical = 24 physical (HIDPI×2). BUTTON_W/H_LOGICAL_PX = 24, 半径正好半宽
 /// → button bbox 视觉等价完全圆形 (rounded rect 半径 ≥ min(w,h)/2 = 圆形).
@@ -1869,14 +1873,16 @@ fn append_titlebar_vertices(
     let icon_pad = 6.0 * hidpi; // 按钮内边距, icon 不贴边
     let half_w = stroke_w / 2.0;
 
-    // 3.1 Close ×: 两条对角线段 (左上↔右下 / 右上↔左下), 铺满 icon 区 (与 Max box
-    //     同 icon_pad → × 与 □ 视觉同尺寸). 走真 AA 线段图元, 取代旧字体字形 "×"
-    //     (发糊发淡 + 比 min/max 细). 无条件画 (与旧 glyph 路径同, 不加 surface 守卫).
+    // 3.1 Close ×: 两条对角线段 (左上↔右下 / 右上↔左下). 走真 AA 线段图元, 取代旧字体字形
+    //     "×" (发糊发淡 + 比 min/max 细). 无条件画 (与旧 glyph 路径同, 不加 surface 守卫).
+    //     ⚠️ × 铺满对角线时视觉比同框 □ **大** (对角线比边长 √2 倍 + 平头端点探到角外),
+    //     故比 □ 多缩 CLOSE_X_EXTRA_INSET (用户实测 2026-07-02 "力量过头/比口大几像素" → 收进来).
     {
-        let cx_min = close_x_min + icon_pad;
-        let cx_max = close_x_max - icon_pad;
-        let cy_min = btn_y_top + icon_pad;
-        let cy_max = btn_y_bot - icon_pad;
+        let x_inset = icon_pad + CLOSE_X_EXTRA_INSET_PX * hidpi;
+        let cx_min = close_x_min + x_inset;
+        let cx_max = close_x_max - x_inset;
+        let cy_min = btn_y_top + x_inset;
+        let cy_max = btn_y_bot - x_inset;
         // ↘ 对角
         append_line_seg_px(
             line_out, cx_min, cy_min, cx_max, cy_max, half_w, surface_w, surface_h, icon_color,
