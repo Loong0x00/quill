@@ -164,6 +164,19 @@
     cursor: pointer; user-select: none; -webkit-user-select: none; touch-action: manipulation;
   }
   #tabbar .newtab:active { background: #2a2a2a; }
+  /* F4:按窗口(workspace)分段。单窗口无 .seghdr/.segdiv → 视觉≈原来的单栏(不退化)。
+     多窗口:每段前一条竖分隔 + 一个窗口标签(锚窗口=home 用共享绿标)。 */
+  #tabbar .seg { flex: 0 0 auto; display: inline-flex; align-items: stretch; gap: .25rem; }
+  #tabbar .segdiv {
+    flex: 0 0 auto; width: 1px; align-self: center; height: 1.4rem; background: #333;
+    margin: 0 .3rem;
+  }
+  #tabbar .seghdr {
+    flex: 0 0 auto; display: inline-flex; align-items: center; white-space: nowrap;
+    color: #8a8a8a; font-family: system-ui, sans-serif; font-size: .7rem; padding: 0 .15rem;
+    user-select: none; -webkit-user-select: none;
+  }
+  #tabbar .seghdr.anchor { color: #3fb950; }   /* 共享锚窗口(home,新 tab 落点)= 共享色 */
 </style>
 </head>
 <body>
@@ -207,7 +220,10 @@ const RECONNECT_MS = 1000;
 // `term` = 当前 viewed 实例的 Terminal(所有 reflow/读取代码都读这个变量,切换时重新指向)。
 const stageEl = $("stage");
 const MAX_WARM_TERMS = 6;
-const termInstances = new Map();  // tab_id -> { term, host, lastUsed, pendingReset }
+// F4:键 = (ws, tab) 复合键。tab_id 是【每窗口进程】的 atomic(各起步 1)→ 跨窗口会撞;
+// 字节流身份 = (ws, tab)(kernel rings / StreamFocus 都带 ws)→ 保暖实例也必须按 (ws,tab) 分。
+const viewKey = (ws, tab) => ws + ":" + tab;
+const termInstances = new Map();  // "ws:tab" -> { term, host, lastUsed, pendingReset }
 let term = null;                  // 当前 viewed 实例(懒建,首个 StreamFocus 后非空)
 let curInst = null;               // 当前 viewed 实例的记录(pendingReset 挂它上)
 let curDims = null;               // 最近的桌面 dims { cols, rows }(新实例按此 resize)
@@ -227,7 +243,7 @@ function newTerminal() {
 // 新建一个 tab 的 xterm 实例(host 可见插入 #reflow 之前 → 测量布局正确;调用方随即在
 // showInstance 里隐藏别的)。每实例各自注册 onData/onBinary/onWriteParsed/onTitleChange
 // (只有当前 active 实例收字节 / 有焦点,故背景实例的这些回调实际不触发;仍逐实例注册求正确)。
-function makeTermInstance(tabId) {
+function makeTermInstance(key) {
   const host = document.createElement("div");
   host.className = "termhost";
   stageEl.insertBefore(host, reflowEl);
@@ -243,33 +259,35 @@ function makeTermInstance(tabId) {
   t.onWriteParsed(() => { if (t === term) scheduleReflowRender(); });
   t.onTitleChange((title) => { if (t === term) titleEl.textContent = title && title.length ? title : "quill"; });
   const inst = { term: t, host, lastUsed: ++lruSeq, pendingReset: false };
-  termInstances.set(tabId, inst);
+  termInstances.set(key, inst);
   return inst;
 }
 
 // 淘汰:超上限时,dispose 最久没看的、且不是当前 viewed 的实例(连 DOM host 一起移除)。
 function evictWarmTerms() {
+  const keep = viewKey(viewedWs, viewedTab);
   while (termInstances.size > MAX_WARM_TERMS) {
-    let victimId = null, victimUsed = Infinity;
-    for (const [id, inst] of termInstances) {
-      if (id === viewedTab) continue;                 // 绝不淘汰当前在看的
-      if (inst.lastUsed < victimUsed) { victimUsed = inst.lastUsed; victimId = id; }
+    let victimKey = null, victimUsed = Infinity;
+    for (const [k, inst] of termInstances) {
+      if (k === keep) continue;                       // 绝不淘汰当前在看的
+      if (inst.lastUsed < victimUsed) { victimUsed = inst.lastUsed; victimKey = k; }
     }
-    if (victimId === null) break;
-    const v = termInstances.get(victimId);
+    if (victimKey === null) break;
+    const v = termInstances.get(victimKey);
     try { v.term.dispose(); } catch (_) {}
     if (v.host && v.host.parentNode) v.host.parentNode.removeChild(v.host);
-    termInstances.delete(victimId);
+    termInstances.delete(victimKey);
   }
 }
 
-// 切到 tabId 的实例:get-or-create(首次看某 tab 才建 = "从 kernel 重放重建");显示它、
-// 隐藏其余;重新指向 `term`/`curInst`;更新 LRU;有界淘汰。返回该实例。
-function showInstance(tabId) {
-  let inst = termInstances.get(tabId);
+// 切到 (ws, tab) 的实例:get-or-create(首次看才建 = "从 kernel 重放重建");显示它、隐藏
+// 其余;重新指向 `term`/`curInst`;更新 LRU;有界淘汰。返回该实例。
+function showInstance(ws, tab) {
+  const key = viewKey(ws, tab);
+  let inst = termInstances.get(key);
   const fresh = !inst;
-  if (fresh) inst = makeTermInstance(tabId);
-  for (const [id, i2] of termInstances) i2.host.style.display = (id === tabId) ? "" : "none";
+  if (fresh) inst = makeTermInstance(key);
+  for (const [k, i2] of termInstances) i2.host.style.display = (k === key) ? "" : "none";
   term = inst.term;
   curInst = inst;
   inst.lastUsed = ++lruSeq;
@@ -776,109 +794,161 @@ function holdOnce() {
     held = true;
   }
 }
-// ── 砖2 W1:标签栏状态 + 渲染 + tab 操作 ─────────────────────────────────────────────
-// 数据来自 ServerMsg::Workspace(WorkspaceInfo){ workspace_id, tabs:[{tab_id,title}], active }。
-//   tabList        = tab 列表(顺序 = 后端 fed_tabs 顺序 → Select 用的 idx == 此数组下标)
-//   desktopFocusIdx = WorkspaceInfo.active(桌面屏前焦点 tab,标琥珀点)
-//   viewedTab      = 本客户端在看的 tab_id(据 StreamFocus,绿框高亮)
-// 手机各看各的 → viewedTab 与桌面焦点可不同。标签栏是【叠加】,坏了忠实单 tab 仍工作。
+// ── F4:按窗口(workspace)分段的标签栏(联邦:一个 kernel 聚合全部窗口)──────────────────
+// K1a/K1b 后 kernel 把【每个】feeder(窗口)的 WorkspaceInfo 发给全部客户端 → 手机能画全部
+// 窗口的 tab。状态:
+//   workspaces = Map<ws_id, { tabs:[{tab_id,title}], active:桌面焦点下标 }>(由每条 Workspace 更新)
+//   wsOrderIds = 窗口顺序(据 Workspaces 列表,后端已按 ws_id 稳定排)
+//   anchorWs   = 共享锚窗口 ws = home = 新 tab 落点(Workspaces.active)
+//   viewedWs / viewedTab = 本客户端在看的 (ws, tab)(据 StreamFocus,绿框高亮,跨所有段唯一)
+// 单窗口 = 一个段、无窗口标签/分隔 → 视觉≈原来的单栏(不退化)。标签栏是【叠加】,坏了忠实
+// 单 tab 视图仍工作。
 const tabbarEl = $("tabbar");
-let curWs = null;
-let tabList = [];
-let desktopFocusIdx = -1;
+const workspaces = new Map();
+let wsOrderIds = [];
+let anchorWs = null;
+let viewedWs = null;
 let viewedTab = null;
 
-// 发一条 TabOp 控制帧(externally-tagged:{"TabOp":{"workspace_id":W,"op":<op>}};
-// op:New="New" / Select={Select:{idx}} / Close={Close:{tab_id}})。
-function sendTabOp(op) {
-  if (curWs !== null) sendControl({ TabOp: { workspace_id: curWs, op } });
+// 发一条 TabOp 控制帧到指定窗口(externally-tagged:{"TabOp":{"workspace_id":W,"op":<op>}};
+// op:New="New" / Select={Select:{idx}} / Close={Close:{tab_id}})。wsId 空则忽略。
+function sendTabOp(wsId, op) {
+  if (wsId === null || wsId === undefined) return;
+  sendControl({ TabOp: { workspace_id: wsId, op } });
+}
+
+// 有明细(Map 里有 tabs)的窗口 id,按 wsOrderIds 顺序;列表里没有的 Map 键(理论上不出现)追加。
+function orderedWsIds() {
+  const ids = [];
+  for (const id of wsOrderIds) if (workspaces.has(id)) ids.push(id);
+  for (const id of workspaces.keys()) if (!wsOrderIds.includes(id)) ids.push(id);
+  return ids;
 }
 
 function renderTabBar() {
-  if (!tabList.length) { tabbarEl.classList.add("hidden"); tabbarEl.replaceChildren(); return; }
+  const order = orderedWsIds();
+  let total = 0;
+  for (const id of order) total += ((workspaces.get(id) || {}).tabs || []).length;
+  if (!order.length || total === 0) { tabbarEl.classList.add("hidden"); tabbarEl.replaceChildren(); return; }
   tabbarEl.classList.remove("hidden");
+  const multi = order.length > 1;   // 单窗口不画窗口标签/分隔 → 视觉≈原单栏
   const frag = document.createDocumentFragment();
-  tabList.forEach((t, i) => {
-    const el = document.createElement("div");
-    el.className = t.tab_id === viewedTab ? "tab viewed" : "tab";
-    if (i === desktopFocusIdx) {          // 桌面焦点标记(琥珀点)
-      const dot = document.createElement("span");
-      dot.className = "focusdot";
-      dot.title = "桌面焦点";
-      el.appendChild(dot);
+  order.forEach((wsId, segIdx) => {
+    const w = workspaces.get(wsId) || { tabs: [], active: -1 };
+    const tabs = w.tabs || [];
+    const seg = document.createElement("div");
+    seg.className = "seg";
+    if (multi) {
+      if (segIdx > 0) { const div = document.createElement("span"); div.className = "segdiv"; seg.appendChild(div); }
+      const hdr = document.createElement("span");
+      hdr.className = "seghdr" + (wsId === anchorWs ? " anchor" : "");
+      hdr.textContent = "窗口 " + (segIdx + 1);
+      if (wsId === anchorWs) hdr.title = "共享锚窗口(新建 tab 落这里)";
+      seg.appendChild(hdr);
     }
-    const label = document.createElement("span");
-    label.className = "label";
-    label.textContent = t.title && t.title.length ? t.title : "tab " + (i + 1);
-    el.appendChild(label);
-    // × 只在 ≥2 tab 时出现:防误触关掉最后一个 tab(= 关整个桌面 quill,后端诚实继承)。
-    if (tabList.length > 1) {
-      const x = document.createElement("span");
-      x.className = "close";
-      x.textContent = "×";
-      // click(非 pointerup):浏览器在滚动手势后抑制 click → 横滑标签栏不会误触 ×。
-      x.addEventListener("click", (e) => {
-        e.stopPropagation();
-        sendTabOp({ Close: { tab_id: t.tab_id } });
+    tabs.forEach((t, i) => {
+      const el = document.createElement("div");
+      el.className = (wsId === viewedWs && t.tab_id === viewedTab) ? "tab viewed" : "tab";
+      if (i === w.active) {                 // 该窗口桌面焦点标记(琥珀点)
+        const dot = document.createElement("span");
+        dot.className = "focusdot";
+        dot.title = "桌面焦点";
+        el.appendChild(dot);
+      }
+      const label = document.createElement("span");
+      label.className = "label";
+      label.textContent = t.title && t.title.length ? t.title : "tab " + (i + 1);
+      el.appendChild(label);
+      // × 只在该窗口 ≥2 tab 时出现:防误触关掉窗口最后一个 tab(= 关整个桌面 quill,后端诚实继承)。
+      if (tabs.length > 1) {
+        const x = document.createElement("span");
+        x.className = "close";
+        x.textContent = "×";
+        // click(非 pointerup):浏览器在滚动手势后抑制 click → 横滑标签栏不会误触 ×。
+        x.addEventListener("click", (e) => {
+          e.stopPropagation();
+          sendTabOp(wsId, { Close: { tab_id: t.tab_id } });
+        });
+        el.appendChild(x);
+      }
+      el.addEventListener("click", () => {
+        if (!(wsId === viewedWs && t.tab_id === viewedTab)) sendTabOp(wsId, { Select: { idx: i } });
       });
-      el.appendChild(x);
-    }
-    el.addEventListener("click", () => {
-      if (t.tab_id !== viewedTab) sendTabOp({ Select: { idx: i } });
+      seg.appendChild(el);
     });
-    frag.appendChild(el);
+    frag.appendChild(seg);
   });
+  // + 新建 → 锚窗口(New 后端已落锚,与传的 workspace_id 无关;传 anchorWs 语义清晰)。
   const plus = document.createElement("div");
   plus.className = "newtab";
   plus.textContent = "+";
-  plus.setAttribute("aria-label", "新建 tab");
-  plus.addEventListener("click", () => sendTabOp("New"));
+  plus.setAttribute("aria-label", "新建 tab(落共享锚窗口)");
+  plus.addEventListener("click", () => {
+    const target = anchorWs !== null ? anchorWs : (viewedWs !== null ? viewedWs : (order[0] ?? null));
+    sendTabOp(target, "New");
+  });
   frag.appendChild(plus);
   tabbarEl.replaceChildren(frag);
 }
 
-// 收到 WorkspaceInfo → 刷新 tab 列表 + 桌面焦点标记 + 重画标签栏。
+// 收到某窗口 WorkspaceInfo → 更新该窗口的 tab 列表 + 桌面焦点下标 + 重画分段栏。
 function updateWorkspace(info) {
-  if (info && typeof info.workspace_id === "number") curWs = info.workspace_id;
-  tabList = Array.isArray(info && info.tabs) ? info.tabs.slice() : [];
-  desktopFocusIdx = Number.isInteger(info && info.active) ? info.active : -1;
+  if (!info || typeof info.workspace_id !== "number") return;
+  const tabs = Array.isArray(info.tabs) ? info.tabs.slice() : [];
+  const active = Number.isInteger(info.active) ? info.active : -1;
+  workspaces.set(info.workspace_id, { tabs, active });
   renderTabBar();
 }
 
-// 收到 StreamFocus{tab_id} = 后端确认"此后字节流属于 tab_id"(连上 / Select 确认 / 跟随焦点)。
-// 砖2 W2:切到该 tab 的实例(看过的瞬时显示上次状态,没看过的新建=从 kernel 重放重建),
-// 标记 pendingReset(随后到达的重放帧一次 reset+write 更新到当前 → 无空白闪),刷新高亮/标题。
-function onStreamFocus(tabId) {
-  viewedTab = tabId;                     // 先设(showInstance/淘汰须保住当前 viewed)
-  const inst = showInstance(tabId);
+// 收到聚合 Workspaces 列表 → 学窗口顺序 + 锚(home)+ 剪除已消失窗口(feeder 断开)的段。
+function updateWorkspacesList(list) {
+  const metas = Array.isArray(list && list.workspaces) ? list.workspaces : [];
+  wsOrderIds = metas.map((m) => m.id);
+  if (typeof list.active === "number") anchorWs = list.active;
+  const present = new Set(wsOrderIds);
+  for (const id of Array.from(workspaces.keys())) if (!present.has(id)) workspaces.delete(id);
+  renderTabBar();
+}
+
+// 收到 StreamFocus{ws,tab} = 后端确认"此后字节流属于 (ws,tab)"(连上 / Select 确认 / 跟随焦点)。
+// 切到该 (ws,tab) 的实例(看过的瞬时显示上次状态,没看过的新建=从 kernel 重放重建),标记
+// pendingReset(随后到达的重放帧一次 reset+write 更新到当前 → 无空白闪),刷新高亮/标题。
+function onStreamFocus(ws, tab) {
+  viewedWs = ws;                         // 先设(showInstance/淘汰须保住当前 viewed)
+  viewedTab = tab;
+  const inst = showInstance(ws, tab);
   inst.pendingReset = true;              // 关键帧重放紧随其后 → 应用前先 reset(见 onmessage)
-  const meta = tabList.find((t) => t.tab_id === tabId);
+  const w = workspaces.get(ws);
+  const meta = w && w.tabs.find((t) => t.tab_id === tab);
   if (meta) titleEl.textContent = meta.title && meta.title.length ? meta.title : "quill";
   renderTabBar();
   scheduleReflowRender();
 }
 
-// 入站控制帧:externally-tagged ServerMsg。学 active workspace id + 驱动标签栏 / viewed tab。
+// 入站控制帧:externally-tagged ServerMsg。驱动分段标签栏 / viewed (ws,tab) / holder。
 function handleServerControl(text) {
   let msg;
   try { msg = JSON.parse(text); } catch (_) { return; }
   if (msg.StreamFocus) {
-    activeWorkspaceId = msg.StreamFocus.workspace_id;
-    curWs = msg.StreamFocus.workspace_id;
-    onStreamFocus(msg.StreamFocus.tab_id);
+    activeWorkspaceId = msg.StreamFocus.workspace_id;   // 本 holder = 在看的 workspace
+    onStreamFocus(msg.StreamFocus.workspace_id, msg.StreamFocus.tab_id);
   } else if (msg.Workspaces) {
-    activeWorkspaceId = msg.Workspaces.active;
-    curWs = msg.Workspaces.active;
+    // 先于 StreamFocus 到 → 让 holdOnce 能尽早 fire(取锚 ws;StreamFocus 到后改为在看的 ws)。
+    if (activeWorkspaceId === null && typeof msg.Workspaces.active === "number") {
+      activeWorkspaceId = msg.Workspaces.active;
+    }
+    updateWorkspacesList(msg.Workspaces);
   } else if (msg.Workspace) {
-    activeWorkspaceId = msg.Workspace.workspace_id;
     updateWorkspace(msg.Workspace);
   } else if (msg.TabAdded) {
-    // 后端 Fed 用整份 Workspace 广播(非增量),这里防御性并入(随后 Workspace 覆盖为权威)。
-    if (msg.TabAdded.tab && !tabList.some((t) => t.tab_id === msg.TabAdded.tab.tab_id)) {
-      tabList.push(msg.TabAdded.tab); renderTabBar();
+    // 后端 Fed 用整份 Workspace 广播(非增量),这里防御性并入该窗口(随后 Workspace 覆盖为权威)。
+    const w = workspaces.get(msg.TabAdded.workspace_id);
+    if (w && msg.TabAdded.tab && !w.tabs.some((t) => t.tab_id === msg.TabAdded.tab.tab_id)) {
+      w.tabs.push(msg.TabAdded.tab); renderTabBar();
     }
   } else if (msg.TabRemoved) {
-    tabList = tabList.filter((t) => t.tab_id !== msg.TabRemoved.tab_id); renderTabBar();
+    const w = workspaces.get(msg.TabRemoved.workspace_id);
+    if (w) { w.tabs = w.tabs.filter((t) => t.tab_id !== msg.TabRemoved.tab_id); renderTabBar(); }
   } else if (msg.Dims) {
     applyDims(msg.Dims.cols, msg.Dims.rows);  // A′ 增量1:按桌面宽渲染
   }
@@ -915,7 +985,7 @@ function connect() {
     // viewedTab 归 null → 首个 StreamFocus 会 showInstance + pendingReset,由随后重放帧一次
     // reset+write 重建当前屏(旧的"reset 防重复"语义移到 pendingReset,且切回不空屏)。
     held = false; // 新连接 → 等学到 workspace id 后重新 Hold
-    viewedTab = null; // 新连接 → 首个 StreamFocus 视作初始 viewed
+    viewedWs = null; viewedTab = null; // 新连接 → 首个 StreamFocus 视作初始 viewed
     scheduleReflowRender();
     setLive(true, "已连接(直播)");
   };
