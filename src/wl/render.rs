@@ -167,6 +167,17 @@ pub struct Renderer {
     /// (3 圆形 = 18 顶点) + tab bar 多 tab (active 1 圆角 + 0~N hover + + box
     /// rounded + close × hover) ≤ ~50 quads = ~300 顶点, 首次按 actual size 分配.
     rounded_buffer_capacity: usize,
+    /// **窗口控制矢量图标 line pipeline** (持 device 引用, INV-002 字段顺序: 在
+    /// `device` 之前 drop). 走 [`LINE_WGSL`] 抗锯齿线段 SDF shader, 顶点格式 40 字节
+    /// ([`LINE_VERTEX_BYTES`]: `pos + color + seg + half_width`), **无 bind group**
+    /// (图标远离 surface 圆角, 不需 corner mask). lazy 初始化, 首次 [`Self::draw_frame`]
+    /// 建好. 与 rounded pipeline 隔离 —— close × / min / max / +/ share 图标笔画走此.
+    line_pipeline: Option<wgpu::RenderPipeline>,
+    /// **窗口控制矢量图标 line vertex buffer** (持 device 引用).
+    line_vertex_buffer: Option<wgpu::Buffer>,
+    /// **line vertex buffer 容量** (顶点数计). 窗口控制图标笔画 ≤ ~12 quads
+    /// (close × 2 + max 4 + min 1 + share 3 + + 2) = 72 顶点, 首次按 actual 分配.
+    line_buffer_capacity: usize,
     /// **T-0610 part 2: corner mask uniform buffer** (持 wgpu device 引用).
     /// `[surface_w, surface_h, corner_radius_phys, alpha_live]` 16 字节 std140.
     /// `Renderer::new` 建好首帧 + `Renderer::resize` 每次 surface 尺寸变更时
@@ -1125,6 +1136,80 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// 每 line-stroke vertex 字节数: `pos[2 f32] + color[3 f32] + seg[4 f32] (ax,ay,bx,by
+/// physical px) + half_width[1 f32]` = 10 f32 = 40 字节. WGSL [`LINE_WGSL`] 端必须一致.
+/// 每线段 6 顶点 (2 三角形 CCW 覆盖 AABB 包围盒, fragment 用 SDF 裁出真笔画).
+const LINE_VERTEX_BYTES: usize = 10 * std::mem::size_of::<f32>();
+
+/// **窗口控制图标 = 抗锯齿矢量线段图元** (close × / minimize / maximize 统一走它).
+///
+/// 标准桌面软件(GTK symbolic SVG / macOS template image / Qt QPainter)画这类简单
+/// 图标都是矢量线段 + AA + 按主题色上色. 本 shader 就是那套的最小实现: 每顶点携带
+/// 线段两端点 (physical px) + 半宽 (physical px), fragment 用 `@builtin(position)`
+/// (physical px 帧坐标) 算到线段的**平头 (butt cap) 有向盒 SDF**距离, `aa = clamp(
+/// 0.5 - d, 0, 1)` 得 1px AA 边. 与 [`ROUNDED_WGSL`] 的 `squircle_sdf` + AA 同机制.
+///
+/// **why 平头盒 SDF (非圆头 capsule)**: 轴对齐线段的平头盒 = **精确矩形** → minimize
+/// 横线 / maximize 四边整数像素吸附后与旧轴对齐矩形逐像素等价 (不退化, 见
+/// [`append_line_rect_px`]); 对角线 × 也是干净的斜笔画. 圆头会把矩形四端磨圆.
+///
+/// **无 bind group**: 图标在 titlebar 内, 远离 surface 圆角区 (close × icon 区 x <
+/// surface_w-24phys, 圆角只影响 x > surface_w-16phys), 不需 group=1 corner mask →
+/// pipeline layout 空. 与 rounded pipeline 隔离, 不共用任何资源.
+///
+/// **alpha**: premultiplied `vec4(color * aa, aa)` + `ALPHA_BLENDING` (与 rounded
+/// 圆角 AA 边同 blend 约定).
+const LINE_WGSL: &str = r#"
+struct VsIn {
+    @location(0) pos: vec2<f32>,
+    @location(1) color: vec3<f32>,
+    @location(2) seg: vec4<f32>,
+    @location(3) half_width: f32,
+};
+
+struct VsOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) color: vec3<f32>,
+    @location(1) seg: vec4<f32>,
+    @location(2) half_width: f32,
+};
+
+@vertex
+fn vs_main(v: VsIn) -> VsOut {
+    var out: VsOut;
+    out.clip = vec4<f32>(v.pos, 0.0, 1.0);
+    out.color = v.color;
+    out.seg = v.seg;
+    out.half_width = v.half_width;
+    return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let p = in.clip.xy;
+    let a = in.seg.xy;
+    let b = in.seg.zw;
+    let ba = b - a;
+    let len = max(length(ba), 1e-6);
+    let dir = ba / len;
+    let nor = vec2<f32>(-dir.y, dir.x);
+    let pa = p - a;
+    // 线段局部坐标: t 沿线段轴 [0, len], s 垂直方向. 平头盒 = [0,len] × [-hw, hw].
+    let t = dot(pa, dir);
+    let s = dot(pa, nor);
+    let dt = max(-t, t - len);
+    let ds = abs(s) - in.half_width;
+    let outside = length(max(vec2<f32>(dt, ds), vec2<f32>(0.0, 0.0)));
+    let inside = min(max(dt, ds), 0.0);
+    let d = outside + inside;
+    let aa = clamp(0.5 - d, 0.0, 1.0);
+    if (aa <= 0.0) {
+        discard;
+    }
+    return vec4<f32>(in.color * aa, aa);
+}
+"#;
+
 /// 把一个像素矩形 (x0, y0, x1, y1) 加 6 顶点到 vertex buffer (CCW 三角化).
 /// `color` 已是 linear f32x3 (调用方按 sRGB-aware [`color_for_vertex_with_srgb`]
 /// 或 [`Renderer::color_for_vertex`] 预处理过).
@@ -1232,6 +1317,100 @@ fn append_rounded_quad_px(
         out.extend_from_slice(&bounds[2].to_ne_bytes());
         out.extend_from_slice(&bounds[3].to_ne_bytes());
         out.extend_from_slice(&elem_radius_phys.to_ne_bytes());
+    }
+}
+
+/// **抗锯齿矢量线段图元 append** (端点 A/B physical px + half_width physical px +
+/// color). 输出 [`LINE_VERTEX_BYTES`] 顶点给 line pipeline (走 [`LINE_WGSL`] 平头盒
+/// SDF). 覆盖线段的 AABB 包围盒 (扩 `half_width + 1px` AA 余量) 用 6 顶点铺满,
+/// fragment 据顶点携带的 A/B/half_width 算 SDF 裁出真笔画, 盒内非笔画区 `discard`.
+///
+/// close × 的两条对角线走本 fn (斜线需真 AA); 轴对齐线段 (min/max/+/share) 走
+/// [`append_line_rect_px`] 做整像素吸附保持锐利.
+///
+/// `clippy::too_many_arguments` allow: 同 [`append_quad_px`] 决策, 参数都直接对应
+/// 线段几何 (端点 / 宽度 / surface dims / color), 抽 struct 反增间接.
+#[allow(clippy::too_many_arguments)]
+fn append_line_seg_px(
+    out: &mut Vec<u8>,
+    ax: f32,
+    ay: f32,
+    bx: f32,
+    by: f32,
+    half_width: f32,
+    surface_w: f32,
+    surface_h: f32,
+    color: [f32; 3],
+) {
+    // AABB 包围盒 = 线段两端点外扩 (half_width + 1px AA 余量). 对角线的包围盒是
+    // 整段的外接矩形, 盒内多数 fragment 会被 SDF discard — 图标区区几十像素, 忽略.
+    let margin = half_width + 1.0;
+    let x0 = ax.min(bx) - margin;
+    let x1 = ax.max(bx) + margin;
+    let y0 = ay.min(by) - margin;
+    let y1 = ay.max(by) + margin;
+    let left = x0 / surface_w * 2.0 - 1.0;
+    let right = x1 / surface_w * 2.0 - 1.0;
+    let top = 1.0 - y0 / surface_h * 2.0;
+    let bottom = 1.0 - y1 / surface_h * 2.0;
+    let verts: [[f32; 2]; 6] = [
+        [left, top],
+        [left, bottom],
+        [right, bottom],
+        [left, top],
+        [right, bottom],
+        [right, top],
+    ];
+    for v in verts {
+        out.extend_from_slice(&v[0].to_ne_bytes());
+        out.extend_from_slice(&v[1].to_ne_bytes());
+        out.extend_from_slice(&color[0].to_ne_bytes());
+        out.extend_from_slice(&color[1].to_ne_bytes());
+        out.extend_from_slice(&color[2].to_ne_bytes());
+        out.extend_from_slice(&ax.to_ne_bytes());
+        out.extend_from_slice(&ay.to_ne_bytes());
+        out.extend_from_slice(&bx.to_ne_bytes());
+        out.extend_from_slice(&by.to_ne_bytes());
+        out.extend_from_slice(&half_width.to_ne_bytes());
+    }
+}
+
+/// **轴对齐 stroke 矩形 → 线段图元 (整像素吸附)**. 是 `append_rounded_quad_px(.., 0.0)`
+/// 用于画轴对齐 icon 笔画时的等价替换: 把矩形四边 `round()` 到整数 physical px, 再当
+/// 一条**平头盒线段**(沿长轴, `half_width = 短边/2`)emit —— 平头盒 SDF 对整数矩形逐
+/// 像素精确 (AA 边落在像素边界 → fragment 中心非 0 即 1, 无灰边), 视觉与旧的无 AA 轴对齐
+/// 矩形一样锐利, **不退化**. 同时与 close × 共用同一 line pipeline, 三控件构造一致.
+///
+/// `clippy::too_many_arguments` allow: 同 [`append_rounded_quad_px`].
+#[allow(clippy::too_many_arguments)]
+fn append_line_rect_px(
+    out: &mut Vec<u8>,
+    x0_px: f32,
+    y0_px: f32,
+    x1_px: f32,
+    y1_px: f32,
+    surface_w: f32,
+    surface_h: f32,
+    color: [f32; 3],
+) {
+    // 整像素吸附: 四边 round 到整数 → 平头盒边落在像素边界 → 锐 (不软化).
+    let x0 = x0_px.round();
+    let y0 = y0_px.round();
+    let x1 = x1_px.round();
+    let y1 = y1_px.round();
+    let w = x1 - x0;
+    let h = y1 - y0;
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    if w >= h {
+        // 横向: 中线 y 居中, half_width = h/2, 端点平头盖在 x0/x1 → 精确覆盖整数矩形.
+        let yc = (y0 + y1) * 0.5;
+        append_line_seg_px(out, x0, yc, x1, yc, h * 0.5, surface_w, surface_h, color);
+    } else {
+        // 纵向: 中线 x 居中, half_width = w/2.
+        let xc = (x0 + x1) * 0.5;
+        append_line_seg_px(out, xc, y0, xc, y1, w * 0.5, surface_w, surface_h, color);
     }
 }
 
@@ -1544,14 +1723,20 @@ fn titlebar_title_baseline_y(titlebar_h_physical: f32) -> f32 {
 // 调用, 本 ticket 把 fn / 配套 const 也清). `BORDER_PX` / `BORDER_COLOR` 已删
 // 在常量区.
 
-/// **T-0615 重构**: titlebar bar bg → cell pipeline (rect, no rounding); 三按钮
-/// → rounded pipeline (圆形, hover 时背景圆显出, 非 hover 走 transparent). icon
-/// 横竖线 (Min / Max stroke) 仍走 cell pipeline (icon 在按钮中央, 不需 rounded
-/// mask). 派单 In #D 字面 "圆形 ~12 px radius / hover 高亮 / hit_test 改距离".
+/// **T-0615 重构 / 窗口控制矢量化重构**: titlebar bar bg → cell pipeline (rect);
+/// 三按钮 hover 圆 bg → rounded pipeline (圆形, hover 显出). **窗口控制图标
+/// (close × / minimize / maximize + 顺带 + / share) → line pipeline** (抗锯齿矢量
+/// 线段, [`append_line_seg_px`] / [`append_line_rect_px`], `line_out`): 三控件构造
+/// 一致 —— close × = 2 对角线段, minimize = 1 横线段, maximize = 4 边线段, 都同
+/// `stroke_w` / `icon_color`. 轴对齐的走整像素吸附保持锐利 (不比旧无 AA 矩形软),
+/// 对角 × 走真 AA. 取代旧的"min/max 走 rounded radius=0 + close × 走字体字形
+/// (发糊发淡)"两套并存.
 #[allow(clippy::too_many_arguments)]
 fn append_titlebar_vertices(
     out: &mut Vec<u8>,
     rounded_out: &mut Vec<u8>,
+    // 窗口控制图标笔画顶点 (line pipeline, 走 [`LINE_WGSL`] 抗锯齿线段 SDF).
+    line_out: &mut Vec<u8>,
     surface_w: f32,
     surface_h: f32,
     is_srgb: bool,
@@ -1675,30 +1860,42 @@ fn append_titlebar_vertices(
         }
     }
 
-    // 3. 按钮 icons. 走"细线 quad"画法 — 单 line stroke 用一个 thin quad,
-    //    宽度 stroke_w = 2 × HIDPI_SCALE physical px (HiDPI 视觉清晰).
+    // 3. 按钮 icons. **全走抗锯齿矢量线段图元 (line_out / [`LINE_WGSL`])** —— close ×
+    //    / minimize / maximize 构造一致: 同 stroke_w 线宽, 同 icon_color 色. 轴对齐笔画
+    //    (min/max 边) 走 [`append_line_rect_px`] 整像素吸附 (锐, 不比旧无 AA 矩形软),
+    //    对角 × 走 [`append_line_seg_px`] 真 AA. line pipeline 在 rounded (hover 圆 bg)
+    //    之后 draw → icon 叠在 hover bg 之上.
     let stroke_w = 2.0 * hidpi;
     let icon_pad = 6.0 * hidpi; // 按钮内边距, icon 不贴边
+    let half_w = stroke_w / 2.0;
 
-    // 3.1 Close × icon: T-0606 hotfix 起改走 glyph pipeline (cosmic-text shape
-    // "×" U+00D7 atlas raster 自带抗锯齿) 在 Renderer::append_close_icon_glyph
-    // 内 append, 此处不再画 stair-stepped 阶梯 quad (肉眼锯齿). minimize/maximize
-    // 仍走下方 stroke quad path (横竖矩形不需抗锯齿).
+    // 3.1 Close ×: 两条对角线段 (左上↔右下 / 右上↔左下), 铺满 icon 区 (与 Max box
+    //     同 icon_pad → × 与 □ 视觉同尺寸). 走真 AA 线段图元, 取代旧字体字形 "×"
+    //     (发糊发淡 + 比 min/max 细). 无条件画 (与旧 glyph 路径同, 不加 surface 守卫).
+    {
+        let cx_min = close_x_min + icon_pad;
+        let cx_max = close_x_max - icon_pad;
+        let cy_min = btn_y_top + icon_pad;
+        let cy_max = btn_y_bot - icon_pad;
+        // ↘ 对角
+        append_line_seg_px(
+            line_out, cx_min, cy_min, cx_max, cy_max, half_w, surface_w, surface_h, icon_color,
+        );
+        // ↗ 对角
+        append_line_seg_px(
+            line_out, cx_max, cy_min, cx_min, cy_max, half_w, surface_w, surface_h, icon_color,
+        );
+    }
 
-    // T-0615: icon stroke quads 走 rounded pipeline (radius=0, 矩形). hover 时
-    // rounded button bg (前面 append) 会覆盖 cell pipeline 上的 icon, 所以 icon
-    // 必须走同一 pipeline 在 bg 之后 append 顺序保证 icon 在 bg 之上 (rounded
-    // pipeline ALPHA blend, 后画覆盖前画).
-
-    // 3.2 Maximize: 矩形框 (4 边). 走 rounded_out (radius=0, 矩形).
+    // 3.2 Maximize: 描边矩形 (4 边线段). 走 line_out 整像素吸附.
     {
         let mx_min = max_x_min + icon_pad;
         let mx_max = max_x_max - icon_pad;
         let my_min = btn_y_top + icon_pad;
         let my_max = btn_y_bot - icon_pad;
         // 上边
-        append_rounded_quad_px(
-            rounded_out,
+        append_line_rect_px(
+            line_out,
             mx_min,
             my_min,
             mx_max,
@@ -1706,11 +1903,10 @@ fn append_titlebar_vertices(
             surface_w,
             surface_h,
             icon_color,
-            0.0,
         );
         // 下边
-        append_rounded_quad_px(
-            rounded_out,
+        append_line_rect_px(
+            line_out,
             mx_min,
             my_max - stroke_w,
             mx_max,
@@ -1718,11 +1914,10 @@ fn append_titlebar_vertices(
             surface_w,
             surface_h,
             icon_color,
-            0.0,
         );
         // 左边
-        append_rounded_quad_px(
-            rounded_out,
+        append_line_rect_px(
+            line_out,
             mx_min,
             my_min,
             mx_min + stroke_w,
@@ -1730,11 +1925,10 @@ fn append_titlebar_vertices(
             surface_w,
             surface_h,
             icon_color,
-            0.0,
         );
         // 右边
-        append_rounded_quad_px(
-            rounded_out,
+        append_line_rect_px(
+            line_out,
             mx_max - stroke_w,
             my_min,
             mx_max,
@@ -1742,33 +1936,31 @@ fn append_titlebar_vertices(
             surface_w,
             surface_h,
             icon_color,
-            0.0,
         );
     }
 
-    // 3.3 Minimize: 中间一横线 (位于按钮垂直中点偏下位置, 视觉上像 _).
+    // 3.3 Minimize: 中间一横线段 (按钮垂直中点, 视觉上像 _). 走 line_out 整像素吸附.
     if min_x_min >= 0.0 {
         let nx_min = min_x_min + icon_pad;
         let nx_max = min_x_max - icon_pad;
         let ny = btn_cy;
-        append_rounded_quad_px(
-            rounded_out,
+        append_line_rect_px(
+            line_out,
             nx_min,
-            ny - stroke_w / 2.0,
+            ny - half_w,
             nx_max,
-            ny + stroke_w / 2.0,
+            ny + half_w,
             surface_w,
             surface_h,
             icon_color,
-            0.0,
         );
     }
 
     // 3.4 E′(ADR-0018)Share: 三根递增"信号条"(底对齐, 左矮右高), 读作 signal /
     //     broadcast / streaming —— 与 +(plus)/ □(box)/ -(minus)/ ×(close)四个 icon
     //     全不撞。色编码三态(见 [`share_icon_color`]): 启动失败=琥珀 #d29922(error),
-    //     共享中=亮绿 #3fb950(on-air), 未共享=暗灰 #6a6a6a。只用轴对齐 stroke quad
-    //     (走 rounded_out radius=0), 与其它 icon 同 pipeline。
+    //     共享中=亮绿 #3fb950(on-air), 未共享=暗灰 #6a6a6a。3 根竖线段走 line_out
+    //     整像素吸附(与其它 icon 同 line pipeline)。
     if share_x_min >= 0.0 {
         let icon_rgb =
             color_for_vertex_with_srgb(share_icon_color(share_active, share_error), is_srgb);
@@ -1786,8 +1978,8 @@ fn append_titlebar_vertices(
         for (i, h) in heights.iter().enumerate() {
             let x0 = ix_min + (i as f32) * (bar_w + gap);
             let x1 = x0 + bar_w;
-            append_rounded_quad_px(
-                rounded_out,
+            append_line_rect_px(
+                line_out,
                 x0,
                 iy_max - h,
                 x1,
@@ -1795,7 +1987,6 @@ fn append_titlebar_vertices(
                 surface_w,
                 surface_h,
                 icon_rgb,
-                0.0,
             );
         }
     }
@@ -1820,34 +2011,32 @@ fn append_titlebar_vertices(
                 btn_radius_phys,
             );
         }
-        // + icon: 横竖两条 stroke quad, 中心点 (inset + btn_w/2, btn_cy).
-        // 走 rounded_out (radius=0 矩形) 让 icon 在 hover bg 之上.
+        // + icon: 横竖两条线段, 中心点 (inset + btn_w/2, btn_cy).
+        // 走 line_out 整像素吸附, 与其它 icon 同 line pipeline (icon 在 hover bg 之上).
         let cx = inset + btn_w / 2.0;
         let cy = btn_cy;
         let icon_size = btn_h - 2.0 * icon_pad;
         // 横线
-        append_rounded_quad_px(
-            rounded_out,
+        append_line_rect_px(
+            line_out,
             cx - icon_size / 2.0,
-            cy - stroke_w / 2.0,
+            cy - half_w,
             cx + icon_size / 2.0,
-            cy + stroke_w / 2.0,
+            cy + half_w,
             surface_w,
             surface_h,
             icon_color,
-            0.0,
         );
         // 竖线
-        append_rounded_quad_px(
-            rounded_out,
-            cx - stroke_w / 2.0,
+        append_line_rect_px(
+            line_out,
+            cx - half_w,
             cy - icon_size / 2.0,
-            cx + stroke_w / 2.0,
+            cx + half_w,
             cy + icon_size / 2.0,
             surface_w,
             surface_h,
             icon_color,
-            0.0,
         );
     }
 }
@@ -2402,6 +2591,11 @@ impl Renderer {
             rounded_pipeline: None,
             rounded_vertex_buffer: None,
             rounded_buffer_capacity: 0,
+            // 窗口控制矢量图标 line pipeline + buffer lazy init, 首次 draw_frame 建.
+            // INV-002 顺序: device 之前 drop.
+            line_pipeline: None,
+            line_vertex_buffer: None,
+            line_buffer_capacity: 0,
             device,
             queue,
             config,
@@ -3039,6 +3233,8 @@ impl Renderer {
         self.ensure_glyph_pipeline();
         // T-0615: rounded element pipeline lazy init.
         self.ensure_rounded_pipeline();
+        // 窗口控制矢量图标 line pipeline lazy init.
+        self.ensure_line_pipeline();
 
         // Step 2: cell pixel size (与 draw_cells 同源)。
         // T-0404: physical px (× HIDPI_SCALE), 见 draw_cells 同段注释解释 cell
@@ -3117,9 +3313,12 @@ impl Renderer {
         // / icon stroke) 走 cell pipeline; 圆形按钮 bg (hover 时浮现) 走 rounded
         // pipeline (rounded_vertex_bytes). hover 来自调用方维护 PointerState.hover().
         let mut rounded_vertex_bytes: Vec<u8> = Vec::new();
+        // 窗口控制矢量图标笔画 (close × / min / max / +/ share) → line pipeline.
+        let mut line_vertex_bytes: Vec<u8> = Vec::new();
         append_titlebar_vertices(
             &mut cell_vertex_bytes,
             &mut rounded_vertex_bytes,
+            &mut line_vertex_bytes,
             surface_w,
             surface_h,
             self.surface_is_srgb,
@@ -3276,18 +3475,10 @@ impl Renderer {
             title_color,
         );
 
-        // T-0606 hotfix: close 按钮 × icon 走 cosmic-text "×" (U+00D7) 经 glyph
-        // pipeline 渲染, atlas raster 自带 freetype/swash 抗锯齿. 之前 12 段
-        // stair-stepped 小矩形阶梯画对角线 (cell pipeline 无 rotation), 用户
-        // 实测肉眼可见锯齿. minimize/maximize 是横竖 quad 不 affected, 仍走
-        // append_titlebar_vertices 内的 stroke quad path.
-        self.append_close_icon_glyph(
-            text_system,
-            &mut glyph_vertex_bytes,
-            surface_w,
-            surface_h,
-            title_color,
-        );
+        // 窗口控制矢量图标重构: close 按钮 × 现走 line pipeline (抗锯齿矢量线段,
+        // 与 min/max 构造一致 + 同色同宽), 在 append_titlebar_vertices 内 append 到
+        // line_vertex_bytes. 取代旧的 cosmic-text "×" 字形路径 (发糊发淡 + 比 min/max
+        // 细). title_color 仅剩标题文字用.
 
         // T-0505: preedit overlay (派单 In #D). 在 cursor cell 起点之后绘制
         // preedit 字 + 底部下划线。preedit 字走 glyph pass (alpha-blended),
@@ -3405,6 +3596,8 @@ impl Renderer {
         let glyph_vertex_count = (glyph_vertex_bytes.len() / GLYPH_VERTEX_BYTES) as u32;
         // T-0615: rounded element vertex count.
         let rounded_vertex_count = (rounded_vertex_bytes.len() / ROUNDED_VERTEX_BYTES) as u32;
+        // 窗口控制矢量图标 line vertex count.
+        let line_vertex_count = (line_vertex_bytes.len() / LINE_VERTEX_BYTES) as u32;
 
         // 调试锚点 (debug 级, 不污染默认 info)
         tracing::debug!(
@@ -3414,6 +3607,7 @@ impl Renderer {
             cell_vertex_count,
             glyph_vertex_count,
             rounded_vertex_count,
+            line_vertex_count,
             atlas_count = self.glyph_atlas.as_ref().map(|a| a.allocations.len()).unwrap_or(0),
             "draw_frame stats"
         );
@@ -3438,6 +3632,13 @@ impl Renderer {
                 anyhow!("rounded_vertex_buffer 应已 lazy 初始化(ensure_rounded_buffer 后)")
             })?;
             self.queue.write_buffer(buf, 0, &rounded_vertex_bytes);
+        }
+        if line_vertex_count > 0 {
+            self.ensure_line_buffer(line_vertex_bytes.len());
+            let buf = self.line_vertex_buffer.as_ref().ok_or_else(|| {
+                anyhow!("line_vertex_buffer 应已 lazy 初始化(ensure_line_buffer 后)")
+            })?;
+            self.queue.write_buffer(buf, 0, &line_vertex_bytes);
         }
 
         // Step 5: acquire frame (与 draw_cells / render 同档错误分类)
@@ -3524,6 +3725,22 @@ impl Renderer {
                 pass.set_bind_group(1, &self.corner_bind_group, &[]);
                 pass.set_vertex_buffer(0, rb.slice(..));
                 pass.draw(0..rounded_vertex_count, 0..1);
+            }
+
+            // 窗口控制矢量图标 (close × / min / max / +/ share). 在 rounded (hover
+            // 圆 bg) 之后画 → icon 叠在 hover bg 之上. line pipeline 无 bind group.
+            if line_vertex_count > 0 {
+                let lp = self
+                    .line_pipeline
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("line_pipeline 应已 lazy 初始化"))?;
+                let lb = self
+                    .line_vertex_buffer
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("line_vertex_buffer 应已 lazy 初始化"))?;
+                pass.set_pipeline(lp);
+                pass.set_vertex_buffer(0, lb.slice(..));
+                pass.draw(0..line_vertex_count, 0..1);
             }
 
             // 基础glyph pass:终端字形、titlebar、preedit先画。
@@ -3899,6 +4116,37 @@ impl Renderer {
         self.rounded_buffer_capacity = alloc_verts;
     }
 
+    /// **lazy 初始化窗口控制矢量图标 line pipeline** (走 [`LINE_WGSL`] 抗锯齿线段
+    /// SDF). 顶点格式 [`LINE_VERTEX_BYTES`] (`pos[2] + color[3] + seg[4] + half_width[1]`).
+    /// **无 bind group** (图标远离 surface 圆角, 不需 corner mask uniform) → pipeline
+    /// layout 空. 与 [`Self::ensure_rounded_pipeline`] 同 lazy 套路, 但独立 shader /
+    /// 独立 pipeline / 独立 vertex buffer (不碰共用 rounded shader).
+    fn ensure_line_pipeline(&mut self) {
+        if self.line_pipeline.is_some() {
+            return;
+        }
+        self.line_pipeline = Some(create_line_pipeline(&self.device, self.config.format));
+    }
+
+    /// **lazy 初始化 / 增长 line vertex buffer**. 与 [`Self::ensure_rounded_buffer`]
+    /// 同套路 (needed_bytes → 顶点数, 不足则重建).
+    fn ensure_line_buffer(&mut self, needed_bytes: usize) {
+        let needed_verts = needed_bytes.div_ceil(LINE_VERTEX_BYTES);
+        if self.line_buffer_capacity >= needed_verts && self.line_vertex_buffer.is_some() {
+            return;
+        }
+        let alloc_verts = needed_verts.max(1);
+        let size_bytes = (alloc_verts * LINE_VERTEX_BYTES) as u64;
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("quill-line-vertex-buffer"),
+            size: size_bytes,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.line_vertex_buffer = Some(buf);
+        self.line_buffer_capacity = alloc_verts;
+    }
+
     /// atlas allocate (含 lazy raster 与 GPU 上传)。返 Some(slot) 当成功 (含 cache
     /// hit), None 当 rasterize 失败 (Color content / 缺字形)。
     ///
@@ -4119,82 +4367,6 @@ impl Renderer {
                 glyph_vertex_bytes.extend_from_slice(&glyph_color[1].to_ne_bytes());
                 glyph_vertex_bytes.extend_from_slice(&glyph_color[2].to_ne_bytes());
             }
-        }
-    }
-
-    /// T-0606 hotfix: shape "×" (U+00D7) + raster + atlas + 居中放 close 按钮.
-    /// 走 glyph pipeline (跟 title 同 path) 自带抗锯齿, 修阶梯近似的肉眼锯齿.
-    fn append_close_icon_glyph(
-        &mut self,
-        text_system: &mut TextSystem,
-        glyph_vertex_bytes: &mut Vec<u8>,
-        surface_w: f32,
-        surface_h: f32,
-        glyph_color: [f32; 3],
-    ) {
-        let glyphs = text_system.shape_line("\u{00D7}");
-        let glyph = match glyphs.first() {
-            Some(g) if g.x_advance.is_finite() => g,
-            _ => return,
-        };
-        let slot = match self.allocate_glyph_slot(text_system, glyph) {
-            Some(s) => s,
-            None => return,
-        };
-        if slot.width == 0 || slot.height == 0 {
-            return;
-        }
-        // close button 中心 (px). 跟 hit_test / append_titlebar_vertices 同源:
-        // close button 在 titlebar 内垂直居中, 右内缩 WINDOW_BUTTON_INSET_PX.
-        let hidpi = HIDPI_SCALE as f32;
-        let btn_w = BUTTON_W_LOGICAL_PX as f32 * hidpi;
-        let btn_h = BUTTON_H_LOGICAL_PX as f32 * hidpi;
-        let titlebar_h = TITLEBAR_H_LOGICAL_PX as f32 * hidpi;
-        let inset = WINDOW_BUTTON_INSET_PX * hidpi;
-        let center_x = surface_w - inset - btn_w / 2.0;
-        let center_y = titlebar_h / 2.0; // T-0618 follow-up: 跟 button bbox 居中
-                                         // T-0618 follow-up part 4: × glyph 视觉跟 Min/Max icon 一档大小. Min/Max
-                                         // 走 icon_pad = 6 logical (12 phys), 实际 icon 区 = btn_h - 2*icon_pad.
-                                         // × 走原生 glyph size (太小, 看着比 Min/Max 小). 等比 scale 到 target_size.
-        let icon_pad_phys = 6.0 * hidpi;
-        let target_size = btn_h - 2.0 * icon_pad_phys;
-        // 等比缩放保 × 不变形. slot 通常近方, 短边为基准.
-        let slot_max = (slot.width.max(slot.height)) as f32;
-        let scale = if slot_max > 0.0 {
-            target_size / slot_max
-        } else {
-            1.0
-        };
-        let render_w = slot.width as f32 * scale;
-        let render_h = slot.height as f32 * scale;
-        let x_left = center_x - render_w / 2.0;
-        let y_top = center_y - render_h / 2.0;
-        let x_right = x_left + render_w;
-        let y_bot = y_top + render_h;
-        let ndc_left = x_left / surface_w * 2.0 - 1.0;
-        let ndc_right = x_right / surface_w * 2.0 - 1.0;
-        let ndc_top = 1.0 - y_top / surface_h * 2.0;
-        let ndc_bot = 1.0 - y_bot / surface_h * 2.0;
-        let uv_l = slot.uv_min[0];
-        let uv_r = slot.uv_max[0];
-        let uv_t = slot.uv_min[1];
-        let uv_b = slot.uv_max[1];
-        let verts: [([f32; 2], [f32; 2]); 6] = [
-            ([ndc_left, ndc_top], [uv_l, uv_t]),
-            ([ndc_left, ndc_bot], [uv_l, uv_b]),
-            ([ndc_right, ndc_bot], [uv_r, uv_b]),
-            ([ndc_left, ndc_top], [uv_l, uv_t]),
-            ([ndc_right, ndc_bot], [uv_r, uv_b]),
-            ([ndc_right, ndc_top], [uv_r, uv_t]),
-        ];
-        for (pos, uv) in verts {
-            glyph_vertex_bytes.extend_from_slice(&pos[0].to_ne_bytes());
-            glyph_vertex_bytes.extend_from_slice(&pos[1].to_ne_bytes());
-            glyph_vertex_bytes.extend_from_slice(&uv[0].to_ne_bytes());
-            glyph_vertex_bytes.extend_from_slice(&uv[1].to_ne_bytes());
-            glyph_vertex_bytes.extend_from_slice(&glyph_color[0].to_ne_bytes());
-            glyph_vertex_bytes.extend_from_slice(&glyph_color[1].to_ne_bytes());
-            glyph_vertex_bytes.extend_from_slice(&glyph_color[2].to_ne_bytes());
         }
     }
 
@@ -4835,10 +5007,14 @@ pub fn render_headless(
     // headless 路径用 HEADLESS_HOVER_OVERRIDE (默认 None) 注入 hover, 测试可走
     // hover 视觉验证.
     let mut rounded_vertex_bytes: Vec<u8> = Vec::new();
+    // 窗口控制矢量图标笔画 (close × / min / max / +/ share) → line pipeline.
+    // headless 也走 append_titlebar_vertices → 顺带补上此前 headless 缺失的 close ×.
+    let mut line_vertex_bytes: Vec<u8> = Vec::new();
     let hover_override = HEADLESS_HOVER_OVERRIDE.with(|c| c.get());
     append_titlebar_vertices(
         &mut cell_vertex_bytes,
         &mut rounded_vertex_bytes,
+        &mut line_vertex_bytes,
         surface_w,
         surface_h,
         is_srgb,
@@ -5361,6 +5537,8 @@ pub fn render_headless(
     let glyph_vertex_count = (glyph_vertex_bytes.len() / GLYPH_VERTEX_BYTES) as u32;
     // T-0615: rounded element vertex count.
     let rounded_vertex_count = (rounded_vertex_bytes.len() / ROUNDED_VERTEX_BYTES) as u32;
+    // 窗口控制矢量图标 line vertex count.
+    let line_vertex_count = (line_vertex_bytes.len() / LINE_VERTEX_BYTES) as u32;
 
     let cell_vbuf = if cell_vertex_count > 0 {
         let buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -5404,12 +5582,28 @@ pub fn render_headless(
         None
     };
 
+    // 窗口控制矢量图标 line pipeline + buffer (本地, 与 Renderer::ensure_line_pipeline
+    // 同 create_line_pipeline factory).
+    let line_pipeline = create_line_pipeline(&device, format);
+    let line_vbuf = if line_vertex_count > 0 {
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("quill-headless-line-vertex"),
+            size: line_vertex_bytes.len() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&buf, 0, &line_vertex_bytes);
+        Some(buf)
+    } else {
+        None
+    };
+
     tracing::debug!(
         target: "quill::wl::render",
         cols, rows,
         logical_w = width, logical_h = height,
         physical_w, physical_h,
-        cell_vertex_count, glyph_vertex_count, rounded_vertex_count,
+        cell_vertex_count, glyph_vertex_count, rounded_vertex_count, line_vertex_count,
         atlas_count = allocations.len(),
         "render_headless stats"
     );
@@ -5450,6 +5644,13 @@ pub fn render_headless(
             pass.set_bind_group(1, &corner_bind_group, &[]);
             pass.set_vertex_buffer(0, buf.slice(..));
             pass.draw(0..base_rounded_vertex_count, 0..1);
+        }
+        // 窗口控制矢量图标 (close × / min / max / +/ share): 在 rounded (hover 圆
+        // bg) 之后 → icon 叠在 hover bg 之上. line pipeline 无 bind group.
+        if let Some(buf) = line_vbuf.as_ref().filter(|_| line_vertex_count > 0) {
+            pass.set_pipeline(&line_pipeline);
+            pass.set_vertex_buffer(0, buf.slice(..));
+            pass.draw(0..line_vertex_count, 0..1);
         }
         if let Some(buf) = glyph_vbuf.as_ref().filter(|_| base_glyph_vertex_count > 0) {
             pass.set_pipeline(&glyph_pipeline);
@@ -5898,6 +6099,85 @@ fn create_headless_rounded_pipeline(
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             buffers: &[wgpu::VertexBufferLayout {
                 array_stride: ROUNDED_VERTEX_BYTES as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &vertex_attrs,
+            }],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            unclipped_depth: false,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            conservative: false,
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// **窗口控制矢量图标 line pipeline factory** (走 [`LINE_WGSL`] 抗锯齿线段 SDF).
+/// `Renderer::ensure_line_pipeline` (live) + [`render_headless`] 同源. 顶点格式
+/// [`LINE_VERTEX_BYTES`] (`pos[2] + color[3] + seg[4] + half_width[1]` = 10 f32).
+/// **无 bind group** (图标远离 surface 圆角, 不需 corner mask) → layout 空.
+/// premultiplied alpha + `ALPHA_BLENDING` (与 rounded pipeline AA 边同 blend).
+fn create_line_pipeline(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("quill-line-shader"),
+        source: wgpu::ShaderSource::Wgsl(LINE_WGSL.into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("quill-line-pipeline-layout"),
+        bind_group_layouts: &[],
+        immediate_size: 0,
+    });
+    let vertex_attrs = [
+        wgpu::VertexAttribute {
+            offset: 0,
+            shader_location: 0,
+            format: wgpu::VertexFormat::Float32x2,
+        },
+        wgpu::VertexAttribute {
+            offset: (2 * std::mem::size_of::<f32>()) as u64,
+            shader_location: 1,
+            format: wgpu::VertexFormat::Float32x3,
+        },
+        wgpu::VertexAttribute {
+            offset: (5 * std::mem::size_of::<f32>()) as u64,
+            shader_location: 2,
+            format: wgpu::VertexFormat::Float32x4,
+        },
+        wgpu::VertexAttribute {
+            offset: (9 * std::mem::size_of::<f32>()) as u64,
+            shader_location: 3,
+            format: wgpu::VertexFormat::Float32,
+        },
+    ];
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("quill-line-pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: LINE_VERTEX_BYTES as u64,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &vertex_attrs,
             }],
@@ -7195,21 +7475,24 @@ mod tests {
         assert_eq!(cell.len(), 6 * VERTEX_BYTES);
     }
 
-    // ---------- T-0615 圆形 button visual (append_titlebar_vertices 整合) ----------
+    // ---------- 窗口控制矢量图标 (append_titlebar_vertices 整合) ----------
 
-    /// hover Close 时 rounded buffer 应含至少 1 quad (圆形 bg). 非 hover 时 rounded
-    /// buffer 仍含 icon stroke quads (Min/Max/+ icon strokes 移到 rounded), 但 close
-    /// 圆形 bg 仅 hover 时 append.
+    /// 窗口控制矢量图标重构后: 图标笔画 (close × / min / max / +/ share) 全走
+    /// **line_out** (line pipeline), rounded_out 只剩 hover 圆 bg. hover Close 时
+    /// rounded_out 含 1 个 close 圆 bg (6 顶点, elem_radius = 按钮半径), line_out 含
+    /// 全部图标笔画 (12 quad = 72 顶点).
     #[test]
     fn append_titlebar_vertices_hover_close_emits_rounded_button_bg() {
         use crate::wl::pointer::{HoverRegion, WindowButton};
         let mut cell_out = Vec::new();
         let mut rounded_out = Vec::new();
+        let mut line_out = Vec::new();
         let surface_w = 1600.0;
         let surface_h = 1200.0;
         append_titlebar_vertices(
             &mut cell_out,
             &mut rounded_out,
+            &mut line_out,
             surface_w,
             surface_h,
             false,
@@ -7217,40 +7500,40 @@ mod tests {
             false,
             false,
         );
-        // hover Close 时: rounded_out 含 close 圆形 bg (6 顶点) + Min/Max icon
-        // strokes (4 边 max + 1 line min = 5 quad × 6 顶点 = 30) ≥ 36 顶点
-        let n_verts = rounded_out.len() / ROUNDED_VERTEX_BYTES;
-        assert!(
-            n_verts >= 6,
-            "hover Close 时 rounded buffer 必含 ≥ 1 quad (圆形 bg + icon strokes), got {n_verts} 顶点"
+        // hover Close 时: rounded_out 只含 close 圆形 bg (1 quad = 6 顶点, 图标笔画
+        // 已移到 line_out).
+        let n_rounded = rounded_out.len() / ROUNDED_VERTEX_BYTES;
+        assert_eq!(
+            n_rounded, 6,
+            "hover Close 时 rounded buffer 只含 close 圆形 bg (6 顶点), got {n_rounded}"
         );
-        // 验某 1 顶点 elem_radius == WINDOW_BUTTON_RADIUS_PX × HIDPI_SCALE
+        // 该圆 bg 的 elem_radius == WINDOW_BUTTON_RADIUS_PX × HIDPI_SCALE.
         let expected_radius = WINDOW_BUTTON_RADIUS_PX * HIDPI_SCALE as f32;
-        let mut found_btn_radius = false;
-        for i in 0..n_verts {
-            let v_off = i * ROUNDED_VERTEX_BYTES;
-            let r = f32::from_ne_bytes(rounded_out[v_off + 36..v_off + 40].try_into().unwrap());
-            if (r - expected_radius).abs() < 1e-5 {
-                found_btn_radius = true;
-                break;
-            }
-        }
+        let r = f32::from_ne_bytes(rounded_out[36..40].try_into().unwrap());
         assert!(
-            found_btn_radius,
-            "hover Close 时 rounded buffer 必含 elem_radius={expected_radius} 顶点 (圆形按钮 bg)"
+            (r - expected_radius).abs() < 1e-5,
+            "close 圆 bg elem_radius 应为 {expected_radius}, got {r}"
+        );
+        // line_out 含全部图标笔画: close × 2 + max 4 + min 1 + share 3 + + 2 = 12 quad = 72 顶点.
+        let n_line = line_out.len() / LINE_VERTEX_BYTES;
+        assert_eq!(
+            n_line, 72,
+            "line buffer 含全部窗口控制图标笔画 (12 quad × 6 = 72), got {n_line}"
         );
     }
 
-    /// 非 hover 时 (HoverRegion::None), 三按钮 bg 都不画 — 仅 icon strokes
-    /// (Min/Max 的横竖线) 在 rounded buffer.
+    /// 非 hover 时 (HoverRegion::None), 无任何 hover 圆 bg → rounded_out 空; 图标笔画
+    /// (close × / min / max / +/ share) 全在 line_out.
     #[test]
     fn append_titlebar_vertices_no_hover_skips_button_bg() {
         use crate::wl::pointer::HoverRegion;
         let mut cell_out = Vec::new();
         let mut rounded_out = Vec::new();
+        let mut line_out = Vec::new();
         append_titlebar_vertices(
             &mut cell_out,
             &mut rounded_out,
+            &mut line_out,
             1600.0,
             1200.0,
             false,
@@ -7258,20 +7541,27 @@ mod tests {
             false,
             false,
         );
-        let n_verts = rounded_out.len() / ROUNDED_VERTEX_BYTES;
-        // icon strokes: Maximize 4 边 + Minimize 1 横 + T-0618 + button 横竖 2 条 = 7 quad × 6 = 42 顶点;
-        // E′ 加共享按钮 3 根信号条 = 3 quad × 6 = 18 顶点 → 42 + 18 = 60 顶点 (无圆形 bg)。
+        // 无 hover → rounded_out 无 hover 圆 bg (图标笔画已不在 rounded).
+        let n_rounded = rounded_out.len() / ROUNDED_VERTEX_BYTES;
         assert_eq!(
-            n_verts, 60,
-            "非 hover 时 rounded 含 Min/Max + 按钮 + 共享 3 信号条 icon strokes (10 quad × 6 = 60), got {n_verts}"
+            n_rounded, 0,
+            "非 hover 时 rounded buffer 应空 (无 hover 圆 bg), got {n_rounded}"
         );
-        // 所有顶点 elem_radius == 0 (icon strokes 矩形)
-        for i in 0..n_verts {
-            let v_off = i * ROUNDED_VERTEX_BYTES;
-            let r = f32::from_ne_bytes(rounded_out[v_off + 36..v_off + 40].try_into().unwrap());
+        // line_out: close × 2 + Maximize 4 边 + Minimize 1 横 + share 3 信号条 + + 横竖 2
+        // = 12 quad × 6 = 72 顶点.
+        let n_line = line_out.len() / LINE_VERTEX_BYTES;
+        assert_eq!(
+            n_line, 72,
+            "非 hover 时 line 含全部图标笔画 (12 quad × 6 = 72), got {n_line}"
+        );
+        // 所有 line 顶点 half_width == stroke_w/2 = HIDPI_SCALE (2*hidpi / 2 = hidpi).
+        let expected_hw = HIDPI_SCALE as f32;
+        for i in 0..n_line {
+            let v_off = i * LINE_VERTEX_BYTES;
+            let hw = f32::from_ne_bytes(line_out[v_off + 36..v_off + 40].try_into().unwrap());
             assert!(
-                r.abs() < 1e-5,
-                "非 hover 时 rounded 顶点应全 radius=0 (icon strokes), v{i} got {r}"
+                (hw - expected_hw).abs() < 1e-5,
+                "line 顶点 half_width 应为 {expected_hw} (stroke_w/2), v{i} got {hw}"
             );
         }
     }
