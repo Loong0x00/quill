@@ -500,9 +500,10 @@ fn federated_new_after_cross_select_realigns_feeder_id() {
             if *workspace_id == 200 && *tab_id == 2)
     });
 
-    // ② 点 + → New 落锚 A(handle_tab_op New 用 anchor_feeder,记 pending_new_select 在 A)。
+    // ② 点【锚窗口 A(100)】的 + → New 落 A(F4+ 按 workspace_id 路由;记 pending_new_select 在 A)。
+    //    (此测要制造"看着 B、新 tab 落 A"的分叉场景,故显式点 A 的 +。)
     let new = serde_json::to_string(&ClientMsg::TabOp {
-        workspace_id: 200,
+        workspace_id: 100,
         op: TabOp::New,
     })
     .expect("ser New");
@@ -690,8 +691,65 @@ fn recv_feeder_frame(
     }
 }
 
-/// F3:手机 `TabOp::New` → 路由到【锚 feeder】(第一个接入的窗口 = home),经其 back-channel 回灌
-/// TabOp::New 帧;非锚 feeder 收不到(新 tab 落锚,不是客户端在看的 workspace)。Close 仍走各自 feeder。
+/// F4+:手机在分段栏点【非锚窗口】的 + → New 按消息 `workspace_id` 落那个窗口(不再一律落锚)。
+/// 客户端 attach 锚 A,发 `TabOp{workspace_id:200(B), New}` → B 的 back-channel 收到 New、锚 A 不收。
+#[test]
+fn federated_new_routes_to_chosen_nonanchor_window() {
+    let port = free_port();
+    let k = FedKernel::spawn(port);
+
+    let mut fa = k.connect_feeder();
+    declare(&mut fa, 100, 1, &[(1, "alpha")]); // 锚 A(ws 100,第一个接入)
+    std::thread::sleep(Duration::from_millis(200));
+    let mut fb = k.connect_feeder();
+    declare(&mut fb, 200, 2, &[(2, "beta")]); // B(ws 200,非锚)
+    std::thread::sleep(Duration::from_millis(300));
+
+    let mut ws = match connect_ws(port, Duration::from_secs(15)) {
+        Some(w) => w,
+        None => {
+            k.cleanup();
+            panic!("15s 内未能连上联邦 kernel WS");
+        }
+    };
+    let _ = ws_recv_text_until(&mut ws, &["\"Workspaces\""], Duration::from_secs(10));
+
+    // 点【窗口 B(200)】的 + → New 应落 B(而非锚 A)。
+    let new = serde_json::to_string(&ClientMsg::TabOp {
+        workspace_id: 200,
+        op: TabOp::New,
+    })
+    .expect("ser New");
+    ws.send(Message::Text(new.into())).expect("send New");
+    let _ = ws.flush();
+
+    // B 的 back-channel 应收到 New 回灌帧。
+    let mut dec_b = FeedDecoder::new();
+    let got_b = recv_feeder_frame(&mut fb, &mut dec_b, Duration::from_secs(10))
+        .expect("非锚窗口 B 应收到 New 回灌帧(New 按 workspace_id 落所点窗口)");
+    assert_eq!(got_b.kind, FrameKind::TabOp, "B 回灌帧 kind 应为 TabOp");
+    assert_eq!(
+        decode_tab_op(&got_b.payload),
+        Some(FeedTabOp::New),
+        "B 回灌 payload 应为 New"
+    );
+
+    // 锚 A 不该收到(New 不再一律落锚,落所点的窗口)。
+    let mut dec_a = FeedDecoder::new();
+    let leaked_a = recv_feeder_frame(&mut fa, &mut dec_a, Duration::from_secs(2));
+    assert!(
+        leaked_a.is_none(),
+        "New 落所点窗口 B → 锚 A 不该收到 New 回灌帧"
+    );
+
+    let _ = ws.close(None);
+    drop(fa);
+    drop(fb);
+    k.cleanup();
+}
+
+/// F4+ 回退:New 的 `workspace_id` 指锚窗口(或找不到窗口时)→ 落锚 feeder(F3 默认 home)。
+/// 客户端 attach 锚 A,发 `TabOp{workspace_id:100(A=锚), New}` → 锚 A 收到 New、非锚 B 不收。
 #[test]
 fn federated_new_tab_routes_to_anchor_feeder() {
     let port = free_port();

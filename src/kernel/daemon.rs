@@ -2375,7 +2375,8 @@ fn handle_client_msg(data: &mut DaemonData, id: u64, text: &str) -> Option<PostA
 ///   attach 的那个 feeder**),把本客户端 viewed 切到该窗口第 idx 个 tab(不动桌面焦点、不影响别的
 ///   客户端)+ 重放目标 tab 环缓冲(`follow=false` pin);并把本客户端 `feeder_id` 更新为目标窗口
 ///   → 随后 Close / 焦点跟随对准"当前所看窗口";
-/// - `New` = **回灌锚 feeder 的窗口 spawn**(F3:新 tab 落"共享锚窗口" = 第一个开共享的窗口);
+/// - `New` = **回灌消息 `workspace_id` 那个窗口 spawn**(F4+:分段栏每窗口各有 +,新 tab 落你点的
+///   那个窗口);找不到该窗口回落锚 feeder(F3 默认 home = 第一个开共享的窗口),再无锚回落 attach;
 /// - `Close` / `Reorder` = 据消息 `workspace_id` 定位窗口回灌(择稳:关/换哪个窗口的 tab 由客户端
 ///   点的段决定,独立于本客户端在看哪个);
 /// - `SetTitle` = 暂不接(桌面无对应操作,留后续)。
@@ -2419,11 +2420,15 @@ fn handle_tab_op(data: &mut DaemonData, id: u64, workspace_id: u64, op: TabOp) {
         // 锚窗口发回含新 tab 的 TabList 时把该客户端自动 Select 到新 tab(见 feeder_tab_list_updated)。
         // 无锚(不该发生:feeders 非空必有锚)回落到客户端 attach 的 feeder。
         TabOp::New => {
-            let Some(target) = data
-                .anchor_feeder
+            // F4+:手机在分段栏点【某个窗口】的 + → 新 tab 落那个窗口(消息 workspace_id)。找不到该
+            // 窗口(race / 未声明 ws)回落锚 feeder(F3 默认 home = 开共享的窗口),再无锚回落客户端
+            // attach 的 feeder。落点 feeder 记 pending_new_select → 其窗口发回含新 tab 的 TabList 时把
+            // 发起客户端自动 Select 到新 tab(feeder_tab_list_updated,含 feeder_id 对齐)。
+            let Some(target) = feeder_id_for_ws(data, workspace_id)
+                .or(data.anchor_feeder)
                 .or_else(|| data.clients.get(&id).and_then(|c| c.feeder_id))
             else {
-                tracing::debug!("TabOp::New 无锚 / 客户端未 attach feeder,忽略");
+                tracing::debug!("TabOp::New 无匹配窗口 / 无锚 / 客户端未 attach feeder,忽略");
                 return;
             };
             if let Some(f) = data.feeders.get_mut(&target) {
