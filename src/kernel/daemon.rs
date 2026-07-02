@@ -2671,7 +2671,10 @@ fn handle_tab_op(data: &mut DaemonData, id: u64, workspace_id: u64, op: TabOp) {
             let Some(feeder_id) = feeder_id_for_ws(data, workspace_id)
                 .or_else(|| data.clients.get(&id).and_then(|c| c.feeder_id))
             else {
-                tracing::debug!(workspace_id, "TabOp::Reorder 无匹配 feeder / 未 attach,忽略");
+                tracing::debug!(
+                    workspace_id,
+                    "TabOp::Reorder 无匹配 feeder / 未 attach,忽略"
+                );
                 return;
             };
             forward_tab_op_to_feeder(

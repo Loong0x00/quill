@@ -732,7 +732,12 @@ reflowEl.addEventListener("pointerup", () => { if (viewMode === "reflow" && term
 // 发原始字节(二进制帧),与片1 出站 Binary 对称;daemon 收到直接写 PTY。`ws` 是
 // 下面的 let 变量,重连会换实例 —— 这里读闭包里的当前 ws,不捕获旧实例。
 function sendBytes(u8) {
-  if (ws && ws.readyState === WebSocket.OPEN && u8 && u8.length) ws.send(u8);
+  if (!(ws && ws.readyState === WebSocket.OPEN && u8 && u8.length)) return;
+  // 按 ≤64KiB 分帧:单帧永不超 kernel 的 WS max_message_size(1MiB,防单条大消息 DoS),
+  // 大粘贴照样发全(拆多帧)。daemon 收到直接顺序写 PTY(帧间无边界要求)。
+  const CHUNK = 65536;
+  if (u8.length <= CHUNK) { ws.send(u8); return; }
+  for (let i = 0; i < u8.length; i += CHUNK) ws.send(u8.subarray(i, i + CHUNK));
 }
 // onData 给的是 UTF-8 文本(普通键 + Enter=\r + Ctrl-C=\x03 + 方向键=\x1b[A… 由
 // xterm 编码好,含粘贴/IME 上屏);TextEncoder 编 UTF-8 后发。

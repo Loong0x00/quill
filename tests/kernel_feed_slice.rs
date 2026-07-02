@@ -27,6 +27,10 @@ use tungstenite::{Bytes, Message, WebSocket};
 
 const MARKER: &[u8] = b"FEED_MARKER_payload_42";
 
+// P0 CSWSH:daemon WS 握手强制 token 鉴权。测试用已知 token(经 `QUILL_SHARE_TOKEN` env 传 kernel),
+// 连接 URL 带 `?t=<TEST_TOKEN>` 才握手成功(同 kernel_ws_slice / kernel_federation_slice 做法)。
+const TEST_TOKEN: &str = "test0token0feedslice";
+
 fn free_port() -> u16 {
     let l = TcpListener::bind("127.0.0.1:0").expect("bind 临时端口");
     l.local_addr().expect("local_addr").port()
@@ -116,6 +120,7 @@ impl FedChild {
             .arg(format!("--fed-in={c_read}"))
             .arg(format!("--fed-out={c_write}"))
             .env("RUST_LOG", "quill=warn")
+            .env("QUILL_SHARE_TOKEN", TEST_TOKEN)
             .spawn()
             .expect("spawn quill-kernel (Fed)");
 
@@ -180,7 +185,7 @@ impl FedChild {
 }
 
 fn connect_ws(port: u16, timeout: Duration) -> Option<WebSocket<MaybeTlsStream<TcpStream>>> {
-    let url = format!("ws://127.0.0.1:{port}/");
+    let url = format!("ws://127.0.0.1:{port}/?t={TEST_TOKEN}");
     let deadline = Instant::now() + timeout;
     loop {
         if Instant::now() >= deadline {
