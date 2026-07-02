@@ -2655,15 +2655,23 @@ fn handle_tab_op(data: &mut DaemonData, id: u64, workspace_id: u64, op: TabOp) {
         }
         // Close / Reorder 按消息 workspace_id 路由到该窗口的 feeder(择稳:不依赖客户端 viewed 状态)。
         TabOp::Close { tab_id } => {
-            let Some(feeder_id) = feeder_id_for_ws(data, workspace_id) else {
-                tracing::debug!(workspace_id, "TabOp::Close 无匹配 feeder,忽略");
+            // 按消息 workspace_id 定位目标窗口;找不到(Fed-child 拓扑 feeder 的 ws≠消息值 / race)
+            // 回退到客户端 attach 的 feeder(= pre-F4 行为)。**安全**:不用 anchor(会关错窗口),
+            // 回退窗口若无此 tab_id 其 apply_tab_op Close 找不到即 no-op,不会误关。
+            let Some(feeder_id) = feeder_id_for_ws(data, workspace_id)
+                .or_else(|| data.clients.get(&id).and_then(|c| c.feeder_id))
+            else {
+                tracing::debug!(workspace_id, "TabOp::Close 无匹配 feeder / 未 attach,忽略");
                 return;
             };
             forward_tab_op_to_feeder(data, feeder_id, FeedTabOp::Close { tab_id });
         }
         TabOp::Reorder { origin, target } => {
-            let Some(feeder_id) = feeder_id_for_ws(data, workspace_id) else {
-                tracing::debug!(workspace_id, "TabOp::Reorder 无匹配 feeder,忽略");
+            // 同 Close:workspace_id 定位不到回退 attach feeder(reorder 索引仅在该窗口内有意义)。
+            let Some(feeder_id) = feeder_id_for_ws(data, workspace_id)
+                .or_else(|| data.clients.get(&id).and_then(|c| c.feeder_id))
+            else {
+                tracing::debug!(workspace_id, "TabOp::Reorder 无匹配 feeder / 未 attach,忽略");
                 return;
             };
             forward_tab_op_to_feeder(
