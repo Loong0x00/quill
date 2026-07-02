@@ -45,9 +45,9 @@
 //! **仍留后续 ticket**:多 tab 动态增删 + 输入按 tab 寻址 + resize 协商(T6)。
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -59,8 +59,9 @@ use calloop::generic::Generic;
 use calloop::signals::{Signal, Signals};
 use calloop::timer::{TimeoutAction, Timer};
 use calloop::{EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction, RegistrationToken};
-use tungstenite::handshake::server::{NoCallback, ServerHandshake};
+use tungstenite::handshake::server::{Callback, ErrorResponse, Request, Response, ServerHandshake};
 use tungstenite::handshake::MidHandshake;
+use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{Bytes, Error as WsError, HandshakeError, Message, WebSocket};
 
 use crate::kernel::feed::{
@@ -134,6 +135,23 @@ const MAX_WS_CONNS: usize = 16;
 /// (快客户端出站队列常空),只有真跟不上的慢客户端(弱网卡死 / 完全不读)才会触顶
 /// 被断,不无界堆内存、不拖累别的客户端。
 const WS_CLIENT_OUT_CAP: usize = 1 << 20;
+
+/// WS 握手显式收紧的单条消息 / 单帧上限(灭安全审计 #2/#14:默认 tungstenite `WebSocketConfig`
+/// 是 64 MiB 消息 / 16 MiB 帧 → 单条大 Text 帧一次性 UTF-8 校验 + `serde_json` 全量解析可瞬时吃
+/// 数十 MB + 卡顿单线程 daemon)。输入只有按键(Binary,web 端已 ≤64KiB 分块)与小控制 JSON
+/// (Text),1 MiB 上限远超正常所需、又封死放大面。**必须在握手 config 里给** —— tungstenite
+/// 用它初始化 `WebSocket`,之后 `read` 按此上限拒超大帧。
+const WS_MAX_MESSAGE_SIZE: usize = 1 << 20;
+
+/// 环境变量:kernel 启动时读取的共享鉴权 token(P0 CSWSH 修复)。owner 窗口(`quill --share`)从
+/// 持久文件 `~/.config/quill/token` 读出后经此 env 传给 spawn 的 detached kernel(见 window.rs
+/// `share_spawn_detached_kernel`);缺失时 kernel 生成临时 token 并 `warn`(绝不裸奔放行)。
+const ENV_SHARE_TOKEN: &str = "QUILL_SHARE_TOKEN";
+
+/// 环境变量:Host/Origin 允许集的**额外**主机名(逗号分隔,如 DDNS 域 `vpn.example.com`)。
+/// 默认允许集已含 localhost + 任意 IP 字面量(见 [`host_is_allowed`]),此 env 仅用于放行用户自有
+/// 域名(纵深防御,不误杀合法访问)。
+const ENV_ALLOWED_HOSTS: &str = "QUILL_SHARE_ALLOWED_HOSTS";
 
 /// Fed back-channel(子→父 Input 帧)出站字节队列上限。WS 客户端输入字节是**长度前缀成帧
 /// 流**(非 PTY 无帧字节流)→ 丢半帧会让父侧 [`FeedDecoder`] framing 错位级联(读 len=N 只
@@ -496,6 +514,11 @@ pub fn run(config: DaemonConfig) -> Result<()> {
         }
     };
 
+    // P0 CSWSH 修复:WS 鉴权 token(env 下发的持久 token / 缺则临时 token)+ Host/Origin 允许集。
+    // 在建 DaemonData 前解析,任一失败(极罕见的 getrandom 故障)早退,不半配置起服务。
+    let ws_token = load_or_generate_token()?;
+    let allowed_hosts = Rc::new(build_allowed_hosts(config.ws_bind));
+
     let mut data = DaemonData {
         session,
         feeders,
@@ -514,6 +537,8 @@ pub fn run(config: DaemonConfig) -> Result<()> {
         http_writers: HashMap::new(),
         next_http_writer_id: 1,
         http_write_deadline,
+        ws_token,
+        allowed_hosts,
     };
 
     // Source: WS TCP listener。owned 交 Generic;可读→accept 新连接注册成各自的源(两拓扑共享)。
@@ -824,6 +849,11 @@ struct DaemonData {
     next_http_writer_id: u64,
     /// HTTP 响应写源从建立起把响应写完的绝对期限;超期未 drain 的被收割 Timer 回收。
     http_write_deadline: Duration,
+    /// WS 握手鉴权 token(P0 CSWSH 修复)。每条连接握手时克隆进 [`AuthCallback`] 与请求 `?t=`
+    /// 常量时间比较。来源见 [`load_or_generate_token`]。
+    ws_token: Rc<str>,
+    /// Host/Origin 允许集(纵深防线;见 [`build_allowed_hosts`] / [`host_is_allowed`])。
+    allowed_hosts: Rc<HashSet<String>>,
 }
 
 /// 一个在飞 HTTP 响应写源的登记项(收割 Timer 用):源 token(回收时 `loop_handle.remove`)
@@ -910,9 +940,183 @@ enum WsStage {
     /// WS 握手中:非阻塞 `MidHandshake`,fd 再可读时 `.handshake()` 续做。`Option` 是为
     /// 了 `take()` 出来调 `handshake(self)`(按值消费),`Interrupted` 时把推进后的存回。
     /// 流是 [`PrefixStream`](已消费的请求字节 + socket dup),tungstenite 从头读完整握手。
-    Handshaking(Option<MidHandshake<ServerHandshake<PrefixStream, NoCallback>>>),
+    /// 回调 [`AuthCallback`] 在握手回复前校验 token(query `?t=`)+ Origin + Host(P0 CSWSH 修复)。
+    Handshaking(Option<MidHandshake<ServerHandshake<PrefixStream, AuthCallback>>>),
     /// 握手完成,长命直播:`WebSocket` 持有 [`PrefixStream`](握手后前缀已耗尽 ≈ 裸 dup)。
     Live(WebSocket<PrefixStream>),
+}
+
+/// WS 握手鉴权回调(P0 CSWSH 修复,ADR-0016 "以后可加 token" 提前落地)。在 tungstenite 生成
+/// 101 回复**之前**被调用,是唯一能拒绝跨站/未授权 WS 升级的钩子(旧码 `NoCallback` = 全放行 =
+/// 教科书级 CSWSH:任意恶意网页 `new WebSocket('ws://<主机>:7878')` 即可读全部 PTY 字节 + 注入
+/// 命令,浏览器对 WS 不施同源策略,VPN/LAN 边界被受害者自己的浏览器穿透)。
+///
+/// **三道校验(全过才放行)**:
+/// 1. **token**(主防线):请求目标 query `?t=<token>` 与 kernel token **常量时间**比较(见
+///    [`constant_time_eq`])。恶意网页拿不到 token(它不在页面里,只在用户手动构造的分享 URL
+///    query 里)→ 连不上 = CSWSH 被堵死。缺失/不匹配 → 403。
+/// 2. **Origin**(纵深):浏览器对 WS **会**带 Origin(本机 serve 的页面 origin);跨源(如
+///    `http://evil.com`)拒。native/无浏览器客户端无 Origin → 放行(见 [`host_is_allowed`])。
+/// 3. **Host**(纵深,防 DNS rebinding):Host 头主机须是 IP 字面量 / localhost / 允许集域名;
+///    攻击者把域名 rebind 到本机 IP 时 Host = 攻击者域名(非 IP、不在允许集)→ 拒。
+///
+/// 字段用 `Rc`(单线程 daemon,每连接握手时从 [`DaemonData`] 克隆 Rc,零深拷贝)。
+struct AuthCallback {
+    /// kernel 的共享 token(与请求 `?t=` 常量时间比较)。
+    token: Rc<str>,
+    /// Host/Origin 允许集(额外域名;IP 字面量 + localhost 恒放行,见 [`host_is_allowed`])。
+    allowed_hosts: Rc<HashSet<String>>,
+}
+
+impl Callback for AuthCallback {
+    fn on_request(self, request: &Request, response: Response) -> Result<Response, ErrorResponse> {
+        // 1) token(主防线)。请求目标是 origin-form(`/?t=...`);从 query 取 `t`。
+        let supplied = request.uri().query().and_then(|q| query_param(q, "t"));
+        let ok_token = supplied
+            .map(|t| constant_time_eq(t.as_bytes(), self.token.as_bytes()))
+            .unwrap_or(false);
+        if !ok_token {
+            tracing::warn!("WS 握手拒绝:token 缺失/不匹配(CSWSH 防线)");
+            return Err(reject_response("missing or invalid token"));
+        }
+        // 2) Origin(纵深)。存在则其主机必须在允许集;不存在 = native/无浏览器客户端 → 放行。
+        if let Some(origin) = request
+            .headers()
+            .get("origin")
+            .and_then(|v| v.to_str().ok())
+        {
+            let host = origin_host(origin).unwrap_or("");
+            if !host_is_allowed(host, &self.allowed_hosts) {
+                tracing::warn!(%origin, "WS 握手拒绝:跨源 Origin(CSWSH 纵深)");
+                return Err(reject_response("cross-origin websocket rejected"));
+            }
+        }
+        // 3) Host(纵深,防 DNS rebinding)。Host 头存在则其主机必须在允许集。
+        if let Some(host_hdr) = request.headers().get("host").and_then(|v| v.to_str().ok()) {
+            let host = host_only(host_hdr);
+            if !host_is_allowed(host, &self.allowed_hosts) {
+                tracing::warn!(%host_hdr, "WS 握手拒绝:Host 不在允许集(防 DNS rebinding)");
+                return Err(reject_response("host not allowed"));
+            }
+        }
+        Ok(response)
+    }
+}
+
+/// 从 URL query 串(`a=1&t=xxx&b=2`)取指定 key 的值。token 值域是 hex / base64url(无需
+/// percent-decode)。
+fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    query.split('&').find_map(|kv| {
+        let (k, v) = kv.split_once('=')?;
+        (k == key).then_some(v)
+    })
+}
+
+/// 常量时间字节比较(避免 `==` 早退泄漏 token 前缀匹配长度这一计时侧信道)。长度不等直接
+/// false(token 长度是公开定长,不算秘密)。
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// 从 authority(`host` / `host:port` / `[::1]` / `[::1]:port`)抠出裸主机(去端口、去 v6 方括号)。
+fn host_only(authority: &str) -> &str {
+    let a = authority.trim();
+    if let Some(rest) = a.strip_prefix('[') {
+        // v6 字面量:`[addr]` 或 `[addr]:port`。
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    // host / host:port(v4 / 域名;Host/Origin 里裸 v6 恒带方括号,故按首个 ':' 切端口安全)。
+    a.split(':').next().unwrap_or(a)
+}
+
+/// 从 Origin 头(`scheme://host[:port]`)抠出裸主机。
+fn origin_host(origin: &str) -> Option<&str> {
+    let authority = origin.split_once("://")?.1;
+    // origin 无 path,但防御性截断到首个 '/'。
+    let authority = authority.split('/').next().unwrap_or(authority);
+    Some(host_only(authority))
+}
+
+/// 主机是否允许(Host/Origin 纵深防线,防 DNS rebinding)。放行:① 任意 **IP 字面量**(v4/v6)
+/// ——DNS rebinding 本质需要**域名**,直连 IP 既非 rebinding 又仍要过 token,故放行任意 IP 干净覆盖
+/// 手机走 LAN IP / VPN IP 的合法访问;② `localhost`;③ 允许集里的额外域名(`QUILL_SHARE_ALLOWED_HOSTS`,
+/// 放行用户自有 DDNS 域)。拒:`evil.com` 这种非 IP、不在允许集的域名(rebinding 到本机 IP 时 Host
+/// 仍是攻击者域名)。**大小写不敏感**。以 token 为主防线,本函数宁宽勿误杀合法 IP/域名访问。
+fn host_is_allowed(host: &str, allowed: &HashSet<String>) -> bool {
+    let h = host.trim().to_ascii_lowercase();
+    if h.is_empty() {
+        return false;
+    }
+    if h == "localhost" {
+        return true;
+    }
+    if h.parse::<IpAddr>().is_ok() {
+        return true;
+    }
+    allowed.contains(&h)
+}
+
+/// 构造握手拒绝响应(403 + 短说明 body)。避免 `unwrap`:`Response::new` 建默认 200,再覆写状态。
+fn reject_response(msg: &str) -> ErrorResponse {
+    let mut resp = ErrorResponse::new(Some(msg.to_string()));
+    *resp.status_mut() = tungstenite::http::StatusCode::FORBIDDEN;
+    resp
+}
+
+/// 生成一个随机共享 token(32 字节 CSPRNG → 64 hex 字符)。P0 CSWSH 修复:kernel 缺 env token 时
+/// 的临时 token、window owner 首次创建持久 token 都走它(见 window.rs)。走 `getrandom(2)` syscall;
+/// 极罕见的失败(pool 未就绪等)**fail-closed** 返 `Err`(宁可开共享失败也绝不产弱/空 token)。
+pub fn generate_ws_token() -> Result<String> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).map_err(|e| anyhow!("getrandom 生成 share token 失败: {e}"))?;
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        use std::fmt::Write as _;
+        // 写入 String 的 fmt 不会失败;忽略返回值(无 unwrap)。
+        let _ = write!(s, "{b:02x}");
+    }
+    Ok(s)
+}
+
+/// kernel 启动时决定 WS 鉴权 token:优先 env `QUILL_SHARE_TOKEN`(owner 窗口下发的持久 token,
+/// 手机存的 URL 重启不失效);缺失 → 生成临时 token + `warn`(WS 仍强制鉴权,不裸奔)。
+fn load_or_generate_token() -> Result<Rc<str>> {
+    if let Ok(t) = std::env::var(ENV_SHARE_TOKEN) {
+        if !t.is_empty() {
+            return Ok(Rc::from(t.as_str()));
+        }
+    }
+    let t = generate_ws_token()?;
+    tracing::warn!(
+        "{ENV_SHARE_TOKEN} 未设置:已生成临时 token(重启后失效;WS 仍强制鉴权,不裸奔放行)。\
+         经 quill 窗口开共享会自动下发持久 token。"
+    );
+    Ok(Rc::from(t.as_str()))
+}
+
+/// 构建 Host/Origin 允许集:localhost + IP 字面量恒由 [`host_is_allowed`] 放行(不入集);此集只
+/// 装**额外域名** —— `QUILL_SHARE_WS_BIND` 的 host(若是域名)+ env `QUILL_SHARE_ALLOWED_HOSTS`
+/// 逗号分隔项。全部小写归一化。
+fn build_allowed_hosts(ws_bind: SocketAddr) -> HashSet<String> {
+    let mut set = HashSet::new();
+    // bind host 若是域名(极少;通常是 0.0.0.0 / IP)也放行。IP 会被 host_is_allowed 直接放行,入不入集无所谓。
+    set.insert(ws_bind.ip().to_string().to_ascii_lowercase());
+    if let Ok(extra) = std::env::var(ENV_ALLOWED_HOSTS) {
+        for h in extra.split(',') {
+            let h = h.trim().to_ascii_lowercase();
+            if !h.is_empty() {
+                set.insert(h);
+            }
+        }
+    }
+    set
 }
 
 /// 同口分流时把**已消费进缓冲**的握手请求字节"退还"给 tungstenite 的链式流。
@@ -1997,7 +2201,20 @@ fn ws_read_head(data: &mut DaemonData, id: u64, original: &TcpStream) -> io::Res
                 return Ok(drop_client_read_self(data, id));
             }
         };
-        let mid = ServerHandshake::start(PrefixStream::new(head, io_stream), NoCallback, None);
+        // P0 CSWSH 修复:带鉴权回调(token + Origin + Host)+ 收紧的 WebSocketConfig(灭 64MiB
+        // 默认消息上限,#2/#14)。callback 从 DaemonData 克隆 token / 允许集(Rc,零深拷贝)。
+        let callback = AuthCallback {
+            token: Rc::clone(&data.ws_token),
+            allowed_hosts: Rc::clone(&data.allowed_hosts),
+        };
+        let ws_config = WebSocketConfig::default()
+            .max_message_size(Some(WS_MAX_MESSAGE_SIZE))
+            .max_frame_size(Some(WS_MAX_MESSAGE_SIZE));
+        let mid = ServerHandshake::start(
+            PrefixStream::new(head, io_stream),
+            callback,
+            Some(ws_config),
+        );
         if let Some(c) = data.clients.get_mut(&id) {
             c.stage = WsStage::Handshaking(Some(mid));
         }
@@ -3317,6 +3534,145 @@ mod tests {
             0,
             "SO_REUSEADDR 应已设上(getsockopt 返非 0)"
         );
+    }
+
+    /// P0 CSWSH:query 取 `t`。
+    #[test]
+    fn query_param_extracts_token() {
+        assert_eq!(query_param("t=abc", "t"), Some("abc"));
+        assert_eq!(query_param("a=1&t=xyz&b=2", "t"), Some("xyz"));
+        assert_eq!(query_param("a=1&b=2", "t"), None);
+        assert_eq!(query_param("", "t"), None);
+        assert_eq!(query_param("t=", "t"), Some("")); // 空值(会被 token 比较拒)
+    }
+
+    /// P0 CSWSH:常量时间比较对/错/长度差。
+    #[test]
+    fn constant_time_eq_matches() {
+        assert!(constant_time_eq(b"deadbeef", b"deadbeef"));
+        assert!(!constant_time_eq(b"deadbeef", b"deadbeee"));
+        assert!(!constant_time_eq(b"short", b"longer-value"));
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    /// P0 CSWSH:authority / origin 抠裸主机(去端口 + v6 方括号)。
+    #[test]
+    fn host_extraction() {
+        assert_eq!(host_only("10.0.0.2:7878"), "10.0.0.2");
+        assert_eq!(host_only("localhost"), "localhost");
+        assert_eq!(host_only("[::1]:7878"), "::1");
+        assert_eq!(host_only("[::1]"), "::1");
+        assert_eq!(origin_host("http://10.0.0.2:7878"), Some("10.0.0.2"));
+        assert_eq!(origin_host("http://evil.com"), Some("evil.com"));
+        assert_eq!(origin_host("https://[::1]:7878"), Some("::1"));
+        assert_eq!(origin_host("not-a-url"), None);
+    }
+
+    /// P0 CSWSH:允许集 —— 任意 IP 字面量 + localhost 放行(防 rebinding 但不误杀合法 IP/域名访问),
+    /// 非 IP 且不在集里的域名(evil.com)拒;env 扩展的域名放行。
+    #[test]
+    fn host_allow_predicate() {
+        let mut allowed = HashSet::new();
+        allowed.insert("vpn.example.com".to_string());
+        assert!(host_is_allowed("127.0.0.1", &allowed));
+        assert!(host_is_allowed("10.0.0.2", &allowed));
+        assert!(host_is_allowed("::1", &allowed));
+        assert!(host_is_allowed("localhost", &allowed));
+        assert!(host_is_allowed("LOCALHOST", &allowed)); // 大小写不敏感
+        assert!(host_is_allowed("vpn.example.com", &allowed));
+        assert!(!host_is_allowed("evil.com", &allowed)); // rebinding 域名:拒
+        assert!(!host_is_allowed("", &allowed));
+    }
+
+    /// P0 CSWSH:随机 token 非空、64 hex 字符、两次不同(熵)。
+    #[test]
+    fn generate_token_is_random_hex() {
+        let a = generate_ws_token().expect("gen token a");
+        let b = generate_ws_token().expect("gen token b");
+        assert_eq!(a.len(), 64, "32 字节 → 64 hex");
+        assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b, "两次生成应不同(CSPRNG)");
+    }
+
+    /// P0 CSWSH:拒绝响应是 403 + body。
+    #[test]
+    fn reject_response_is_403() {
+        let r = reject_response("nope");
+        assert_eq!(r.status(), tungstenite::http::StatusCode::FORBIDDEN);
+        assert_eq!(r.body().as_deref(), Some("nope"));
+    }
+
+    /// P0 CSWSH:构建一个测试请求(origin-form target + 可选 origin/host 头)。
+    fn mk_request(target: &str, origin: Option<&str>, host: Option<&str>) -> Request {
+        let mut b = tungstenite::http::Request::builder().uri(target);
+        if let Some(o) = origin {
+            b = b.header("origin", o);
+        }
+        if let Some(h) = host {
+            b = b.header("host", h);
+        }
+        b.body(()).expect("build test request")
+    }
+
+    fn mk_callback(token: &str) -> AuthCallback {
+        AuthCallback {
+            token: Rc::from(token),
+            allowed_hosts: Rc::new(HashSet::new()),
+        }
+    }
+
+    /// P0 CSWSH 正向:对 token + 同源 Origin + IP Host → 放行。
+    #[test]
+    fn auth_callback_accepts_valid() {
+        let req = mk_request(
+            "/?t=secret",
+            Some("http://10.0.0.2:7878"),
+            Some("10.0.0.2:7878"),
+        );
+        let resp = tungstenite::http::Response::new(());
+        assert!(mk_callback("secret").on_request(&req, resp).is_ok());
+    }
+
+    /// P0 CSWSH 正向:native 客户端(无 Origin)+ 正确 token + localhost Host → 放行。
+    #[test]
+    fn auth_callback_accepts_no_origin() {
+        let req = mk_request("/?t=secret", None, Some("localhost:7878"));
+        let resp = tungstenite::http::Response::new(());
+        assert!(mk_callback("secret").on_request(&req, resp).is_ok());
+    }
+
+    /// P0 CSWSH 负向:token 缺失 → 拒。
+    #[test]
+    fn auth_callback_rejects_missing_token() {
+        let req = mk_request("/", None, Some("10.0.0.2:7878"));
+        let resp = tungstenite::http::Response::new(());
+        let err = mk_callback("secret").on_request(&req, resp).unwrap_err();
+        assert_eq!(err.status(), tungstenite::http::StatusCode::FORBIDDEN);
+    }
+
+    /// P0 CSWSH 负向:token 错误 → 拒。
+    #[test]
+    fn auth_callback_rejects_wrong_token() {
+        let req = mk_request("/?t=wrong", None, Some("10.0.0.2:7878"));
+        let resp = tungstenite::http::Response::new(());
+        assert!(mk_callback("secret").on_request(&req, resp).is_err());
+    }
+
+    /// P0 CSWSH 负向:token 对但跨源 Origin(evil.com)→ 拒(CSWSH 核心场景)。
+    #[test]
+    fn auth_callback_rejects_cross_origin() {
+        let req = mk_request("/?t=secret", Some("http://evil.com"), Some("10.0.0.2:7878"));
+        let resp = tungstenite::http::Response::new(());
+        assert!(mk_callback("secret").on_request(&req, resp).is_err());
+    }
+
+    /// P0 CSWSH 负向:token 对但 Host 是攻击者域名(DNS rebinding)→ 拒。
+    #[test]
+    fn auth_callback_rejects_rebinding_host() {
+        let req = mk_request("/?t=secret", None, Some("evil.com"));
+        let resp = tungstenite::http::Response::new(());
+        assert!(mk_callback("secret").on_request(&req, resp).is_err());
     }
 
     /// SO_REUSEADDR **不破坏正常独占**:同地址端口上已有 active listener 时,再 bind 仍须失败

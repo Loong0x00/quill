@@ -11,6 +11,10 @@ async-trait = "0.1"
 calloop = { version = "0.14", features = ["signals"] }
 cosmic-text = "0.12"
 futures = "0.3"
+# P0 CSWSH 修复(kernel-auth):WS 握手鉴权用的随机 share token 生成。已是依赖树里的
+# transitive crate(rand / 其它依赖引),此处提为直接依赖不新增构建单元;走 getrandom(2)
+# syscall 拿 CSPRNG 字节,比手搓读 /dev/urandom 更稳(处理 EINTR / 短读 / pool 未就绪)。
+getrandom = "0.3"
 # T-0408: PNG encoding for --headless-screenshot CLI flag (offscreen render →
 # PNG, agent 自验视觉)。default-features=false 关 jpg/webp/tiff 等不用 codec,
 # 仅留 png feature。详见 docs/adr/0005-image-crate-png-encoding.md。

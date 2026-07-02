@@ -1312,6 +1312,7 @@ dependencies = [
  "calloop 0.14.4",
  "cosmic-text",
  "futures",
+ "getrandom",
  "image",
  "libc",
  "pollster",

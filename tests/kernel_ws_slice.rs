@@ -24,9 +24,18 @@ use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, Instant};
 
 use tungstenite::stream::MaybeTlsStream;
-use tungstenite::{Bytes, Error as WsError, Message, WebSocket};
+use tungstenite::{Bytes, ClientRequestBuilder, Error as WsError, Message, WebSocket};
 
 const MARKER: &str = "QUILL_BYTES_MARKER";
+
+/// P0 CSWSH:daemon 起 WS 后强制握手鉴权。测试用一个已知 token(经 `QUILL_SHARE_TOKEN` env 传给
+/// kernel),连接 URL 带 `?t=<TEST_TOKEN>` 才能握手成功。
+const TEST_TOKEN: &str = "test0token0deadbeef";
+
+/// 带对 token 的本机 WS URL(正向用例的默认 URL)。
+fn ws_url(port: u16) -> String {
+    format!("ws://127.0.0.1:{port}/?t={TEST_TOKEN}")
+}
 
 /// 抓一个空闲 TCP 端口(bind :0 拿到后立刻释放,把端口号交给 daemon)。
 fn free_port() -> u16 {
@@ -126,6 +135,7 @@ fn spawn_daemon(sock: &std::path::Path, shell: &std::path::Path, port: u16) -> s
         .arg(format!("--ws-bind=127.0.0.1:{port}"))
         .env("SHELL", shell)
         .env("RUST_LOG", "quill=warn")
+        .env("QUILL_SHARE_TOKEN", TEST_TOKEN)
         .spawn()
         .expect("spawn quill-kernel daemon")
 }
@@ -258,7 +268,7 @@ fn daemon_streams_known_pty_bytes_over_ws_and_keeps_alive() {
     let port = free_port();
     let mut child = spawn_daemon(&sock, &shell, port);
 
-    let url = format!("ws://127.0.0.1:{port}/");
+    let url = ws_url(port);
     let cleanup = |child: &mut std::process::Child, dir: &std::path::Path| {
         send_signal(child.id(), libc::SIGTERM);
         let _ = child.wait();
@@ -322,7 +332,7 @@ fn daemon_round_trips_input_over_ws() {
     let port = free_port();
     let mut child = spawn_daemon(&sock, &shell, port);
 
-    let url = format!("ws://127.0.0.1:{port}/");
+    let url = ws_url(port);
     let cleanup = |child: &mut std::process::Child, dir: &std::path::Path| {
         send_signal(child.id(), libc::SIGTERM);
         let _ = child.wait();
@@ -371,7 +381,7 @@ fn daemon_drops_slow_client_over_cap() {
     let port = free_port();
     let mut child = spawn_daemon(&sock, &shell, port);
 
-    let url = format!("ws://127.0.0.1:{port}/");
+    let url = ws_url(port);
     let cleanup = |child: &mut std::process::Child, dir: &std::path::Path| {
         send_signal(child.id(), libc::SIGTERM);
         let _ = child.wait();
@@ -500,6 +510,7 @@ fn daemon_reaps_stuck_handshake_connection() {
         .arg(format!("--ws-bind=127.0.0.1:{port}"))
         .env("SHELL", &shell)
         .env("RUST_LOG", "quill=warn")
+        .env("QUILL_SHARE_TOKEN", TEST_TOKEN)
         .env("QUILL_WS_REAP_MS", "200")
         .env("QUILL_WS_HANDSHAKE_DEADLINE_MS", "600")
         .spawn()
@@ -613,6 +624,7 @@ fn daemon_reaps_unread_http_response_writer() {
         .arg(format!("--ws-bind=127.0.0.1:{port}"))
         .env("SHELL", &shell)
         .env("RUST_LOG", "quill=warn")
+        .env("QUILL_SHARE_TOKEN", TEST_TOKEN)
         .env("QUILL_WS_REAP_MS", "200")
         .env("QUILL_WS_HTTP_WRITE_DEADLINE_MS", "600")
         .spawn()
@@ -706,7 +718,7 @@ fn daemon_sends_control_text_frames_on_connect() {
     let port = free_port();
     let mut child = spawn_daemon(&sock, &shell, port);
 
-    let url = format!("ws://127.0.0.1:{port}/");
+    let url = ws_url(port);
     let cleanup = |child: &mut std::process::Child, dir: &std::path::Path| {
         send_signal(child.id(), libc::SIGTERM);
         let _ = child.wait();
@@ -769,7 +781,7 @@ fn daemon_reaps_disconnected_clients_and_anchor_keeps_alive() {
     let port = free_port();
     let mut child = spawn_daemon(&sock, &shell, port);
 
-    let url = format!("ws://127.0.0.1:{port}/");
+    let url = ws_url(port);
     let cleanup = |child: &mut std::process::Child, dir: &std::path::Path| {
         send_signal(child.id(), libc::SIGTERM);
         let _ = child.wait();
@@ -813,7 +825,7 @@ fn daemon_release_closes_connection_but_keeps_workspace() {
     let port = free_port();
     let mut child = spawn_daemon(&sock, &shell, port);
 
-    let url = format!("ws://127.0.0.1:{port}/");
+    let url = ws_url(port);
     let cleanup = |child: &mut std::process::Child, dir: &std::path::Path| {
         send_signal(child.id(), libc::SIGTERM);
         let _ = child.wait();
@@ -880,5 +892,129 @@ fn daemon_release_closes_connection_but_keeps_workspace() {
     assert!(
         alive,
         "Release 只关那个 view;anchor 保活 → 工作区不销毁,新连接仍能收 MARKER"
+    );
+}
+
+// ── P0 CSWSH 握手鉴权(token + Origin + Host)端到端验收 ────────────────────────────
+
+/// 尝试一次 WS 握手,返回是否被 daemon **以 403 拒绝**(CSWSH 防线命中)。daemon 须已在跑
+///(调用前先用带对 token 的连接确认 up),故单次尝试即确定:成功=非拒绝;`Http(403)`=正确拒绝。
+fn ws_rejected_403<R: tungstenite::client::IntoClientRequest>(req: R) -> bool {
+    match tungstenite::connect(req) {
+        Ok((mut ws, _)) => {
+            let _ = ws.close(None);
+            false
+        }
+        Err(WsError::Http(resp)) => resp.status() == tungstenite::http::StatusCode::FORBIDDEN,
+        Err(_) => false,
+    }
+}
+
+/// 正向:带**对** token 的握手成功 + 收到控制面帧(证鉴权放行合法客户端)。
+#[test]
+fn daemon_accepts_ws_with_valid_token() {
+    let dir = std::env::temp_dir().join(format!("quill-auth-ok-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("建临时目录");
+    let sock = dir.join("kernel.sock");
+    let shell = dir.join("shell.sh");
+    write_marker_shell(&shell);
+    let port = free_port();
+    let mut child = spawn_daemon(&sock, &shell, port);
+    let cleanup = |child: &mut std::process::Child, dir: &std::path::Path| {
+        send_signal(child.id(), libc::SIGTERM);
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(dir);
+    };
+
+    let ws = connect_ws(&ws_url(port), Duration::from_secs(15));
+    let ok = match ws {
+        Some(mut w) => {
+            let got = ws_recv_until(&mut w, MARKER.as_bytes(), Duration::from_secs(10));
+            let _ = w.close(None);
+            got
+        }
+        None => false,
+    };
+    cleanup(&mut child, &dir);
+    assert!(ok, "带对 token 的 WS 握手应成功并收到直播字节");
+}
+
+/// 负向:**缺 token**(裸 `ws://host/`,恶意网页 `new WebSocket` 的形态)→ 403 拒绝(CSWSH 核心)。
+#[test]
+fn daemon_rejects_ws_without_token() {
+    let dir = std::env::temp_dir().join(format!("quill-auth-notok-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("建临时目录");
+    let sock = dir.join("kernel.sock");
+    let shell = dir.join("shell.sh");
+    write_marker_shell(&shell);
+    let port = free_port();
+    let mut child = spawn_daemon(&sock, &shell, port);
+    let cleanup = |child: &mut std::process::Child, dir: &std::path::Path| {
+        send_signal(child.id(), libc::SIGTERM);
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(dir);
+    };
+
+    // 先用对 token 确认 daemon up(排除"连不上"混淆)。
+    let up = connect_ws(&ws_url(port), Duration::from_secs(15)).is_some();
+    let rejected = ws_rejected_403(format!("ws://127.0.0.1:{port}/"));
+    cleanup(&mut child, &dir);
+    assert!(up, "前置:带对 token 应能连上(daemon up)");
+    assert!(
+        rejected,
+        "缺 token 的 WS 握手应被 403 拒绝(CSWSH:恶意网页拿不到 token)"
+    );
+}
+
+/// 负向:**错 token** → 403 拒绝。
+#[test]
+fn daemon_rejects_ws_with_wrong_token() {
+    let dir = std::env::temp_dir().join(format!("quill-auth-badtok-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("建临时目录");
+    let sock = dir.join("kernel.sock");
+    let shell = dir.join("shell.sh");
+    write_marker_shell(&shell);
+    let port = free_port();
+    let mut child = spawn_daemon(&sock, &shell, port);
+    let cleanup = |child: &mut std::process::Child, dir: &std::path::Path| {
+        send_signal(child.id(), libc::SIGTERM);
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(dir);
+    };
+
+    let up = connect_ws(&ws_url(port), Duration::from_secs(15)).is_some();
+    let rejected = ws_rejected_403(format!("ws://127.0.0.1:{port}/?t=wrongtokenvalue"));
+    cleanup(&mut child, &dir);
+    assert!(up, "前置:带对 token 应能连上(daemon up)");
+    assert!(rejected, "错 token 的 WS 握手应被 403 拒绝");
+}
+
+/// 负向:token 对但 **Origin 跨源**(`http://evil.com`,恶意网页真实形态:浏览器自动带其页面
+/// Origin)→ 403 拒绝(CSWSH 纵深防线)。
+#[test]
+fn daemon_rejects_ws_cross_origin() {
+    let dir = std::env::temp_dir().join(format!("quill-auth-origin-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("建临时目录");
+    let sock = dir.join("kernel.sock");
+    let shell = dir.join("shell.sh");
+    write_marker_shell(&shell);
+    let port = free_port();
+    let mut child = spawn_daemon(&sock, &shell, port);
+    let cleanup = |child: &mut std::process::Child, dir: &std::path::Path| {
+        send_signal(child.id(), libc::SIGTERM);
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(dir);
+    };
+
+    let up = connect_ws(&ws_url(port), Duration::from_secs(15)).is_some();
+    // 带对 token + 合法 Host(IP)但跨源 Origin → 应被拒。
+    let uri: tungstenite::http::Uri = ws_url(port).parse().expect("parse ws uri");
+    let evil = ClientRequestBuilder::new(uri).with_header("Origin", "http://evil.com");
+    let rejected = ws_rejected_403(evil);
+    cleanup(&mut child, &dir);
+    assert!(up, "前置:带对 token 应能连上(daemon up)");
+    assert!(
+        rejected,
+        "token 对但 Origin=evil.com 的握手应被 403 拒绝(CSWSH 纵深:跨源浏览器请求)"
     );
 }

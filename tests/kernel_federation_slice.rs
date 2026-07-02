@@ -32,6 +32,10 @@ fn free_port() -> u16 {
     l.local_addr().expect("local_addr").port()
 }
 
+/// P0 CSWSH:联邦 kernel 也强制 WS 握手 token 鉴权。已知 token 经 `QUILL_SHARE_TOKEN` env 下发,
+/// [`connect_ws`] 连接 URL 带 `?t=<TEST_TOKEN>`。
+const TEST_TOKEN: &str = "fed0test0token0cafe";
+
 /// 会合 kernel 子进程 + 会合 socket 路径。
 struct FedKernel {
     child: Child,
@@ -52,6 +56,8 @@ impl FedKernel {
         cmd.arg(format!("--rendezvous={}", sock.display()))
             .arg(format!("--ws-bind=127.0.0.1:{port}"))
             .env("RUST_LOG", "quill=warn")
+            // P0 CSWSH:WS 握手强制 token 鉴权,已知 token 经 env 下发,connect_ws 带 `?t=`。
+            .env("QUILL_SHARE_TOKEN", TEST_TOKEN)
             // 关键:每 feeder 断都会触发"最后 feeder?"检查;若 kernel 启动即零 feeder 会等 grace。
             // 测试里我们很快接入 feeder,不必等 grace;但把 grace 设长防误退。
             .env("QUILL_FED_STARTUP_GRACE_MS", "60000");
@@ -128,7 +134,7 @@ fn declare(stream: &mut UnixStream, ws: u64, focus_tab: u64, tabs: &[(u64, &str)
 }
 
 fn connect_ws(port: u16, timeout: Duration) -> Option<WebSocket<MaybeTlsStream<TcpStream>>> {
-    let url = format!("ws://127.0.0.1:{port}/");
+    let url = format!("ws://127.0.0.1:{port}/?t={TEST_TOKEN}");
     let deadline = Instant::now() + timeout;
     loop {
         if Instant::now() >= deadline {
